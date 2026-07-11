@@ -48,8 +48,8 @@ Each mitigation gets a test as its phase lands (see ARCHITECTURE.md roadmap):
 - Phase 7 [DONE]: ASVS L2 review complete (see below). Relay access control and
   deserialization bounds fixed and tested; parsers fuzzed for panic-safety; TLS
   on the signaling hop and per-connection rate limiting implemented and tested;
-  CI gate (fmt/clippy/test/audit/secret-scan) in `ci/ci.yml` (activate under
-  `.github/workflows/`). One upstream advisory waived as verified non-exploitable.
+  CI gate (fmt/clippy/test/audit/secret-scan) in `.github/workflows/ci.yml`. One
+  upstream advisory waived as verified non-exploitable.
 
 ## Accepted risks (explicit)
 

@@ -162,8 +162,8 @@ window by default and only add the WASM/browser target when we choose to.
    deserialization is size-bounded (UDP 64 KiB, WS 1 MiB); parsers fuzzed for
    panic-safety; optional TLS (wss) on the signaling hop; per-connection rate
    limiting; a CI gate runs fmt + clippy(-D warnings) + tests + `cargo audit` +
-   secret scan on every push (`ci/ci.yml`; copy into `.github/workflows/` to
-   activate). One upstream advisory (RUSTSEC-2026-0124) is waived as verified
+   secret scan on every push (`.github/workflows/ci.yml`). One upstream advisory
+   (RUSTSEC-2026-0124) is waived as verified
    non-exploitable and tracked.
 
 Each phase ends compiling and tested; no half-done work carried forward.
