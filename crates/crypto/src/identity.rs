@@ -7,10 +7,15 @@
 
 use std::path::Path;
 
+use argon2::password_hash::rand_core::{OsRng, RngCore};
+use argon2::Argon2;
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use openmls::prelude::{tls_codec::*, *};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider;
+use zeroize::Zeroize;
 
 use crate::{CryptoError, CIPHERSUITE};
 
@@ -79,21 +84,64 @@ impl Identity {
             .map_err(|e| CryptoError::Serialize(e.to_string()))
     }
 
-    /// Persist this identity's signing key to `path`, so a later login on this
-    /// device restores the same identity (and therefore the same safety
-    /// number). The private key never leaves the device.
-    pub fn save(&self, path: &Path) -> Result<(), CryptoError> {
-        let bytes = serde_json::to_vec(&self.signer)
+    /// Persist this identity's signing key to `path`, encrypted at rest with a
+    /// key derived from `password` (Argon2id -> ChaCha20-Poly1305). The private
+    /// key never leaves the device and is useless on disk without the password.
+    /// File layout: salt(16) || nonce(12) || ciphertext.
+    pub fn save(&self, path: &Path, password: &str) -> Result<(), CryptoError> {
+        let mut plaintext = serde_json::to_vec(&self.signer)
             .map_err(|e| CryptoError::Identity(format!("serialize: {e}")))?;
-        std::fs::write(path, bytes).map_err(|e| CryptoError::Identity(format!("write: {e}")))?;
+
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        let mut nonce = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce);
+
+        let mut key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(password.as_bytes(), &salt, &mut key)
+            .map_err(|e| CryptoError::Identity(format!("kdf: {e}")))?;
+        let cipher = ChaCha20Poly1305::new(&Key::from(key));
+        key.zeroize();
+
+        let ciphertext = cipher
+            .encrypt(&Nonce::from(nonce), plaintext.as_slice())
+            .map_err(|_| CryptoError::Identity("encrypt failed".into()))?;
+        plaintext.zeroize();
+
+        let mut out = Vec::with_capacity(28 + ciphertext.len());
+        out.extend_from_slice(&salt);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ciphertext);
+        std::fs::write(path, out).map_err(|e| CryptoError::Identity(format!("write: {e}")))?;
         Ok(())
     }
 
-    /// Load an identity for `name` from a signing key saved by [`Identity::save`].
-    pub fn load(name: &str, path: &Path) -> Result<Self, CryptoError> {
+    /// Load an identity for `name`, decrypting the file with `password`. Fails
+    /// (not silently succeeds) on a wrong password or a tampered file.
+    pub fn load(name: &str, path: &Path, password: &str) -> Result<Self, CryptoError> {
         let bytes = std::fs::read(path).map_err(|e| CryptoError::Identity(format!("read: {e}")))?;
-        let signer: SignatureKeyPair = serde_json::from_slice(&bytes)
+        if bytes.len() < 28 {
+            return Err(CryptoError::Identity("identity file too short".into()));
+        }
+        let salt = &bytes[0..16];
+        let nonce: [u8; 12] = bytes[16..28].try_into().expect("12 bytes");
+        let ciphertext = &bytes[28..];
+
+        let mut key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(password.as_bytes(), salt, &mut key)
+            .map_err(|e| CryptoError::Identity(format!("kdf: {e}")))?;
+        let cipher = ChaCha20Poly1305::new(&Key::from(key));
+        key.zeroize();
+
+        let mut plaintext = cipher
+            .decrypt(&Nonce::from(nonce), ciphertext)
+            .map_err(|_| CryptoError::Identity("wrong password or corrupt identity".into()))?;
+        let signer: SignatureKeyPair = serde_json::from_slice(&plaintext)
             .map_err(|e| CryptoError::Identity(format!("deserialize: {e}")))?;
+        plaintext.zeroize();
+
         let provider = OpenMlsRustCrypto::default();
         signer
             .store(provider.storage())

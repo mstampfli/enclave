@@ -101,7 +101,7 @@ impl Client {
         password: &str,
     ) -> Result<(), ClientError> {
         let identity = Identity::generate(username)?;
-        let _ = identity.save(&self.identity_path(username));
+        let _ = identity.save(&self.identity_path(username), password);
         let key_package = identity.new_key_package()?;
         self.conn.send(ClientMsg::CreateAccount {
             username: username.to_string(),
@@ -117,7 +117,7 @@ impl Client {
     /// Log in to an existing account, restoring the saved identity on this
     /// device (a fresh one is generated if none is saved here).
     pub async fn login(&mut self, username: &str, password: &str) -> Result<(), ClientError> {
-        let identity = Identity::load(username, &self.identity_path(username))
+        let identity = Identity::load(username, &self.identity_path(username), password)
             .or_else(|_| Identity::generate(username))?;
         let key_package = identity.new_key_package()?;
         self.conn.send(ClientMsg::Login {
@@ -126,7 +126,7 @@ impl Client {
             key_package,
         });
         self.await_auth().await?;
-        let _ = identity.save(&self.identity_path(username));
+        let _ = identity.save(&self.identity_path(username), password);
         self.finish_login(identity, username);
         Ok(())
     }

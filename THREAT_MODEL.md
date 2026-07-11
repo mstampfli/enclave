@@ -112,6 +112,51 @@ Target level L2 (private communications). Chapters touched and status:
   latest and exact-pin `libcrux-aead 0.0.7`. Waived in CI with this
   justification; re-checked on every build.
 
+## Account authentication (STRIDE + ASVS L2)
+
+Target level **L2**. Scope: account create / login / logout, credential storage,
+and the identity key at rest.
+
+### Data flow and trust boundaries
+
+- **External entity:** the user (knows their password).
+- **Process:** the relay's auth handler (`AccountStore` + relay).
+- **Data stores:** server account file (`enclave-accounts.json`); client identity
+  file (`enclave-<user>.id`).
+- **Flows crossing the client->server trust boundary:** the login credential and
+  the create-account credential.
+
+### STRIDE
+
+| Threat | Concrete risk | Status / mitigation |
+|---|---|---|
+| **S** Spoofing | Impersonate a user | Password auth; identity key pinned per account. **GAP: MFA not offered.** |
+| **T** Tampering | Alter the account/identity file | AEAD/integrity on the identity file (below); server file is server-trusted. |
+| **R** Repudiation | Deny an action | Not a goal (private-comms); accepted. |
+| **I** Info disclosure (password) | Server learns the password | **CURRENT GAP: not zero-knowledge -- the client sends the plaintext password and the server hashes it, so the server sees the password at login.** Fix: a PAKE (server never sees it). |
+| **I** Info disclosure (identity at rest) | Private key read off disk | **CURRENT GAP: `enclave-<user>.id` is unencrypted.** Fix: encrypt with a password-derived key. |
+| **I** Info disclosure (stored verifier) | Server DB leak -> offline crack | Argon2id verifier resists it; a PAKE verifier is stronger. |
+| **D** Denial of service | Login flooding / brute force | Per-connection lockout after 5 failures (ASVS V2); coarse. |
+| **E** Elevation | Act before/without auth | Deny-by-default auth gate: nothing routes before login (ASVS V4). |
+
+### ASVS L2 status (honest)
+
+- **V2 Authentication** [PARTIAL]: Argon2id + per-password salt + 12-char min +
+  lockout are in place. **Missing: the server sees the password (not ZK); no
+  breach-corpus check; no MFA.**
+- **V6 Stored Cryptography** [PARTIAL]: password stored as an Argon2id verifier
+  (good). **Identity private key stored unencrypted (gap).**
+- **V8 Data Protection** [GAP]: the identity key at rest is not encrypted.
+- **V9 Communications** [PARTIAL]: TLS is available (`serve_signaling_tls`) but the
+  default run is plaintext `ws://`.
+
+### Remediation (in progress)
+
+1. **Zero-knowledge auth (PAKE):** replace send-password-and-hash with a PAKE so
+   the server never sees the password. Closes the V2/STRIDE-I credential gap.
+2. **Encrypt the identity at rest** with a password-derived key. Closes the
+   V8/STRIDE-I identity gap.
+
 ## Deferred mitigations (scheduled, not skipped)
 
 No outstanding security mitigations: the ASVS L2 chapters above are addressed
