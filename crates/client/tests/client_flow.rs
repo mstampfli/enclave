@@ -15,6 +15,35 @@ async fn next_event(client: &mut Client) -> Event {
 }
 
 #[tokio::test]
+async fn presence_events_reach_a_watcher() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+
+    let mut alice = Client::connect(&url, "alice").await.unwrap();
+    alice.add_friend("bob"); // start watching Bob
+
+    // Bob comes online -> Alice is told (via broadcast or the watch reply).
+    let bob = Client::connect(&url, "bob").await.unwrap();
+    loop {
+        if let Event::Presence { user, status } = next_event(&mut alice).await {
+            if user == "bob" && status == "online" {
+                break;
+            }
+        }
+    }
+
+    // Bob drops -> Alice is told he went offline.
+    drop(bob);
+    loop {
+        if let Event::Presence { user, status } = next_event(&mut alice).await {
+            if user == "bob" && status == "offline" {
+                break;
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn two_clients_chat_through_the_controller() {
     let handle = serve("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", handle.addr);

@@ -29,6 +29,8 @@ enum UiCommand {
     StartGroup,
     Invite { peer: String },
     SendText { text: String },
+    AddFriend { user: String },
+    SetPresence { status: String },
 }
 
 /// Events the core sends to the UI (serialized straight into `onEnclaveEvent`).
@@ -45,6 +47,10 @@ enum UiEvent {
         from: String,
         text: String,
         mine: bool,
+    },
+    Presence {
+        user: String,
+        status: String,
     },
     Status {
         message: String,
@@ -133,6 +139,9 @@ async fn run_client(
                     let safety_number = client.as_ref().and_then(|c| c.safety_number());
                     emit(&proxy, UiEvent::Membership { safety_number });
                 }
+                Event::Presence { user, status } => {
+                    emit(&proxy, UiEvent::Presence { user, status })
+                }
                 Event::Error(message) => emit(
                     &proxy,
                     UiEvent::Status {
@@ -163,8 +172,9 @@ async fn handle_command(
 ) {
     match cmd {
         UiCommand::Connect { server, name } => match Client::connect(&server, &name).await {
-            Ok(c) => {
+            Ok(mut c) => {
                 let name = c.name().to_string();
+                c.use_roster_file(format!("enclave-{name}-friends.json"));
                 *client = Some(c);
                 emit(proxy, UiEvent::Connected { name });
             }
@@ -233,6 +243,21 @@ async fn handle_command(
                         },
                     ),
                 }
+            }
+        }
+        UiCommand::AddFriend { user } => {
+            if let Some(c) = client.as_mut() {
+                c.add_friend(&user);
+            }
+        }
+        UiCommand::SetPresence { status } => {
+            if let Some(c) = client.as_ref() {
+                let status = match status.as_str() {
+                    "away" => enclave_protocol::Presence::Away,
+                    "offline" => enclave_protocol::Presence::Offline,
+                    _ => enclave_protocol::Presence::Online,
+                };
+                c.set_status(status);
             }
         }
     }

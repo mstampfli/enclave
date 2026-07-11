@@ -10,10 +10,11 @@
 //! non-`Send` MLS group never has to cross a thread boundary.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use enclave_crypto::{Group, Identity};
-use enclave_protocol::{ClientMsg, DeviceId, GroupId, Sealed, ServerMsg, UserId};
+use enclave_protocol::{ClientMsg, DeviceId, GroupId, Presence, Sealed, ServerMsg, UserId};
 use enclave_transport::Connection;
 
 /// Errors surfaced to the UI.
@@ -38,8 +39,19 @@ pub enum Event {
     Text { from: String, text: String },
     /// Group membership changed (someone joined, or we joined).
     MembershipChanged,
+    /// A watched friend's presence changed ("online" / "away" / "offline").
+    Presence { user: String, status: String },
     /// A non-fatal error worth showing.
     Error(String),
+}
+
+fn presence_label(status: Presence) -> String {
+    match status {
+        Presence::Online => "online",
+        Presence::Away => "away",
+        Presence::Offline => "offline",
+    }
+    .to_string()
 }
 
 /// One connected user session. One device, one group (for now).
@@ -50,11 +62,13 @@ pub struct Client {
     group: Option<Group>,
     group_id: Option<GroupId>,
     pending: VecDeque<Event>,
+    friends: Vec<UserId>,
+    roster_path: Option<PathBuf>,
 }
 
 impl Client {
     /// Connect to a server and register under `name` (one device per user for
-    /// now; the device id is the name).
+    /// now; the device id is the name). Announces presence as online.
     pub async fn connect(server_url: &str, name: &str) -> Result<Self, ClientError> {
         let identity = Identity::generate(name)?;
         let conn = Connection::connect(server_url).await?;
@@ -64,6 +78,8 @@ impl Client {
             identity_pub: identity.identity_key(),
             key_package: identity.new_key_package()?,
         });
+        // Registration already marks the user online; `Presence` is for later
+        // status changes (e.g. away).
         Ok(Self {
             identity,
             conn,
@@ -71,12 +87,64 @@ impl Client {
             group: None,
             group_id: None,
             pending: VecDeque::new(),
+            friends: Vec::new(),
+            roster_path: None,
         })
     }
 
     /// Our display name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Manually set our presence (e.g. Away, or back to Online). Registration
+    /// already announces Online; this is for the user to override it.
+    pub fn set_status(&self, status: Presence) {
+        self.conn.send(ClientMsg::Presence { status });
+    }
+
+    /// The current friends roster.
+    pub fn friends(&self) -> &[UserId] {
+        &self.friends
+    }
+
+    /// Point the client at a JSON roster file: load any existing friends, watch
+    /// their presence, and auto-save on future changes.
+    pub fn use_roster_file(&mut self, path: impl Into<PathBuf>) {
+        let path = path.into();
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(names) = serde_json::from_str::<Vec<String>>(&text) {
+                self.friends = names.into_iter().map(UserId).collect();
+            }
+        }
+        if !self.friends.is_empty() {
+            self.conn.send(ClientMsg::WatchPresence {
+                users: self.friends.clone(),
+            });
+        }
+        self.roster_path = Some(path);
+    }
+
+    /// Add a friend, watch their presence, and persist the roster.
+    pub fn add_friend(&mut self, user: &str) {
+        let user = UserId(user.to_string());
+        if self.friends.contains(&user) {
+            return;
+        }
+        self.friends.push(user.clone());
+        self.conn
+            .send(ClientMsg::WatchPresence { users: vec![user] });
+        self.save_roster();
+    }
+
+    fn save_roster(&self) {
+        let Some(path) = &self.roster_path else {
+            return;
+        };
+        let names: Vec<&str> = self.friends.iter().map(|u| u.0.as_str()).collect();
+        if let Ok(text) = serde_json::to_string_pretty(&names) {
+            let _ = std::fs::write(path, text);
+        }
     }
 
     /// Start a fresh group that we own. The routing id is derived from our
@@ -220,6 +288,10 @@ impl Client {
                     Err(_) => None,
                 }
             }
+            ServerMsg::Presence { user, status } => Some(Event::Presence {
+                user: user.0,
+                status: presence_label(status),
+            }),
             ServerMsg::Error { detail } => Some(Event::Error(detail)),
             _ => None,
         }

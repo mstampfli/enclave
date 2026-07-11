@@ -95,6 +95,9 @@ pub enum ClientMsg {
     Media(MediaFrame),
     /// Coarse presence the user chooses to expose. Metadata, visible to server.
     Presence { status: Presence },
+    /// Subscribe to presence updates for these users (a friends roster). The
+    /// server replies with their current presence and pushes future changes.
+    WatchPresence { users: Vec<UserId> },
 }
 
 /// Server -> client messages.

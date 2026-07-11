@@ -242,11 +242,18 @@ where
         }
     }
 
-    // Cleanup.
-    {
+    // Cleanup: disconnect may produce presence-offline broadcasts to deliver.
+    let sends: Vec<(mpsc::UnboundedSender<ServerMsg>, ServerMsg)> = {
         let mut s = state.lock().unwrap();
-        s.relay.disconnect(conn);
+        let outgoing = s.relay.disconnect(conn);
         s.txs.remove(&conn);
+        outgoing
+            .into_iter()
+            .filter_map(|o| s.txs.get(&o.to).cloned().map(|tx| (tx, o.msg)))
+            .collect()
+    };
+    for (tx, msg) in sends {
+        let _ = tx.send(msg);
     }
     writer.abort();
 }

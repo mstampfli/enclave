@@ -17,10 +17,20 @@ use tokio_tungstenite::WebSocketStream;
 
 use crate::error::TransportError;
 
-/// A live signaling connection to the server.
+/// A live signaling connection to the server. Dropping it closes the socket
+/// (both I/O tasks are aborted), so the server promptly sees the disconnect.
 pub struct Connection {
     out_tx: mpsc::UnboundedSender<ClientMsg>,
     in_rx: mpsc::UnboundedReceiver<ServerMsg>,
+    reader: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.reader.abort();
+        self.writer.abort();
+    }
 }
 
 impl Connection {
@@ -57,7 +67,7 @@ impl Connection {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ClientMsg>();
         let (in_tx, in_rx) = mpsc::unbounded_channel::<ServerMsg>();
 
-        tokio::spawn(async move {
+        let writer = tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
                 let Ok(bytes) = serde_json::to_vec(&msg) else {
                     continue;
@@ -68,7 +78,7 @@ impl Connection {
             }
         });
 
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             while let Some(Ok(msg)) = read.next().await {
                 let bytes = match msg {
                     Message::Binary(b) => b.to_vec(),
@@ -84,7 +94,12 @@ impl Connection {
             }
         });
 
-        Self { out_tx, in_rx }
+        Self {
+            out_tx,
+            in_rx,
+            reader,
+            writer,
+        }
     }
 
     /// Queue a message to the server. Non-blocking.

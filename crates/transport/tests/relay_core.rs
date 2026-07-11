@@ -1,6 +1,6 @@
 //! Unit tests for the pure relay routing core (no network).
 
-use enclave_protocol::{ClientMsg, DeviceId, GroupId, Sealed, ServerMsg, UserId};
+use enclave_protocol::{ClientMsg, DeviceId, GroupId, Presence, Sealed, ServerMsg, UserId};
 use enclave_transport::Relay;
 
 fn register(r: &mut Relay, user: &str, device: &str, kp: Vec<u8>) -> u64 {
@@ -266,4 +266,55 @@ fn non_member_cannot_join_or_inject() {
     );
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].to, b);
+}
+
+#[test]
+fn presence_reaches_watchers_on_connect_and_disconnect() {
+    let mut r = Relay::new();
+
+    // Alice connects and watches Bob before Bob is online.
+    let a = r.connect();
+    r.handle(
+        a,
+        ClientMsg::Register {
+            user: UserId("alice".into()),
+            device: DeviceId("a1".into()),
+            identity_pub: vec![],
+            key_package: vec![1],
+        },
+    );
+    let out = r.handle(
+        a,
+        ClientMsg::WatchPresence {
+            users: vec![UserId("bob".into())],
+        },
+    );
+    assert!(out.is_empty(), "Bob is unknown, so nothing yet");
+
+    // Bob registers -> Alice (watching Bob) is told he is online.
+    let b = r.connect();
+    let out = r.handle(
+        b,
+        ClientMsg::Register {
+            user: UserId("bob".into()),
+            device: DeviceId("b1".into()),
+            identity_pub: vec![],
+            key_package: vec![2],
+        },
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].to, a);
+    assert!(matches!(
+        &out[0].msg,
+        ServerMsg::Presence { user, status: Presence::Online } if user.0 == "bob"
+    ));
+
+    // Bob disconnects -> Alice is told he is offline.
+    let out = r.disconnect(b);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].to, a);
+    assert!(matches!(
+        &out[0].msg,
+        ServerMsg::Presence { user, status: Presence::Offline } if user.0 == "bob"
+    ));
 }

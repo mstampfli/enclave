@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 
-use enclave_protocol::{ClientMsg, DeviceId, GroupId, ServerMsg, UserId};
+use enclave_protocol::{ClientMsg, DeviceId, GroupId, Presence, ServerMsg, UserId};
 
 /// Opaque handle for one client connection. Assigned by the relay on connect.
 pub type ConnId = u64;
@@ -41,6 +41,12 @@ pub struct Relay {
     group_members: HashMap<GroupId, HashSet<DeviceId>>,
     /// Learned UDP endpoint per device, for the real-time media channel.
     udp_addrs: HashMap<DeviceId, SocketAddr>,
+    /// The user on each connection (from Register), for presence.
+    conn_user: HashMap<ConnId, UserId>,
+    /// Last-known presence per user.
+    presence: HashMap<UserId, Presence>,
+    /// Connections that want presence updates about a given user (friends).
+    presence_watchers: HashMap<UserId, HashSet<ConnId>>,
 }
 
 impl Relay {
@@ -55,14 +61,43 @@ impl Relay {
         id
     }
 
-    /// Drop a connection: forget its device and remove it from all routing sets.
-    pub fn disconnect(&mut self, conn: ConnId) {
+    /// Drop a connection: forget its device, remove it from all routing sets,
+    /// and (if this was the user's last connection) broadcast that they went
+    /// offline. Returns any presence updates to deliver.
+    pub fn disconnect(&mut self, conn: ConnId) -> Vec<Outgoing> {
         if let Some(device) = self.conn_device.remove(&conn) {
             self.device_conn.remove(&device);
             self.udp_addrs.remove(&device);
             for members in self.group_members.values_mut() {
                 members.remove(&device);
             }
+        }
+        for watchers in self.presence_watchers.values_mut() {
+            watchers.remove(&conn);
+        }
+        if let Some(user) = self.conn_user.remove(&conn) {
+            if !self.conn_user.values().any(|u| *u == user) {
+                return self.set_presence(&user, Presence::Offline);
+            }
+        }
+        vec![]
+    }
+
+    /// Record a user's presence and return updates for everyone watching them.
+    fn set_presence(&mut self, user: &UserId, status: Presence) -> Vec<Outgoing> {
+        self.presence.insert(user.clone(), status);
+        match self.presence_watchers.get(user) {
+            Some(watchers) => watchers
+                .iter()
+                .map(|&conn| Outgoing {
+                    to: conn,
+                    msg: ServerMsg::Presence {
+                        user: user.clone(),
+                        status,
+                    },
+                })
+                .collect(),
+            None => vec![],
         }
     }
 
@@ -115,11 +150,13 @@ impl Relay {
                 // A device may reconnect; overwrite its mapping.
                 self.device_conn.insert(device.clone(), from);
                 self.conn_device.insert(from, device);
+                self.conn_user.insert(from, user.clone());
                 self.key_packages
-                    .entry(user)
+                    .entry(user.clone())
                     .or_default()
                     .push_back(key_package);
-                vec![]
+                // Mark online and notify anyone watching this user.
+                self.set_presence(&user, Presence::Online)
             }
 
             ClientMsg::FetchKeyPackages { user } => {
@@ -191,7 +228,28 @@ impl Relay {
                 self.fanout(from, &group, |_| ServerMsg::Media(frame.clone()))
             }
 
-            ClientMsg::Presence { .. } => vec![], // Phase 6
+            ClientMsg::Presence { status } => match self.conn_user.get(&from).cloned() {
+                Some(user) => self.set_presence(&user, status),
+                None => vec![],
+            },
+
+            ClientMsg::WatchPresence { users } => {
+                let mut out = Vec::new();
+                for user in users {
+                    self.presence_watchers
+                        .entry(user.clone())
+                        .or_default()
+                        .insert(from);
+                    // Send the current status right away, if known.
+                    if let Some(&status) = self.presence.get(&user) {
+                        out.push(Outgoing {
+                            to: from,
+                            msg: ServerMsg::Presence { user, status },
+                        });
+                    }
+                }
+                out
+            }
         }
     }
 
