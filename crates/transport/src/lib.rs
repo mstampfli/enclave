@@ -15,6 +15,7 @@
 //! [`ServerMsg`]: enclave_protocol::ServerMsg
 //! [`MediaFrame`]: enclave_protocol::MediaFrame
 
+pub mod accounts;
 pub mod client;
 pub mod error;
 pub mod media_socket;
@@ -22,6 +23,7 @@ pub mod ratelimit;
 pub mod relay;
 pub mod server;
 
+pub use accounts::{AccountStore, AuthOutcome};
 pub use client::Connection;
 pub use error::TransportError;
 pub use media_socket::MediaSocket;
