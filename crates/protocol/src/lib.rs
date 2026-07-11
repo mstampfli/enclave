@@ -100,17 +100,33 @@ pub enum ClientMsg {
 /// Server -> client messages.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerMsg {
-    KeyPackages { user: UserId, packages: Vec<Vec<u8>> },
+    KeyPackages {
+        user: UserId,
+        packages: Vec<Vec<u8>>,
+    },
     Welcome {
         group: GroupId,
         from: DeviceId,
         message: Sealed,
     },
-    Mls { group: GroupId, from: DeviceId, message: Sealed },
-    Text { group: GroupId, from: DeviceId, message: Sealed },
+    Mls {
+        group: GroupId,
+        from: DeviceId,
+        message: Sealed,
+    },
+    Text {
+        group: GroupId,
+        from: DeviceId,
+        message: Sealed,
+    },
     Media(MediaFrame),
-    Presence { user: UserId, status: Presence },
-    Error { detail: String },
+    Presence {
+        user: UserId,
+        status: Presence,
+    },
+    Error {
+        detail: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]

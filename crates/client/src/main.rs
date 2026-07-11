@@ -35,10 +35,21 @@ enum UiCommand {
 #[derive(serde::Serialize, Clone)]
 #[serde(tag = "type")]
 enum UiEvent {
-    Connected { name: String },
-    Membership { safety_number: Option<String> },
-    Text { from: String, text: String, mine: bool },
-    Status { message: String, error: bool },
+    Connected {
+        name: String,
+    },
+    Membership {
+        safety_number: Option<String>,
+    },
+    Text {
+        from: String,
+        text: String,
+        mine: bool,
+    },
+    Status {
+        message: String,
+        error: bool,
+    },
 }
 
 fn main() -> wry::Result<()> {
@@ -90,7 +101,10 @@ fn emit(proxy: &EventLoopProxy<UiEvent>, event: UiEvent) {
     let _ = proxy.send_event(event);
 }
 
-async fn run_client(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, proxy: EventLoopProxy<UiEvent>) {
+async fn run_client(
+    mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
+    proxy: EventLoopProxy<UiEvent>,
+) {
     let mut client: Option<Client> = None;
     loop {
         // Drain queued commands first (no borrow held across event polling).

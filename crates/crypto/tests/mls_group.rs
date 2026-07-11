@@ -16,7 +16,10 @@ fn two_members_agree_on_secret_and_safety_number() {
     let bob_kp = bob.new_key_package().expect("bob key package");
 
     let mut alice_group = Group::create(&alice).expect("create group");
-    let welcome = alice_group.add_member(&alice, &bob_kp).expect("add bob").welcome;
+    let welcome = alice_group
+        .add_member(&alice, &bob_kp)
+        .expect("add bob")
+        .welcome;
 
     let bob_group = Group::join(&bob, &welcome).expect("bob joins");
 

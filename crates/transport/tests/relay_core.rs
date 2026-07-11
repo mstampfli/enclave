@@ -22,7 +22,12 @@ fn fetch_returns_a_published_key_package_once() {
     let mut r = Relay::new();
     let conn = register(&mut r, "u", "u1", vec![9, 9, 9]);
 
-    let out = r.handle(conn, ClientMsg::FetchKeyPackages { user: UserId("u".into()) });
+    let out = r.handle(
+        conn,
+        ClientMsg::FetchKeyPackages {
+            user: UserId("u".into()),
+        },
+    );
     assert_eq!(out.len(), 1);
     match &out[0].msg {
         ServerMsg::KeyPackages { packages, .. } => assert_eq!(packages, &vec![vec![9, 9, 9]]),
@@ -30,7 +35,12 @@ fn fetch_returns_a_published_key_package_once() {
     }
 
     // Single-use: a second fetch returns nothing.
-    let out2 = r.handle(conn, ClientMsg::FetchKeyPackages { user: UserId("u".into()) });
+    let out2 = r.handle(
+        conn,
+        ClientMsg::FetchKeyPackages {
+            user: UserId("u".into()),
+        },
+    );
     match &out2[0].msg {
         ServerMsg::KeyPackages { packages, .. } => assert!(packages.is_empty()),
         other => panic!("expected empty KeyPackages, got {other:?}"),
@@ -43,8 +53,20 @@ fn text_fans_out_to_other_members_only_and_relays_bytes_unchanged() {
     let a = register(&mut r, "a", "a1", vec![1]);
     let b = register(&mut r, "b", "b1", vec![2]);
     let group = GroupId([5u8; 32]);
-    r.handle(a, ClientMsg::JoinGroup { group: group.clone() });
-    r.handle(b, ClientMsg::JoinGroup { group: group.clone() });
+    r.handle(
+        a,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    ); // Alice bootstraps
+    r.handle(
+        a,
+        ClientMsg::Welcome {
+            to: DeviceId("b1".into()),
+            group: group.clone(),
+            message: Sealed(vec![]),
+        },
+    ); // Alice invites Bob into routing
 
     let out = r.handle(
         a,
@@ -71,8 +93,21 @@ fn text_fans_out_to_all_other_members_in_a_larger_group() {
     let b = register(&mut r, "b", "b1", vec![2]);
     let c = register(&mut r, "c", "c1", vec![3]);
     let group = GroupId([6u8; 32]);
-    for conn in [a, b, c] {
-        r.handle(conn, ClientMsg::JoinGroup { group: group.clone() });
+    r.handle(
+        a,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    ); // Alice bootstraps
+    for peer in ["b1", "c1"] {
+        r.handle(
+            a,
+            ClientMsg::Welcome {
+                to: DeviceId(peer.into()),
+                group: group.clone(),
+                message: Sealed(vec![]),
+            },
+        );
     }
 
     let out = r.handle(
@@ -96,7 +131,12 @@ fn welcome_is_directed_and_adds_the_recipient_to_routing() {
     let a = register(&mut r, "a", "a1", vec![1]);
     let b = register(&mut r, "b", "b1", vec![2]);
     let group = GroupId([3u8; 32]);
-    r.handle(a, ClientMsg::JoinGroup { group: group.clone() });
+    r.handle(
+        a,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    );
 
     // Alice welcomes Bob's device directly.
     let out = r.handle(
@@ -130,8 +170,20 @@ fn disconnect_removes_the_device_from_routing() {
     let a = register(&mut r, "a", "a1", vec![1]);
     let b = register(&mut r, "b", "b1", vec![2]);
     let group = GroupId([8u8; 32]);
-    r.handle(a, ClientMsg::JoinGroup { group: group.clone() });
-    r.handle(b, ClientMsg::JoinGroup { group: group.clone() });
+    r.handle(
+        a,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    ); // Alice bootstraps
+    r.handle(
+        a,
+        ClientMsg::Welcome {
+            to: DeviceId("b1".into()),
+            group: group.clone(),
+            message: Sealed(vec![]),
+        },
+    );
 
     r.disconnect(b);
 
@@ -142,5 +194,76 @@ fn disconnect_removes_the_device_from_routing() {
             message: Sealed(vec![0]),
         },
     );
-    assert!(out.is_empty(), "a disconnected device must not be routed to");
+    assert!(
+        out.is_empty(),
+        "a disconnected device must not be routed to"
+    );
+}
+
+#[test]
+fn non_member_cannot_join_or_inject() {
+    let mut r = Relay::new();
+    let a = register(&mut r, "a", "a1", vec![1]);
+    let b = register(&mut r, "b", "b1", vec![2]);
+    let mallory = register(&mut r, "mallory", "m1", vec![3]);
+    let group = GroupId([9u8; 32]);
+
+    // Alice creates the group and invites Bob (the legitimate path).
+    r.handle(
+        a,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    );
+    r.handle(
+        a,
+        ClientMsg::Welcome {
+            to: DeviceId("b1".into()),
+            group: group.clone(),
+            message: Sealed(vec![]),
+        },
+    );
+
+    // Mallory tries to self-join the existing group: rejected.
+    r.handle(
+        mallory,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    );
+
+    // She cannot inject a message (not a member).
+    let injected = r.handle(
+        mallory,
+        ClientMsg::Text {
+            group: group.clone(),
+            message: Sealed(vec![6, 6, 6]),
+        },
+    );
+    assert!(
+        injected.is_empty(),
+        "a non-member must not inject into a group"
+    );
+
+    // She cannot invite herself via a Welcome (not a member).
+    let sneaked = r.handle(
+        mallory,
+        ClientMsg::Welcome {
+            to: DeviceId("m1".into()),
+            group: group.clone(),
+            message: Sealed(vec![]),
+        },
+    );
+    assert!(sneaked.is_empty(), "a non-member cannot invite");
+
+    // Alice's legitimate message still reaches only Bob.
+    let out = r.handle(
+        a,
+        ClientMsg::Text {
+            group,
+            message: Sealed(vec![1]),
+        },
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].to, b);
 }

@@ -1,0 +1,53 @@
+# To activate this pipeline, copy this file to .github/workflows/ci.yml. That
+# path is pushed only by a token with `workflow` scope, so it lives here in the
+# meantime; the content is ready to run as-is.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Security and quality gates. A failure here breaks the build; nothing merges
+# past a new HIGH advisory, a lint, or a leaked secret. See DevSecOps notes in
+# THREAT_MODEL.md.
+jobs:
+  build-test:
+    name: Build, lint, test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      - name: Scan for known-vulnerable dependencies
+        # RUSTSEC-2026-0124 (libcrux-chacha20poly1305 DoS panic on overlong
+        # ciphertext) is an explicit, recorded waiver: the fix is blocked by an
+        # upstream exact pin in libcrux-aead 0.0.7, reached via
+        # openmls_rust_crypto -> hpke-rs -> hpke-rs-libcrux. Tracked in
+        # THREAT_MODEL.md; re-check when openmls/hpke-rs ship a libcrux bump.
+        # Every OTHER advisory still breaks the build.
+        run: cargo audit --ignore RUSTSEC-2026-0124
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2

@@ -27,7 +27,10 @@ async fn two_clients_chat_through_the_controller() {
     alice.invite("bob").await.unwrap();
 
     // Bob learns he joined.
-    assert!(matches!(next_event(&mut bob).await, Event::MembershipChanged));
+    assert!(matches!(
+        next_event(&mut bob).await,
+        Event::MembershipChanged
+    ));
 
     // Both sides show the same safety number.
     assert!(alice.safety_number().is_some());

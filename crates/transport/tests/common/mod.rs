@@ -112,7 +112,10 @@ pub async fn establish() -> Established {
 
     let mut alice_group = Group::create(&alice).expect("create group");
     alice_conn.send(ClientMsg::JoinGroup { group: GROUP });
-    let welcome = alice_group.add_member(&alice, &bob_kp).expect("add bob").welcome;
+    let welcome = alice_group
+        .add_member(&alice, &bob_kp)
+        .expect("add bob")
+        .welcome;
     alice_conn.send(ClientMsg::Welcome {
         to: DeviceId("bob-1".into()),
         group: GROUP,

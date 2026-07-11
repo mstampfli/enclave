@@ -68,7 +68,9 @@ fn an_outsider_cannot_decrypt() {
     let mallory = Identity::generate("mallory").expect("mallory");
     let mut mallory_group = Group::create(&mallory).expect("mallory group");
 
-    let sealed = alice_group.encrypt_text(&alice, b"secret").expect("encrypt");
+    let sealed = alice_group
+        .encrypt_text(&alice, b"secret")
+        .expect("encrypt");
     let result = mallory_group.decrypt_text(&mallory, &sealed);
     assert!(
         result.is_err(),

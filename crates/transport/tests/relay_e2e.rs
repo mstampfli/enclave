@@ -11,7 +11,10 @@ async fn two_clients_exchange_e2e_text_through_the_server() {
     let mut e = establish().await;
 
     let plaintext = b"the relay never sees this";
-    let sealed = e.alice_group.encrypt_text(&e.alice, plaintext).expect("encrypt");
+    let sealed = e
+        .alice_group
+        .encrypt_text(&e.alice, plaintext)
+        .expect("encrypt");
     e.alice_conn.send(ClientMsg::Text {
         group: GROUP,
         message: Sealed(sealed.clone()),

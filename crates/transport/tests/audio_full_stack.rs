@@ -67,7 +67,11 @@ async fn clear_voice_in_garbage_on_wire_clear_voice_out() {
         // What a wiretap on the relay sees is NOT the Opus audio.
         assert_ne!(&relayed.payload.0, opus, "wire bytes must not be the audio");
         assert!(
-            !relayed.payload.0.windows(opus.len()).any(|w| w == opus.as_slice()),
+            !relayed
+                .payload
+                .0
+                .windows(opus.len())
+                .any(|w| w == opus.as_slice()),
             "sealed frame must not contain the Opus packet"
         );
 
@@ -78,5 +82,8 @@ async fn clear_voice_in_garbage_on_wire_clear_voice_out() {
 
     // Through the addon, Bob hears clear voice -- a real tone, not silence.
     let recovered = rms(&decoded[FRAME_SAMPLES..]);
-    assert!(recovered > 1_000.0, "recovered voice too quiet: rms={recovered}");
+    assert!(
+        recovered > 1_000.0,
+        "recovered voice too quiet: rms={recovered}"
+    );
 }

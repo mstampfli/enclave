@@ -29,5 +29,4 @@ pub use media::{MediaOpener, MediaSealer};
 /// The single ciphersuite Enclave uses: X25519 KEM, AES-128-GCM, SHA-256, and
 /// Ed25519 signatures. One fixed ciphersuite (not a negotiated set) keeps the
 /// security surface small; Ed25519 identity matches `docs/PRIMITIVES.md`.
-pub const CIPHERSUITE: Ciphersuite =
-    Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;

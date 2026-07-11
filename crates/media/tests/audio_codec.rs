@@ -51,5 +51,8 @@ fn opus_round_trips_a_tone_and_compresses() {
     // Recovered audio is a real tone, not silence. Skip the first frame for
     // Opus priming/lookahead.
     let recovered = rms(&decoded[FRAME_SAMPLES..]);
-    assert!(recovered > 1_000.0, "recovered audio too quiet: rms={recovered}");
+    assert!(
+        recovered > 1_000.0,
+        "recovered audio too quiet: rms={recovered}"
+    );
 }

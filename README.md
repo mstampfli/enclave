@@ -9,17 +9,18 @@ that matters: **trust**.
 
 ## Status
 
-Phase 6 -- the full premise proven end to end, multi-party groups, and a
-self-contained window (`cargo test`, 36 tests): audio is Opus-encoded, sealed
-per-frame, relayed through the live server (which sees only ciphertext), then
-opened and decoded back to clear audio; groups rekey on join/leave, cutting
-departed members off; sealed frames stream over a low-latency UDP carrier; and a
-`Client` controller (connect, group, invite, E2E text, safety number) drives a
-wry/WebView2 window whose UI is bundled into the binary. Remaining: presence and
-a persistent friends roster, on-hardware validation of audio devices and the
-window, video/screenshare, and hardening. See `ARCHITECTURE.md` for the roadmap
-and `THREAT_MODEL.md` for the STRIDE analysis. Nothing here is secure to rely on
-yet.
+Phase 7 -- the full premise end to end, multi-party groups, a self-contained
+window, and a hardening pass (`cargo test`, 38 tests): audio is Opus-encoded,
+sealed per-frame, relayed through the live server (which sees only ciphertext),
+then opened and decoded back to clear audio; groups rekey on join/leave, cutting
+departed members off; sealed frames stream over a low-latency UDP carrier; a
+`Client` controller drives a wry/WebView2 window whose UI is bundled into the
+binary; and the relay is deny-by-default access control with size-bounded,
+panic-safe parsing, gated by CI (fmt, clippy, tests, dependency audit, secret
+scan). Remaining: TLS on the signaling hop, rate limiting, presence and a
+friends roster, video/screenshare, and on-hardware validation of the audio
+devices and window. See `ARCHITECTURE.md` for the roadmap and `THREAT_MODEL.md`
+for the STRIDE + ASVS analysis. Nothing here is secure to rely on yet.
 
 ## Workspace
 

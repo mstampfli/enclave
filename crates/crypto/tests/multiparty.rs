@@ -43,7 +43,9 @@ fn three_members_agree_then_rekey_on_leave() {
     let secret_with_bob = alice_group.media_root_secret(&alice).unwrap();
 
     // Alice removes Bob; Charlie applies the removal commit.
-    let removal = alice_group.remove_member(&alice, &bob.identity_key()).unwrap();
+    let removal = alice_group
+        .remove_member(&alice, &bob.identity_key())
+        .unwrap();
     charlie_group.apply_commit(&charlie, &removal).unwrap();
 
     let s_alice_after = alice_group.media_root_secret(&alice).unwrap();
@@ -76,7 +78,9 @@ fn three_members_agree_then_rekey_on_leave() {
         new_epoch,
     )
     .unwrap();
-    let frame = sealer.seal(MediaKind::Audio, b"after bob was removed").unwrap();
+    let frame = sealer
+        .seal(MediaKind::Audio, b"after bob was removed")
+        .unwrap();
 
     let mut bob_opener =
         MediaOpener::new(&s_bob_stale, &GID, &alice.identity_key(), new_epoch).unwrap();

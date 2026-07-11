@@ -103,6 +103,9 @@ mod tests {
             assert_eq!(frame.len(), FRAME_SAMPLES);
             frames += 1;
         });
-        assert_eq!(frames, 2, "buffered remainder completes into a second frame");
+        assert_eq!(
+            frames, 2,
+            "buffered remainder completes into a second frame"
+        );
     }
 }

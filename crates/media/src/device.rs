@@ -54,7 +54,7 @@ impl AudioCapture {
 
         let stream = match sample_format {
             SampleFormat::F32 => device.build_input_stream(
-                config.clone(),
+                config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let mono = downmix_to_mono(data, channels);
                     let pcm: Vec<i16> = mono.iter().map(|&s| f32_to_i16(s)).collect();
@@ -66,7 +66,7 @@ impl AudioCapture {
                 None,
             ),
             SampleFormat::I16 => device.build_input_stream(
-                config.clone(),
+                config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     let floats: Vec<f32> = data.iter().map(|&s| i16_to_f32(s)).collect();
                     let mono = downmix_to_mono(&floats, channels);
@@ -115,7 +115,7 @@ impl AudioPlayback {
 
         let stream = match sample_format {
             SampleFormat::F32 => device.build_output_stream(
-                config.clone(),
+                config,
                 move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut q = q.lock().unwrap();
                     for frame in out.chunks_mut(channels) {
@@ -127,7 +127,7 @@ impl AudioPlayback {
                 None,
             ),
             SampleFormat::I16 => device.build_output_stream(
-                config.clone(),
+                config,
                 move |out: &mut [i16], _: &cpal::OutputCallbackInfo| {
                     let mut q = q.lock().unwrap();
                     for frame in out.chunks_mut(channels) {

@@ -8,10 +8,22 @@
 
 use std::net::SocketAddr;
 
+use bincode::Options;
 use enclave_protocol::{DeviceId, GroupId, MediaFrame, UdpMsg};
 use tokio::net::UdpSocket;
 
 use crate::error::TransportError;
+
+/// Max size of a UDP media datagram. A frame is a small Opus packet plus a
+/// header; this cap keeps a malicious datagram from triggering a huge
+/// allocation on deserialize (ASVS V5/V12). Used on both ends so encode and
+/// decode agree.
+pub(crate) const MEDIA_DATAGRAM_LIMIT: u64 = 64 * 1024;
+
+/// Size-limited bincode config for the UDP media channel.
+pub(crate) fn media_codec() -> impl Options {
+    bincode::DefaultOptions::new().with_limit(MEDIA_DATAGRAM_LIMIT)
+}
 
 /// A UDP media channel to the relay for one device in one group.
 pub struct MediaSocket {
@@ -28,14 +40,14 @@ impl MediaSocket {
     ) -> Result<Self, TransportError> {
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
         sock.connect(server).await?;
-        let hello = bincode::serialize(&UdpMsg::Hello { device, group })?;
+        let hello = media_codec().serialize(&UdpMsg::Hello { device, group })?;
         sock.send(&hello).await?;
         Ok(Self { sock })
     }
 
     /// Send one sealed frame to the relay for fan-out to the group.
     pub async fn send_frame(&self, frame: &MediaFrame) -> Result<(), TransportError> {
-        let bytes = bincode::serialize(&UdpMsg::Frame(frame.clone()))?;
+        let bytes = media_codec().serialize(&UdpMsg::Frame(frame.clone()))?;
         self.sock.send(&bytes).await?;
         Ok(())
     }
@@ -45,7 +57,7 @@ impl MediaSocket {
         let mut buf = vec![0u8; 65_536];
         loop {
             let n = self.sock.recv(&mut buf).await?;
-            if let UdpMsg::Frame(frame) = bincode::deserialize::<UdpMsg>(&buf[..n])? {
+            if let UdpMsg::Frame(frame) = media_codec().deserialize::<UdpMsg>(&buf[..n])? {
                 return Ok(frame);
             }
             // Ignore anything that is not a frame (the relay only sends frames).

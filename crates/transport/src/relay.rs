@@ -71,11 +71,16 @@ impl Relay {
     /// A device announces its UDP endpoint and the group it will stream to.
     pub fn udp_hello(&mut self, src: SocketAddr, device: DeviceId, group: GroupId) {
         self.udp_addrs.insert(device.clone(), src);
-        self.group_members.entry(group).or_default().insert(device);
+        // Same deny-by-default rule as JoinGroup: only bootstrap or re-affirm.
+        let members = self.group_members.entry(group).or_default();
+        if members.is_empty() || members.contains(&device) {
+            members.insert(device);
+        }
     }
 
     /// Learn `sender`'s current UDP endpoint from an incoming frame, and return
-    /// the UDP endpoints of the other group members to forward it to.
+    /// the UDP endpoints of the other group members to forward it to. A
+    /// non-member is dropped (ASVS V4).
     pub fn udp_media_targets(
         &mut self,
         src: SocketAddr,
@@ -83,6 +88,9 @@ impl Relay {
         sender: &DeviceId,
     ) -> Vec<SocketAddr> {
         self.udp_addrs.insert(sender.clone(), src);
+        if !self.is_member(group, sender) {
+            return vec![];
+        }
         let Some(members) = self.group_members.get(group) else {
             return vec![];
         };
@@ -107,16 +115,16 @@ impl Relay {
                 // A device may reconnect; overwrite its mapping.
                 self.device_conn.insert(device.clone(), from);
                 self.conn_device.insert(from, device);
-                self.key_packages.entry(user).or_default().push_back(key_package);
+                self.key_packages
+                    .entry(user)
+                    .or_default()
+                    .push_back(key_package);
                 vec![]
             }
 
             ClientMsg::FetchKeyPackages { user } => {
                 // Key packages are single-use; hand out one per fetch.
-                let package = self
-                    .key_packages
-                    .get_mut(&user)
-                    .and_then(|q| q.pop_front());
+                let package = self.key_packages.get_mut(&user).and_then(|q| q.pop_front());
                 let packages = package.into_iter().collect();
                 vec![Outgoing {
                     to: from,
@@ -126,18 +134,27 @@ impl Relay {
 
             ClientMsg::JoinGroup { group } => {
                 if let Some(device) = self.conn_device.get(&from).cloned() {
-                    self.group_members.entry(group).or_default().insert(device);
+                    // Deny-by-default (ASVS V4): a self-join may only bootstrap a
+                    // new (empty) group or re-affirm existing membership. Joining
+                    // an existing group is done via a Welcome from a member.
+                    let members = self.group_members.entry(group).or_default();
+                    if members.is_empty() || members.contains(&device) {
+                        members.insert(device);
+                    }
                 }
                 vec![]
             }
 
             ClientMsg::Welcome { to, group, message } => {
-                // The new member is now a routing member of the group.
+                let from_device = self.device_for(from);
+                // Only a current member may invite (ASVS V4, deny-by-default).
+                if !self.is_member(&group, &from_device) {
+                    return vec![];
+                }
                 self.group_members
                     .entry(group.clone())
                     .or_default()
                     .insert(to.clone());
-                let from_device = self.device_for(from);
                 match self.device_conn.get(&to) {
                     Some(&conn) => vec![Outgoing {
                         to: conn,
@@ -186,8 +203,15 @@ impl Relay {
             .unwrap_or_else(|| DeviceId(String::new()))
     }
 
+    /// Whether `device` is a routing member of `group`.
+    fn is_member(&self, group: &GroupId, device: &DeviceId) -> bool {
+        self.group_members
+            .get(group)
+            .is_some_and(|members| members.contains(device))
+    }
+
     /// Deliver `make(group)` to every online member of `group` except the
-    /// sender's own device.
+    /// sender's own device. Deny-by-default: a non-member cannot inject.
     fn fanout(
         &self,
         from: ConnId,
@@ -195,6 +219,11 @@ impl Relay {
         make: impl Fn(GroupId) -> ServerMsg,
     ) -> Vec<Outgoing> {
         let sender_device = self.conn_device.get(&from);
+        // Only a member of the group may fan traffic to it (ASVS V4).
+        match sender_device {
+            Some(device) if self.is_member(group, device) => {}
+            _ => return vec![],
+        }
         let Some(members) = self.group_members.get(group) else {
             return vec![];
         };

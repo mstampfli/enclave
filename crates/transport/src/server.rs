@@ -10,14 +10,21 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use bincode::Options;
 use enclave_protocol::{ClientMsg, ServerMsg, UdpMsg};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::error::TransportError;
+use crate::media_socket::media_codec;
 use crate::relay::{ConnId, Relay};
+
+/// Cap on a signaling message. Key packages and Welcomes are small; this bounds
+/// memory a malicious client can force the server to allocate (ASVS V5/V12).
+const SIGNALING_MSG_LIMIT: usize = 1 << 20; // 1 MiB
 
 /// Shared server state: the routing brain plus a per-connection outbound queue.
 struct ServerState {
@@ -75,7 +82,7 @@ impl Server {
                     Ok(x) => x,
                     Err(_) => continue,
                 };
-                let Ok(msg) = bincode::deserialize::<UdpMsg>(&buf[..n]) else {
+                let Ok(msg) = media_codec().deserialize::<UdpMsg>(&buf[..n]) else {
                     continue;
                 };
                 let targets: Vec<SocketAddr> = {
@@ -126,7 +133,10 @@ fn frame_bytes(msg: Message) -> Option<Vec<u8>> {
 }
 
 async fn handle_conn(stream: TcpStream, state: Arc<Mutex<ServerState>>) {
-    let ws = match tokio_tungstenite::accept_async(stream).await {
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(SIGNALING_MSG_LIMIT))
+        .max_frame_size(Some(SIGNALING_MSG_LIMIT));
+    let ws = match tokio_tungstenite::accept_async_with_config(stream, Some(config)).await {
         Ok(ws) => ws,
         Err(_) => return,
     };

@@ -24,11 +24,7 @@ fn round_trips_and_wire_bytes_are_opaque() {
 
     let frame = s.seal(MediaKind::Audio, encoded).unwrap();
     assert!(
-        !frame
-            .payload
-            .0
-            .windows(encoded.len())
-            .any(|w| w == encoded),
+        !frame.payload.0.windows(encoded.len()).any(|w| w == encoded),
         "sealed frame must not contain the plaintext"
     );
 
@@ -38,11 +34,9 @@ fn round_trips_and_wire_bytes_are_opaque() {
 #[test]
 fn counters_are_monotonic_so_nonces_never_repeat() {
     let mut s = sealer(1);
-    let mut expected = 0u64;
-    for _ in 0..2000 {
+    for expected in 0..2000u64 {
         let f = s.seal(MediaKind::Audio, b"x").unwrap();
         assert_eq!(f.counter, expected);
-        expected += 1;
     }
 }
 
