@@ -1,0 +1,18 @@
+[package]
+name = "enclave-client"
+description = "The client app: orchestrates crypto + media + transport behind a WebView UI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "enclave"
+path = "src/main.rs"
+
+[dependencies]
+enclave-protocol = { path = "../protocol" }
+enclave-crypto = { path = "../crypto" }
+enclave-media = { path = "../media" }
+enclave-transport = { path = "../transport" }
+# Phase 6 adds: wry/tao (self-contained WebView window; HTML/CSS/JS front end).

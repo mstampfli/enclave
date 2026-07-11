@@ -1,0 +1,18 @@
+[package]
+name = "enclave-server"
+description = "Self-hosted signaling + SFU. Routes ciphertext; holds no media keys."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "enclave-server"
+path = "src/main.rs"
+
+[dependencies]
+enclave-protocol = { path = "../protocol" }
+enclave-transport = { path = "../transport" }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+# Phase 2 adds: async runtime + TLS WebSocket signaling.
+# Phase 4 adds: SFU fan-out with per-call resource caps + rate limits.
