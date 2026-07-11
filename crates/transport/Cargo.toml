@@ -1,0 +1,23 @@
+[package]
+name = "enclave-transport"
+description = "Signaling channel (TLS) and real-time media transport to the SFU."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+enclave-protocol = { path = "../protocol" }
+futures-util = "0.3.32"
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time"] }
+tokio-tungstenite = "0.30.0"
+
+[dev-dependencies]
+enclave-crypto = { path = "../crypto" }
+enclave-media = { path = "../media" }
+# TLS on the signaling hop is a Phase 7 hardening item (defense-in-depth for
+# metadata in transit); the E2E content guarantee does not depend on it.
+# Phase 3 adds: WebRTC (webrtc crate) or QUIC for media; the SFrame layer rides
+# INSIDE it so the client<->SFU hop is DTLS-SRTP while content stays E2E-sealed.
