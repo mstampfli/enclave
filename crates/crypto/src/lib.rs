@@ -14,7 +14,7 @@
 //! Wire crossings are always bytes (serialized key packages and Welcomes); the
 //! untrusted server only ever forwards these opaque blobs.
 
-use openmls::prelude::Ciphersuite;
+use openmls::prelude::{Capabilities, Ciphersuite, CredentialType};
 
 pub mod error;
 pub mod group;
@@ -30,3 +30,17 @@ pub use media::{MediaOpener, MediaSealer};
 /// Ed25519 signatures. One fixed ciphersuite (not a negotiated set) keeps the
 /// security surface small; Ed25519 identity matches `docs/PRIMITIVES.md`.
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+
+/// The MLS capabilities we advertise: our single ciphersuite and Basic
+/// credentials only. Advertising just AES-128-GCM means a peer can never add us
+/// to a ChaCha20-Poly1305 group, so libcrux's ChaCha path is structurally
+/// unreachable -- defense in depth around RUSTSEC-2026-0124.
+pub(crate) fn enclave_capabilities() -> Capabilities {
+    Capabilities::new(
+        None,
+        Some(&[CIPHERSUITE]),
+        None,
+        None,
+        Some(&[CredentialType::Basic]),
+    )
+}

@@ -62,6 +62,7 @@ impl Identity {
     /// joins the group the key package was consumed into.
     pub fn new_key_package(&self) -> Result<Vec<u8>, CryptoError> {
         let bundle = KeyPackage::builder()
+            .leaf_node_capabilities(crate::enclave_capabilities())
             .build(
                 CIPHERSUITE,
                 &self.provider,

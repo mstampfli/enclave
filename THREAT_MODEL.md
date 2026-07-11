@@ -86,24 +86,31 @@ Target level L2 (private communications). Chapters touched and status:
 
 ### Known advisory (waived: verified not exploitable, tracked)
 
-- **RUSTSEC-2026-0124** -- `libcrux-chacha20poly1305` < 0.0.8: a potential panic
-  on an overlong ciphertext buffer (a DoS in ChaCha20-Poly1305 `open`). Severity
-  8.2. **Not exploitable in Enclave**, verified three ways:
-  1. **Not compiled on the client target.** The client is the only binary that
-     uses crypto, and it ships for Windows/WebView2, where
-     `libcrux-chacha20poly1305` is not in the normal dependency graph
-     (`cargo tree -i libcrux-chacha20poly1305` prints nothing).
-  2. **Not reachable by our ciphersuite.** `MLS_128_DHKEMX25519_AES128GCM_...`
-     uses AES-128-GCM for HPKE, so libcrux's ChaCha20-Poly1305 `open` is never
-     called, on any target.
-  3. **Absent from the server.** `enclave-server` does not depend on
-     `enclave-crypto`, so the (Linux) relay never pulls libcrux.
+- **RUSTSEC-2026-0124** -- `libcrux-chacha20poly1305` < 0.0.8. The advisory (read
+  in full) is an **encryption-side** bug: `libcrux_chacha20poly1305::encrypt`
+  (and the xchacha variant) panic when the *caller* passes an output buffer
+  longer than `plaintext.len() + TAG_LEN`, and only where that length is
+  attacker-controlled. It is **not** a decrypt/open bug. Severity 8.2. **Not
+  exploitable in Enclave**, verified four independent ways:
+  1. **Wrong operation, caller-controlled buffer.** The panic is on `encrypt`,
+     driven by a caller-chosen oversized output buffer. hpke-rs / libcrux-aead
+     size their own buffers to exactly `ptxt + TAG`; that length is never
+     attacker-controlled in library usage. A received attacker-crafted message
+     is *decrypted*, which cannot reach the affected function at all.
+  2. **Wrong AEAD.** Our ciphersuite is `...AES128GCM...`; libcrux routes AES-GCM
+     to its AES-GCM code, never to ChaCha, so ChaCha `encrypt` is never called.
+  3. **Structurally excluded.** Our KeyPackage advertises only the AES-GCM
+     ciphersuite (`enclave_capabilities`), so a peer cannot add us to a ChaCha
+     group even by choosing one -- ChaCha can never be negotiated for us.
+  4. **Not present where it runs.** `libcrux-chacha20poly1305` is absent from the
+     Windows client build graph (`cargo tree -i` is empty), and `enclave-server`
+     does not depend on `enclave-crypto`, so the relay never pulls libcrux.
 
   The correct remediation is an upstream bump, not forking a formally-verified
   crypto crate (which would void its verification provenance). No upstream fix is
   available yet: `openmls_rust_crypto` 0.5.1 and `hpke-rs-libcrux` 0.6.1 are the
-  latest and exact-pin the vulnerable `libcrux-aead 0.0.7`. Waived in CI with
-  this justification; re-checked on every build for an upstream release.
+  latest and exact-pin `libcrux-aead 0.0.7`. Waived in CI with this
+  justification; re-checked on every build.
 
 ## Deferred mitigations (scheduled, not skipped)
 
