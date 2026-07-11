@@ -1,0 +1,11 @@
+[package]
+name = "enclave-protocol"
+description = "Shared wire types. Everything the untrusted server touches is opaque bytes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.92"
+license = "AGPL-3.0-or-later"
+repository = ""
+
+# Shared dependency versions live here so every crate pins the same line.
+# Heavy deps (openmls, webrtc, opus, cpal, nokhwa, wry) are added per-phase in
+# the crate that first uses them; see ARCHITECTURE.md "Dependency plan".
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# Real-time media and crypto are latency-sensitive; a slim release profile.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
