@@ -122,7 +122,8 @@ fn integrates_with_group_media_root_secret() {
     let mut alice_group = Group::create(&alice).unwrap();
     let welcome = alice_group
         .add_member(&alice, &bob.new_key_package().unwrap())
-        .unwrap();
+        .unwrap()
+        .welcome;
     let bob_group = Group::join(&bob, &welcome).unwrap();
 
     let root_a = alice_group.media_root_secret(&alice).unwrap();

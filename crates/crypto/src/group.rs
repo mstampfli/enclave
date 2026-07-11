@@ -41,25 +41,26 @@ impl Group {
     ///
     /// The key package signature is validated first, so a forged or tampered
     /// identity is rejected ([`CryptoError::KeyPackageInvalid`]) before it can
-    /// become a member. Returns the serialized Welcome to deliver to the new
-    /// member out-of-band (via the server relay). The commit is merged
-    /// immediately, advancing this member to the new epoch.
+    /// become a member. The commit is merged immediately, advancing this member
+    /// to the new epoch, and both artifacts are returned in a [`MemberAdd`]:
+    /// deliver `welcome` to the new member and fan `commit` out to every
+    /// *existing* member so they advance to the same epoch via [`apply_commit`].
+    /// (In a 2-member group there is no other existing member, so `commit` is
+    /// simply unused.)
     ///
-    /// NOTE (Phase 4): with 3+ existing members the returned commit must also be
-    /// fanned out to the *existing* members. For the current 1:1 use there is no
-    /// other existing member, so only the Welcome is surfaced.
+    /// [`apply_commit`]: Group::apply_commit
     pub fn add_member(
         &mut self,
         owner: &Identity,
         key_package_bytes: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
+    ) -> Result<MemberAdd, CryptoError> {
         let key_package_in = KeyPackageIn::tls_deserialize(&mut &key_package_bytes[..])
             .map_err(|e| CryptoError::KeyPackage(format!("deserialize: {e}")))?;
         let key_package = key_package_in
             .validate(owner.provider.crypto(), ProtocolVersion::Mls10)
             .map_err(|e| CryptoError::KeyPackageInvalid(e.to_string()))?;
 
-        let (_commit, welcome, _group_info) = self
+        let (commit, welcome, _group_info) = self
             .inner
             .add_members(&owner.provider, &owner.signer, &[key_package])
             .map_err(|e| CryptoError::AddMember(e.to_string()))?;
@@ -68,7 +69,69 @@ impl Group {
             .merge_pending_commit(&owner.provider)
             .map_err(|e| CryptoError::AddMember(format!("merge: {e}")))?;
 
-        welcome
+        Ok(MemberAdd {
+            commit: commit
+                .tls_serialize_detached()
+                .map_err(|e| CryptoError::Serialize(e.to_string()))?,
+            welcome: welcome
+                .tls_serialize_detached()
+                .map_err(|e| CryptoError::Serialize(e.to_string()))?,
+        })
+    }
+
+    /// Apply a relayed commit produced by another member's add/remove, advancing
+    /// this member to the new epoch. Rejects anything that is not a commit.
+    pub fn apply_commit(
+        &mut self,
+        member: &Identity,
+        commit_bytes: &[u8],
+    ) -> Result<(), CryptoError> {
+        let message = MlsMessageIn::tls_deserialize_exact(commit_bytes)
+            .map_err(|e| CryptoError::Commit(format!("deserialize: {e}")))?;
+        let protocol_message = message
+            .try_into_protocol_message()
+            .map_err(|e| CryptoError::Commit(format!("not a protocol message: {e}")))?;
+        let processed = self
+            .inner
+            .process_message(&member.provider, protocol_message)
+            .map_err(|e| CryptoError::Commit(e.to_string()))?;
+
+        match processed.into_content() {
+            ProcessedMessageContent::StagedCommitMessage(staged) => {
+                self.inner
+                    .merge_staged_commit(&member.provider, *staged)
+                    .map_err(|e| CryptoError::Commit(format!("merge: {e}")))?;
+                Ok(())
+            }
+            _ => Err(CryptoError::Commit("expected a commit message".into())),
+        }
+    }
+
+    /// Remove the member whose identity key is `target_identity_key`, rekeying
+    /// the group so the removed member cannot read the new epoch (forward
+    /// secrecy). Returns the commit to fan out to the remaining members.
+    pub fn remove_member(
+        &mut self,
+        remover: &Identity,
+        target_identity_key: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        let leaf = self
+            .inner
+            .members()
+            .find(|m| m.signature_key.as_slice() == target_identity_key)
+            .map(|m| m.index)
+            .ok_or_else(|| CryptoError::RemoveMember("target is not a member".into()))?;
+
+        let (commit, _welcome, _group_info) = self
+            .inner
+            .remove_members(&remover.provider, &remover.signer, &[leaf])
+            .map_err(|e| CryptoError::RemoveMember(e.to_string()))?;
+
+        self.inner
+            .merge_pending_commit(&remover.provider)
+            .map_err(|e| CryptoError::RemoveMember(format!("merge: {e}")))?;
+
+        commit
             .tls_serialize_detached()
             .map_err(|e| CryptoError::Serialize(e.to_string()))
     }
@@ -189,6 +252,14 @@ pub struct TextMessage {
     /// MLS -- not attacker-spoofable within the group.
     pub sender: Vec<u8>,
     pub plaintext: Vec<u8>,
+}
+
+/// The two artifacts of adding a member: the `welcome` for the new member and
+/// the `commit` to fan out to existing members.
+#[derive(Debug, Clone)]
+pub struct MemberAdd {
+    pub commit: Vec<u8>,
+    pub welcome: Vec<u8>,
 }
 
 /// A 256-bit fingerprint of a group's membership, for out-of-band comparison.

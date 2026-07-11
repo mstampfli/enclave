@@ -26,6 +26,12 @@ pub enum CryptoError {
     #[error("adding member failed: {0}")]
     AddMember(String),
 
+    #[error("applying commit failed: {0}")]
+    Commit(String),
+
+    #[error("removing member failed: {0}")]
+    RemoveMember(String),
+
     #[error("joining group from welcome failed: {0}")]
     Join(String),
 

@@ -22,7 +22,7 @@ pub mod identity;
 pub mod media;
 
 pub use error::CryptoError;
-pub use group::{Group, SafetyNumber, TextMessage};
+pub use group::{Group, MemberAdd, SafetyNumber, TextMessage};
 pub use identity::Identity;
 pub use media::{MediaOpener, MediaSealer};
 

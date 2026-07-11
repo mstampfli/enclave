@@ -65,6 +65,32 @@ fn text_fans_out_to_other_members_only_and_relays_bytes_unchanged() {
 }
 
 #[test]
+fn text_fans_out_to_all_other_members_in_a_larger_group() {
+    let mut r = Relay::new();
+    let a = register(&mut r, "a", "a1", vec![1]);
+    let b = register(&mut r, "b", "b1", vec![2]);
+    let c = register(&mut r, "c", "c1", vec![3]);
+    let group = GroupId([6u8; 32]);
+    for conn in [a, b, c] {
+        r.handle(conn, ClientMsg::JoinGroup { group: group.clone() });
+    }
+
+    let out = r.handle(
+        a,
+        ClientMsg::Text {
+            group,
+            message: Sealed(vec![1, 2, 3]),
+        },
+    );
+
+    // Delivered to both other members, never to the sender.
+    assert_eq!(out.len(), 2);
+    assert!(out.iter().any(|o| o.to == b));
+    assert!(out.iter().any(|o| o.to == c));
+    assert!(!out.iter().any(|o| o.to == a));
+}
+
+#[test]
 fn welcome_is_directed_and_adds_the_recipient_to_routing() {
     let mut r = Relay::new();
     let a = register(&mut r, "a", "a1", vec![1]);

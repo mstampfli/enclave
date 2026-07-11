@@ -135,7 +135,13 @@ window by default and only add the WASM/browser target when we choose to.
    (b) a low-latency UDP/WebRTC media carrier -- media currently rides the
    WebSocket relay (functional, proves the premise); the sealed-frame format is
    transport-agnostic, so swapping the carrier is localized.
-4. Multi-party audio SFU; rekey on join/leave.
+4. [DONE] Multi-party groups with rekey on join/leave. `Group::add_member` now
+   returns the commit (to fan out to existing members) plus the welcome;
+   `apply_commit` advances an existing member; `remove_member` rekeys and cuts
+   the removed member off. The relay already fans out to N members. Proven by
+   `crates/crypto/tests/multiparty.rs` (three members agree; add/remove rekey;
+   a removed member cannot open post-removal media) and the larger-group relay
+   fan-out test. Device I/O and the UDP media carrier from Phase 3 remain.
 5. Video + screenshare.
 6. Presence + friends + WebView UI.
 7. Hardening: STRIDE re-pass, ASVS on server + keystore, fuzz the frame parser.

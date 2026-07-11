@@ -43,7 +43,8 @@ Each mitigation gets a test as its phase lands (see ARCHITECTURE.md roadmap):
   monotonic counter proves nonces never repeat; tamper/forgery/replay/cross-epoch
   rejected. See `crates/crypto/tests/media_seal.rs`,
   `crates/transport/tests/audio_full_stack.rs`.
-- Phase 4: removed member cannot read the next epoch.
+- Phase 4 [DONE]: add/remove rekey the group; a removed member cannot derive the
+  new epoch secret or open post-removal media. See `crates/crypto/tests/multiparty.rs`.
 - Phase 7: fuzz the frame parser; ASVS L2 pass on server + keystore.
 
 ## Accepted risks (explicit)
