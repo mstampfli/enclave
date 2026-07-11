@@ -9,22 +9,31 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use bincode::Options;
 use enclave_protocol::{ClientMsg, ServerMsg, UdpMsg};
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::error::TransportError;
 use crate::media_socket::media_codec;
+use crate::ratelimit::TokenBucket;
 use crate::relay::{ConnId, Relay};
 
 /// Cap on a signaling message. Key packages and Welcomes are small; this bounds
 /// memory a malicious client can force the server to allocate (ASVS V5/V12).
 const SIGNALING_MSG_LIMIT: usize = 1 << 20; // 1 MiB
+
+/// Per-connection signaling rate limit (ASVS V11): a burst then a sustained
+/// rate, both far above what a human client needs.
+const SIGNALING_BURST: f64 = 40.0;
+const SIGNALING_RATE_PER_SEC: f64 = 25.0;
 
 /// Shared server state: the routing brain plus a per-connection outbound queue.
 struct ServerState {
@@ -107,6 +116,42 @@ impl Server {
         });
         Ok(local)
     }
+
+    /// Like [`serve_signaling`](Self::serve_signaling) but over TLS (wss).
+    /// Provide the server certificate chain and private key (DER). This
+    /// protects signaling metadata in transit (ASVS V9); the E2E content
+    /// guarantee does not depend on it.
+    pub async fn serve_signaling_tls(
+        &self,
+        addr: &str,
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<SocketAddr, TransportError> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| TransportError::Tls(e.to_string()))?
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .map_err(|e| TransportError::Tls(e.to_string()))?;
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+
+        let listener = TcpListener::bind(addr).await?;
+        let local = listener.local_addr()?;
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _peer)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let state = state.clone();
+                tokio::spawn(async move {
+                    if let Ok(tls) = acceptor.accept(stream).await {
+                        handle_conn(tls, state).await;
+                    }
+                });
+            }
+        });
+        Ok(local)
+    }
 }
 
 /// A running signaling server. Dropping it does not stop the accept loop.
@@ -132,7 +177,10 @@ fn frame_bytes(msg: Message) -> Option<Vec<u8>> {
     }
 }
 
-async fn handle_conn(stream: TcpStream, state: Arc<Mutex<ServerState>>) {
+async fn handle_conn<S>(stream: S, state: Arc<Mutex<ServerState>>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let config = WebSocketConfig::default()
         .max_message_size(Some(SIGNALING_MSG_LIMIT))
         .max_frame_size(Some(SIGNALING_MSG_LIMIT));
@@ -164,6 +212,7 @@ async fn handle_conn(stream: TcpStream, state: Arc<Mutex<ServerState>>) {
     });
 
     // Reader loop: decode ClientMsgs, route, dispatch.
+    let mut bucket = TokenBucket::new(SIGNALING_BURST, SIGNALING_RATE_PER_SEC, Instant::now());
     while let Some(Ok(msg)) = read.next().await {
         if matches!(msg, Message::Close(_)) {
             break;
@@ -171,6 +220,10 @@ async fn handle_conn(stream: TcpStream, state: Arc<Mutex<ServerState>>) {
         let Some(bytes) = frame_bytes(msg) else {
             continue;
         };
+        // Drop messages from a connection that is over its rate (ASVS V11).
+        if !bucket.try_take(Instant::now()) {
+            continue;
+        }
         let Ok(client_msg) = serde_json::from_slice::<ClientMsg>(&bytes) else {
             continue;
         };

@@ -45,11 +45,11 @@ Each mitigation gets a test as its phase lands (see ARCHITECTURE.md roadmap):
   `crates/transport/tests/audio_full_stack.rs`.
 - Phase 4 [DONE]: add/remove rekey the group; a removed member cannot derive the
   new epoch secret or open post-removal media. See `crates/crypto/tests/multiparty.rs`.
-- Phase 7 [PARTIAL]: ASVS L2 review done (see below); relay access control and
-  deserialization bounds fixed and tested; parsers fuzzed for panic-safety; CI
-  gate (fmt/clippy/test/audit/secret-scan) added in `ci/ci.yml` (activate under
-  `.github/workflows/`). Remaining: TLS on the
-  signaling hop, rate limiting, and the waived upstream advisory.
+- Phase 7 [DONE]: ASVS L2 review complete (see below). Relay access control and
+  deserialization bounds fixed and tested; parsers fuzzed for panic-safety; TLS
+  on the signaling hop and per-connection rate limiting implemented and tested;
+  CI gate (fmt/clippy/test/audit/secret-scan) in `ci/ci.yml` (activate under
+  `.github/workflows/`). One upstream advisory waived as verified non-exploitable.
 
 ## Accepted risks (explicit)
 
@@ -76,25 +76,39 @@ Target level L2 (private communications). Chapters touched and status:
   and are never written to disk.
 - **V7 Error Handling & Logging** [OK]: the server drops bad input silently and
   logs no key material; errors carry no secrets.
-- **V9 Communications** [REMAINING]: TLS on the signaling hop (see below).
-- **V11 Business Logic** [REMAINING]: no rate limiting yet; a client can flood
-  the relay. Planned: per-connection token-bucket limits.
+- **V9 Communications** [FIXED]: optional TLS (wss) on the signaling hop via
+  `Server::serve_signaling_tls` + `Connection::connect_tls` (rustls/ring); the
+  server binary serves wss when `ENCLAVE_TLS_CERT`/`ENCLAVE_TLS_KEY` are set. See
+  `crates/transport/tests/tls_signaling.rs`.
+- **V11 Business Logic** [FIXED]: a per-connection token bucket
+  (`ratelimit::TokenBucket`) throttles signaling floods; unit-tested with an
+  injected clock.
 
-### Known advisory (waived, tracked)
+### Known advisory (waived: verified not exploitable, tracked)
 
 - **RUSTSEC-2026-0124** -- `libcrux-chacha20poly1305` < 0.0.8: a potential panic
-  on an overlong ciphertext buffer (HPKE decryption path, reachable via a
-  malicious MLS Welcome, i.e. DoS). Severity 8.2. The fix is blocked upstream:
-  `libcrux-aead 0.0.7` (pulled through `openmls_rust_crypto -> hpke-rs`) pins the
-  vulnerable patch exactly. Waived in CI with written justification; re-check on
-  each build for an openmls/hpke-rs release that bumps libcrux. Impact is a crash
-  (panic = abort), not a confidentiality break; partial mitigations in place are
-  the signaling message-size cap and the join-path fuzz test.
+  on an overlong ciphertext buffer (a DoS in ChaCha20-Poly1305 `open`). Severity
+  8.2. **Not exploitable in Enclave**, verified three ways:
+  1. **Not compiled on the client target.** The client is the only binary that
+     uses crypto, and it ships for Windows/WebView2, where
+     `libcrux-chacha20poly1305` is not in the normal dependency graph
+     (`cargo tree -i libcrux-chacha20poly1305` prints nothing).
+  2. **Not reachable by our ciphersuite.** `MLS_128_DHKEMX25519_AES128GCM_...`
+     uses AES-128-GCM for HPKE, so libcrux's ChaCha20-Poly1305 `open` is never
+     called, on any target.
+  3. **Absent from the server.** `enclave-server` does not depend on
+     `enclave-crypto`, so the (Linux) relay never pulls libcrux.
+
+  The correct remediation is an upstream bump, not forking a formally-verified
+  crypto crate (which would void its verification provenance). No upstream fix is
+  available yet: `openmls_rust_crypto` 0.5.1 and `hpke-rs-libcrux` 0.6.1 are the
+  latest and exact-pin the vulnerable `libcrux-aead 0.0.7`. Waived in CI with
+  this justification; re-checked on every build for an upstream release.
 
 ## Deferred mitigations (scheduled, not skipped)
 
-- **TLS on the signaling hop** (defense-in-depth for metadata in transit) is
-  deferred. The E2E content guarantee does not depend on it: content is already
-  sealed before it reaches the socket. Tracked in `crates/transport/Cargo.toml`
-  and the roadmap.
-- **Rate limiting** on the relay (ASVS V11): planned per-connection token bucket.
+No outstanding security mitigations: the ASVS L2 chapters above are addressed
+(TLS and rate limiting are now implemented). The only tracked security item is
+the waived, verified-non-exploitable upstream advisory above. Remaining work is
+product features (presence, a persistent friends roster, video) plus on-hardware
+validation of the audio devices and the window.

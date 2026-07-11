@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 enclave-protocol = { path = "../protocol" }
 enclave-transport = { path = "../transport" }
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2.2.0"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 # Phase 2 adds: async runtime + TLS WebSocket signaling.
 # Phase 4 adds: SFU fan-out with per-call resource caps + rate limits.

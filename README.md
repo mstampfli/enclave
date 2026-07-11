@@ -15,12 +15,13 @@ sealed per-frame, relayed through the live server (which sees only ciphertext),
 then opened and decoded back to clear audio; groups rekey on join/leave, cutting
 departed members off; sealed frames stream over a low-latency UDP carrier; a
 `Client` controller drives a wry/WebView2 window whose UI is bundled into the
-binary; and the relay is deny-by-default access control with size-bounded,
-panic-safe parsing, gated by CI (fmt, clippy, tests, dependency audit, secret
-scan). Remaining: TLS on the signaling hop, rate limiting, presence and a
-friends roster, video/screenshare, and on-hardware validation of the audio
-devices and window. See `ARCHITECTURE.md` for the roadmap and `THREAT_MODEL.md`
-for the STRIDE + ASVS analysis. Nothing here is secure to rely on yet.
+binary; and the relay has deny-by-default access control, size-bounded panic-safe
+parsing, optional TLS (wss) on the signaling hop, and per-connection rate
+limiting, gated by CI (fmt, clippy, tests, dependency audit, secret scan). The
+ASVS L2 review is complete. Remaining: presence and a friends roster,
+video/screenshare, and on-hardware validation of the audio devices and window.
+See `ARCHITECTURE.md` for the roadmap and `THREAT_MODEL.md` for the STRIDE + ASVS
+analysis. Nothing here is secure to rely on yet.
 
 ## Workspace
 

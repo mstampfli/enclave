@@ -35,12 +35,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-audit
       - name: Scan for known-vulnerable dependencies
-        # RUSTSEC-2026-0124 (libcrux-chacha20poly1305 DoS panic on overlong
-        # ciphertext) is an explicit, recorded waiver: the fix is blocked by an
-        # upstream exact pin in libcrux-aead 0.0.7, reached via
-        # openmls_rust_crypto -> hpke-rs -> hpke-rs-libcrux. Tracked in
-        # THREAT_MODEL.md; re-check when openmls/hpke-rs ship a libcrux bump.
-        # Every OTHER advisory still breaks the build.
+        # RUSTSEC-2026-0124 (libcrux-chacha20poly1305 DoS panic) is waived: it is
+        # verified not exploitable in Enclave (not compiled on the Windows client
+        # target; our AES-128-GCM ciphersuite never calls libcrux's ChaCha open;
+        # the server has no libcrux dep). No upstream fix exists yet -- the fix is
+        # exact-pinned out via openmls_rust_crypto -> hpke-rs -> libcrux-aead
+        # 0.0.7. See THREAT_MODEL.md. Every OTHER advisory still breaks the build.
         run: cargo audit --ignore RUSTSEC-2026-0124
 
   secret-scan:

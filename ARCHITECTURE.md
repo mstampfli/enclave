@@ -157,13 +157,13 @@ window by default and only add the WASM/browser target when we choose to.
    never a browser or localhost) and driven over an IPC bridge. **Remaining:**
    presence broadcast and a persistent friends roster (currently invite-by-name),
    and on-hardware validation of the window (it compiles; GUI can't run in CI).
-7. [PARTIAL] Hardening. Done: ASVS L2 review (`THREAT_MODEL.md`); relay access
-   control is deny-by-default (non-members cannot join/invite/inject); untrusted
+7. [DONE] Hardening. ASVS L2 review (`THREAT_MODEL.md`); relay access control is
+   deny-by-default (non-members cannot join/invite/inject); untrusted
    deserialization is size-bounded (UDP 64 KiB, WS 1 MiB); parsers fuzzed for
-   panic-safety; a CI gate runs fmt + clippy(-D warnings) + tests + `cargo audit`
-   + secret scan on every push (`ci/ci.yml`; copy into `.github/workflows/` to
-   activate). Remaining: TLS on
-   the signaling hop, rate limiting, and one waived upstream advisory
-   (RUSTSEC-2026-0124, tracked).
+   panic-safety; optional TLS (wss) on the signaling hop; per-connection rate
+   limiting; a CI gate runs fmt + clippy(-D warnings) + tests + `cargo audit` +
+   secret scan on every push (`ci/ci.yml`; copy into `.github/workflows/` to
+   activate). One upstream advisory (RUSTSEC-2026-0124) is waived as verified
+   non-exploitable and tracked.
 
 Each phase ends compiling and tested; no half-done work carried forward.

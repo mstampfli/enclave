@@ -18,11 +18,13 @@
 pub mod client;
 pub mod error;
 pub mod media_socket;
+pub mod ratelimit;
 pub mod relay;
 pub mod server;
 
 pub use client::Connection;
 pub use error::TransportError;
 pub use media_socket::MediaSocket;
+pub use ratelimit::TokenBucket;
 pub use relay::{ConnId, Outgoing, Relay};
 pub use server::{serve, Server, ServerHandle};

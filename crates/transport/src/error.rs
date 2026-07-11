@@ -11,4 +11,7 @@ pub enum TransportError {
 
     #[error("media codec error: {0}")]
     Codec(#[from] bincode::Error),
+
+    #[error("tls error: {0}")]
+    Tls(String),
 }
