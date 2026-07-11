@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Enclave</title>
+<style>
+  :root {
+    --bg: #121315;
+    --surface: #1a1c1f;
+    --surface-2: #212429;
+    --border: rgba(255, 255, 255, 0.09);
+    --text: #e7e9ea;
+    --text-dim: #9aa0a6;
+    --accent: #2f9e8f;
+    --accent-text: #061512;
+    --danger: #c9605a;
+    --radius: 6px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.55 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+  header .name { font-weight: 600; letter-spacing: -0.01em; }
+  header .tag { color: var(--text-dim); font-size: 12px; }
+  .app { flex: 1; display: flex; min-height: 0; }
+
+  aside {
+    width: 290px;
+    border-right: 1px solid var(--border);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    overflow-y: auto;
+  }
+  .group { display: flex; flex-direction: column; gap: 8px; }
+  .group h2 {
+    margin: 0;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-dim);
+  }
+  label { font-size: 12px; color: var(--text-dim); }
+  input {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font: inherit;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  button {
+    padding: 8px 12px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+    transition: background-color 150ms ease-out, border-color 150ms ease-out;
+  }
+  button:hover { background: #282c32; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+  button.primary:hover { background: #35b0a0; }
+  button:disabled { opacity: 0.5; cursor: default; }
+
+  .safety { display: flex; flex-direction: column; gap: 6px; }
+  .safety code {
+    display: block;
+    padding: 8px 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    font-size: 12px;
+    word-break: break-all;
+    color: var(--text);
+  }
+  .safety .hint { font-size: 12px; color: var(--text-dim); }
+
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #log {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .msg { max-width: 68ch; }
+  .msg .who { font-size: 12px; color: var(--text-dim); margin-bottom: 2px; }
+  .msg.self { align-self: flex-end; text-align: right; }
+  .msg .body {
+    display: inline-block;
+    padding: 7px 11px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .msg.self .body { background: var(--surface-2); }
+  .msg.system .body { background: transparent; border: none; color: var(--text-dim); font-size: 13px; padding: 0; }
+
+  #composer { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); }
+  #composer input { flex: 1; }
+  #status { padding: 8px 16px; font-size: 12px; color: var(--text-dim); border-top: 1px solid var(--border); min-height: 32px; }
+  #status.error { color: var(--danger); }
+</style>
+</head>
+<body>
+  <header>
+    <span class="name">Enclave</span>
+    <span class="tag">end-to-end encrypted</span>
+  </header>
+
+  <div class="app">
+    <aside>
+      <div class="group">
+        <h2>Connection</h2>
+        <label for="server">Server</label>
+        <input id="server" value="ws://127.0.0.1:8443" spellcheck="false" />
+        <label for="name">Your name</label>
+        <input id="name" placeholder="alice" spellcheck="false" />
+        <button id="connect" class="primary">Connect</button>
+      </div>
+
+      <div class="group">
+        <h2>Call</h2>
+        <button id="start-group" disabled>Start a group</button>
+        <label for="peer">Invite by name</label>
+        <input id="peer" placeholder="bob" spellcheck="false" />
+        <button id="invite" disabled>Invite</button>
+      </div>
+
+      <div class="group safety">
+        <h2>Safety number</h2>
+        <code id="safety">not in a group</code>
+        <span class="hint">Read this aloud with your friends. If it matches, no one is listening.</span>
+      </div>
+    </aside>
+
+    <main>
+      <div id="log"></div>
+      <form id="composer">
+        <input id="message" placeholder="Message" autocomplete="off" disabled />
+        <button type="submit" class="primary" disabled>Send</button>
+      </form>
+    </main>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const send = (cmd) => window.ipc.postMessage(JSON.stringify(cmd));
+
+  function addMessage(kind, who, text) {
+    const el = document.createElement("div");
+    el.className = "msg " + kind;
+    if (who) {
+      const w = document.createElement("div");
+      w.className = "who";
+      w.textContent = who;
+      el.appendChild(w);
+    }
+    const b = document.createElement("div");
+    b.className = "body";
+    b.textContent = text;
+    el.appendChild(b);
+    const log = $("log");
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function setStatus(message, isError) {
+    const s = $("status") || (() => {
+      const d = document.createElement("div");
+      d.id = "status";
+      document.querySelector("main").appendChild(d);
+      return d;
+    })();
+    s.textContent = message || "";
+    s.className = isError ? "error" : "";
+  }
+
+  let connected = false;
+  let inGroup = false;
+
+  function refresh() {
+    $("start-group").disabled = !connected;
+    $("invite").disabled = !inGroup;
+    $("message").disabled = !inGroup;
+    $("composer").querySelector("button").disabled = !inGroup;
+  }
+
+  $("connect").addEventListener("click", () => {
+    const server = $("server").value.trim();
+    const name = $("name").value.trim();
+    if (!server || !name) { setStatus("Enter a server and a name.", true); return; }
+    send({ type: "Connect", server, name });
+  });
+  $("start-group").addEventListener("click", () => send({ type: "StartGroup" }));
+  $("invite").addEventListener("click", () => {
+    const peer = $("peer").value.trim();
+    if (peer) send({ type: "Invite", peer });
+  });
+  $("composer").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const input = $("message");
+    const text = input.value;
+    if (text.trim()) { send({ type: "SendText", text }); input.value = ""; }
+  });
+
+  // Called from Rust with a parsed event object.
+  window.onEnclaveEvent = (ev) => {
+    switch (ev.type) {
+      case "Connected":
+        connected = true;
+        setStatus("Connected as " + ev.name + ".");
+        addMessage("system", null, "Connected. Start a group, then invite a friend.");
+        break;
+      case "Membership":
+        inGroup = true;
+        $("safety").textContent = ev.safety_number || "in a group";
+        break;
+      case "Text":
+        addMessage(ev.mine ? "self" : "", ev.mine ? null : ev.from, ev.text);
+        break;
+      case "Status":
+        setStatus(ev.message, ev.error === true);
+        break;
+    }
+    refresh();
+  };
+
+  refresh();
+</script>
+</body>
+</html>

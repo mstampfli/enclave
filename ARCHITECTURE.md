@@ -51,8 +51,9 @@ crypto  media  transport
   signaling channel and a low-latency UDP media channel (`Server` runs both over
   shared state; `Connection` and `MediaSocket` are the client sides). TLS on the
   signaling hop is deferred to Phase 7 hardening.
-- `enclave-client` -- orchestrates the three libs behind a self-contained
-  WebView window (see "UI" below).
+- `enclave-client` -- lib + bin. The lib is the high-level `Client` controller
+  (the app-logic API the UI drives); the bin is the self-contained WebView
+  window (see "UI" below) that bridges IPC to the controller.
 - `enclave-server` -- signaling relay + SFU fan-out; holds no media keys.
 
 ## UI (self-contained window -- hard requirement)
@@ -62,9 +63,10 @@ and never a localhost web service. It embeds a system WebView (`wry`/`tao` ->
 WebView2 on Windows, WebKit elsewhere) inside a single app window.
 
 - The front end may be whatever web stack we like -- TypeScript, React, Svelte,
-  or plain HTML/CSS. It is built to **static assets bundled into the binary** and
-  loaded via a custom in-process protocol (`enclave://`), not served over
-  `http://localhost` and not opened in the user's browser.
+  or plain HTML/CSS. It is **bundled into the binary** (today a single
+  `src/ui/index.html` via `include_str!` + wry `with_html`; a custom `enclave://`
+  protocol when it grows to multiple assets), never served over `http://localhost`
+  and never opened in the user's browser.
 - The Rust core and the front end talk over `wry`'s IPC bridge (typed
   request/response), so all crypto, keys, capture, and transport stay in Rust;
   the WebView renders UI only and never touches key material.
@@ -147,7 +149,14 @@ window by default and only add the WASM/browser target when we choose to.
    a removed member cannot open post-removal media) and the larger-group relay
    fan-out test.
 5. Video + screenshare.
-6. Presence + friends + WebView UI.
+6. [MOSTLY DONE] Self-contained window + client controller. `enclave-client` is
+   now a lib + bin: the lib is a high-level `Client` controller (connect, start
+   group, invite, send text, safety number, event pump) proven by
+   `crates/client/tests/client_flow.rs` (two clients chat via the API); the bin
+   is a wry/WebView2 window whose UI is bundled into the binary (`src/ui/`,
+   never a browser or localhost) and driven over an IPC bridge. **Remaining:**
+   presence broadcast and a persistent friends roster (currently invite-by-name),
+   and on-hardware validation of the window (it compiles; GUI can't run in CI).
 7. Hardening: STRIDE re-pass, ASVS on server + keystore, fuzz the frame parser.
 
 Each phase ends compiling and tested; no half-done work carried forward.
