@@ -13,7 +13,10 @@
 //! and video (Phase 5) build on top.
 
 pub mod audio;
+pub mod device;
 pub mod error;
+pub mod frame;
 
 pub use audio::{AudioDecoder, AudioEncoder};
+pub use device::{AudioCapture, AudioPlayback};
 pub use error::MediaError;

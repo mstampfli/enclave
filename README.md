@@ -14,7 +14,8 @@ Phase 4 -- the full premise, proven end to end plus multi-party groups
 through the live server (which sees only ciphertext), then opened and decoded
 back to clear audio on the far end; groups add and remove members with a rekey
 that cuts departed members off; and sealed frames stream over a low-latency UDP
-media carrier. Remaining glue: mic/speaker device I/O (`cpal`). See
+media carrier. Mic/speaker I/O (`cpal`) is built on tested framing helpers,
+pending on-device validation; the self-contained UI is next. See
 `ARCHITECTURE.md` for the roadmap and `THREAT_MODEL.md` for the STRIDE analysis.
 Nothing here is secure to rely on yet.
 

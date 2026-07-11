@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 audiopus = "0.2.0"
+cpal = "0.18.1"
 enclave-protocol = { path = "../protocol" }
 thiserror.workspace = true
 # Phase 3 adds: cpal (capture/playback), opus (audio codec).
