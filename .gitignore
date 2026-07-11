@@ -5,3 +5,7 @@
 *.pem
 /keystore/
 .env
+# Per-user runtime state written by the client and server.
+enclave-*.id
+enclave-*-friends.json
+enclave-accounts.json

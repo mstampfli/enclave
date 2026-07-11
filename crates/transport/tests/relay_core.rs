@@ -3,13 +3,15 @@
 use enclave_protocol::{ClientMsg, DeviceId, GroupId, Presence, Sealed, ServerMsg, UserId};
 use enclave_transport::Relay;
 
-fn register(r: &mut Relay, user: &str, device: &str, kp: Vec<u8>) -> u64 {
+// Create an account and authenticate a connection. The device id is the
+// username in the account model.
+fn register(r: &mut Relay, user: &str, kp: Vec<u8>) -> u64 {
     let conn = r.connect();
     r.handle(
         conn,
-        ClientMsg::Register {
-            user: UserId(user.into()),
-            device: DeviceId(device.into()),
+        ClientMsg::CreateAccount {
+            username: user.into(),
+            password: "a-sufficiently-long-password".into(),
             identity_pub: vec![],
             key_package: kp,
         },
@@ -20,7 +22,7 @@ fn register(r: &mut Relay, user: &str, device: &str, kp: Vec<u8>) -> u64 {
 #[test]
 fn fetch_returns_a_published_key_package_once() {
     let mut r = Relay::new();
-    let conn = register(&mut r, "u", "u1", vec![9, 9, 9]);
+    let conn = register(&mut r, "u", vec![9, 9, 9]);
 
     let out = r.handle(
         conn,
@@ -50,8 +52,8 @@ fn fetch_returns_a_published_key_package_once() {
 #[test]
 fn text_fans_out_to_other_members_only_and_relays_bytes_unchanged() {
     let mut r = Relay::new();
-    let a = register(&mut r, "a", "a1", vec![1]);
-    let b = register(&mut r, "b", "b1", vec![2]);
+    let a = register(&mut r, "a", vec![1]);
+    let b = register(&mut r, "b", vec![2]);
     let group = GroupId([5u8; 32]);
     r.handle(
         a,
@@ -62,7 +64,7 @@ fn text_fans_out_to_other_members_only_and_relays_bytes_unchanged() {
     r.handle(
         a,
         ClientMsg::Welcome {
-            to: DeviceId("b1".into()),
+            to: DeviceId("b".into()),
             group: group.clone(),
             message: Sealed(vec![]),
         },
@@ -89,9 +91,9 @@ fn text_fans_out_to_other_members_only_and_relays_bytes_unchanged() {
 #[test]
 fn text_fans_out_to_all_other_members_in_a_larger_group() {
     let mut r = Relay::new();
-    let a = register(&mut r, "a", "a1", vec![1]);
-    let b = register(&mut r, "b", "b1", vec![2]);
-    let c = register(&mut r, "c", "c1", vec![3]);
+    let a = register(&mut r, "a", vec![1]);
+    let b = register(&mut r, "b", vec![2]);
+    let c = register(&mut r, "c", vec![3]);
     let group = GroupId([6u8; 32]);
     r.handle(
         a,
@@ -99,7 +101,7 @@ fn text_fans_out_to_all_other_members_in_a_larger_group() {
             group: group.clone(),
         },
     ); // Alice bootstraps
-    for peer in ["b1", "c1"] {
+    for peer in ["b", "c"] {
         r.handle(
             a,
             ClientMsg::Welcome {
@@ -128,8 +130,8 @@ fn text_fans_out_to_all_other_members_in_a_larger_group() {
 #[test]
 fn welcome_is_directed_and_adds_the_recipient_to_routing() {
     let mut r = Relay::new();
-    let a = register(&mut r, "a", "a1", vec![1]);
-    let b = register(&mut r, "b", "b1", vec![2]);
+    let a = register(&mut r, "a", vec![1]);
+    let b = register(&mut r, "b", vec![2]);
     let group = GroupId([3u8; 32]);
     r.handle(
         a,
@@ -142,7 +144,7 @@ fn welcome_is_directed_and_adds_the_recipient_to_routing() {
     let out = r.handle(
         a,
         ClientMsg::Welcome {
-            to: DeviceId("b1".into()),
+            to: DeviceId("b".into()),
             group: group.clone(),
             message: Sealed(vec![4, 2]),
         },
@@ -167,8 +169,8 @@ fn welcome_is_directed_and_adds_the_recipient_to_routing() {
 #[test]
 fn disconnect_removes_the_device_from_routing() {
     let mut r = Relay::new();
-    let a = register(&mut r, "a", "a1", vec![1]);
-    let b = register(&mut r, "b", "b1", vec![2]);
+    let a = register(&mut r, "a", vec![1]);
+    let b = register(&mut r, "b", vec![2]);
     let group = GroupId([8u8; 32]);
     r.handle(
         a,
@@ -179,7 +181,7 @@ fn disconnect_removes_the_device_from_routing() {
     r.handle(
         a,
         ClientMsg::Welcome {
-            to: DeviceId("b1".into()),
+            to: DeviceId("b".into()),
             group: group.clone(),
             message: Sealed(vec![]),
         },
@@ -203,9 +205,9 @@ fn disconnect_removes_the_device_from_routing() {
 #[test]
 fn non_member_cannot_join_or_inject() {
     let mut r = Relay::new();
-    let a = register(&mut r, "a", "a1", vec![1]);
-    let b = register(&mut r, "b", "b1", vec![2]);
-    let mallory = register(&mut r, "mallory", "m1", vec![3]);
+    let a = register(&mut r, "a", vec![1]);
+    let b = register(&mut r, "b", vec![2]);
+    let mallory = register(&mut r, "mallory", vec![3]);
     let group = GroupId([9u8; 32]);
 
     // Alice creates the group and invites Bob (the legitimate path).
@@ -218,7 +220,7 @@ fn non_member_cannot_join_or_inject() {
     r.handle(
         a,
         ClientMsg::Welcome {
-            to: DeviceId("b1".into()),
+            to: DeviceId("b".into()),
             group: group.clone(),
             message: Sealed(vec![]),
         },
@@ -249,7 +251,7 @@ fn non_member_cannot_join_or_inject() {
     let sneaked = r.handle(
         mallory,
         ClientMsg::Welcome {
-            to: DeviceId("m1".into()),
+            to: DeviceId("mallory".into()),
             group: group.clone(),
             message: Sealed(vec![]),
         },
@@ -276,9 +278,9 @@ fn presence_reaches_watchers_on_connect_and_disconnect() {
     let a = r.connect();
     r.handle(
         a,
-        ClientMsg::Register {
-            user: UserId("alice".into()),
-            device: DeviceId("a1".into()),
+        ClientMsg::CreateAccount {
+            username: "alice".into(),
+            password: "alice-password-12".into(),
             identity_pub: vec![],
             key_package: vec![1],
         },
@@ -295,19 +297,19 @@ fn presence_reaches_watchers_on_connect_and_disconnect() {
     let b = r.connect();
     let out = r.handle(
         b,
-        ClientMsg::Register {
-            user: UserId("bob".into()),
-            device: DeviceId("b1".into()),
+        ClientMsg::CreateAccount {
+            username: "bob".into(),
+            password: "bob-password-1234".into(),
             identity_pub: vec![],
             key_package: vec![2],
         },
     );
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].to, a);
-    assert!(matches!(
-        &out[0].msg,
-        ServerMsg::Presence { user, status: Presence::Online } if user.0 == "bob"
-    ));
+    // (CreateAccount also returns an Auth reply to Bob, so look for the presence.)
+    assert!(out.iter().any(|o| o.to == a
+        && matches!(
+            &o.msg,
+            ServerMsg::Presence { user, status: Presence::Online } if user.0 == "bob"
+        )));
 
     // Bob disconnects -> Alice is told he is offline.
     let out = r.disconnect(b);

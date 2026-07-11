@@ -68,6 +68,16 @@ impl Server {
         }
     }
 
+    /// Create a server backed by a persistent account store.
+    pub fn with_accounts(accounts: crate::accounts::AccountStore) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ServerState {
+                relay: Relay::with_accounts(accounts),
+                txs: HashMap::new(),
+            })),
+        }
+    }
+
     /// Bind and start the reliable WebSocket signaling channel. Returns the
     /// bound address; the accept loop runs on a background task.
     pub async fn serve_signaling(&self, addr: &str) -> Result<SocketAddr, TransportError> {

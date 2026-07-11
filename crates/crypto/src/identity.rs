@@ -5,6 +5,8 @@
 //! storage and never leave the device. What goes on the wire is only the
 //! *public* key package produced by [`Identity::new_key_package`].
 
+use std::path::Path;
+
 use openmls::prelude::{tls_codec::*, *};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -75,5 +77,36 @@ impl Identity {
             .key_package()
             .tls_serialize_detached()
             .map_err(|e| CryptoError::Serialize(e.to_string()))
+    }
+
+    /// Persist this identity's signing key to `path`, so a later login on this
+    /// device restores the same identity (and therefore the same safety
+    /// number). The private key never leaves the device.
+    pub fn save(&self, path: &Path) -> Result<(), CryptoError> {
+        let bytes = serde_json::to_vec(&self.signer)
+            .map_err(|e| CryptoError::Identity(format!("serialize: {e}")))?;
+        std::fs::write(path, bytes).map_err(|e| CryptoError::Identity(format!("write: {e}")))?;
+        Ok(())
+    }
+
+    /// Load an identity for `name` from a signing key saved by [`Identity::save`].
+    pub fn load(name: &str, path: &Path) -> Result<Self, CryptoError> {
+        let bytes = std::fs::read(path).map_err(|e| CryptoError::Identity(format!("read: {e}")))?;
+        let signer: SignatureKeyPair = serde_json::from_slice(&bytes)
+            .map_err(|e| CryptoError::Identity(format!("deserialize: {e}")))?;
+        let provider = OpenMlsRustCrypto::default();
+        signer
+            .store(provider.storage())
+            .map_err(|e| CryptoError::Identity(format!("store: {e}")))?;
+        let credential = BasicCredential::new(name.as_bytes().to_vec());
+        let credential = CredentialWithKey {
+            credential: credential.into(),
+            signature_key: signer.to_public_vec().into(),
+        };
+        Ok(Self {
+            provider,
+            signer,
+            credential,
+        })
     }
 }

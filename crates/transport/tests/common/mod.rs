@@ -95,15 +95,15 @@ pub async fn establish() -> Established {
     let mut alice_conn = Connection::connect(&url).await.expect("alice connects");
     let mut bob_conn = Connection::connect(&url).await.expect("bob connects");
 
-    alice_conn.send(ClientMsg::Register {
-        user: UserId("alice".into()),
-        device: DeviceId("alice-1".into()),
+    alice_conn.send(ClientMsg::CreateAccount {
+        username: "alice".into(),
+        password: "alice-password-12".into(),
         identity_pub: alice.identity_key(),
         key_package: alice.new_key_package().expect("alice kp"),
     });
-    bob_conn.send(ClientMsg::Register {
-        user: UserId("bob".into()),
-        device: DeviceId("bob-1".into()),
+    bob_conn.send(ClientMsg::CreateAccount {
+        username: "bob".into(),
+        password: "bob-password-1234".into(),
         identity_pub: bob.identity_key(),
         key_package: bob.new_key_package().expect("bob kp"),
     });
@@ -117,7 +117,7 @@ pub async fn establish() -> Established {
         .expect("add bob")
         .welcome;
     alice_conn.send(ClientMsg::Welcome {
-        to: DeviceId("bob-1".into()),
+        to: DeviceId("bob".into()),
         group: GROUP,
         message: Sealed(welcome),
     });

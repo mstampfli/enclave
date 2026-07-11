@@ -6,193 +6,180 @@
 <title>Enclave</title>
 <style>
   :root {
-    --bg: #121315;
-    --surface: #1a1c1f;
-    --surface-2: #212429;
-    --border: rgba(255, 255, 255, 0.09);
-    --text: #e7e9ea;
-    --text-dim: #9aa0a6;
-    --accent: #2f9e8f;
-    --accent-text: #061512;
-    --danger: #c9605a;
-    --radius: 6px;
+    --rail: #1e1f22;
+    --sidebar: #2b2d31;
+    --chat: #313338;
+    --input: #383a40;
+    --hover: #35373c;
+    --text: #dbdee1;
+    --muted: #949ba4;
+    --bright: #f2f3f5;
+    --accent: #5865f2;
+    --accent-hover: #4752c4;
+    --online: #23a55a;
+    --away: #f0b232;
+    --danger: #da373c;
+    --border: rgba(255, 255, 255, 0.06);
+    --radius: 8px;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
-    background: var(--bg);
+    background: var(--chat);
     color: var(--text);
-    font: 14px/1.55 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    display: flex;
-    flex-direction: column;
+    font: 15px/1.4 "gg sans", -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    overflow: hidden;
   }
-  header {
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-  }
-  header .name { font-weight: 600; letter-spacing: -0.01em; }
-  header .tag { color: var(--text-dim); font-size: 12px; }
-  .app { flex: 1; display: flex; min-height: 0; }
-
-  aside {
-    width: 290px;
-    border-right: 1px solid var(--border);
-    padding: 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 20px;
-    overflow-y: auto;
-  }
-  .group { display: flex; flex-direction: column; gap: 8px; }
-  .group h2 {
-    margin: 0;
-    font-size: 12px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--text-dim);
-  }
-  label { font-size: 12px; color: var(--text-dim); }
-  input {
-    width: 100%;
-    padding: 8px 10px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    color: var(--text);
-    font: inherit;
-  }
-  input:focus { outline: none; border-color: var(--accent); }
-  select {
-    width: 100%;
-    padding: 8px 10px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    color: var(--text);
-    font: inherit;
-  }
-  select:focus { outline: none; border-color: var(--accent); }
   button {
-    padding: 8px 12px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    color: var(--text);
     font: inherit;
     cursor: pointer;
-    transition: background-color 150ms ease-out, border-color 150ms ease-out;
-  }
-  button:hover { background: #282c32; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
-  button.primary:hover { background: #35b0a0; }
-  button:disabled { opacity: 0.5; cursor: default; }
-
-  .safety { display: flex; flex-direction: column; gap: 6px; }
-  .safety code {
-    display: block;
-    padding: 8px 10px;
-    background: var(--surface);
-    border: 1px solid var(--border);
+    border: none;
     border-radius: var(--radius);
-    font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-    font-size: 12px;
-    word-break: break-all;
-    color: var(--text);
+    color: var(--bright);
+    background: var(--input);
+    padding: 9px 14px;
+    transition: background-color 120ms ease;
   }
-  .safety .hint { font-size: 12px; color: var(--text-dim); }
+  button:hover { background: var(--hover); }
+  button.primary { background: var(--accent); }
+  button.primary:hover { background: var(--accent-hover); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  input, select {
+    font: inherit;
+    background: var(--rail);
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: var(--text);
+    padding: 10px 11px;
+    width: 100%;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  label { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.02em; }
+  .error { color: #f38688; font-size: 13px; min-height: 18px; }
 
-  #friends { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
-  #friends li { display: flex; align-items: center; gap: 8px; font-size: 13px; }
-  #friends .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); flex: none; }
-  #friends li.online .dot { background: var(--accent); }
-  #friends li.away .dot { background: #c9a14a; }
-  #friends .status { margin-left: auto; color: var(--text-dim); font-size: 12px; }
-
-  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  #log {
-    flex: 1;
-    overflow-y: auto;
-    padding: 16px;
+  /* Login view */
+  #login-view { height: 100%; display: flex; align-items: center; justify-content: center; }
+  .login-card {
+    width: 420px;
+    max-width: calc(100% - 32px);
+    background: var(--sidebar);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 28px;
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 8px;
   }
-  .msg { max-width: 68ch; }
-  .msg .who { font-size: 12px; color: var(--text-dim); margin-bottom: 2px; }
-  .msg.self { align-self: flex-end; text-align: right; }
-  .msg .body {
-    display: inline-block;
-    padding: 7px 11px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-  .msg.self .body { background: var(--surface-2); }
-  .msg.system .body { background: transparent; border: none; color: var(--text-dim); font-size: 13px; padding: 0; }
+  .login-card h1 { margin: 0; font-size: 22px; letter-spacing: -0.01em; }
+  .login-card .sub { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
+  .login-card label { margin-top: 8px; }
+  .login-card .row { display: flex; gap: 8px; margin-top: 14px; }
+  .login-card .row button { flex: 1; }
+  .server-adv { margin-top: 14px; }
+  .server-adv summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  .server-adv input { margin-top: 6px; }
 
-  #composer { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); }
-  #composer input { flex: 1; }
-  #status { padding: 8px 16px; font-size: 12px; color: var(--text-dim); border-top: 1px solid var(--border); min-height: 32px; }
-  #status.error { color: var(--danger); }
+  /* App view */
+  #app-view { height: 100%; display: flex; }
+  .sidebar {
+    width: 260px;
+    background: var(--sidebar);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .sidebar-header { padding: 16px; font-weight: 700; font-size: 15px; border-bottom: 1px solid var(--border); }
+  .sidebar-actions { padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .sidebar-actions #start-group { width: 100%; }
+  .add-friend-row { display: flex; gap: 6px; }
+  .add-friend-row input { flex: 1; }
+  .add-friend-row button { width: 40px; padding: 0; }
+
+  .friends { list-style: none; margin: 0; padding: 4px 8px; flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+  .friends li { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 4px; font-size: 14px; }
+  .friends li:hover { background: var(--hover); }
+  .friends .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .friends li.online .dot { background: var(--online); }
+  .friends li.away .dot { background: var(--away); }
+  .friends .status { margin-left: auto; color: var(--muted); font-size: 12px; }
+
+  .user-panel { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: var(--rail); }
+  .avatar { width: 32px; height: 32px; border-radius: 50%; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; flex: none; text-transform: uppercase; }
+  .user-name { font-weight: 600; font-size: 14px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .status-select { width: auto; padding: 5px 6px; font-size: 12px; }
+  .user-panel #logout { padding: 6px 10px; font-size: 12px; }
+
+  .chat { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--chat); }
+  .chat-header { height: 48px; display: flex; align-items: center; gap: 12px; padding: 0 16px; border-bottom: 1px solid var(--border); font-weight: 600; }
+  .chat-header .safety { margin-left: auto; font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 11px; color: var(--muted); }
+  .log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 70ch; }
+  .msg .who { font-size: 13px; color: var(--muted); margin-bottom: 2px; }
+  .msg.self { align-self: flex-end; text-align: right; }
+  .msg .body { display: inline-block; padding: 8px 12px; background: var(--input); border-radius: var(--radius); white-space: pre-wrap; word-break: break-word; }
+  .msg.self .body { background: var(--accent); color: #fff; }
+  .msg.system .body { background: transparent; padding: 0; color: var(--muted); font-size: 13px; }
+
+  .composer { padding: 12px 16px 16px; }
+  .composer input { background: var(--input); border-radius: var(--radius); padding: 12px 14px; }
+  .status { padding: 0 16px 8px; font-size: 12px; color: var(--muted); min-height: 16px; }
+  .status.err { color: #f38688; }
 </style>
 </head>
 <body>
-  <header>
-    <span class="name">Enclave</span>
-    <span class="tag">end-to-end encrypted</span>
-  </header>
+  <div id="login-view">
+    <div class="login-card">
+      <h1>Enclave</h1>
+      <p class="sub">end-to-end encrypted</p>
+      <label for="login-username">Username</label>
+      <input id="login-username" spellcheck="false" autocomplete="off" />
+      <label for="login-password">Password</label>
+      <input id="login-password" type="password" />
+      <div class="row">
+        <button id="login-btn" class="primary">Log in</button>
+        <button id="register-btn">Create account</button>
+      </div>
+      <details class="server-adv">
+        <summary>Server</summary>
+        <input id="login-server" value="ws://127.0.0.1:8443" spellcheck="false" />
+      </details>
+      <div id="login-error" class="error"></div>
+    </div>
+  </div>
 
-  <div class="app">
-    <aside>
-      <div class="group">
-        <h2>Connection</h2>
-        <label for="server">Server</label>
-        <input id="server" value="ws://127.0.0.1:8443" spellcheck="false" />
-        <label for="name">Your name</label>
-        <input id="name" placeholder="alice" spellcheck="false" />
-        <button id="connect" class="primary">Connect</button>
-        <label for="presence">Status</label>
-        <select id="presence" disabled>
+  <div id="app-view" hidden>
+    <aside class="sidebar">
+      <div class="sidebar-header">Direct messages</div>
+      <div class="sidebar-actions">
+        <button id="start-group">Start a group</button>
+        <div class="add-friend-row">
+          <input id="friend" placeholder="Add friend by name" spellcheck="false" />
+          <button id="add-friend" title="Add friend">+</button>
+        </div>
+      </div>
+      <ul id="friends" class="friends"></ul>
+      <div class="user-panel">
+        <div class="avatar" id="avatar"></div>
+        <div class="user-name" id="me-name"></div>
+        <select id="presence" class="status-select">
           <option value="online">Online</option>
           <option value="away">Away</option>
-          <option value="offline">Appear offline</option>
+          <option value="offline">Invisible</option>
         </select>
-      </div>
-
-      <div class="group">
-        <h2>Call</h2>
-        <button id="start-group" disabled>Start a group</button>
-        <label for="peer">Invite by name</label>
-        <input id="peer" placeholder="bob" spellcheck="false" />
-        <button id="invite" disabled>Invite</button>
-      </div>
-
-      <div class="group">
-        <h2>Friends</h2>
-        <input id="friend" placeholder="name" spellcheck="false" />
-        <button id="add-friend" disabled>Add friend</button>
-        <ul id="friends"></ul>
-      </div>
-
-      <div class="group safety">
-        <h2>Safety number</h2>
-        <code id="safety">not in a group</code>
-        <span class="hint">Read this aloud with your friends. If it matches, no one is listening.</span>
+        <button id="logout">Log out</button>
       </div>
     </aside>
 
-    <main>
-      <div id="log"></div>
-      <form id="composer">
+    <main class="chat">
+      <header class="chat-header">
+        <span id="chat-title">No conversation yet</span>
+        <span class="safety" id="safety" title="Read this aloud with your friends to verify no one is listening"></span>
+      </header>
+      <div id="log" class="log"></div>
+      <form id="composer" class="composer">
         <input id="message" placeholder="Message" autocomplete="off" disabled />
-        <button type="submit" class="primary" disabled>Send</button>
       </form>
+      <div id="status" class="status"></div>
     </main>
   </div>
 
@@ -200,45 +187,41 @@
   const $ = (id) => document.getElementById(id);
   const send = (cmd) => window.ipc.postMessage(JSON.stringify(cmd));
 
+  let inGroup = false;
+
+  function serverUrl() { return $("login-server").value.trim() || "ws://127.0.0.1:8443"; }
+
+  function doAuth(create) {
+    const username = $("login-username").value.trim();
+    const password = $("login-password").value;
+    $("login-error").textContent = "";
+    if (!username || !password) { $("login-error").textContent = "Enter a username and password."; return; }
+    if (create && password.length < 12) { $("login-error").textContent = "Password must be at least 12 characters."; return; }
+    send({ type: create ? "CreateAccount" : "Login", server: serverUrl(), username, password });
+  }
+  $("login-btn").addEventListener("click", () => doAuth(false));
+  $("register-btn").addEventListener("click", () => doAuth(true));
+  $("login-password").addEventListener("keydown", (e) => { if (e.key === "Enter") doAuth(false); });
+
+  $("logout").addEventListener("click", () => send({ type: "Logout" }));
+  $("start-group").addEventListener("click", () => send({ type: "StartGroup" }));
+  $("add-friend").addEventListener("click", () => {
+    const user = $("friend").value.trim();
+    if (user) { send({ type: "AddFriend", user }); upsertFriend(user, "offline"); $("friend").value = ""; }
+  });
+  $("presence").addEventListener("change", (e) => send({ type: "SetPresence", status: e.target.value }));
+  $("composer").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const input = $("message");
+    if (input.value.trim()) { send({ type: "SendText", text: input.value }); input.value = ""; }
+  });
+
   function addMessage(kind, who, text) {
     const el = document.createElement("div");
     el.className = "msg " + kind;
-    if (who) {
-      const w = document.createElement("div");
-      w.className = "who";
-      w.textContent = who;
-      el.appendChild(w);
-    }
-    const b = document.createElement("div");
-    b.className = "body";
-    b.textContent = text;
-    el.appendChild(b);
-    const log = $("log");
-    log.appendChild(el);
-    log.scrollTop = log.scrollHeight;
-  }
-
-  function setStatus(message, isError) {
-    const s = $("status") || (() => {
-      const d = document.createElement("div");
-      d.id = "status";
-      document.querySelector("main").appendChild(d);
-      return d;
-    })();
-    s.textContent = message || "";
-    s.className = isError ? "error" : "";
-  }
-
-  let connected = false;
-  let inGroup = false;
-
-  function refresh() {
-    $("start-group").disabled = !connected;
-    $("invite").disabled = !inGroup;
-    $("add-friend").disabled = !connected;
-    $("presence").disabled = !connected;
-    $("message").disabled = !inGroup;
-    $("composer").querySelector("button").disabled = !inGroup;
+    if (who) { const w = document.createElement("div"); w.className = "who"; w.textContent = who; el.appendChild(w); }
+    const b = document.createElement("div"); b.className = "body"; b.textContent = text; el.appendChild(b);
+    const log = $("log"); log.appendChild(el); log.scrollTop = log.scrollHeight;
   }
 
   function upsertFriend(user, status) {
@@ -254,40 +237,44 @@
     li.querySelector(".status").textContent = status;
   }
 
-  $("connect").addEventListener("click", () => {
-    const server = $("server").value.trim();
-    const name = $("name").value.trim();
-    if (!server || !name) { setStatus("Enter a server and a name.", true); return; }
-    send({ type: "Connect", server, name });
-  });
-  $("start-group").addEventListener("click", () => send({ type: "StartGroup" }));
-  $("invite").addEventListener("click", () => {
-    const peer = $("peer").value.trim();
-    if (peer) send({ type: "Invite", peer });
-  });
-  $("add-friend").addEventListener("click", () => {
-    const user = $("friend").value.trim();
-    if (user) { send({ type: "AddFriend", user }); upsertFriend(user, "offline"); $("friend").value = ""; }
-  });
-  $("presence").addEventListener("change", (e) => send({ type: "SetPresence", status: e.target.value }));
-  $("composer").addEventListener("submit", (e) => {
-    e.preventDefault();
-    const input = $("message");
-    const text = input.value;
-    if (text.trim()) { send({ type: "SendText", text }); input.value = ""; }
-  });
+  function setStatus(message, isError) {
+    const s = $("status");
+    s.textContent = message || "";
+    s.className = "status" + (isError ? " err" : "");
+  }
 
-  // Called from Rust with a parsed event object.
+  function showApp(username) {
+    $("login-view").hidden = true;
+    $("app-view").hidden = false;
+    $("me-name").textContent = username;
+    $("avatar").textContent = username.slice(0, 1);
+  }
+  function showLogin() {
+    $("app-view").hidden = true;
+    $("login-view").hidden = false;
+    inGroup = false;
+    $("friends").innerHTML = "";
+    $("log").innerHTML = "";
+    $("safety").textContent = "";
+    $("chat-title").textContent = "No conversation yet";
+    $("message").disabled = true;
+    $("login-password").value = "";
+  }
+
   window.onEnclaveEvent = (ev) => {
     switch (ev.type) {
-      case "Connected":
-        connected = true;
-        setStatus("Connected as " + ev.name + ".");
-        addMessage("system", null, "Connected. Start a group, then invite a friend.");
+      case "LoggedIn":
+        showApp(ev.username);
+        if (ev.safety_number) { inGroup = true; $("safety").textContent = ev.safety_number; }
+        break;
+      case "LoggedOut":
+        showLogin();
         break;
       case "Membership":
         inGroup = true;
-        $("safety").textContent = ev.safety_number || "in a group";
+        $("message").disabled = false;
+        $("chat-title").textContent = "Group";
+        if (ev.safety_number) $("safety").textContent = ev.safety_number;
         break;
       case "Text":
         addMessage(ev.mine ? "self" : "", ev.mine ? null : ev.from, ev.text);
@@ -296,13 +283,12 @@
         upsertFriend(ev.user, ev.status);
         break;
       case "Status":
-        setStatus(ev.message, ev.error === true);
+        // Auth errors show on the login card; in-app errors on the status bar.
+        if ($("login-view").hidden) setStatus(ev.message, ev.error);
+        else $("login-error").textContent = ev.message;
         break;
     }
-    refresh();
   };
-
-  refresh();
 </script>
 </body>
 </html>

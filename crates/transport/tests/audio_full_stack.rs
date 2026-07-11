@@ -40,7 +40,7 @@ async fn clear_voice_in_garbage_on_wire_clear_voice_out() {
     let mut sealer = MediaSealer::new(
         &root_alice,
         GROUP,
-        DeviceId("alice-1".into()),
+        DeviceId("alice".into()),
         &e.alice.identity_key(),
         1,
     )

@@ -23,7 +23,7 @@ async fn two_clients_stream_sealed_audio_through_the_server() {
     let mut sealer = MediaSealer::new(
         &root_alice,
         GROUP,
-        DeviceId("alice-1".into()),
+        DeviceId("alice".into()),
         &e.alice.identity_key(),
         1,
     )

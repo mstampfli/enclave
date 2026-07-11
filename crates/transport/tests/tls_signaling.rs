@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use enclave_protocol::{ClientMsg, DeviceId, ServerMsg, UserId};
+use enclave_protocol::{ClientMsg, ServerMsg, UserId};
 use enclave_transport::{Connection, Server};
 
 #[tokio::test]
@@ -35,10 +35,10 @@ async fn signaling_works_over_tls() {
     let url = format!("wss://localhost:{}", addr.port());
     let mut conn = Connection::connect_tls(&url, config).await.unwrap();
 
-    // A register + fetch round-trip proves the protocol rides the encrypted hop.
-    conn.send(ClientMsg::Register {
-        user: UserId("a".into()),
-        device: DeviceId("a".into()),
+    // A create-account + fetch round-trip proves the protocol rides the hop.
+    conn.send(ClientMsg::CreateAccount {
+        username: "a".into(),
+        password: "a-long-enough-password".into(),
         identity_pub: vec![],
         key_package: vec![9, 9],
     });

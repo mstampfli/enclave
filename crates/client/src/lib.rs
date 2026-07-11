@@ -1,13 +1,13 @@
 //! The Enclave client controller: the high-level app-logic API the UI drives.
 //!
-//! It composes identity + crypto + transport into a small surface -- connect,
-//! start or join a group, invite a friend, send text, read the safety number,
-//! and pump events -- so the window (or a test) never touches the wire types or
-//! the MLS machinery directly.
+//! Flow: `connect` opens the socket, then `create_account` or `login`
+//! authenticates (username + password, no email). Once logged in, the caller
+//! can start/join groups, invite friends, send text, watch presence, and pump
+//! events. The identity key is persisted per account on this device, so logging
+//! back in restores the same identity (and safety number).
 //!
-//! The design is single-task and caller-driven: the owner calls async methods
-//! and pumps [`Client::next_event`]; there is no background task, so the
-//! non-`Send` MLS group never has to cross a thread boundary.
+//! Single-task and caller-driven: there is no background task, so the non-`Send`
+//! MLS group never crosses a thread boundary.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -24,6 +24,10 @@ pub enum ClientError {
     Crypto(#[from] enclave_crypto::CryptoError),
     #[error("transport: {0}")]
     Transport(#[from] enclave_transport::TransportError),
+    #[error("{0}")]
+    Auth(String),
+    #[error("not logged in")]
+    NotLoggedIn,
     #[error("not in a group yet")]
     NoGroup,
     #[error("no key package available for that peer")]
@@ -54,11 +58,12 @@ fn presence_label(status: Presence) -> String {
     .to_string()
 }
 
-/// One connected user session. One device, one group (for now).
+/// One connected session. Unauthenticated until `create_account`/`login`.
 pub struct Client {
-    identity: Identity,
     conn: Connection,
-    name: String,
+    identity: Option<Identity>,
+    username: Option<String>,
+    keystore_dir: PathBuf,
     group: Option<Group>,
     group_id: Option<GroupId>,
     pending: VecDeque<Event>,
@@ -67,23 +72,14 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connect to a server and register under `name` (one device per user for
-    /// now; the device id is the name). Announces presence as online.
-    pub async fn connect(server_url: &str, name: &str) -> Result<Self, ClientError> {
-        let identity = Identity::generate(name)?;
+    /// Open a connection to a server. Not authenticated yet.
+    pub async fn connect(server_url: &str) -> Result<Self, ClientError> {
         let conn = Connection::connect(server_url).await?;
-        conn.send(ClientMsg::Register {
-            user: UserId(name.into()),
-            device: DeviceId(name.into()),
-            identity_pub: identity.identity_key(),
-            key_package: identity.new_key_package()?,
-        });
-        // Registration already marks the user online; `Presence` is for later
-        // status changes (e.g. away).
         Ok(Self {
-            identity,
             conn,
-            name: name.into(),
+            identity: None,
+            username: None,
+            keystore_dir: PathBuf::from("."),
             group: None,
             group_id: None,
             pending: VecDeque::new(),
@@ -92,13 +88,103 @@ impl Client {
         })
     }
 
-    /// Our display name.
-    pub fn name(&self) -> &str {
-        &self.name
+    /// Where identity key files and rosters are stored (default: current dir).
+    pub fn set_keystore_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.keystore_dir = dir.into();
     }
 
-    /// Manually set our presence (e.g. Away, or back to Online). Registration
-    /// already announces Online; this is for the user to override it.
+    /// Create a new account (username + password, no email) and log in. The new
+    /// identity is generated and saved to this device.
+    pub async fn create_account(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> Result<(), ClientError> {
+        let identity = Identity::generate(username)?;
+        let _ = identity.save(&self.identity_path(username));
+        let key_package = identity.new_key_package()?;
+        self.conn.send(ClientMsg::CreateAccount {
+            username: username.to_string(),
+            password: password.to_string(),
+            identity_pub: identity.identity_key(),
+            key_package,
+        });
+        self.await_auth().await?;
+        self.finish_login(identity, username);
+        Ok(())
+    }
+
+    /// Log in to an existing account, restoring the saved identity on this
+    /// device (a fresh one is generated if none is saved here).
+    pub async fn login(&mut self, username: &str, password: &str) -> Result<(), ClientError> {
+        let identity = Identity::load(username, &self.identity_path(username))
+            .or_else(|_| Identity::generate(username))?;
+        let key_package = identity.new_key_package()?;
+        self.conn.send(ClientMsg::Login {
+            username: username.to_string(),
+            password: password.to_string(),
+            key_package,
+        });
+        self.await_auth().await?;
+        let _ = identity.save(&self.identity_path(username));
+        self.finish_login(identity, username);
+        Ok(())
+    }
+
+    /// End the session: go offline and forget the group.
+    pub fn logout(&mut self) {
+        self.conn.send(ClientMsg::Logout);
+        self.identity = None;
+        self.username = None;
+        self.group = None;
+        self.group_id = None;
+        self.friends.clear();
+        self.roster_path = None;
+    }
+
+    fn finish_login(&mut self, identity: Identity, username: &str) {
+        self.identity = Some(identity);
+        self.username = Some(username.to_string());
+    }
+
+    /// Pump messages until the auth result arrives; queue any other events.
+    async fn await_auth(&mut self) -> Result<(), ClientError> {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), self.conn.recv()).await {
+                Ok(Some(ServerMsg::Auth { ok: true, .. })) => return Ok(()),
+                Ok(Some(ServerMsg::Auth {
+                    ok: false, detail, ..
+                })) => return Err(ClientError::Auth(detail)),
+                Ok(Some(other)) => {
+                    if let Some(event) = self.handle(other) {
+                        self.pending.push_back(event);
+                    }
+                }
+                Ok(None) => return Err(ClientError::Disconnected),
+                Err(_) => return Err(ClientError::Auth("server did not respond".into())),
+            }
+        }
+    }
+
+    fn identity_path(&self, username: &str) -> PathBuf {
+        self.keystore_dir.join(format!("enclave-{username}.id"))
+    }
+
+    fn identity(&self) -> Result<&Identity, ClientError> {
+        self.identity.as_ref().ok_or(ClientError::NotLoggedIn)
+    }
+
+    /// The logged-in username, or "" if not logged in.
+    pub fn name(&self) -> &str {
+        self.username.as_deref().unwrap_or("")
+    }
+
+    /// Whether we are logged in.
+    pub fn is_logged_in(&self) -> bool {
+        self.identity.is_some()
+    }
+
+    /// Manually set our presence (e.g. Away, or back to Online).
     pub fn set_status(&self, status: Presence) {
         self.conn.send(ClientMsg::Presence { status });
     }
@@ -150,8 +236,9 @@ impl Client {
     /// Start a fresh group that we own. The routing id is derived from our
     /// identity key (unique per user).
     pub fn start_group(&mut self) -> Result<(), ClientError> {
-        let group = Group::create(&self.identity)?;
-        let group_id = self.derive_group_id();
+        let identity = self.identity()?;
+        let group = Group::create(identity)?;
+        let group_id = derive_group_id(identity);
         self.conn.send(ClientMsg::JoinGroup {
             group: group_id.clone(),
         });
@@ -161,22 +248,20 @@ impl Client {
     }
 
     /// Invite a peer by name: fetch their key package, add them, and deliver the
-    /// Welcome (plus the commit for any existing members) through the server.
+    /// Welcome (plus the commit for existing members) through the server.
     pub async fn invite(&mut self, peer: &str) -> Result<(), ClientError> {
         let group_id = self.group_id.clone().ok_or(ClientError::NoGroup)?;
         let key_package = self.fetch_key_package(peer).await?;
 
+        let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
         let group = self.group.as_mut().ok_or(ClientError::NoGroup)?;
-        let add = group.add_member(&self.identity, &key_package)?;
+        let add = group.add_member(identity, &key_package)?;
 
         self.conn.send(ClientMsg::Welcome {
             to: DeviceId(peer.into()),
             group: group_id.clone(),
             message: Sealed(add.welcome),
         });
-        // Fan the commit out to any pre-existing members. A just-added member
-        // also receives it but cannot apply it (already at that epoch), which is
-        // benign and ignored on their side.
         self.conn.send(ClientMsg::Mls {
             group: group_id,
             message: Sealed(add.commit),
@@ -187,8 +272,9 @@ impl Client {
     /// Encrypt and send a text message to the group.
     pub async fn send_text(&mut self, text: &str) -> Result<(), ClientError> {
         let group_id = self.group_id.clone().ok_or(ClientError::NoGroup)?;
+        let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
         let group = self.group.as_mut().ok_or(ClientError::NoGroup)?;
-        let sealed = group.encrypt_text(&self.identity, text.as_bytes())?;
+        let sealed = group.encrypt_text(identity, text.as_bytes())?;
         self.conn.send(ClientMsg::Text {
             group: group_id,
             message: Sealed(sealed),
@@ -196,8 +282,7 @@ impl Client {
         Ok(())
     }
 
-    /// The group's safety number, if we are in a group. Compare it out-of-band
-    /// with peers to confirm no ghost member was inserted.
+    /// The group's safety number, if we are in a group.
     pub fn safety_number(&self) -> Option<String> {
         self.group.as_ref().map(|g| g.safety_number().to_string())
     }
@@ -216,17 +301,7 @@ impl Client {
         }
     }
 
-    /// Routing group id derived from our 32-byte Ed25519 identity key.
-    fn derive_group_id(&self) -> GroupId {
-        let key = self.identity.identity_key();
-        let mut id = [0u8; 32];
-        let n = key.len().min(32);
-        id[..n].copy_from_slice(&key[..n]);
-        GroupId(id)
-    }
-
-    /// Fetch a peer's key package, retrying until their registration lands and
-    /// queueing any events that arrive meanwhile.
+    /// Fetch a peer's key package, retrying until their registration lands.
     async fn fetch_key_package(&mut self, peer: &str) -> Result<Vec<u8>, ClientError> {
         for _ in 0..100 {
             self.conn.send(ClientMsg::FetchKeyPackages {
@@ -238,7 +313,7 @@ impl Client {
                         if let Some(kp) = packages.into_iter().next() {
                             return Ok(kp);
                         }
-                        break; // empty; retry after a short wait
+                        break;
                     }
                     Ok(Some(other)) => {
                         if let Some(event) = self.handle(other) {
@@ -246,7 +321,7 @@ impl Client {
                         }
                     }
                     Ok(None) => return Err(ClientError::Disconnected),
-                    Err(_) => break, // timed out; retry
+                    Err(_) => break,
                 }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -258,7 +333,8 @@ impl Client {
     fn handle(&mut self, msg: ServerMsg) -> Option<Event> {
         match msg {
             ServerMsg::Welcome { group, message, .. } => {
-                match Group::join(&self.identity, &message.0) {
+                let identity = self.identity.as_ref()?;
+                match Group::join(identity, &message.0) {
                     Ok(joined) => {
                         self.group = Some(joined);
                         self.group_id = Some(group.clone());
@@ -269,8 +345,9 @@ impl Client {
                 }
             }
             ServerMsg::Text { message, .. } => {
+                let identity = self.identity.as_ref()?;
                 let group = self.group.as_mut()?;
-                match group.decrypt_text(&self.identity, &message.0) {
+                match group.decrypt_text(identity, &message.0) {
                     Ok(tm) => Some(Event::Text {
                         from: String::from_utf8_lossy(&tm.sender).into_owned(),
                         text: String::from_utf8_lossy(&tm.plaintext).into_owned(),
@@ -279,11 +356,9 @@ impl Client {
                 }
             }
             ServerMsg::Mls { message, .. } => {
+                let identity = self.identity.as_ref()?;
                 let group = self.group.as_mut()?;
-                // Pre-existing members advance; a member who just joined via a
-                // Welcome gets its own add-commit echoed and cannot apply it,
-                // which is benign and ignored.
-                match group.apply_commit(&self.identity, &message.0) {
+                match group.apply_commit(identity, &message.0) {
                     Ok(()) => Some(Event::MembershipChanged),
                     Err(_) => None,
                 }
@@ -292,8 +367,18 @@ impl Client {
                 user: user.0,
                 status: presence_label(status),
             }),
+            ServerMsg::Auth { .. } => None,
             ServerMsg::Error { detail } => Some(Event::Error(detail)),
             _ => None,
         }
     }
+}
+
+/// Routing group id derived from a 32-byte Ed25519 identity key.
+fn derive_group_id(identity: &Identity) -> GroupId {
+    let key = identity.identity_key();
+    let mut id = [0u8; 32];
+    let n = key.len().min(32);
+    id[..n].copy_from_slice(&key[..n]);
+    GroupId(id)
 }

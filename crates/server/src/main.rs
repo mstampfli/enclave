@@ -11,7 +11,7 @@
 use std::fs::File;
 use std::io::BufReader;
 
-use enclave_transport::Server;
+use enclave_transport::{AccountStore, Server};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 fn load_certs(path: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
@@ -40,7 +40,7 @@ async fn main() {
         .nth(2)
         .unwrap_or_else(|| "127.0.0.1:8444".to_string());
 
-    let server = Server::new();
+    let server = Server::with_accounts(AccountStore::load("enclave-accounts.json"));
 
     // Signaling: TLS when a cert + key are provided, plaintext otherwise.
     let tls = std::env::var("ENCLAVE_TLS_CERT")

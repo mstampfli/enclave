@@ -15,8 +15,13 @@ use std::net::SocketAddr;
 
 use enclave_protocol::{ClientMsg, DeviceId, GroupId, Presence, ServerMsg, UserId};
 
+use crate::accounts::{AccountStore, AuthOutcome};
+
 /// Opaque handle for one client connection. Assigned by the relay on connect.
 pub type ConnId = u64;
+
+/// Failed logins allowed per connection before it is locked out (ASVS V2).
+const MAX_LOGIN_ATTEMPTS: u32 = 5;
 
 /// A message the relay wants delivered to a specific connection.
 #[derive(Debug, Clone)]
@@ -47,11 +52,23 @@ pub struct Relay {
     presence: HashMap<UserId, Presence>,
     /// Connections that want presence updates about a given user (friends).
     presence_watchers: HashMap<UserId, HashSet<ConnId>>,
+    /// Accounts (username + Argon2id password + identity key).
+    accounts: AccountStore,
+    /// Failed login attempts per connection, for lockout.
+    login_attempts: HashMap<ConnId, u32>,
 }
 
 impl Relay {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a relay backed by a specific (e.g. persistent) account store.
+    pub fn with_accounts(accounts: AccountStore) -> Self {
+        Self {
+            accounts,
+            ..Self::default()
+        }
     }
 
     /// Register a new connection and get its id.
@@ -72,6 +89,7 @@ impl Relay {
                 members.remove(&device);
             }
         }
+        self.login_attempts.remove(&conn);
         for watchers in self.presence_watchers.values_mut() {
             watchers.remove(&conn);
         }
@@ -81,6 +99,28 @@ impl Relay {
             }
         }
         vec![]
+    }
+
+    /// Establish an authenticated session for `conn`: map user/device, publish
+    /// the key package, and mark online.
+    fn setup_session(
+        &mut self,
+        conn: ConnId,
+        username: String,
+        identity_pub: Vec<u8>,
+        key_package: Vec<u8>,
+    ) -> Vec<Outgoing> {
+        let user = UserId(username.clone());
+        let device = DeviceId(username);
+        self.identities.insert(user.clone(), identity_pub);
+        self.device_conn.insert(device.clone(), conn);
+        self.conn_device.insert(conn, device);
+        self.conn_user.insert(conn, user.clone());
+        self.key_packages
+            .entry(user.clone())
+            .or_default()
+            .push_back(key_package);
+        self.set_presence(&user, Presence::Online)
     }
 
     /// Record a user's presence and return updates for everyone watching them.
@@ -139,25 +179,72 @@ impl Relay {
     /// Handle one client message, returning messages to deliver. Pure: the only
     /// effect is on `self`'s routing state.
     pub fn handle(&mut self, from: ConnId, msg: ClientMsg) -> Vec<Outgoing> {
+        // Auth gate (ASVS V4): only account messages are allowed before login.
+        match &msg {
+            ClientMsg::CreateAccount { .. } | ClientMsg::Login { .. } | ClientMsg::Logout => {}
+            _ if self.conn_user.contains_key(&from) => {}
+            _ => return vec![],
+        }
         match msg {
-            ClientMsg::Register {
-                user,
-                device,
+            ClientMsg::CreateAccount {
+                username,
+                password,
                 identity_pub,
                 key_package,
+            } => match self
+                .accounts
+                .create_account(&username, &password, identity_pub.clone())
+            {
+                AuthOutcome::Created => {
+                    let mut out = vec![Outgoing {
+                        to: from,
+                        msg: ServerMsg::Auth {
+                            ok: true,
+                            username: username.clone(),
+                            detail: "account created".into(),
+                        },
+                    }];
+                    out.extend(self.setup_session(from, username, identity_pub, key_package));
+                    out
+                }
+                other => auth_error(from, username, other),
+            },
+
+            ClientMsg::Login {
+                username,
+                password,
+                key_package,
             } => {
-                self.identities.insert(user.clone(), identity_pub);
-                // A device may reconnect; overwrite its mapping.
-                self.device_conn.insert(device.clone(), from);
-                self.conn_device.insert(from, device);
-                self.conn_user.insert(from, user.clone());
-                self.key_packages
-                    .entry(user.clone())
-                    .or_default()
-                    .push_back(key_package);
-                // Mark online and notify anyone watching this user.
-                self.set_presence(&user, Presence::Online)
+                if *self.login_attempts.get(&from).unwrap_or(&0) >= MAX_LOGIN_ATTEMPTS {
+                    return auth_error(from, username, AuthOutcome::WrongPassword);
+                }
+                match self.accounts.verify_login(&username, &password) {
+                    AuthOutcome::LoggedIn => {
+                        self.login_attempts.remove(&from);
+                        let identity_pub = self
+                            .accounts
+                            .identity_pub(&username)
+                            .map(|s| s.to_vec())
+                            .unwrap_or_default();
+                        let mut out = vec![Outgoing {
+                            to: from,
+                            msg: ServerMsg::Auth {
+                                ok: true,
+                                username: username.clone(),
+                                detail: "logged in".into(),
+                            },
+                        }];
+                        out.extend(self.setup_session(from, username, identity_pub, key_package));
+                        out
+                    }
+                    other => {
+                        *self.login_attempts.entry(from).or_insert(0) += 1;
+                        auth_error(from, username, other)
+                    }
+                }
             }
+
+            ClientMsg::Logout => self.disconnect(from),
 
             ClientMsg::FetchKeyPackages { user } => {
                 // Key packages are single-use; hand out one per fetch.
@@ -295,4 +382,24 @@ impl Relay {
             })
             .collect()
     }
+}
+
+/// Build an auth-failure reply. The message is intentionally coarse so it does
+/// not leak whether a username exists (ASVS V2).
+fn auth_error(conn: ConnId, username: String, outcome: AuthOutcome) -> Vec<Outgoing> {
+    let detail = match outcome {
+        AuthOutcome::UsernameTaken => "that username is taken",
+        AuthOutcome::UnknownUser | AuthOutcome::WrongPassword => "wrong username or password",
+        AuthOutcome::PasswordTooShort => "password must be at least 12 characters",
+        AuthOutcome::InvalidUsername => "please enter a username",
+        AuthOutcome::Created | AuthOutcome::LoggedIn => "ok",
+    };
+    vec![Outgoing {
+        to: conn,
+        msg: ServerMsg::Auth {
+            ok: false,
+            username,
+            detail: detail.into(),
+        },
+    }]
 }

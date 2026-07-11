@@ -1,16 +1,15 @@
-//! Enclave client: a self-contained native window (wry/WebView2, never a
-//! browser or localhost) whose UI is bundled into the binary and driven over an
-//! IPC bridge. All crypto, keys, capture, and transport live in Rust
-//! ([`enclave_client::Client`]); the WebView renders UI only.
+//! Enclave client: a self-contained native window (wry/WebView2). The UI is
+//! bundled into the binary and driven over an IPC bridge; all crypto, keys, and
+//! transport live in Rust ([`enclave_client::Client`]).
 //!
-//! Threading: the tao event loop owns the WebView on the main thread. The
-//! non-`Send` client controller runs on its own thread with a Tokio runtime,
-//! receiving UI commands over a channel and pushing events back to the main
-//! thread (which evaluates them into the WebView) via an event-loop proxy.
+//! The controller runs on its own thread with a Tokio runtime; the tao event
+//! loop owns the WebView on the main thread and shuttles events between them.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use enclave_client::{Client, Event};
+use enclave_protocol::Presence;
 use tao::event::{Event as TaoEvent, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
@@ -18,28 +17,47 @@ use tokio::sync::mpsc;
 use wry::http::Request;
 use wry::WebViewBuilder;
 
-/// The UI, bundled into the binary. No file or network fetch at runtime.
 const UI_HTML: &str = include_str!("ui/index.html");
 
 /// Commands the UI sends to the core.
 #[derive(serde::Deserialize)]
 #[serde(tag = "type")]
 enum UiCommand {
-    Connect { server: String, name: String },
+    CreateAccount {
+        server: String,
+        username: String,
+        password: String,
+    },
+    Login {
+        server: String,
+        username: String,
+        password: String,
+    },
+    Logout,
     StartGroup,
-    Invite { peer: String },
-    SendText { text: String },
-    AddFriend { user: String },
-    SetPresence { status: String },
+    Invite {
+        peer: String,
+    },
+    SendText {
+        text: String,
+    },
+    AddFriend {
+        user: String,
+    },
+    SetPresence {
+        status: String,
+    },
 }
 
 /// Events the core sends to the UI (serialized straight into `onEnclaveEvent`).
 #[derive(serde::Serialize, Clone)]
 #[serde(tag = "type")]
 enum UiEvent {
-    Connected {
-        name: String,
+    LoggedIn {
+        username: String,
+        safety_number: Option<String>,
     },
+    LoggedOut,
     Membership {
         safety_number: Option<String>,
     },
@@ -64,7 +82,7 @@ fn main() -> wry::Result<()> {
 
     let window = WindowBuilder::new()
         .with_title("Enclave")
-        .with_inner_size(tao::dpi::LogicalSize::new(960.0, 640.0))
+        .with_inner_size(tao::dpi::LogicalSize::new(1000.0, 680.0))
         .build(&event_loop)
         .expect("build window");
 
@@ -79,8 +97,6 @@ fn main() -> wry::Result<()> {
         })
         .build(&window)?;
 
-    // The controller is not Send, so it stays on its own thread; only the
-    // command channel and the proxy (both Send) cross the boundary.
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         runtime.block_on(run_client(cmd_rx, proxy));
@@ -107,18 +123,30 @@ fn emit(proxy: &EventLoopProxy<UiEvent>, event: UiEvent) {
     let _ = proxy.send_event(event);
 }
 
+fn error_status(proxy: &EventLoopProxy<UiEvent>, message: String) {
+    emit(
+        proxy,
+        UiEvent::Status {
+            message,
+            error: true,
+        },
+    );
+}
+
+fn app_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
 async fn run_client(
     mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
     proxy: EventLoopProxy<UiEvent>,
 ) {
     let mut client: Option<Client> = None;
     loop {
-        // Drain queued commands first (no borrow held across event polling).
         while let Ok(cmd) = cmd_rx.try_recv() {
             handle_command(&mut client, &proxy, cmd).await;
         }
 
-        // Poll for one incoming event, waking periodically to re-check commands.
         let next = async {
             match client.as_mut() {
                 Some(c) => c.next_event().await,
@@ -142,26 +170,56 @@ async fn run_client(
                 Event::Presence { user, status } => {
                     emit(&proxy, UiEvent::Presence { user, status })
                 }
-                Event::Error(message) => emit(
-                    &proxy,
-                    UiEvent::Status {
-                        message,
-                        error: true,
-                    },
-                ),
+                Event::Error(message) => error_status(&proxy, message),
             },
             Ok(None) => {
-                emit(
-                    &proxy,
-                    UiEvent::Status {
-                        message: "Disconnected from server.".into(),
-                        error: true,
-                    },
-                );
-                return;
+                client = None;
+                emit(&proxy, UiEvent::LoggedOut);
+                error_status(&proxy, "Disconnected from server.".into());
             }
-            Err(_) => {} // timed out; loop to re-check commands
+            Err(_) => {}
         }
+    }
+}
+
+/// Connect + authenticate (creating the account or logging in), then wire up the
+/// roster and report the logged-in state.
+async fn authenticate(
+    client: &mut Option<Client>,
+    proxy: &EventLoopProxy<UiEvent>,
+    server: &str,
+    username: &str,
+    password: &str,
+    create: bool,
+) {
+    let mut c = match Client::connect(server).await {
+        Ok(c) => c,
+        Err(_) => {
+            error_status(proxy, format!("Could not reach {server}."));
+            return;
+        }
+    };
+    c.set_keystore_dir(app_dir());
+    let result = if create {
+        c.create_account(username, password).await
+    } else {
+        c.login(username, password).await
+    };
+    match result {
+        Ok(()) => {
+            c.use_roster_file(app_dir().join(format!("enclave-{username}-friends.json")));
+            let safety_number = c.safety_number();
+            let username = c.name().to_string();
+            *client = Some(c);
+            emit(
+                proxy,
+                UiEvent::LoggedIn {
+                    username,
+                    safety_number,
+                },
+            );
+        }
+        Err(e) => error_status(proxy, e.to_string()),
     }
 }
 
@@ -171,21 +229,23 @@ async fn handle_command(
     cmd: UiCommand,
 ) {
     match cmd {
-        UiCommand::Connect { server, name } => match Client::connect(&server, &name).await {
-            Ok(mut c) => {
-                let name = c.name().to_string();
-                c.use_roster_file(format!("enclave-{name}-friends.json"));
-                *client = Some(c);
-                emit(proxy, UiEvent::Connected { name });
+        UiCommand::CreateAccount {
+            server,
+            username,
+            password,
+        } => authenticate(client, proxy, &server, &username, &password, true).await,
+        UiCommand::Login {
+            server,
+            username,
+            password,
+        } => authenticate(client, proxy, &server, &username, &password, false).await,
+        UiCommand::Logout => {
+            if let Some(c) = client.as_mut() {
+                c.logout();
             }
-            Err(e) => emit(
-                proxy,
-                UiEvent::Status {
-                    message: format!("Connect failed: {e}"),
-                    error: true,
-                },
-            ),
-        },
+            *client = None;
+            emit(proxy, UiEvent::LoggedOut);
+        }
         UiCommand::StartGroup => {
             if let Some(c) = client.as_mut() {
                 match c.start_group() {
@@ -195,13 +255,7 @@ async fn handle_command(
                             safety_number: c.safety_number(),
                         },
                     ),
-                    Err(e) => emit(
-                        proxy,
-                        UiEvent::Status {
-                            message: format!("Could not start group: {e}"),
-                            error: true,
-                        },
-                    ),
+                    Err(e) => error_status(proxy, format!("Could not start group: {e}")),
                 }
             }
         }
@@ -214,13 +268,7 @@ async fn handle_command(
                             safety_number: c.safety_number(),
                         },
                     ),
-                    Err(e) => emit(
-                        proxy,
-                        UiEvent::Status {
-                            message: format!("Invite failed: {e}"),
-                            error: true,
-                        },
-                    ),
+                    Err(e) => error_status(proxy, format!("Invite failed: {e}")),
                 }
             }
         }
@@ -235,13 +283,7 @@ async fn handle_command(
                             mine: true,
                         },
                     ),
-                    Err(e) => emit(
-                        proxy,
-                        UiEvent::Status {
-                            message: format!("Send failed: {e}"),
-                            error: true,
-                        },
-                    ),
+                    Err(e) => error_status(proxy, format!("Send failed: {e}")),
                 }
             }
         }
@@ -253,9 +295,9 @@ async fn handle_command(
         UiCommand::SetPresence { status } => {
             if let Some(c) = client.as_ref() {
                 let status = match status.as_str() {
-                    "away" => enclave_protocol::Presence::Away,
-                    "offline" => enclave_protocol::Presence::Offline,
-                    _ => enclave_protocol::Presence::Online,
+                    "away" => Presence::Away,
+                    "offline" => Presence::Offline,
+                    _ => Presence::Online,
                 };
                 c.set_status(status);
             }

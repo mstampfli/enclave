@@ -64,15 +64,22 @@ pub struct MediaFrame {
 /// Client -> server messages over the (TLS) signaling channel.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
-    /// Announce this device's identity public key + signed MLS KeyPackage so
-    /// others can add it to a group. `key_package` is verifiable by peers, not
-    /// by the server.
-    Register {
-        user: UserId,
-        device: DeviceId,
+    /// Create a new account (username + password, no email) and authenticate.
+    /// Carries this device's identity public key and a signed MLS KeyPackage.
+    CreateAccount {
+        username: String,
+        password: String,
         identity_pub: Vec<u8>,
         key_package: Vec<u8>,
     },
+    /// Log in to an existing account and publish a fresh KeyPackage.
+    Login {
+        username: String,
+        password: String,
+        key_package: Vec<u8>,
+    },
+    /// End the authenticated session (go offline).
+    Logout,
     /// Ask for a peer's published KeyPackages in order to add them to a group.
     FetchKeyPackages { user: UserId },
     /// Announce that this device is now a routing member of `group` (sent after
@@ -103,6 +110,12 @@ pub enum ClientMsg {
 /// Server -> client messages.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerMsg {
+    /// Result of a CreateAccount or Login attempt.
+    Auth {
+        ok: bool,
+        username: String,
+        detail: String,
+    },
     KeyPackages {
         user: UserId,
         packages: Vec<Vec<u8>>,

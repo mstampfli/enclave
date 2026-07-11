@@ -20,17 +20,17 @@ async fn media_streams_over_udp_and_far_end_opens_it() {
     let mut sealer = MediaSealer::new(
         &root_alice,
         GROUP,
-        DeviceId("alice-1".into()),
+        DeviceId("alice".into()),
         &e.alice.identity_key(),
         1,
     )
     .unwrap();
     let mut opener = MediaOpener::new(&root_bob, &GROUP, &e.alice.identity_key(), 1).unwrap();
 
-    let alice_media = MediaSocket::connect(e.media_addr, DeviceId("alice-1".into()), GROUP)
+    let alice_media = MediaSocket::connect(e.media_addr, DeviceId("alice".into()), GROUP)
         .await
         .unwrap();
-    let bob_media = MediaSocket::connect(e.media_addr, DeviceId("bob-1".into()), GROUP)
+    let bob_media = MediaSocket::connect(e.media_addr, DeviceId("bob".into()), GROUP)
         .await
         .unwrap();
 
