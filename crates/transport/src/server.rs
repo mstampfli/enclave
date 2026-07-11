@@ -35,6 +35,11 @@ const SIGNALING_MSG_LIMIT: usize = 1 << 20; // 1 MiB
 const SIGNALING_BURST: f64 = 40.0;
 const SIGNALING_RATE_PER_SEC: f64 = 25.0;
 
+/// Per-source UDP media rate limit (ASVS V11). Audio is ~50 frames/sec; this
+/// allows bursts and several concurrent streams while capping a flood.
+const MEDIA_BURST: f64 = 400.0;
+const MEDIA_RATE_PER_SEC: f64 = 250.0;
+
 /// Shared server state: the routing brain plus a per-connection outbound queue.
 struct ServerState {
     relay: Relay,
@@ -86,11 +91,23 @@ impl Server {
         let sock = socket.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65_536];
+            let mut buckets: HashMap<SocketAddr, TokenBucket> = HashMap::new();
             loop {
                 let (n, src) = match sock.recv_from(&mut buf).await {
                     Ok(x) => x,
                     Err(_) => continue,
                 };
+                // Per-source rate limit (ASVS V11): drop a flooding sender. Only
+                // group members' frames are forwarded anyway (access control),
+                // so this bounds member-side abuse.
+                let now = Instant::now();
+                if !buckets
+                    .entry(src)
+                    .or_insert_with(|| TokenBucket::new(MEDIA_BURST, MEDIA_RATE_PER_SEC, now))
+                    .try_take(now)
+                {
+                    continue;
+                }
                 let Ok(msg) = media_codec().deserialize::<UdpMsg>(&buf[..n]) else {
                     continue;
                 };

@@ -16,7 +16,9 @@ pub mod audio;
 pub mod device;
 pub mod error;
 pub mod frame;
+pub mod jitter;
 
 pub use audio::{AudioDecoder, AudioEncoder};
 pub use device::{AudioCapture, AudioPlayback};
 pub use error::MediaError;
+pub use jitter::{JitterBuffer, Popped};
