@@ -46,9 +46,10 @@ crypto  media  transport
   nonce-safe frame sealer/opener, safety numbers.
 - `enclave-media` -- capture/encode/decode; the real-time hot path.
 - `enclave-transport` -- signaling + media transport. A pure `relay` routing
-  core (metadata only; every payload opaque) driven by an async WebSocket
-  `server` + `client`. TLS on this hop is deferred to Phase 7 hardening;
-  WebRTC/QUIC media arrives in Phase 3.
+  core (metadata only; every payload opaque) drives both a reliable WebSocket
+  signaling channel and a low-latency UDP media channel (`Server` runs both over
+  shared state; `Connection` and `MediaSocket` are the client sides). TLS on the
+  signaling hop is deferred to Phase 7 hardening.
 - `enclave-client` -- orchestrates the three libs behind a self-contained
   WebView window (see "UI" below).
 - `enclave-server` -- signaling relay + SFU fan-out; holds no media keys.
@@ -130,18 +131,18 @@ window by default and only add the WASM/browser target when we choose to.
    replay/cross-epoch rejected, out-of-order tolerated) and
    `crates/transport/tests/audio_full_stack.rs` (tone -> encode -> seal -> relay
    -> open -> decode -> clear voice; wire carries only ciphertext).
-   **Deferred, scheduled:** (a) `cpal` mic/speaker device I/O -- the pipeline it
-   feeds is built and tested, but device capture can't be unit-tested headlessly;
-   (b) a low-latency UDP/WebRTC media carrier -- media currently rides the
-   WebSocket relay (functional, proves the premise); the sealed-frame format is
-   transport-agnostic, so swapping the carrier is localized.
+   **Media carrier:** a low-latency UDP path (`serve_media` + `MediaSocket`)
+   fans sealed frames out over UDP; the reliable WebSocket path remains as a
+   fallback. See `crates/transport/tests/udp_media.rs`.
+   **Deferred, scheduled:** `cpal` mic/speaker device I/O -- the pipeline it
+   feeds is built and tested, but device capture can't be unit-tested headlessly.
 4. [DONE] Multi-party groups with rekey on join/leave. `Group::add_member` now
    returns the commit (to fan out to existing members) plus the welcome;
    `apply_commit` advances an existing member; `remove_member` rekeys and cuts
    the removed member off. The relay already fans out to N members. Proven by
    `crates/crypto/tests/multiparty.rs` (three members agree; add/remove rekey;
    a removed member cannot open post-removal media) and the larger-group relay
-   fan-out test. Device I/O and the UDP media carrier from Phase 3 remain.
+   fan-out test. The `cpal` device I/O from Phase 3 remains.
 5. Video + screenshare.
 6. Presence + friends + WebView UI.
 7. Hardening: STRIDE re-pass, ASVS on server + keystore, fuzz the frame parser.

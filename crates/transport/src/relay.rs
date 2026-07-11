@@ -11,6 +11,7 @@
 //! addressed connections.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 
 use enclave_protocol::{ClientMsg, DeviceId, GroupId, ServerMsg, UserId};
 
@@ -38,6 +39,8 @@ pub struct Relay {
     identities: HashMap<UserId, Vec<u8>>,
     /// Group routing fan-out sets: which devices should receive group traffic.
     group_members: HashMap<GroupId, HashSet<DeviceId>>,
+    /// Learned UDP endpoint per device, for the real-time media channel.
+    udp_addrs: HashMap<DeviceId, SocketAddr>,
 }
 
 impl Relay {
@@ -56,10 +59,38 @@ impl Relay {
     pub fn disconnect(&mut self, conn: ConnId) {
         if let Some(device) = self.conn_device.remove(&conn) {
             self.device_conn.remove(&device);
+            self.udp_addrs.remove(&device);
             for members in self.group_members.values_mut() {
                 members.remove(&device);
             }
         }
+    }
+
+    // --- Real-time UDP media channel ---
+
+    /// A device announces its UDP endpoint and the group it will stream to.
+    pub fn udp_hello(&mut self, src: SocketAddr, device: DeviceId, group: GroupId) {
+        self.udp_addrs.insert(device.clone(), src);
+        self.group_members.entry(group).or_default().insert(device);
+    }
+
+    /// Learn `sender`'s current UDP endpoint from an incoming frame, and return
+    /// the UDP endpoints of the other group members to forward it to.
+    pub fn udp_media_targets(
+        &mut self,
+        src: SocketAddr,
+        group: &GroupId,
+        sender: &DeviceId,
+    ) -> Vec<SocketAddr> {
+        self.udp_addrs.insert(sender.clone(), src);
+        let Some(members) = self.group_members.get(group) else {
+            return vec![];
+        };
+        members
+            .iter()
+            .filter(|device| *device != sender)
+            .filter_map(|device| self.udp_addrs.get(device).copied())
+            .collect()
     }
 
     /// Handle one client message, returning messages to deliver. Pure: the only

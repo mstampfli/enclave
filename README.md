@@ -13,9 +13,10 @@ Phase 4 -- the full premise, proven end to end plus multi-party groups
 (`cargo test`, 31 tests): a tone is Opus-encoded, sealed per-frame, relayed
 through the live server (which sees only ciphertext), then opened and decoded
 back to clear audio on the far end; groups add and remove members with a rekey
-that cuts departed members off. Remaining glue: mic/speaker device I/O (`cpal`)
-and a low-latency UDP media carrier. See `ARCHITECTURE.md` for the roadmap and
-`THREAT_MODEL.md` for the STRIDE analysis. Nothing here is secure to rely on yet.
+that cuts departed members off; and sealed frames stream over a low-latency UDP
+media carrier. Remaining glue: mic/speaker device I/O (`cpal`). See
+`ARCHITECTURE.md` for the roadmap and `THREAT_MODEL.md` for the STRIDE analysis.
+Nothing here is secure to rely on yet.
 
 ## Workspace
 

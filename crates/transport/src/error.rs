@@ -8,4 +8,7 @@ pub enum TransportError {
 
     #[error("websocket error: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+
+    #[error("media codec error: {0}")]
+    Codec(#[from] bincode::Error),
 }

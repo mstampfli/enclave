@@ -120,6 +120,18 @@ pub enum Presence {
     Offline,
 }
 
+/// Messages on the real-time UDP media channel. The frame payload is the same
+/// opaque `Sealed` bytes as everywhere else; UDP just carries it with lower
+/// latency (and loss tolerance) than the reliable signaling channel.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum UdpMsg {
+    /// Announce this device's UDP endpoint and the group it streams to, so the
+    /// relay learns where to forward frames addressed to that group.
+    Hello { device: DeviceId, group: GroupId },
+    /// One sealed media frame to fan out to the rest of the group.
+    Frame(MediaFrame),
+}
+
 /// Protocol-level errors shared across crates.
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {

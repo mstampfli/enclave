@@ -1,15 +1,18 @@
-//! Async WebSocket signaling + relay server. Owns one [`Relay`] and drives it:
-//! decode each client's [`ClientMsg`], route it through the relay, and ship the
-//! resulting [`ServerMsg`]s to the addressed connections. It only ever moves
-//! opaque `Sealed` payloads plus routing metadata -- it holds no keys.
+//! The self-hosted server: a reliable WebSocket signaling channel and a
+//! low-latency UDP media channel, both driving one shared [`Relay`]. It only
+//! ever moves opaque `Sealed` payloads plus routing metadata; it holds no keys.
+//!
+//! Signaling (`serve_signaling`) carries registration, key packages, MLS
+//! handshake, Welcomes, and text. Media (`serve_media`) fans out sealed frames
+//! over UDP. Both share group membership through the same `Relay`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use enclave_protocol::{ClientMsg, ServerMsg};
+use enclave_protocol::{ClientMsg, ServerMsg, UdpMsg};
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -22,30 +25,94 @@ struct ServerState {
     txs: HashMap<ConnId, mpsc::UnboundedSender<ServerMsg>>,
 }
 
-/// A running server. Dropping it does not stop the accept loop (it runs on a
-/// detached task); keep the process alive to keep serving.
+/// A server instance. Start the signaling and/or media channels on it; they
+/// share one routing brain, so group membership is consistent across both.
+pub struct Server {
+    state: Arc<Mutex<ServerState>>,
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Server {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ServerState {
+                relay: Relay::new(),
+                txs: HashMap::new(),
+            })),
+        }
+    }
+
+    /// Bind and start the reliable WebSocket signaling channel. Returns the
+    /// bound address; the accept loop runs on a background task.
+    pub async fn serve_signaling(&self, addr: &str) -> Result<SocketAddr, TransportError> {
+        let listener = TcpListener::bind(addr).await?;
+        let local = listener.local_addr()?;
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _peer)) = listener.accept().await {
+                tokio::spawn(handle_conn(stream, state.clone()));
+            }
+        });
+        Ok(local)
+    }
+
+    /// Bind and start the low-latency UDP media channel. Returns the bound
+    /// address; the receive/forward loop runs on a background task.
+    pub async fn serve_media(&self, addr: &str) -> Result<SocketAddr, TransportError> {
+        let socket = Arc::new(UdpSocket::bind(addr).await?);
+        let local = socket.local_addr()?;
+        let state = self.state.clone();
+        let sock = socket.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_536];
+            loop {
+                let (n, src) = match sock.recv_from(&mut buf).await {
+                    Ok(x) => x,
+                    Err(_) => continue,
+                };
+                let Ok(msg) = bincode::deserialize::<UdpMsg>(&buf[..n]) else {
+                    continue;
+                };
+                let targets: Vec<SocketAddr> = {
+                    let mut s = state.lock().unwrap();
+                    match &msg {
+                        UdpMsg::Hello { device, group } => {
+                            s.relay.udp_hello(src, device.clone(), group.clone());
+                            Vec::new()
+                        }
+                        UdpMsg::Frame(frame) => {
+                            s.relay.udp_media_targets(src, &frame.group, &frame.sender)
+                        }
+                    }
+                };
+                // Forward the original datagram unchanged (no re-serialization).
+                if matches!(msg, UdpMsg::Frame(_)) {
+                    for target in targets {
+                        let _ = sock.send_to(&buf[..n], target).await;
+                    }
+                }
+            }
+        });
+        Ok(local)
+    }
+}
+
+/// A running signaling server. Dropping it does not stop the accept loop.
 pub struct ServerHandle {
     pub addr: SocketAddr,
 }
 
-/// Bind and start serving on `addr` (e.g. `"127.0.0.1:0"` for an ephemeral
-/// port). Returns once bound; the accept loop runs on a background task.
+/// Convenience: start a signaling-only server (used by the binary and tests
+/// that do not need the media channel).
 pub async fn serve(addr: &str) -> Result<ServerHandle, TransportError> {
-    let listener = TcpListener::bind(addr).await?;
-    let local = listener.local_addr()?;
-
-    let state = Arc::new(Mutex::new(ServerState {
-        relay: Relay::new(),
-        txs: HashMap::new(),
-    }));
-
-    tokio::spawn(async move {
-        while let Ok((stream, _peer)) = listener.accept().await {
-            tokio::spawn(handle_conn(stream, state.clone()));
-        }
-    });
-
-    Ok(ServerHandle { addr: local })
+    let server = Server::new();
+    let addr = server.serve_signaling(addr).await?;
+    Ok(ServerHandle { addr })
 }
 
 /// Decode one WebSocket frame into raw payload bytes, or `None` for control /
@@ -98,8 +165,7 @@ async fn handle_conn(stream: TcpStream, state: Arc<Mutex<ServerState>>) {
             continue;
         };
 
-        // Route under the lock; resolve target senders; release before sending
-        // so we never hold the lock across a channel operation.
+        // Route under the lock; resolve target senders; release before sending.
         let sends: Vec<(mpsc::UnboundedSender<ServerMsg>, ServerMsg)> = {
             let mut s = state.lock().unwrap();
             let outgoing = s.relay.handle(conn, client_msg);

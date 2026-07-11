@@ -2,11 +2,12 @@
 //! bring two clients (Alice, Bob) into the same MLS group through it.
 #![allow(dead_code)] // each test binary uses a subset of these helpers.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use enclave_crypto::{Group, Identity};
 use enclave_protocol::{ClientMsg, DeviceId, GroupId, MediaFrame, Sealed, ServerMsg, UserId};
-use enclave_transport::{serve, Connection};
+use enclave_transport::{Connection, Server};
 
 /// App-level routing group id (independent of MLS's internal group id).
 pub const GROUP: GroupId = GroupId([7u8; 32]);
@@ -73,14 +74,20 @@ pub struct Established {
     pub bob_group: Group,
     pub alice_conn: Connection,
     pub bob_conn: Connection,
+    pub media_addr: SocketAddr,
 }
 
 /// Start a server, connect Alice and Bob, register both, and add Bob to a group
 /// via a Welcome relayed through the server. Returns everything the caller needs
 /// to exchange messages.
 pub async fn establish() -> Established {
-    let handle = serve("127.0.0.1:0").await.expect("bind server");
-    let url = format!("ws://{}", handle.addr);
+    let server = Server::new();
+    let ws_addr = server
+        .serve_signaling("127.0.0.1:0")
+        .await
+        .expect("bind signaling");
+    let media_addr = server.serve_media("127.0.0.1:0").await.expect("bind media");
+    let url = format!("ws://{ws_addr}");
 
     let alice = Identity::generate("alice").expect("alice");
     let bob = Identity::generate("bob").expect("bob");
@@ -123,5 +130,6 @@ pub async fn establish() -> Established {
         bob_group,
         alice_conn,
         bob_conn,
+        media_addr,
     }
 }
