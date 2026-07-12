@@ -201,6 +201,10 @@ enum UiEvent {
         message: String,
         error: bool,
     },
+    /// Connection state to the server: "online" | "reconnecting" | "offline".
+    Connection {
+        state: String,
+    },
 }
 
 fn main() -> wry::Result<()> {
@@ -427,9 +431,47 @@ async fn run_client(
                 Event::Error(message) => error_status(&proxy, message),
             },
             Ok(None) => {
-                client = None;
-                emit(&proxy, UiEvent::LoggedOut);
-                error_status(&proxy, "Disconnected from server.".into());
+                // The socket dropped (server restart, network blip). Try to
+                // reconnect with backoff, re-authenticating with the retained
+                // credentials, before giving up and logging out.
+                let reconnected = if client.is_some() {
+                    emit(
+                        &proxy,
+                        UiEvent::Connection {
+                            state: "reconnecting".into(),
+                        },
+                    );
+                    let mut ok = false;
+                    let mut delay = 1u64;
+                    for _ in 0..6 {
+                        tokio::time::sleep(Duration::from_secs(delay)).await;
+                        if let Some(c) = client.as_mut() {
+                            if c.reconnect().await.is_ok() {
+                                ok = true;
+                                break;
+                            }
+                        }
+                        delay = (delay * 2).min(15);
+                    }
+                    ok
+                } else {
+                    false
+                };
+                if reconnected {
+                    emit(
+                        &proxy,
+                        UiEvent::Connection {
+                            state: "online".into(),
+                        },
+                    );
+                    if let Some(c) = client.as_ref() {
+                        emit_conversations(&proxy, c);
+                    }
+                } else {
+                    client = None;
+                    emit(&proxy, UiEvent::LoggedOut);
+                    error_status(&proxy, "Lost connection to the server.".into());
+                }
             }
             Err(_) => {}
         }

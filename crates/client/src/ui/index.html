@@ -114,6 +114,8 @@
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--offline); flex: none; }
   .badge { flex: none; background: var(--danger); color: #fff; border-radius: 10px; font-size: 11px; font-weight: 600; padding: 0 6px; min-width: 18px; height: 18px; line-height: 18px; text-align: center; }
   .call-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: #3ba55d; }
+  #conn-banner { position: fixed; top: 0; left: 0; right: 0; z-index: 50; text-align: center; padding: 6px; font-size: 13px; background: var(--danger); color: #fff; }
+  #conn-banner.online { background: #3ba55d; }
   .dot.online { background: var(--online); }
   .dot.away { background: var(--away); }
   .dot.offline { background: var(--offline); }
@@ -203,6 +205,8 @@
       <div id="login-error" class="error"></div>
     </div>
   </div>
+
+  <div id="conn-banner" hidden>Reconnecting to server...</div>
 
   <div id="app-view" hidden>
     <nav class="rail">
@@ -684,6 +688,7 @@
     for (const k in callPart) delete callPart[k];
     for (const k in unread) delete unread[k];
     $("call-btn").classList.remove("in-call"); $("call-banner").hidden = true;
+    $("conn-banner").hidden = true;
     $("audio-modal").hidden = true; $("group-modal").hidden = true;
     for (const k in messages) delete messages[k];
     for (const k in presence) delete presence[k];
@@ -747,6 +752,18 @@
       case "CallDeclined":
         setStatus(ev.from + " declined the call", false);
         break;
+      case "Connection": {
+        const b = $("conn-banner");
+        if (ev.state === "reconnecting") {
+          b.textContent = "Reconnecting to server..."; b.classList.remove("online"); b.hidden = false;
+        } else if (ev.state === "online") {
+          b.textContent = "Reconnected"; b.classList.add("online"); b.hidden = false;
+          setTimeout(() => { b.hidden = true; }, 1500);
+        } else {
+          b.hidden = true;
+        }
+        break;
+      }
       case "AudioDevices":
         fillDevices($("audio-input"), ev.inputs, ev.input);
         fillDevices($("audio-output"), ev.outputs, ev.output);

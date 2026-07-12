@@ -19,6 +19,7 @@ use enclave_protocol::{ClientMsg, DeviceId, Friend, GroupId, Presence, Sealed, S
 use enclave_transport::accounts::MIN_PASSWORD_LEN;
 use enclave_transport::{opaque, Connection};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 mod call;
 mod session;
@@ -158,6 +159,12 @@ pub struct Client {
     input_device: Option<String>,
     /// Selected speaker (output) device name; `None` = host default.
     output_device: Option<String>,
+    /// The server URL, retained so a dropped socket can be reconnected.
+    server_url: String,
+    /// The login password, kept in memory (zeroized) only for the session so a
+    /// reconnect can re-authenticate. Never persisted. (A session-resumption
+    /// token would avoid retaining it; see the reconnect note.)
+    password: Zeroizing<String>,
 }
 
 impl Client {
@@ -183,7 +190,23 @@ impl Client {
             call_group: None,
             input_device: None,
             output_device: None,
+            server_url: server_url.to_string(),
+            password: Zeroizing::new(String::new()),
         })
+    }
+
+    /// Reconnect to the server after the socket dropped (restart, network blip)
+    /// and re-authenticate with the retained credentials, restoring routing. The
+    /// full login path is reused, which is idempotent: the same identity and
+    /// session are re-loaded from disk and re-affirmed. Fails if not logged in.
+    pub async fn reconnect(&mut self) -> Result<(), ClientError> {
+        let handle = self.username.clone().ok_or(ClientError::NotLoggedIn)?;
+        if self.password.is_empty() {
+            return Err(ClientError::NotLoggedIn);
+        }
+        let password = self.password.clone();
+        self.conn = Connection::connect(&self.server_url).await?;
+        self.login(&handle, &password).await
     }
 
     /// Where identity key files and rosters are stored (default: current dir).
@@ -237,6 +260,7 @@ impl Client {
         let server_display = self.await_auth().await?;
         self.finish_login(identity, &handle, server_display);
         self.export_key = export_key;
+        self.password = Zeroizing::new(password.to_string());
         Ok(())
     }
 
@@ -268,6 +292,7 @@ impl Client {
         let _ = identity.save(&self.identity_path(handle), password);
         self.finish_login(identity, handle, server_display);
         self.export_key = export_key;
+        self.password = Zeroizing::new(password.to_string());
         self.load_session();
         Ok(())
     }
@@ -281,6 +306,8 @@ impl Client {
         self.conversations.clear();
         self.active = None;
         self.export_key.clear();
+        self.password = Zeroizing::new(String::new());
+        self.call_group = None;
         self.display.clear();
         self.friends.clear();
         self.incoming.clear();
