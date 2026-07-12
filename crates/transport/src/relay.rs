@@ -59,13 +59,18 @@ pub struct Relay {
     opaque: OpaqueServer,
     /// In-flight OPAQUE logins, keyed by connection, between the two round-trips.
     pending_login: HashMap<ConnId, PendingLogin>,
+    /// Handles reserved by an in-flight registration, so two concurrent sign-ups
+    /// of the same name cannot be assigned the same `name#1234`.
+    reserved: HashSet<String>,
+    /// The handle reserved for the registration in progress on each connection.
+    pending_register: HashMap<ConnId, String>,
     /// Failed login attempts per connection, for lockout.
     login_attempts: HashMap<ConnId, u32>,
 }
 
 /// Server-side state for an OPAQUE login in progress on one connection.
 struct PendingLogin {
-    username: String,
+    handle: String,
     state: ServerLoginState,
 }
 
@@ -115,6 +120,9 @@ impl Relay {
         }
         self.login_attempts.remove(&conn);
         self.pending_login.remove(&conn);
+        if let Some(handle) = self.pending_register.remove(&conn) {
+            self.reserved.remove(&handle);
+        }
         for watchers in self.presence_watchers.values_mut() {
             watchers.remove(&conn);
         }
@@ -216,77 +224,87 @@ impl Relay {
             _ => return vec![],
         }
         match msg {
-            ClientMsg::RegisterStart { username, request } => {
-                // Refuse to begin registering over an existing name (re-checked
-                // atomically at finish). This does reveal name existence, which
-                // is unavoidable without email confirmation (accepted risk).
-                if self.accounts.contains(&username) {
-                    return auth_fail(from, username, "that username is taken");
+            ClientMsg::RegisterStart { name, request } => {
+                // Release any prior in-flight reservation on this connection.
+                if let Some(prev) = self.pending_register.remove(&from) {
+                    self.reserved.remove(&prev);
                 }
-                match self.opaque.register_start(&username, &request) {
-                    Ok(response) => vec![Outgoing {
-                        to: from,
-                        msg: ServerMsg::RegisterResponse { response },
-                    }],
-                    Err(_) => auth_fail(from, username, "registration failed"),
+                let name = name.trim().to_string();
+                if name.is_empty() || name.contains('#') || name.chars().count() > 32 {
+                    return auth_fail(from, String::new(), "please choose a valid name (no #)");
+                }
+                let Some(handle) = self.assign_handle(&name) else {
+                    return auth_fail(from, name, "that name is full; try another");
+                };
+                match self.opaque.register_start(&handle, &request) {
+                    Ok(response) => {
+                        self.reserved.insert(handle.clone());
+                        self.pending_register.insert(from, handle.clone());
+                        vec![Outgoing {
+                            to: from,
+                            msg: ServerMsg::RegisterResponse { handle, response },
+                        }]
+                    }
+                    Err(_) => auth_fail(from, name, "registration failed"),
                 }
             }
 
             ClientMsg::RegisterFinish {
-                username,
                 upload,
                 identity_pub,
                 key_package,
             } => {
+                // The handle was assigned and reserved at RegisterStart.
+                let Some(handle) = self.pending_register.remove(&from) else {
+                    return auth_fail(from, String::new(), "registration expired; start over");
+                };
+                self.reserved.remove(&handle);
                 let envelope = match self.opaque.register_finish(&upload) {
                     Ok(env) => env,
-                    Err(_) => return auth_fail(from, username, "registration failed"),
+                    Err(_) => return auth_fail(from, handle, "registration failed"),
                 };
                 match self
                     .accounts
-                    .create_account(&username, envelope, identity_pub.clone())
+                    .create_account(&handle, envelope, identity_pub.clone())
                 {
                     AuthOutcome::Created => {
                         let mut out = vec![Outgoing {
                             to: from,
                             msg: ServerMsg::Auth {
                                 ok: true,
-                                username: username.clone(),
+                                handle: handle.clone(),
                                 detail: "account created".into(),
                             },
                         }];
-                        out.extend(self.setup_session(from, username, identity_pub, key_package));
+                        out.extend(self.setup_session(from, handle, identity_pub, key_package));
                         out
                     }
-                    AuthOutcome::UsernameTaken => {
-                        auth_fail(from, username, "that username is taken")
-                    }
-                    AuthOutcome::InvalidUsername => {
-                        auth_fail(from, username, "please enter a username")
-                    }
+                    // The handle was reserved unique, so these should not occur.
+                    AuthOutcome::UsernameTaken => auth_fail(from, handle, "that handle is taken"),
+                    AuthOutcome::InvalidUsername => auth_fail(from, handle, "invalid handle"),
                 }
             }
 
-            ClientMsg::LoginStart { username, request } => {
+            ClientMsg::LoginStart { handle, request } => {
                 if *self.login_attempts.get(&from).unwrap_or(&0) >= MAX_LOGIN_ATTEMPTS {
-                    return auth_fail(from, username, "too many attempts; reconnect to retry");
+                    return auth_fail(from, handle, "too many attempts; reconnect to retry");
                 }
-                // Unknown users take the same path via OPAQUE dummy mode (a
-                // `None` envelope), so a login attempt cannot enumerate usernames.
-                let envelope = self.accounts.envelope(&username).map(|e| e.to_vec());
+                // Unknown handles take the same path via OPAQUE dummy mode (a
+                // `None` envelope), so a login attempt cannot enumerate handles.
+                let envelope = self.accounts.envelope(&handle).map(|e| e.to_vec());
                 match self
                     .opaque
-                    .login_start(&username, envelope.as_deref(), &request)
+                    .login_start(&handle, envelope.as_deref(), &request)
                 {
                     Ok((response, state)) => {
                         self.pending_login
-                            .insert(from, PendingLogin { username, state });
+                            .insert(from, PendingLogin { handle, state });
                         vec![Outgoing {
                             to: from,
                             msg: ServerMsg::LoginResponse { response },
                         }]
                     }
-                    Err(_) => auth_fail(from, username, "wrong username or password"),
+                    Err(_) => auth_fail(from, handle, "wrong handle or password"),
                 }
             }
 
@@ -294,8 +312,7 @@ impl Relay {
                 finalization,
                 key_package,
             } => {
-                let Some(PendingLogin { username, state }) = self.pending_login.remove(&from)
-                else {
+                let Some(PendingLogin { handle, state }) = self.pending_login.remove(&from) else {
                     return vec![];
                 };
                 match state.finish(&finalization) {
@@ -305,23 +322,23 @@ impl Relay {
                         self.login_attempts.remove(&from);
                         let identity_pub = self
                             .accounts
-                            .identity_pub(&username)
+                            .identity_pub(&handle)
                             .map(|s| s.to_vec())
                             .unwrap_or_default();
                         let mut out = vec![Outgoing {
                             to: from,
                             msg: ServerMsg::Auth {
                                 ok: true,
-                                username: username.clone(),
+                                handle: handle.clone(),
                                 detail: "logged in".into(),
                             },
                         }];
-                        out.extend(self.setup_session(from, username, identity_pub, key_package));
+                        out.extend(self.setup_session(from, handle, identity_pub, key_package));
                         out
                     }
                     Err(_) => {
                         *self.login_attempts.entry(from).or_insert(0) += 1;
-                        auth_fail(from, username, "wrong username or password")
+                        auth_fail(from, handle, "wrong handle or password")
                     }
                 }
             }
@@ -422,6 +439,24 @@ impl Relay {
         }
     }
 
+    /// Assign an unused `name#1234` handle, or `None` if every discriminator for
+    /// `name` is taken. Tries random slots first (cheap when the name is rare),
+    /// then scans exhaustively (correct when it is crowded).
+    fn assign_handle(&self, name: &str) -> Option<String> {
+        use rand::Rng;
+        let taken = |h: &str| self.accounts.contains(h) || self.reserved.contains(h);
+        let mut rng = rand::thread_rng();
+        for _ in 0..48 {
+            let handle = format!("{name}#{:04}", rng.gen_range(1..=9999));
+            if !taken(&handle) {
+                return Some(handle);
+            }
+        }
+        (1..=9999u16)
+            .map(|d| format!("{name}#{d:04}"))
+            .find(|h| !taken(h))
+    }
+
     /// The device currently on `conn`, or an empty id if unregistered.
     fn device_for(&self, conn: ConnId) -> DeviceId {
         self.conn_device
@@ -467,14 +502,14 @@ impl Relay {
 }
 
 /// Build an auth-failure reply. Login failures use a single coarse message so
-/// they do not leak whether a username exists (ASVS V2); OPAQUE dummy mode makes
+/// they do not leak whether a handle exists (ASVS V2); OPAQUE dummy mode makes
 /// the crypto path indistinguishable too.
-fn auth_fail(conn: ConnId, username: String, detail: &str) -> Vec<Outgoing> {
+fn auth_fail(conn: ConnId, handle: String, detail: &str) -> Vec<Outgoing> {
     vec![Outgoing {
         to: conn,
         msg: ServerMsg::Auth {
             ok: false,
-            username,
+            handle,
             detail: detail.into(),
         },
     }]

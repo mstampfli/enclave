@@ -20,16 +20,16 @@ pub async fn register_account(
     username: &str,
     identity_pub: Vec<u8>,
     key_package: Vec<u8>,
-) {
+) -> String {
     let password = "a-sufficiently-long-password";
     let (request, state) = opaque::client_register_start(password).expect("client register start");
     conn.send(ClientMsg::RegisterStart {
-        username: username.into(),
+        name: username.into(),
         request,
     });
-    let response = loop {
+    let (handle, response) = loop {
         match tokio::time::timeout(RECV_TIMEOUT, conn.recv()).await {
-            Ok(Some(ServerMsg::RegisterResponse { response })) => break response,
+            Ok(Some(ServerMsg::RegisterResponse { handle, response })) => break (handle, response),
             Ok(Some(_)) => continue,
             _ => panic!("no register response for {username}"),
         }
@@ -38,7 +38,6 @@ pub async fn register_account(
         .finish(password, &response)
         .expect("client register finish");
     conn.send(ClientMsg::RegisterFinish {
-        username: username.into(),
         upload,
         identity_pub,
         key_package,
@@ -55,6 +54,7 @@ pub async fn register_account(
             _ => panic!("no auth for {username}"),
         }
     }
+    handle
 }
 
 pub async fn fetch_key_package(conn: &mut Connection, user: &str) -> Vec<u8> {
@@ -114,6 +114,9 @@ pub async fn recv_media(conn: &mut Connection) -> MediaFrame {
 pub struct Established {
     pub alice: Identity,
     pub bob: Identity,
+    /// Server-assigned handles (name#1234); also the routing device ids.
+    pub alice_handle: String,
+    pub bob_handle: String,
     pub alice_group: Group,
     pub bob_group: Group,
     pub alice_conn: Connection,
@@ -139,14 +142,14 @@ pub async fn establish() -> Established {
     let mut alice_conn = Connection::connect(&url).await.expect("alice connects");
     let mut bob_conn = Connection::connect(&url).await.expect("bob connects");
 
-    register_account(
+    let alice_handle = register_account(
         &mut alice_conn,
         "alice",
         alice.identity_key(),
         alice.new_key_package().expect("alice kp"),
     )
     .await;
-    register_account(
+    let bob_handle = register_account(
         &mut bob_conn,
         "bob",
         bob.identity_key(),
@@ -154,7 +157,7 @@ pub async fn establish() -> Established {
     )
     .await;
 
-    let bob_kp = fetch_key_package(&mut alice_conn, "bob").await;
+    let bob_kp = fetch_key_package(&mut alice_conn, &bob_handle).await;
 
     let mut alice_group = Group::create(&alice).expect("create group");
     alice_conn.send(ClientMsg::JoinGroup { group: GROUP });
@@ -163,7 +166,7 @@ pub async fn establish() -> Established {
         .expect("add bob")
         .welcome;
     alice_conn.send(ClientMsg::Welcome {
-        to: DeviceId("bob".into()),
+        to: DeviceId(bob_handle.clone()),
         group: GROUP,
         message: Sealed(welcome),
     });
@@ -175,6 +178,8 @@ pub async fn establish() -> Established {
     Established {
         alice,
         bob,
+        alice_handle,
+        bob_handle,
         alice_group,
         bob_group,
         alice_conn,

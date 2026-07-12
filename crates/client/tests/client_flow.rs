@@ -31,13 +31,14 @@ async fn presence_events_reach_a_watcher() {
     let url = format!("ws://{}", handle.addr);
 
     let mut alice = account(&url, "alice").await;
-    alice.add_friend("bob"); // start watching Bob
-
-    // Bob comes online -> Alice is told (via broadcast or the watch reply).
     let bob = account(&url, "bob").await;
+    let bob_handle = bob.name().to_string();
+
+    // Alice watches Bob (already online) -> she is told he is online.
+    alice.add_friend(&bob_handle);
     loop {
         if let Event::Presence { user, status } = next_event(&mut alice).await {
-            if user == "bob" && status == "online" {
+            if user == bob_handle && status == "online" {
                 break;
             }
         }
@@ -47,7 +48,7 @@ async fn presence_events_reach_a_watcher() {
     drop(bob);
     loop {
         if let Event::Presence { user, status } = next_event(&mut alice).await {
-            if user == "bob" && status == "offline" {
+            if user == bob_handle && status == "offline" {
                 break;
             }
         }
@@ -61,10 +62,12 @@ async fn two_clients_chat_through_the_controller() {
 
     let mut alice = account(&url, "alice").await;
     let mut bob = account(&url, "bob").await;
+    let alice_handle = alice.name().to_string();
+    let bob_handle = bob.name().to_string();
 
-    // Alice starts a group and invites Bob.
+    // Alice starts a group and invites Bob by his handle.
     alice.start_group().unwrap();
-    alice.invite("bob").await.unwrap();
+    alice.invite(&bob_handle).await.unwrap();
 
     // Bob learns he joined.
     assert!(matches!(
@@ -76,11 +79,11 @@ async fn two_clients_chat_through_the_controller() {
     assert!(alice.safety_number().is_some());
     assert_eq!(alice.safety_number(), bob.safety_number());
 
-    // Alice sends text; Bob receives it decrypted, authenticated as Alice.
+    // Alice sends text; Bob receives it decrypted, authenticated as Alice's handle.
     alice.send_text("hello bob").await.unwrap();
     match next_event(&mut bob).await {
         Event::Text { from, text } => {
-            assert_eq!(from, "alice");
+            assert_eq!(from, alice_handle);
             assert_eq!(text, "hello bob");
         }
         other => panic!("expected text, got {other:?}"),
@@ -90,7 +93,7 @@ async fn two_clients_chat_through_the_controller() {
     bob.send_text("hi alice").await.unwrap();
     match next_event(&mut alice).await {
         Event::Text { from, text } => {
-            assert_eq!(from, "bob");
+            assert_eq!(from, bob_handle);
             assert_eq!(text, "hi alice");
         }
         other => panic!("expected text, got {other:?}"),
@@ -102,17 +105,21 @@ async fn wrong_password_is_rejected() {
     let handle = serve("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", handle.addr);
 
-    // Create the account.
-    let mut alice = Client::connect(&url).await.unwrap();
-    alice.set_keystore_dir(std::env::temp_dir());
-    alice
-        .create_account("zara", "the-right-password")
+    // Create the account and learn the assigned handle.
+    let mut zara = Client::connect(&url).await.unwrap();
+    zara.set_keystore_dir(std::env::temp_dir());
+    zara.create_account("zara", "the-right-password")
         .await
         .unwrap();
+    let zara_handle = zara.name().to_string();
 
-    // A second connection with the wrong password is rejected.
+    // A second connection with the correct handle but wrong password is rejected
+    // (this exercises the OPAQUE password check, not handle enumeration).
     let mut imposter = Client::connect(&url).await.unwrap();
     imposter.set_keystore_dir(std::env::temp_dir());
-    assert!(imposter.login("zara", "the-wrong-password").await.is_err());
+    assert!(imposter
+        .login(&zara_handle, "the-wrong-password")
+        .await
+        .is_err());
     assert!(!imposter.is_logged_in());
 }

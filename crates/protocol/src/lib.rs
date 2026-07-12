@@ -64,20 +64,22 @@ pub struct MediaFrame {
 /// Client -> server messages over the (TLS) signaling channel.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
-    /// OPAQUE registration, step 1: a blinded registration request. The password
-    /// is never sent -- not here, not anywhere. See `enclave-transport::opaque`.
-    RegisterStart { username: String, request: Vec<u8> },
+    /// OPAQUE registration, step 1: a desired display `name` plus a blinded
+    /// registration request. The server assigns a `name#1234` handle and returns
+    /// it. The password is never sent -- not here, not anywhere.
+    RegisterStart { name: String, request: Vec<u8> },
     /// OPAQUE registration, step 2: the client's upload (the future stored
     /// envelope), plus this device's identity public key and signed KeyPackage.
-    /// On success the server stores the account and authenticates the session.
+    /// The handle was fixed by the server in step 1 (kept per-connection). On
+    /// success the server stores the account and authenticates the session.
     RegisterFinish {
-        username: String,
         upload: Vec<u8>,
         identity_pub: Vec<u8>,
         key_package: Vec<u8>,
     },
-    /// OPAQUE login, step 1: a blinded credential request for `username`.
-    LoginStart { username: String, request: Vec<u8> },
+    /// OPAQUE login, step 1: a blinded credential request for the full `handle`
+    /// (`name#1234`).
+    LoginStart { handle: String, request: Vec<u8> },
     /// OPAQUE login, step 2: the client's credential finalization proving
     /// knowledge of the password, plus a fresh KeyPackage to publish. The server
     /// verifies the proof and authenticates (or rejects) the session.
@@ -117,8 +119,10 @@ pub enum ClientMsg {
 /// Server -> client messages.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerMsg {
-    /// OPAQUE registration, step 1 reply: the server's registration response.
+    /// OPAQUE registration, step 1 reply: the server-assigned `handle`
+    /// (`name#1234`) plus the server's registration response.
     RegisterResponse {
+        handle: String,
         response: Vec<u8>,
     },
     /// OPAQUE login, step 1 reply: the server's credential response (a challenge
@@ -126,10 +130,11 @@ pub enum ServerMsg {
     LoginResponse {
         response: Vec<u8>,
     },
-    /// Final result of a registration or login exchange.
+    /// Final result of a registration or login exchange. `handle` is the full
+    /// `name#1234` the session is authenticated as.
     Auth {
         ok: bool,
-        username: String,
+        handle: String,
         detail: String,
     },
     KeyPackages {

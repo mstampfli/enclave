@@ -3,53 +3,53 @@
 use enclave_protocol::{ClientMsg, DeviceId, GroupId, Presence, Sealed, ServerMsg, UserId};
 use enclave_transport::{Outgoing, Relay};
 
-// Drive a full OPAQUE registration against the relay on `conn`, returning the
-// finish outgoings (Auth + any presence). Uses the real handshake -- no test
-// backdoor into the auth path.
-fn authenticate(r: &mut Relay, conn: u64, user: &str, kp: Vec<u8>) -> Vec<Outgoing> {
+// Drive a full OPAQUE registration against the relay on `conn`. Returns the
+// server-assigned handle (name#1234) and the finish outgoings (Auth + presence).
+// Uses the real handshake -- no test backdoor into the auth path.
+fn authenticate(r: &mut Relay, conn: u64, name: &str, kp: Vec<u8>) -> (String, Vec<Outgoing>) {
     let password = "a-sufficiently-long-password";
     let (request, state) =
         enclave_transport::opaque::client_register_start(password).expect("register start");
     let out = r.handle(
         conn,
         ClientMsg::RegisterStart {
-            username: user.into(),
+            name: name.into(),
             request,
         },
     );
-    let response = match &out[0].msg {
-        ServerMsg::RegisterResponse { response } => response.clone(),
+    let (handle, response) = match &out[0].msg {
+        ServerMsg::RegisterResponse { handle, response } => (handle.clone(), response.clone()),
         other => panic!("expected RegisterResponse, got {other:?}"),
     };
     let upload = state.finish(password, &response).expect("register finish");
-    r.handle(
+    let finish = r.handle(
         conn,
         ClientMsg::RegisterFinish {
-            username: user.into(),
             upload,
             identity_pub: vec![],
             key_package: kp,
         },
-    )
+    );
+    (handle, finish)
 }
 
-// Create an account and authenticate a fresh connection. The device id is the
-// username in the account model.
-fn register(r: &mut Relay, user: &str, kp: Vec<u8>) -> u64 {
+// Create an account on a fresh connection. Returns (conn, handle); the handle is
+// the routing device id in the account model.
+fn register(r: &mut Relay, name: &str, kp: Vec<u8>) -> (u64, String) {
     let conn = r.connect();
-    authenticate(r, conn, user, kp);
-    conn
+    let (handle, _) = authenticate(r, conn, name, kp);
+    (conn, handle)
 }
 
 #[test]
 fn fetch_returns_a_published_key_package_once() {
     let mut r = Relay::new();
-    let conn = register(&mut r, "u", vec![9, 9, 9]);
+    let (conn, h) = register(&mut r, "u", vec![9, 9, 9]);
 
     let out = r.handle(
         conn,
         ClientMsg::FetchKeyPackages {
-            user: UserId("u".into()),
+            user: UserId(h.clone()),
         },
     );
     assert_eq!(out.len(), 1);
@@ -59,12 +59,7 @@ fn fetch_returns_a_published_key_package_once() {
     }
 
     // Single-use: a second fetch returns nothing.
-    let out2 = r.handle(
-        conn,
-        ClientMsg::FetchKeyPackages {
-            user: UserId("u".into()),
-        },
-    );
+    let out2 = r.handle(conn, ClientMsg::FetchKeyPackages { user: UserId(h) });
     match &out2[0].msg {
         ServerMsg::KeyPackages { packages, .. } => assert!(packages.is_empty()),
         other => panic!("expected empty KeyPackages, got {other:?}"),
@@ -74,8 +69,8 @@ fn fetch_returns_a_published_key_package_once() {
 #[test]
 fn text_fans_out_to_other_members_only_and_relays_bytes_unchanged() {
     let mut r = Relay::new();
-    let a = register(&mut r, "a", vec![1]);
-    let b = register(&mut r, "b", vec![2]);
+    let (a, _ah) = register(&mut r, "a", vec![1]);
+    let (b, bh) = register(&mut r, "b", vec![2]);
     let group = GroupId([5u8; 32]);
     r.handle(
         a,
@@ -86,7 +81,7 @@ fn text_fans_out_to_other_members_only_and_relays_bytes_unchanged() {
     r.handle(
         a,
         ClientMsg::Welcome {
-            to: DeviceId("b".into()),
+            to: DeviceId(bh),
             group: group.clone(),
             message: Sealed(vec![]),
         },
@@ -113,9 +108,9 @@ fn text_fans_out_to_other_members_only_and_relays_bytes_unchanged() {
 #[test]
 fn text_fans_out_to_all_other_members_in_a_larger_group() {
     let mut r = Relay::new();
-    let a = register(&mut r, "a", vec![1]);
-    let b = register(&mut r, "b", vec![2]);
-    let c = register(&mut r, "c", vec![3]);
+    let (a, _ah) = register(&mut r, "a", vec![1]);
+    let (b, bh) = register(&mut r, "b", vec![2]);
+    let (c, ch) = register(&mut r, "c", vec![3]);
     let group = GroupId([6u8; 32]);
     r.handle(
         a,
@@ -123,11 +118,11 @@ fn text_fans_out_to_all_other_members_in_a_larger_group() {
             group: group.clone(),
         },
     ); // Alice bootstraps
-    for peer in ["b", "c"] {
+    for peer in [bh, ch] {
         r.handle(
             a,
             ClientMsg::Welcome {
-                to: DeviceId(peer.into()),
+                to: DeviceId(peer),
                 group: group.clone(),
                 message: Sealed(vec![]),
             },
@@ -152,8 +147,8 @@ fn text_fans_out_to_all_other_members_in_a_larger_group() {
 #[test]
 fn welcome_is_directed_and_adds_the_recipient_to_routing() {
     let mut r = Relay::new();
-    let a = register(&mut r, "a", vec![1]);
-    let b = register(&mut r, "b", vec![2]);
+    let (a, _ah) = register(&mut r, "a", vec![1]);
+    let (b, bh) = register(&mut r, "b", vec![2]);
     let group = GroupId([3u8; 32]);
     r.handle(
         a,
@@ -166,7 +161,7 @@ fn welcome_is_directed_and_adds_the_recipient_to_routing() {
     let out = r.handle(
         a,
         ClientMsg::Welcome {
-            to: DeviceId("b".into()),
+            to: DeviceId(bh),
             group: group.clone(),
             message: Sealed(vec![4, 2]),
         },
@@ -191,8 +186,8 @@ fn welcome_is_directed_and_adds_the_recipient_to_routing() {
 #[test]
 fn disconnect_removes_the_device_from_routing() {
     let mut r = Relay::new();
-    let a = register(&mut r, "a", vec![1]);
-    let b = register(&mut r, "b", vec![2]);
+    let (a, _ah) = register(&mut r, "a", vec![1]);
+    let (b, bh) = register(&mut r, "b", vec![2]);
     let group = GroupId([8u8; 32]);
     r.handle(
         a,
@@ -203,7 +198,7 @@ fn disconnect_removes_the_device_from_routing() {
     r.handle(
         a,
         ClientMsg::Welcome {
-            to: DeviceId("b".into()),
+            to: DeviceId(bh),
             group: group.clone(),
             message: Sealed(vec![]),
         },
@@ -227,9 +222,9 @@ fn disconnect_removes_the_device_from_routing() {
 #[test]
 fn non_member_cannot_join_or_inject() {
     let mut r = Relay::new();
-    let a = register(&mut r, "a", vec![1]);
-    let b = register(&mut r, "b", vec![2]);
-    let mallory = register(&mut r, "mallory", vec![3]);
+    let (a, _ah) = register(&mut r, "a", vec![1]);
+    let (b, bh) = register(&mut r, "b", vec![2]);
+    let (mallory, mallory_h) = register(&mut r, "mallory", vec![3]);
     let group = GroupId([9u8; 32]);
 
     // Alice creates the group and invites Bob (the legitimate path).
@@ -242,7 +237,7 @@ fn non_member_cannot_join_or_inject() {
     r.handle(
         a,
         ClientMsg::Welcome {
-            to: DeviceId("b".into()),
+            to: DeviceId(bh),
             group: group.clone(),
             message: Sealed(vec![]),
         },
@@ -273,7 +268,7 @@ fn non_member_cannot_join_or_inject() {
     let sneaked = r.handle(
         mallory,
         ClientMsg::Welcome {
-            to: DeviceId("mallory".into()),
+            to: DeviceId(mallory_h),
             group: group.clone(),
             message: Sealed(vec![]),
         },
@@ -295,34 +290,28 @@ fn non_member_cannot_join_or_inject() {
 #[test]
 fn presence_reaches_watchers_on_connect_and_disconnect() {
     let mut r = Relay::new();
+    let (a, _ah) = register(&mut r, "alice", vec![1]);
+    let (b, bob_h) = register(&mut r, "bob", vec![2]);
 
-    // Alice connects and watches Bob before Bob is online.
-    let a = r.connect();
-    authenticate(&mut r, a, "alice", vec![1]);
+    // Alice watches Bob (already online) -> she is told immediately he is online.
     let out = r.handle(
         a,
         ClientMsg::WatchPresence {
-            users: vec![UserId("bob".into())],
+            users: vec![UserId(bob_h.clone())],
         },
     );
-    assert!(out.is_empty(), "Bob is unknown, so nothing yet");
-
-    // Bob registers -> Alice (watching Bob) is told he is online.
-    let b = r.connect();
-    let out = authenticate(&mut r, b, "bob", vec![2]);
-    // (CreateAccount also returns an Auth reply to Bob, so look for the presence.)
     assert!(out.iter().any(|o| o.to == a
         && matches!(
             &o.msg,
-            ServerMsg::Presence { user, status: Presence::Online } if user.0 == "bob"
+            ServerMsg::Presence { user, status: Presence::Online } if user.0 == bob_h
         )));
 
-    // Bob disconnects -> Alice is told he is offline.
+    // Bob disconnects -> Alice (watching Bob) is told he is offline.
     let out = r.disconnect(b);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].to, a);
     assert!(matches!(
         &out[0].msg,
-        ServerMsg::Presence { user, status: Presence::Offline } if user.0 == "bob"
+        ServerMsg::Presence { user, status: Presence::Offline } if user.0 == bob_h
     ));
 }

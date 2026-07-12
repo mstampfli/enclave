@@ -94,14 +94,11 @@ impl Client {
         self.keystore_dir = dir.into();
     }
 
-    /// Create a new account (username + password, no email) and log in via
-    /// OPAQUE: the password is used only locally and never sent to the server.
-    /// The new identity is generated and saved (encrypted) to this device.
-    pub async fn create_account(
-        &mut self,
-        username: &str,
-        password: &str,
-    ) -> Result<(), ClientError> {
+    /// Create a new account from a display `name` and log in via OPAQUE: the
+    /// password is used only locally and never sent to the server. The server
+    /// assigns a full `name#1234` handle; the new identity is bound to it and
+    /// saved (encrypted) to this device.
+    pub async fn create_account(&mut self, name: &str, password: &str) -> Result<(), ClientError> {
         // The zero-knowledge server cannot measure the password, so the policy
         // is enforced here.
         if password.len() < MIN_PASSWORD_LEN {
@@ -109,38 +106,38 @@ impl Client {
                 "password must be at least {MIN_PASSWORD_LEN} characters"
             )));
         }
-        let identity = Identity::generate(username)?;
-        let _ = identity.save(&self.identity_path(username), password);
-        let key_package = identity.new_key_package()?;
-
         // OPAQUE registration (2 round-trips). The password stays in this method.
         let (request, reg_state) = opaque::client_register_start(password)
             .map_err(|e| ClientError::Auth(e.to_string()))?;
         self.conn.send(ClientMsg::RegisterStart {
-            username: username.to_string(),
+            name: name.to_string(),
             request,
         });
-        let response = self.await_register_response().await?;
+        // The server assigns our full handle (name#1234); bind the identity to it.
+        let (handle, response) = self.await_register_response().await?;
+
+        let identity = Identity::generate(&handle)?;
+        let _ = identity.save(&self.identity_path(&handle), password);
+        let key_package = identity.new_key_package()?;
         let upload = reg_state
             .finish(password, &response)
             .map_err(|e| ClientError::Auth(e.to_string()))?;
         self.conn.send(ClientMsg::RegisterFinish {
-            username: username.to_string(),
             upload,
             identity_pub: identity.identity_key(),
             key_package,
         });
         self.await_auth().await?;
-        self.finish_login(identity, username);
+        self.finish_login(identity, &handle);
         Ok(())
     }
 
-    /// Log in to an existing account via OPAQUE, restoring the saved identity on
-    /// this device (a fresh one is generated if none is saved here). The password
-    /// never leaves this device.
-    pub async fn login(&mut self, username: &str, password: &str) -> Result<(), ClientError> {
-        let identity = Identity::load(username, &self.identity_path(username), password)
-            .or_else(|_| Identity::generate(username))?;
+    /// Log in to an existing account by full `handle` (`name#1234`) via OPAQUE,
+    /// restoring the saved identity on this device (a fresh one is generated if
+    /// none is saved here). The password never leaves this device.
+    pub async fn login(&mut self, handle: &str, password: &str) -> Result<(), ClientError> {
+        let identity = Identity::load(handle, &self.identity_path(handle), password)
+            .or_else(|_| Identity::generate(handle))?;
         let key_package = identity.new_key_package()?;
 
         // OPAQUE login (2 round-trips): prove knowledge of the password without
@@ -148,20 +145,20 @@ impl Client {
         let (request, login_state) =
             opaque::client_login_start(password).map_err(|e| ClientError::Auth(e.to_string()))?;
         self.conn.send(ClientMsg::LoginStart {
-            username: username.to_string(),
+            handle: handle.to_string(),
             request,
         });
         let response = self.await_login_response().await?;
         let finalization = login_state
             .finish(password, &response)
-            .map_err(|_| ClientError::Auth("wrong username or password".into()))?;
+            .map_err(|_| ClientError::Auth("wrong handle or password".into()))?;
         self.conn.send(ClientMsg::LoginFinish {
             finalization,
             key_package,
         });
         self.await_auth().await?;
-        let _ = identity.save(&self.identity_path(username), password);
-        self.finish_login(identity, username);
+        let _ = identity.save(&self.identity_path(handle), password);
+        self.finish_login(identity, handle);
         Ok(())
     }
 
@@ -202,10 +199,12 @@ impl Client {
 
     /// Pump messages until the OPAQUE registration response arrives. A failure
     /// (e.g. username taken) comes back as an `Auth { ok: false }` instead.
-    async fn await_register_response(&mut self) -> Result<Vec<u8>, ClientError> {
+    async fn await_register_response(&mut self) -> Result<(String, Vec<u8>), ClientError> {
         loop {
             match tokio::time::timeout(Duration::from_secs(10), self.conn.recv()).await {
-                Ok(Some(ServerMsg::RegisterResponse { response })) => return Ok(response),
+                Ok(Some(ServerMsg::RegisterResponse { handle, response })) => {
+                    return Ok((handle, response))
+                }
                 Ok(Some(ServerMsg::Auth {
                     ok: false, detail, ..
                 })) => return Err(ClientError::Auth(detail)),
@@ -240,8 +239,10 @@ impl Client {
         }
     }
 
-    fn identity_path(&self, username: &str) -> PathBuf {
-        self.keystore_dir.join(format!("enclave-{username}.id"))
+    fn identity_path(&self, handle: &str) -> PathBuf {
+        // '#' is filename-legal on Windows but noisy; keep the keystore tidy.
+        let safe = handle.replace('#', "-");
+        self.keystore_dir.join(format!("enclave-{safe}.id"))
     }
 
     fn identity(&self) -> Result<&Identity, ClientError> {

@@ -39,9 +39,9 @@ async fn signaling_works_over_tls() {
 
     // A full OPAQUE registration + fetch round-trip proves the protocol (and the
     // multi-round handshake) rides the TLS hop.
-    common::register_account(&mut conn, "a", vec![], vec![9, 9]).await;
+    let handle = common::register_account(&mut conn, "a", vec![], vec![9, 9]).await;
     conn.send(ClientMsg::FetchKeyPackages {
-        user: UserId("a".into()),
+        user: UserId(handle),
     });
 
     loop {
