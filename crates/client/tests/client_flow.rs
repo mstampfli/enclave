@@ -26,16 +26,26 @@ async fn account(url: &str, name: &str) -> Client {
 }
 
 #[tokio::test]
-async fn presence_events_reach_a_watcher() {
+async fn friend_request_accept_and_presence() {
     let handle = serve("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", handle.addr);
 
     let mut alice = account(&url, "alice").await;
-    let bob = account(&url, "bob").await;
+    let mut bob = account(&url, "bob").await;
+    let alice_handle = alice.name().to_string();
     let bob_handle = bob.name().to_string();
 
-    // Alice watches Bob (already online) -> she is told he is online.
-    alice.add_friend(&bob_handle);
+    // Alice requests Bob; Bob receives the request and accepts it.
+    alice.send_friend_request(&bob_handle);
+    loop {
+        if let Event::FriendRequest { from } = next_event(&mut bob).await {
+            assert_eq!(from, alice_handle);
+            break;
+        }
+    }
+    bob.accept_friend(&alice_handle);
+
+    // Now friends, Alice is told Bob is online (friends watch each other).
     loop {
         if let Event::Presence { user, status } = next_event(&mut alice).await {
             if user == bob_handle && status == "online" {
@@ -53,6 +63,8 @@ async fn presence_events_reach_a_watcher() {
             }
         }
     }
+    // Having drained the stream, Alice lists Bob as a friend.
+    assert!(alice.friends().contains(&bob_handle));
 }
 
 #[tokio::test]
@@ -69,11 +81,12 @@ async fn two_clients_chat_through_the_controller() {
     alice.start_group().unwrap();
     alice.invite(&bob_handle).await.unwrap();
 
-    // Bob learns he joined.
-    assert!(matches!(
-        next_event(&mut bob).await,
-        Event::MembershipChanged
-    ));
+    // Bob learns he joined (skipping any login friend-list chatter).
+    loop {
+        if matches!(next_event(&mut bob).await, Event::MembershipChanged) {
+            break;
+        }
+    }
 
     // Both sides show the same safety number.
     assert!(alice.safety_number().is_some());
@@ -81,22 +94,22 @@ async fn two_clients_chat_through_the_controller() {
 
     // Alice sends text; Bob receives it decrypted, authenticated as Alice's handle.
     alice.send_text("hello bob").await.unwrap();
-    match next_event(&mut bob).await {
-        Event::Text { from, text } => {
+    loop {
+        if let Event::Text { from, text } = next_event(&mut bob).await {
             assert_eq!(from, alice_handle);
             assert_eq!(text, "hello bob");
+            break;
         }
-        other => panic!("expected text, got {other:?}"),
     }
 
     // And the reverse direction works too.
     bob.send_text("hi alice").await.unwrap();
-    match next_event(&mut alice).await {
-        Event::Text { from, text } => {
+    loop {
+        if let Event::Text { from, text } = next_event(&mut alice).await {
             assert_eq!(from, bob_handle);
             assert_eq!(text, "hi alice");
+            break;
         }
-        other => panic!("expected text, got {other:?}"),
     }
 }
 

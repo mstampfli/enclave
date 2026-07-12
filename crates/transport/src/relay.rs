@@ -16,6 +16,7 @@ use std::net::SocketAddr;
 use enclave_protocol::{ClientMsg, DeviceId, GroupId, Presence, ServerMsg, UserId};
 
 use crate::accounts::{AccountStore, AuthOutcome};
+use crate::friends::{FriendStore, RequestOutcome};
 use crate::opaque::{OpaqueServer, ServerLoginState};
 
 /// Opaque handle for one client connection. Assigned by the relay on connect.
@@ -55,6 +56,8 @@ pub struct Relay {
     presence_watchers: HashMap<UserId, HashSet<ConnId>>,
     /// Accounts (OPAQUE envelope + identity key). Server never sees passwords.
     accounts: AccountStore,
+    /// The friend graph (accepted friends + pending requests). Metadata.
+    friends: FriendStore,
     /// The server's long-term OPAQUE state (OPRF seed + static keypair).
     opaque: OpaqueServer,
     /// In-flight OPAQUE logins, keyed by connection, between the two round-trips.
@@ -89,13 +92,14 @@ impl Relay {
         }
     }
 
-    /// Create a relay backed by a persistent account store *and* a persistent
-    /// OPAQUE server setup. Both must persist together: the envelopes in the
-    /// store are only usable under the setup they were registered against.
-    pub fn with_auth(accounts: AccountStore, opaque: OpaqueServer) -> Self {
+    /// Create a relay backed by a persistent account store, OPAQUE setup, and
+    /// friend graph. The account envelopes are only usable under the OPAQUE
+    /// setup they were registered against, so those two must persist together.
+    pub fn with_auth(accounts: AccountStore, opaque: OpaqueServer, friends: FriendStore) -> Self {
         Self {
             accounts,
             opaque,
+            friends,
             ..Self::default()
         }
     }
@@ -139,12 +143,12 @@ impl Relay {
     fn setup_session(
         &mut self,
         conn: ConnId,
-        username: String,
+        handle: String,
         identity_pub: Vec<u8>,
         key_package: Vec<u8>,
     ) -> Vec<Outgoing> {
-        let user = UserId(username.clone());
-        let device = DeviceId(username);
+        let user = UserId(handle.clone());
+        let device = DeviceId(handle.clone());
         self.identities.insert(user.clone(), identity_pub);
         self.device_conn.insert(device.clone(), conn);
         self.conn_device.insert(conn, device);
@@ -153,7 +157,77 @@ impl Relay {
             .entry(user.clone())
             .or_default()
             .push_back(key_package);
-        self.set_presence(&user, Presence::Online)
+
+        let mut out = vec![Outgoing {
+            to: conn,
+            msg: self.friends_snapshot(&handle),
+        }];
+        // Wire mutual friend presence BEFORE announcing, so online friends are
+        // already watching us when the Online broadcast goes out.
+        out.extend(self.wire_friend_presence(conn, &handle));
+        out.extend(self.set_presence(&user, Presence::Online));
+        out
+    }
+
+    /// The friends + pending-requests snapshot for `handle`.
+    fn friends_snapshot(&self, handle: &str) -> ServerMsg {
+        ServerMsg::Friends {
+            friends: self.friends.friends_of(handle),
+            incoming: self.friends.incoming(handle),
+            outgoing: self.friends.outgoing(handle),
+        }
+    }
+
+    /// Set up mutual presence watching between `handle` (on `conn`) and each of
+    /// its friends, returning each friend's current presence for `conn`.
+    fn wire_friend_presence(&mut self, conn: ConnId, handle: &str) -> Vec<Outgoing> {
+        let mut out = Vec::new();
+        for f in self.friends.friends_of(handle) {
+            let fu = UserId(f.clone());
+            // We watch the friend.
+            self.presence_watchers
+                .entry(fu.clone())
+                .or_default()
+                .insert(conn);
+            if let Some(&status) = self.presence.get(&fu) {
+                out.push(Outgoing {
+                    to: conn,
+                    msg: ServerMsg::Presence { user: fu, status },
+                });
+            }
+            // If the friend is online, they watch us.
+            if let Some(&f_conn) = self.device_conn.get(&DeviceId(f)) {
+                self.presence_watchers
+                    .entry(UserId(handle.to_string()))
+                    .or_default()
+                    .insert(f_conn);
+            }
+        }
+        out
+    }
+
+    /// Two handles just became friends: wire presence both ways and notify the
+    /// other side (if online). `me` is on `my_conn`.
+    fn on_new_friendship(&mut self, my_conn: ConnId, me: &str, other: &str) -> Vec<Outgoing> {
+        let mut out = self.wire_friend_presence(my_conn, me);
+        out.push(Outgoing {
+            to: my_conn,
+            msg: self.friends_snapshot(me),
+        });
+        if let Some(&other_conn) = self.device_conn.get(&DeviceId(other.to_string())) {
+            out.push(Outgoing {
+                to: other_conn,
+                msg: ServerMsg::FriendAccepted {
+                    handle: me.to_string(),
+                },
+            });
+            out.extend(self.wire_friend_presence(other_conn, other));
+            out.push(Outgoing {
+                to: other_conn,
+                msg: self.friends_snapshot(other),
+            });
+        }
+        out
     }
 
     /// Record a user's presence and return updates for everyone watching them.
@@ -434,6 +508,118 @@ impl Relay {
                         });
                     }
                 }
+                out
+            }
+
+            ClientMsg::FriendRequest { to } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                if !self.accounts.contains(&to) {
+                    return vec![Outgoing {
+                        to: from,
+                        msg: ServerMsg::Error {
+                            detail: "no such handle".into(),
+                        },
+                    }];
+                }
+                match self.friends.request(&me, &to) {
+                    RequestOutcome::Sent => {
+                        let mut out = vec![Outgoing {
+                            to: from,
+                            msg: self.friends_snapshot(&me),
+                        }];
+                        // Notify the target if they are online.
+                        if let Some(&to_conn) = self.device_conn.get(&DeviceId(to.clone())) {
+                            out.push(Outgoing {
+                                to: to_conn,
+                                msg: ServerMsg::FriendRequestReceived { from: me.clone() },
+                            });
+                            out.push(Outgoing {
+                                to: to_conn,
+                                msg: self.friends_snapshot(&to),
+                            });
+                        }
+                        out
+                    }
+                    RequestOutcome::NowFriends => self.on_new_friendship(from, &me, &to),
+                    _ => vec![Outgoing {
+                        to: from,
+                        msg: self.friends_snapshot(&me),
+                    }],
+                }
+            }
+
+            ClientMsg::FriendAccept { from: requester } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                if self.friends.accept(&me, &requester) {
+                    self.on_new_friendship(from, &me, &requester)
+                } else {
+                    vec![Outgoing {
+                        to: from,
+                        msg: self.friends_snapshot(&me),
+                    }]
+                }
+            }
+
+            ClientMsg::FriendDecline { who } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                self.friends.decline(&me, &who);
+                let mut out = vec![Outgoing {
+                    to: from,
+                    msg: self.friends_snapshot(&me),
+                }];
+                if let Some(&other_conn) = self.device_conn.get(&DeviceId(who.clone())) {
+                    out.push(Outgoing {
+                        to: other_conn,
+                        msg: self.friends_snapshot(&who),
+                    });
+                }
+                out
+            }
+
+            ClientMsg::FriendRemove { handle } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                self.friends.remove(&me, &handle);
+                // Stop watching each other's presence.
+                if let Some(w) = self.presence_watchers.get_mut(&UserId(handle.clone())) {
+                    w.remove(&from);
+                }
+                let mut out = vec![Outgoing {
+                    to: from,
+                    msg: self.friends_snapshot(&me),
+                }];
+                if let Some(&other_conn) = self.device_conn.get(&DeviceId(handle.clone())) {
+                    if let Some(w) = self.presence_watchers.get_mut(&UserId(me.clone())) {
+                        w.remove(&other_conn);
+                    }
+                    out.push(Outgoing {
+                        to: other_conn,
+                        msg: ServerMsg::FriendRemoved { handle: me.clone() },
+                    });
+                    out.push(Outgoing {
+                        to: other_conn,
+                        msg: self.friends_snapshot(&handle),
+                    });
+                }
+                out
+            }
+
+            ClientMsg::ListFriends => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                let mut out = vec![Outgoing {
+                    to: from,
+                    msg: self.friends_snapshot(&me),
+                }];
+                out.extend(self.wire_friend_presence(from, &me));
                 out
             }
         }

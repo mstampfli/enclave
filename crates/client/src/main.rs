@@ -41,8 +41,18 @@ enum UiCommand {
     SendText {
         text: String,
     },
+    /// Send a friend request to a full handle.
     AddFriend {
         user: String,
+    },
+    AcceptFriend {
+        handle: String,
+    },
+    DeclineFriend {
+        handle: String,
+    },
+    RemoveFriend {
+        handle: String,
     },
     SetPresence {
         status: String,
@@ -69,6 +79,16 @@ enum UiEvent {
     Presence {
         user: String,
         status: String,
+    },
+    /// Someone sent us a friend request.
+    FriendRequest {
+        from: String,
+    },
+    /// The current friends + pending-requests snapshot.
+    Friends {
+        friends: Vec<String>,
+        incoming: Vec<String>,
+        outgoing: Vec<String>,
     },
     Status {
         message: String,
@@ -170,6 +190,19 @@ async fn run_client(
                 Event::Presence { user, status } => {
                     emit(&proxy, UiEvent::Presence { user, status })
                 }
+                Event::FriendRequest { from } => emit(&proxy, UiEvent::FriendRequest { from }),
+                Event::FriendsChanged => {
+                    if let Some(c) = client.as_ref() {
+                        emit(
+                            &proxy,
+                            UiEvent::Friends {
+                                friends: c.friends().to_vec(),
+                                incoming: c.incoming_requests().to_vec(),
+                                outgoing: c.outgoing_requests().to_vec(),
+                            },
+                        );
+                    }
+                }
                 Event::Error(message) => error_status(&proxy, message),
             },
             Ok(None) => {
@@ -207,7 +240,7 @@ async fn authenticate(
     };
     match result {
         Ok(()) => {
-            c.use_roster_file(app_dir().join(format!("enclave-{username}-friends.json")));
+            // The server pushes our friends + presence automatically on login.
             let safety_number = c.safety_number();
             let username = c.name().to_string();
             *client = Some(c);
@@ -288,8 +321,23 @@ async fn handle_command(
             }
         }
         UiCommand::AddFriend { user } => {
-            if let Some(c) = client.as_mut() {
-                c.add_friend(&user);
+            if let Some(c) = client.as_ref() {
+                c.send_friend_request(&user);
+            }
+        }
+        UiCommand::AcceptFriend { handle } => {
+            if let Some(c) = client.as_ref() {
+                c.accept_friend(&handle);
+            }
+        }
+        UiCommand::DeclineFriend { handle } => {
+            if let Some(c) = client.as_ref() {
+                c.decline_friend(&handle);
+            }
+        }
+        UiCommand::RemoveFriend { handle } => {
+            if let Some(c) = client.as_ref() {
+                c.remove_friend(&handle);
             }
         }
         UiCommand::SetPresence { status } => {

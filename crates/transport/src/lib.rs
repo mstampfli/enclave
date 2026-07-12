@@ -18,6 +18,7 @@
 pub mod accounts;
 pub mod client;
 pub mod error;
+pub mod friends;
 pub mod media_socket;
 pub mod opaque;
 pub mod ratelimit;
@@ -27,6 +28,7 @@ pub mod server;
 pub use accounts::{AccountStore, AuthOutcome};
 pub use client::Connection;
 pub use error::TransportError;
+pub use friends::{FriendStore, RequestOutcome};
 pub use media_socket::MediaSocket;
 pub use ratelimit::TokenBucket;
 pub use relay::{ConnId, Outgoing, Relay};

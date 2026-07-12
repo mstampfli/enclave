@@ -14,7 +14,7 @@ use std::io::BufReader;
 use std::path::Path;
 
 use enclave_transport::opaque::OpaqueServer;
-use enclave_transport::{AccountStore, Server};
+use enclave_transport::{AccountStore, FriendStore, Server};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 fn load_certs(path: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
@@ -47,7 +47,8 @@ async fn main() {
     // account store is only usable under the setup it was registered against.
     let accounts = AccountStore::load("enclave-accounts.json");
     let opaque = OpaqueServer::load_or_generate(Path::new("enclave-opaque.setup"));
-    let server = Server::with_auth(accounts, opaque);
+    let friends = FriendStore::load("enclave-friends.json");
+    let server = Server::with_auth(accounts, opaque, friends);
 
     // Signaling: TLS when a cert + key are provided, plaintext otherwise.
     let tls = std::env::var("ENCLAVE_TLS_CERT")

@@ -46,6 +46,10 @@ pub enum Event {
     MembershipChanged,
     /// A watched friend's presence changed ("online" / "away" / "offline").
     Presence { user: String, status: String },
+    /// Someone sent us a friend request (their full handle).
+    FriendRequest { from: String },
+    /// The friends list or pending requests changed; read them via the getters.
+    FriendsChanged,
     /// A non-fatal error worth showing.
     Error(String),
 }
@@ -68,8 +72,10 @@ pub struct Client {
     group: Option<Group>,
     group_id: Option<GroupId>,
     pending: VecDeque<Event>,
-    friends: Vec<UserId>,
-    roster_path: Option<PathBuf>,
+    /// Accepted friends and pending requests, mirrored from the server.
+    friends: Vec<String>,
+    incoming: Vec<String>,
+    outgoing: Vec<String>,
 }
 
 impl Client {
@@ -85,7 +91,8 @@ impl Client {
             group_id: None,
             pending: VecDeque::new(),
             friends: Vec::new(),
-            roster_path: None,
+            incoming: Vec::new(),
+            outgoing: Vec::new(),
         })
     }
 
@@ -170,7 +177,8 @@ impl Client {
         self.group = None;
         self.group_id = None;
         self.friends.clear();
-        self.roster_path = None;
+        self.incoming.clear();
+        self.outgoing.clear();
     }
 
     fn finish_login(&mut self, identity: Identity, username: &str) {
@@ -264,48 +272,53 @@ impl Client {
         self.conn.send(ClientMsg::Presence { status });
     }
 
-    /// The current friends roster.
-    pub fn friends(&self) -> &[UserId] {
+    /// Accepted friends (full handles), mirrored from the server.
+    pub fn friends(&self) -> &[String] {
         &self.friends
     }
 
-    /// Point the client at a JSON roster file: load any existing friends, watch
-    /// their presence, and auto-save on future changes.
-    pub fn use_roster_file(&mut self, path: impl Into<PathBuf>) {
-        let path = path.into();
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(names) = serde_json::from_str::<Vec<String>>(&text) {
-                self.friends = names.into_iter().map(UserId).collect();
-            }
-        }
-        if !self.friends.is_empty() {
-            self.conn.send(ClientMsg::WatchPresence {
-                users: self.friends.clone(),
-            });
-        }
-        self.roster_path = Some(path);
+    /// Incoming friend requests awaiting our accept/decline.
+    pub fn incoming_requests(&self) -> &[String] {
+        &self.incoming
     }
 
-    /// Add a friend, watch their presence, and persist the roster.
-    pub fn add_friend(&mut self, user: &str) {
-        let user = UserId(user.to_string());
-        if self.friends.contains(&user) {
-            return;
-        }
-        self.friends.push(user.clone());
-        self.conn
-            .send(ClientMsg::WatchPresence { users: vec![user] });
-        self.save_roster();
+    /// Friend requests we have sent that are not yet accepted.
+    pub fn outgoing_requests(&self) -> &[String] {
+        &self.outgoing
     }
 
-    fn save_roster(&self) {
-        let Some(path) = &self.roster_path else {
-            return;
-        };
-        let names: Vec<&str> = self.friends.iter().map(|u| u.0.as_str()).collect();
-        if let Ok(text) = serde_json::to_string_pretty(&names) {
-            let _ = std::fs::write(path, text);
-        }
+    /// Send a friend request to a full handle (`name#1234`). If they had already
+    /// requested us, the server makes us friends immediately.
+    pub fn send_friend_request(&self, handle: &str) {
+        self.conn.send(ClientMsg::FriendRequest {
+            to: handle.to_string(),
+        });
+    }
+
+    /// Accept a pending incoming request from `handle`.
+    pub fn accept_friend(&self, handle: &str) {
+        self.conn.send(ClientMsg::FriendAccept {
+            from: handle.to_string(),
+        });
+    }
+
+    /// Decline an incoming request from, or cancel an outgoing request to, `handle`.
+    pub fn decline_friend(&self, handle: &str) {
+        self.conn.send(ClientMsg::FriendDecline {
+            who: handle.to_string(),
+        });
+    }
+
+    /// Remove an existing friend.
+    pub fn remove_friend(&self, handle: &str) {
+        self.conn.send(ClientMsg::FriendRemove {
+            handle: handle.to_string(),
+        });
+    }
+
+    /// Ask the server for the current friends + pending-requests snapshot.
+    pub fn refresh_friends(&self) {
+        self.conn.send(ClientMsg::ListFriends);
     }
 
     /// Start a fresh group that we own. The routing id is derived from our
@@ -442,6 +455,22 @@ impl Client {
                 user: user.0,
                 status: presence_label(status),
             }),
+            ServerMsg::Friends {
+                friends,
+                incoming,
+                outgoing,
+            } => {
+                self.friends = friends;
+                self.incoming = incoming;
+                self.outgoing = outgoing;
+                Some(Event::FriendsChanged)
+            }
+            ServerMsg::FriendRequestReceived { from } => Some(Event::FriendRequest { from }),
+            // The authoritative list follows in a Friends snapshot; surface the
+            // change so the UI refreshes.
+            ServerMsg::FriendAccepted { .. } | ServerMsg::FriendRemoved { .. } => {
+                Some(Event::FriendsChanged)
+            }
             ServerMsg::Auth { .. } => None,
             ServerMsg::Error { detail } => Some(Event::Error(detail)),
             _ => None,

@@ -114,6 +114,17 @@ pub enum ClientMsg {
     /// Subscribe to presence updates for these users (a friends roster). The
     /// server replies with their current presence and pushes future changes.
     WatchPresence { users: Vec<UserId> },
+    /// Send a friend request to the full handle `to`. If they had already
+    /// requested you, you become friends immediately.
+    FriendRequest { to: String },
+    /// Accept a pending incoming friend request from `from`.
+    FriendAccept { from: String },
+    /// Decline an incoming request from, or cancel an outgoing request to, `who`.
+    FriendDecline { who: String },
+    /// Remove an existing friend.
+    FriendRemove { handle: String },
+    /// Ask for the current friends + pending-requests snapshot.
+    ListFriends,
 }
 
 /// Server -> client messages.
@@ -160,6 +171,24 @@ pub enum ServerMsg {
     Presence {
         user: UserId,
         status: Presence,
+    },
+    /// Someone sent you a friend request.
+    FriendRequestReceived {
+        from: String,
+    },
+    /// A handle you requested has accepted; you are now friends.
+    FriendAccepted {
+        handle: String,
+    },
+    /// A handle removed you as a friend (or you removed them).
+    FriendRemoved {
+        handle: String,
+    },
+    /// The current friends + pending-requests snapshot for this session.
+    Friends {
+        friends: Vec<String>,
+        incoming: Vec<String>,
+        outgoing: Vec<String>,
     },
     Error {
         detail: String,

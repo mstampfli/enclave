@@ -9,5 +9,6 @@
 enclave-*.id
 enclave-*-friends.json
 enclave-accounts.json
+enclave-friends.json
 # Server's long-term OPAQUE setup (OPRF seed + keypair). Secret; never commit.
 enclave-opaque.setup
