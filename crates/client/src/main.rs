@@ -55,6 +55,10 @@ enum UiCommand {
     DeclineCall {
         conv: String,
     },
+    /// Start sharing this screen into the current call.
+    StartScreenShare,
+    /// Stop sharing the screen.
+    StopScreenShare,
     /// Report the available audio devices + current selection (settings modal).
     ListAudioDevices,
     /// Choose the microphone (empty string = host default).
@@ -187,6 +191,16 @@ enum UiEvent {
         conv: String,
         from: String,
     },
+    /// An H.264 screen frame (base64 Annex-B) from `from` to render via WebCodecs.
+    ScreenFrame {
+        from: String,
+        data: String,
+        keyframe: bool,
+    },
+    /// Whether we are currently sharing our own screen.
+    ScreenShareState {
+        sharing: bool,
+    },
     /// Someone sent us a friend request.
     FriendRequest {
         from: String,
@@ -257,6 +271,34 @@ fn main() -> wry::Result<()> {
             _ => {}
         }
     });
+}
+
+/// Standard base64 (no line breaks) for shipping a binary H.264 frame to the
+/// WebView as a JSON string. Small dependency-free encoder for the hot path.
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// Raise an OS desktop notification (toast) off the async loop.
@@ -416,6 +458,18 @@ async fn run_client(
                 Event::CallDeclined { conv, from } => {
                     emit(&proxy, UiEvent::CallDeclined { conv, from })
                 }
+                Event::ScreenFrame {
+                    from,
+                    data,
+                    keyframe,
+                } => emit(
+                    &proxy,
+                    UiEvent::ScreenFrame {
+                        from,
+                        data: base64_encode(&data),
+                        keyframe,
+                    },
+                ),
                 Event::FriendsChanged => {
                     if let Some(c) = client.as_ref() {
                         emit(
@@ -593,6 +647,20 @@ async fn handle_command(
         UiCommand::DeclineCall { conv } => {
             if let Some(c) = client.as_mut() {
                 c.decline_call(&conv);
+            }
+        }
+        UiCommand::StartScreenShare => {
+            if let Some(c) = client.as_mut() {
+                match c.start_screen_share() {
+                    Ok(()) => emit(proxy, UiEvent::ScreenShareState { sharing: true }),
+                    Err(e) => error_status(proxy, format!("Could not share screen: {e}")),
+                }
+            }
+        }
+        UiCommand::StopScreenShare => {
+            if let Some(c) = client.as_mut() {
+                c.stop_screen_share();
+                emit(proxy, UiEvent::ScreenShareState { sharing: false });
             }
         }
         UiCommand::ListAudioDevices => {

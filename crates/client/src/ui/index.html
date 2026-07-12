@@ -116,6 +116,9 @@
   .call-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: #3ba55d; }
   #conn-banner { position: fixed; top: 0; left: 0; right: 0; z-index: 50; text-align: center; padding: 6px; font-size: 13px; background: var(--danger); color: #fff; }
   #conn-banner.online { background: #3ba55d; }
+  #screen-viewer { position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,0.9); display: flex; flex-direction: column; }
+  .sv-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; color: var(--text); font-size: 13px; }
+  #sv-canvas { flex: 1; min-height: 0; width: 100%; object-fit: contain; background: #000; }
   .dot.online { background: var(--online); }
   .dot.away { background: var(--away); }
   .dot.offline { background: var(--offline); }
@@ -271,6 +274,7 @@
         <span id="chat-title" class="chat-title">No conversation</span>
         <span id="safety" class="safety" title="Compare this with your friend out-of-band to verify no one is in the middle"></span>
         <button id="call-btn" class="hdr-btn small" hidden title="Start or join a voice call in this conversation">Call</button>
+        <button id="share-btn" class="hdr-btn small" hidden title="Share your screen into the call">Share screen</button>
         <button id="add-to-group" class="hdr-btn small" hidden title="Add a friend to this group">Add member</button>
         <button id="remove-member" class="hdr-btn small" hidden title="Remove a member from this group">Remove member</button>
         <button id="leave-conv" class="hdr-btn small" hidden title="Leave and delete this conversation">Leave</button>
@@ -315,6 +319,14 @@
     </div>
   </div>
 
+  <div id="screen-viewer" hidden>
+    <div class="sv-head">
+      <span id="sv-title"></span>
+      <button id="sv-close" class="small">Close</button>
+    </div>
+    <canvas id="sv-canvas"></canvas>
+  </div>
+
   <div id="ring-modal" class="overlay" hidden>
     <div class="modal ring-modal">
       <div class="ring-avatar" id="ring-avatar"></div>
@@ -343,6 +355,50 @@
   const callPart = {};           // conv id -> [participant display names]
   let ringConv = null;           // conv id currently ringing (incoming)
   const unread = {};             // conv id -> unread message count
+  let sharing = false;           // am I sharing my screen
+
+  // ---- screen share viewer (WebCodecs H.264 -> canvas) ----
+  let svDecoder = null, svGotKey = false, svTs = 0, svTimer = null;
+  function b64ToBytes(b64) {
+    const bin = atob(b64), bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+  function resetViewer() {
+    if (svDecoder) { try { svDecoder.close(); } catch (e) {} svDecoder = null; }
+    svGotKey = false; svTs = 0;
+    if (svTimer) { clearTimeout(svTimer); svTimer = null; }
+    $("screen-viewer").hidden = true;
+  }
+  function ensureDecoder() {
+    if (svDecoder) return;
+    const canvas = $("sv-canvas"), ctx = canvas.getContext("2d");
+    svDecoder = new VideoDecoder({
+      output: (frame) => {
+        if (canvas.width !== frame.displayWidth) { canvas.width = frame.displayWidth; canvas.height = frame.displayHeight; }
+        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+        frame.close();
+      },
+      error: (e) => { console.error("screen decoder", e); resetViewer(); },
+    });
+    try { svDecoder.configure({ codec: "avc1.42E01E", optimizeForLatency: true }); }
+    catch (e) { console.error("configure", e); resetViewer(); }
+  }
+  function handleScreenFrame(ev) {
+    if (typeof VideoDecoder === "undefined") return; // no WebCodecs support
+    $("sv-title").textContent = ev.from + " is sharing their screen";
+    $("screen-viewer").hidden = false;
+    ensureDecoder();
+    if (!svDecoder) return;
+    if (!svGotKey && !ev.keyframe) return; // a decoder must start on a keyframe
+    svGotKey = true;
+    try {
+      svDecoder.decode(new EncodedVideoChunk({ type: ev.keyframe ? "key" : "delta", timestamp: svTs, data: b64ToBytes(ev.data) }));
+      svTs += 33333;
+    } catch (e) { console.error("decode", e); }
+    if (svTimer) clearTimeout(svTimer);
+    svTimer = setTimeout(resetViewer, 2500); // hide if the stream stops
+  }
 
   // A short in-app "ding" for a message arriving in a non-focused conversation.
   function ding() {
@@ -414,7 +470,7 @@
   }
   function leaveCall() {
     send({ type: "LeaveCall" });
-    inCall = false; myCallConv = null;
+    inCall = false; myCallConv = null; sharing = false;
     renderCall();
   }
   // Reflect current call state on the header button and the in-conversation banner.
@@ -428,6 +484,10 @@
     btn.hidden = false;
     btn.textContent = mineHere ? "Leave call" : (active ? "Join call" : "Call");
     btn.classList.toggle("in-call", mineHere);
+    // Screen share is only available once you are in the call.
+    $("share-btn").hidden = !mineHere;
+    $("share-btn").textContent = sharing ? "Stop sharing" : "Share screen";
+    $("share-btn").classList.toggle("in-call", sharing);
     if (mineHere) {
       const others = parts.filter((p) => p !== myDisplay);
       banner.hidden = false;
@@ -521,6 +581,10 @@
     else joinCall(activeConv);
   });
   $("call-banner-btn").addEventListener("click", () => joinCall(activeConv));
+  $("share-btn").addEventListener("click", () => {
+    send({ type: sharing ? "StopScreenShare" : "StartScreenShare" });
+  });
+  $("sv-close").addEventListener("click", resetViewer);
   $("ring-accept").addEventListener("click", () => { if (ringConv) joinCall(ringConv); });
   $("ring-decline").addEventListener("click", () => {
     if (ringConv) send({ type: "DeclineCall", conv: ringConv });
@@ -684,7 +748,7 @@
   function showLogin() {
     $("app-view").hidden = true; $("login-view").hidden = false;
     myUsername = ""; myDisplay = ""; friends = []; incoming = []; outgoing = []; conversations = []; activeConv = null;
-    inCall = false; myCallConv = null; dismissRing();
+    inCall = false; myCallConv = null; sharing = false; dismissRing(); resetViewer();
     for (const k in callPart) delete callPart[k];
     for (const k in unread) delete unread[k];
     $("call-btn").classList.remove("in-call"); $("call-banner").hidden = true;
@@ -725,7 +789,7 @@
         break;
       case "CallState":
         inCall = ev.in_call;
-        if (!inCall) myCallConv = null;
+        if (!inCall) { myCallConv = null; sharing = false; }
         renderCall();
         break;
       case "CallOffer":
@@ -751,6 +815,13 @@
         break;
       case "CallDeclined":
         setStatus(ev.from + " declined the call", false);
+        break;
+      case "ScreenFrame":
+        handleScreenFrame(ev);
+        break;
+      case "ScreenShareState":
+        sharing = ev.sharing;
+        renderCall();
         break;
       case "Connection": {
         const b = $("conn-banner");

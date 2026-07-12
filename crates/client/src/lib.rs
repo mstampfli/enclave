@@ -75,6 +75,13 @@ pub enum Event {
     },
     /// `from` (display name) declined our call in conversation `conv`.
     CallDeclined { conv: String, from: String },
+    /// An H.264 screen frame from `from` (display name) to show in the viewer.
+    /// `data` is the Annex-B bytes; the UI decodes it with WebCodecs.
+    ScreenFrame {
+        from: String,
+        data: Vec<u8>,
+        keyframe: bool,
+    },
     /// A non-fatal error worth showing.
     Error(String),
 }
@@ -152,6 +159,8 @@ pub struct Client {
     media_addr: Option<SocketAddr>,
     /// The in-progress voice call, if any.
     call: Option<call::Call>,
+    /// Incoming screen frames from the current call, drained by `next_event`.
+    screen_rx: Option<tokio::sync::mpsc::UnboundedReceiver<call::ScreenFrameOut>>,
     /// The conversation the current call belongs to (for the LeaveCall signal,
     /// since the user may switch conversations while in a call).
     call_group: Option<GroupId>,
@@ -187,6 +196,7 @@ impl Client {
             display_names: HashMap::new(),
             media_addr: media_addr_from(server_url),
             call: None,
+            screen_rx: None,
             call_group: None,
             input_device: None,
             output_device: None,
@@ -810,20 +820,45 @@ impl Client {
                 output_device: self.output_device.clone(),
             }
         };
-        self.call = Some(call::Call::start(params).await?);
+        let (call, screen_rx) = call::Call::start(params).await?;
+        self.call = Some(call);
+        self.screen_rx = Some(screen_rx);
         self.call_group = Some(group_id.clone());
         // Signal the call so the server rings other members and tracks who is in.
         self.conn.send(ClientMsg::JoinCall { group: group_id });
         Ok(())
     }
 
-    /// Leave the current voice call (tears down the audio pipeline and tells the
+    /// Leave the current voice call (tears down the media pipeline and tells the
     /// server, so the other participants see us leave).
     pub fn leave_call(&mut self) {
         self.call = None;
+        self.screen_rx = None;
         if let Some(group) = self.call_group.take() {
             self.conn.send(ClientMsg::LeaveCall { group });
         }
+    }
+
+    /// Start sharing this device's screen into the current call. Requires being
+    /// in the call (the media session carries both audio and screen).
+    pub fn start_screen_share(&mut self) -> Result<(), ClientError> {
+        let call = self
+            .call
+            .as_mut()
+            .ok_or_else(|| ClientError::Audio("join the call before sharing".into()))?;
+        call.start_screen()
+    }
+
+    /// Stop sharing the screen (the call keeps running).
+    pub fn stop_screen_share(&mut self) {
+        if let Some(call) = self.call.as_mut() {
+            call.stop_screen();
+        }
+    }
+
+    /// Whether we are currently sharing our screen.
+    pub fn is_sharing(&self) -> bool {
+        self.call.as_ref().is_some_and(|c| c.is_sharing())
     }
 
     /// Decline an incoming call in conversation `conv_hex` (we were rung but will
@@ -1029,23 +1064,54 @@ impl Client {
     /// Await the next event, processing incoming server messages until one
     /// produces something the UI cares about. Returns `None` if disconnected.
     pub async fn next_event(&mut self) -> Option<Event> {
-        if let Some(event) = self.pending.pop_front() {
-            return Some(event);
+        enum Src {
+            Msg(ServerMsg),
+            Screen(call::ScreenFrameOut),
         }
         loop {
-            let msg = self.conn.recv().await?;
-            // A DM nudge needs an async follow-up (create the group + invite),
-            // which the sync `handle` cannot do -- so service it here. It must
-            // not steal focus, so the active conversation is preserved.
-            if let ServerMsg::DmRequested { from } = &msg {
-                let from = from.clone();
-                let prev = self.active.clone();
-                let _ = self.open_dm(&from).await;
-                self.active = prev;
-                return Some(Event::ConversationsChanged);
-            }
-            if let Some(event) = self.handle(msg) {
+            if let Some(event) = self.pending.pop_front() {
                 return Some(event);
+            }
+            // Wait for a server message, or an incoming screen frame from the
+            // active call. Disjoint field borrows so both can be selected on.
+            let src = {
+                let Self {
+                    conn, screen_rx, ..
+                } = &mut *self;
+                match screen_rx.as_mut() {
+                    Some(rx) => tokio::select! {
+                        m = conn.recv() => Src::Msg(m?),
+                        sf = rx.recv() => match sf {
+                            Some(sf) => Src::Screen(sf),
+                            None => continue, // screen channel closed with the call
+                        },
+                    },
+                    None => Src::Msg(conn.recv().await?),
+                }
+            };
+            match src {
+                Src::Screen(sf) => {
+                    return Some(Event::ScreenFrame {
+                        from: self.display_of(&sf.from),
+                        data: sf.h264,
+                        keyframe: sf.keyframe,
+                    });
+                }
+                Src::Msg(msg) => {
+                    // A DM nudge needs an async follow-up (create the group +
+                    // invite), which the sync `handle` cannot do -- service it
+                    // here without stealing focus from the active conversation.
+                    if let ServerMsg::DmRequested { from } = &msg {
+                        let from = from.clone();
+                        let prev = self.active.clone();
+                        let _ = self.open_dm(&from).await;
+                        self.active = prev;
+                        return Some(Event::ConversationsChanged);
+                    }
+                    if let Some(event) = self.handle(msg) {
+                        return Some(event);
+                    }
+                }
             }
         }
     }
