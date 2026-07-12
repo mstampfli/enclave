@@ -112,6 +112,8 @@
   .avatar.group { border-radius: 30%; background: #5c6069; }
   .row-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--offline); flex: none; }
+  .badge { flex: none; background: var(--danger); color: #fff; border-radius: 10px; font-size: 11px; font-weight: 600; padding: 0 6px; min-width: 18px; height: 18px; line-height: 18px; text-align: center; }
+  .call-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: #3ba55d; }
   .dot.online { background: var(--online); }
   .dot.away { background: var(--away); }
   .dot.offline { background: var(--offline); }
@@ -334,6 +336,33 @@
   let myCallConv = null;         // conv id my call is in
   const callPart = {};           // conv id -> [participant display names]
   let ringConv = null;           // conv id currently ringing (incoming)
+  const unread = {};             // conv id -> unread message count
+
+  // A short in-app "ding" for a message arriving in a non-focused conversation.
+  function ding() {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = "sine"; o.frequency.value = 660;
+      o.connect(g); g.connect(ctx.destination);
+      const t = ctx.currentTime;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.15, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
+      o.start(t); o.stop(t + 0.27);
+      setTimeout(() => { try { ctx.close(); } catch (e) {} }, 400);
+    } catch (e) {}
+  }
+
+  // Unread count + call-active indicators for a sidebar row.
+  function rowBadge(convId) {
+    if (!convId) return "";
+    let h = "";
+    if (callPart[convId] && callPart[convId].length) h += '<span class="call-dot" title="Call in progress"></span>';
+    const n = unread[convId] || 0;
+    if (n > 0) h += '<span class="badge">' + (n > 99 ? "99+" : n) + '</span>';
+    return h;
+  }
 
   function serverUrl() { return $("login-server").value.trim() || "ws://127.0.0.1:8443"; }
   const initial = (s) => (s || "?").trim().charAt(0);
@@ -563,7 +592,7 @@
       const dm = conversations.find((c) => c.is_dm && c.members && c.members.includes(f.username));
       const li = document.createElement("li");
       if (dm && dm.id === activeConv) li.className = "active";
-      li.innerHTML = '<span class="avatar">' + initial(f.display) + '</span><span class="row-name"></span><span class="dot ' + statusOf(f.username) + '"></span>';
+      li.innerHTML = '<span class="avatar">' + initial(f.display) + '</span><span class="row-name"></span>' + rowBadge(dm ? dm.id : null) + '<span class="dot ' + statusOf(f.username) + '"></span>';
       li.querySelector(".row-name").textContent = f.display;
       li.addEventListener("click", () => send({ type: "OpenDm", handle: f.username }));
       ul.appendChild(li);
@@ -575,7 +604,7 @@
     for (const c of conversations.filter((c) => !c.is_dm)) {
       const li = document.createElement("li");
       if (c.id === activeConv) li.className = "active";
-      li.innerHTML = '<span class="avatar group">' + initial(c.title) + '</span><span class="row-name"></span>';
+      li.innerHTML = '<span class="avatar group">' + initial(c.title) + '</span><span class="row-name"></span>' + rowBadge(c.id);
       li.querySelector(".row-name").textContent = c.title;
       li.addEventListener("click", () => send({ type: "SwitchConversation", conv: c.id }));
       gul.appendChild(li);
@@ -637,6 +666,7 @@
     myUsername = ""; myDisplay = ""; friends = []; incoming = []; outgoing = []; conversations = []; activeConv = null;
     inCall = false; myCallConv = null; dismissRing();
     for (const k in callPart) delete callPart[k];
+    for (const k in unread) delete unread[k];
     $("call-btn").classList.remove("in-call"); $("call-banner").hidden = true;
     $("audio-modal").hidden = true; $("group-modal").hidden = true;
     for (const k in messages) delete messages[k];
@@ -656,14 +686,21 @@
         break;
       case "ActiveConversation":
         activeConv = ev.conv;
-        if (ev.conv) messages[ev.conv] = ev.history.slice();
+        if (ev.conv) { messages[ev.conv] = ev.history.slice(); delete unread[ev.conv]; }
         $("safety").textContent = ev.safety || "";
         renderSidebar(); renderChat();
         break;
       case "Message":
         if (!messages[ev.conv]) messages[ev.conv] = [];
         messages[ev.conv].push({ from: ev.from, text: ev.text, mine: ev.mine });
-        if (ev.conv === activeConv) appendMessage({ from: ev.from, text: ev.text, mine: ev.mine });
+        if (ev.conv === activeConv) {
+          appendMessage({ from: ev.from, text: ev.text, mine: ev.mine });
+        } else if (!ev.mine) {
+          // Not the open conversation: bump the unread badge and ding in-app.
+          unread[ev.conv] = (unread[ev.conv] || 0) + 1;
+          ding();
+          renderSidebar();
+        }
         break;
       case "CallState":
         inCall = ev.in_call;

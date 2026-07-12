@@ -6,6 +6,8 @@
 //! loop owns the WebView on the main thread and shuttles events between them.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use enclave_client::{Client, Event};
@@ -204,6 +206,10 @@ fn main() -> wry::Result<()> {
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
 
+    // Whether the window is focused, so the core only raises OS toasts when the
+    // user is not already looking at Enclave.
+    let focused = Arc::new(AtomicBool::new(true));
+
     let webview = WebViewBuilder::new()
         .with_html(UI_HTML)
         .with_ipc_handler(move |req: Request<String>| {
@@ -213,9 +219,10 @@ fn main() -> wry::Result<()> {
         })
         .build(&window)?;
 
+    let core_focused = focused.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-        runtime.block_on(run_client(cmd_rx, proxy));
+        runtime.block_on(run_client(cmd_rx, proxy, core_focused));
     });
 
     event_loop.run(move |event, _, control_flow| {
@@ -227,11 +234,26 @@ fn main() -> wry::Result<()> {
                 }
             }
             TaoEvent::WindowEvent {
+                event: WindowEvent::Focused(f),
+                ..
+            } => focused.store(f, Ordering::Relaxed),
+            TaoEvent::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => *control_flow = ControlFlow::Exit,
             _ => {}
         }
+    });
+}
+
+/// Raise an OS desktop notification (toast) off the async loop.
+fn notify_os(title: String, body: String) {
+    std::thread::spawn(move || {
+        let _ = notify_rust::Notification::new()
+            .summary(&title)
+            .body(&body)
+            .appname("Enclave")
+            .show();
     });
 }
 
@@ -322,6 +344,7 @@ fn app_dir() -> PathBuf {
 async fn run_client(
     mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
     proxy: EventLoopProxy<UiEvent>,
+    focused: Arc<AtomicBool>,
 ) {
     let mut client: Option<Client> = None;
     loop {
@@ -342,15 +365,23 @@ async fn run_client(
                     from,
                     text,
                     mine,
-                } => emit(
-                    &proxy,
-                    UiEvent::Message {
-                        conv,
-                        from,
-                        text,
-                        mine,
-                    },
-                ),
+                } => {
+                    // Toast an incoming message only when the user is not looking
+                    // at Enclave (unfocused); the in-app ding + unread badge cover
+                    // the focused-but-other-conversation case.
+                    if !mine && !focused.load(Ordering::Relaxed) {
+                        notify_os(from.clone(), text.clone());
+                    }
+                    emit(
+                        &proxy,
+                        UiEvent::Message {
+                            conv,
+                            from,
+                            text,
+                            mine,
+                        },
+                    );
+                }
                 Event::ConversationsChanged => {
                     if let Some(c) = client.as_ref() {
                         emit_conversations(&proxy, c);
@@ -360,7 +391,12 @@ async fn run_client(
                     emit(&proxy, UiEvent::Presence { user, status })
                 }
                 Event::FriendRequest { from } => emit(&proxy, UiEvent::FriendRequest { from }),
-                Event::CallOffer { conv, from } => emit(&proxy, UiEvent::CallOffer { conv, from }),
+                Event::CallOffer { conv, from } => {
+                    if !focused.load(Ordering::Relaxed) {
+                        notify_os("Incoming call".into(), format!("{from} is calling"));
+                    }
+                    emit(&proxy, UiEvent::CallOffer { conv, from })
+                }
                 Event::CallParticipants { conv, participants } => {
                     emit(&proxy, UiEvent::CallParticipants { conv, participants })
                 }
