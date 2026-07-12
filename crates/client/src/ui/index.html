@@ -23,6 +23,10 @@
     --radius: 8px;
   }
   * { box-sizing: border-box; }
+  /* Make the `hidden` attribute authoritative: the view containers set an
+     ID-specificity `display`, which would otherwise beat the UA `[hidden]`
+     rule and leave a "hidden" view visible (login/app view never switch). */
+  [hidden] { display: none !important; }
   html, body { height: 100%; margin: 0; }
   body {
     background: var(--chat);
