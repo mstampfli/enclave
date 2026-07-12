@@ -21,6 +21,9 @@ pub mod jitter;
 /// Windows screen capture (Windows Graphics Capture / DXGI duplication).
 #[cfg(windows)]
 pub mod screen;
+/// Windows WASAPI system-audio loopback capture.
+#[cfg(windows)]
+pub mod system_audio;
 pub mod video;
 
 pub use audio::{AudioDecoder, AudioEncoder};
@@ -34,4 +37,6 @@ pub use jitter::{JitterBuffer, Popped};
 pub use screen::{
     monitor_sources, window_sources, CapturedFrame, ScreenCapture, ScreenSource, WindowSource,
 };
+#[cfg(windows)]
+pub use system_audio::{window_pid, AudioMix, LoopbackMode, SystemAudioCapture};
 pub use video::H264Encoder;

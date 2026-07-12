@@ -15,7 +15,7 @@
 //! HARDWARE PATH: the mic/speaker and screen paths cannot be exercised
 //! headlessly; they are compile-verified and validated on a real device.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -29,6 +29,11 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::ClientError;
+
+/// A shared 48 kHz mono ring the system-audio loopback fills and the mic encoder
+/// drains + sums into each outgoing frame (so shared audio rides the one Opus
+/// stream, needing no receiver change). Empty whenever nothing is shared.
+type MixRing = Arc<Mutex<VecDeque<i16>>>;
 
 /// An H.264 video frame to show in the UI (which decodes it with WebCodecs).
 /// Either a peer's frame (received + opened) or our own camera, looped back for
@@ -91,6 +96,11 @@ pub struct Call {
     output_device: Option<String>,
     screen: Option<VideoSender>,
     camera: Option<VideoSender>,
+    /// Shared system audio mixed into the mic stream; the ring is drained by the
+    /// audio encode thread. `system_audio` holds the live loopback capture.
+    mix: MixRing,
+    #[cfg(windows)]
+    system_audio: Option<enclave_media::SystemAudioCapture>,
     /// Our own username, tagged on locally looped-back camera preview frames.
     me: String,
     /// A clone of the UI frame channel so the camera sender can loop our own
@@ -137,19 +147,24 @@ impl Call {
 
         let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel::<MediaFrame>();
 
-        // Audio capture thread: Opus-encode mic frames and seal them.
+        // Audio capture thread: mix in shared system audio, Opus-encode, seal.
         let audio_sealer = sealer.clone();
         let audio_frame_tx = frame_tx.clone();
         let muted = Arc::new(AtomicBool::new(false));
         let audio_muted = muted.clone();
+        let mix: MixRing = Arc::new(Mutex::new(VecDeque::new()));
+        let audio_mix = mix.clone();
         std::thread::spawn(move || {
             let mut encoder = match AudioEncoder::new() {
                 Ok(e) => e,
                 Err(_) => return,
             };
-            while let Ok(pcm) = mic_rx.recv() {
-                // Muted: keep draining the mic but transmit nothing.
-                if audio_muted.load(Ordering::Relaxed) {
+            while let Ok(mut pcm) = mic_rx.recv() {
+                let is_muted = audio_muted.load(Ordering::Relaxed);
+                // Muting silences the mic but NOT shared system audio; sum any
+                // shared audio in. When muted with nothing shared, send nothing.
+                let mixed = mix_into(&audio_mix, &mut pcm, is_muted);
+                if is_muted && !mixed {
                     continue;
                 }
                 let Ok(packet) = encoder.encode(&pcm) else {
@@ -260,6 +275,9 @@ impl Call {
             output_device: p.output_device,
             screen: None,
             camera: None,
+            mix,
+            #[cfg(windows)]
+            system_audio: None,
             me,
             local_frame_tx,
             muted,
@@ -439,6 +457,72 @@ impl Call {
     pub fn stop_camera(&mut self) {
         self.camera = None; // Drop stops the thread and closes the device.
     }
+
+    /// Whether we are currently sharing system audio.
+    pub fn is_sharing_audio(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.system_audio.is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// Start mixing shared system audio into our outgoing stream. `pid` shares a
+    /// single application's audio (echo-free); `None` shares the whole endpoint.
+    #[cfg(windows)]
+    pub fn start_system_audio(&mut self, pid: Option<u32>) -> Result<(), ClientError> {
+        use enclave_media::{LoopbackMode, SystemAudioCapture};
+        if self.system_audio.is_some() {
+            return Ok(());
+        }
+        let mode = match pid {
+            Some(p) => LoopbackMode::Process(p),
+            None => LoopbackMode::System,
+        };
+        let capture = SystemAudioCapture::start(mode, self.mix.clone()).map_err(audio)?;
+        self.system_audio = Some(capture);
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn start_system_audio(&mut self, _pid: Option<u32>) -> Result<(), ClientError> {
+        Err(ClientError::Audio("system audio share is Windows-only".into()))
+    }
+
+    /// Stop sharing system audio; the ring drains and the mic goes back to normal.
+    pub fn stop_system_audio(&mut self) {
+        #[cfg(windows)]
+        {
+            self.system_audio = None; // Drop stops the loopback thread.
+        }
+        // Clear any residual shared audio so it does not linger in the mic mix.
+        self.mix.lock().unwrap().clear();
+    }
+}
+
+/// Drain shared system audio from `mix` into a mic `frame`, summing sample by
+/// sample (saturating). When `muted`, the mic samples are zeroed first so only
+/// shared audio remains. Returns whether any shared audio was mixed in.
+fn mix_into(mix: &MixRing, frame: &mut [i16], muted: bool) -> bool {
+    if muted {
+        frame.iter_mut().for_each(|s| *s = 0);
+    }
+    let mut ring = mix.lock().unwrap();
+    if ring.is_empty() {
+        return false;
+    }
+    let mut mixed = false;
+    for slot in frame.iter_mut() {
+        let Some(v) = ring.pop_front() else {
+            break;
+        };
+        *slot = (*slot as i32 + v as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        mixed = true;
+    }
+    mixed
 }
 
 /// The shared video send loop for both screen share and camera. Pulls BGRA
@@ -545,4 +629,54 @@ fn is_h264_keyframe(annexb: &[u8]) -> bool {
 
 fn audio(e: enclave_media::MediaError) -> ClientError {
     ClientError::Audio(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ring(samples: &[i16]) -> MixRing {
+        Arc::new(Mutex::new(samples.iter().copied().collect()))
+    }
+
+    #[test]
+    fn empty_ring_leaves_mic_untouched() {
+        let mix = ring(&[]);
+        let mut frame = [100, -100, 50];
+        assert!(!mix_into(&mix, &mut frame, false));
+        assert_eq!(frame, [100, -100, 50]);
+    }
+
+    #[test]
+    fn sums_shared_audio_into_mic_and_drains() {
+        let mix = ring(&[10, -20, 30, 40]);
+        let mut frame = [1, 2, 3];
+        assert!(mix_into(&mix, &mut frame, false));
+        assert_eq!(frame, [11, -18, 33]); // summed sample by sample
+        assert_eq!(mix.lock().unwrap().len(), 1); // only 3 drained, one left
+    }
+
+    #[test]
+    fn muted_drops_the_mic_but_keeps_shared_audio() {
+        let mix = ring(&[7, 8, 9]);
+        let mut frame = [1000, 1000, 1000];
+        assert!(mix_into(&mix, &mut frame, true));
+        assert_eq!(frame, [7, 8, 9]); // mic zeroed, only shared audio remains
+    }
+
+    #[test]
+    fn muted_with_empty_ring_signals_nothing_to_send() {
+        let mix = ring(&[]);
+        let mut frame = [1000, -1000];
+        assert!(!mix_into(&mix, &mut frame, true));
+        assert_eq!(frame, [0, 0]); // mic silenced; caller skips sending
+    }
+
+    #[test]
+    fn mixing_saturates_instead_of_wrapping() {
+        let mix = ring(&[i16::MAX, i16::MIN]);
+        let mut frame = [i16::MAX, i16::MIN];
+        assert!(mix_into(&mix, &mut frame, false));
+        assert_eq!(frame, [i16::MAX, i16::MIN]); // clamped, no wrap-around
+    }
 }

@@ -60,10 +60,13 @@ enum UiCommand {
     /// Report the shareable screens, windows, and cameras for the source picker.
     ListShareSources,
     /// Start sharing a chosen source: "monitor:N", "window:HWND", or "camera:N".
+    /// `audio` also shares that source's audio (per-app for a window, whole
+    /// system for a monitor); ignored for cameras.
     StartShare {
         source: String,
+        audio: bool,
     },
-    /// Stop sharing the screen or window.
+    /// Stop sharing the screen or window (and any shared audio).
     StopScreenShare,
     /// Stop sharing the camera.
     StopCamera,
@@ -445,8 +448,9 @@ fn emit_audio_devices(proxy: &EventLoopProxy<UiEvent>, c: &Client) {
 }
 
 /// Parse a share-source token ("monitor:N", "window:HWND", or "camera:N") and
-/// start that share, reporting the new state or an error to the UI.
-fn start_share(c: &mut Client, proxy: &EventLoopProxy<UiEvent>, source: &str) {
+/// start that share, optionally also sharing its audio, reporting the new state
+/// or an error to the UI.
+fn start_share(c: &mut Client, proxy: &EventLoopProxy<UiEvent>, source: &str, audio: bool) {
     let Some((kind, id)) = source.split_once(':') else {
         error_status(proxy, format!("Bad share source: {source}"));
         return;
@@ -454,14 +458,33 @@ fn start_share(c: &mut Client, proxy: &EventLoopProxy<UiEvent>, source: &str) {
     match kind {
         "monitor" => match id.parse::<usize>() {
             Ok(m) => match c.start_screen_share(m) {
-                Ok(()) => emit(proxy, UiEvent::ScreenShareState { sharing: true }),
+                Ok(()) => {
+                    emit(proxy, UiEvent::ScreenShareState { sharing: true });
+                    // A monitor has no single owning process: whole-endpoint
+                    // loopback (the UI already warned about the echo).
+                    if audio {
+                        share_audio(c, proxy, None);
+                    }
+                }
                 Err(e) => error_status(proxy, format!("Could not share screen: {e}")),
             },
             Err(_) => error_status(proxy, format!("Bad monitor id: {id}")),
         },
         "window" => match id.parse::<isize>() {
             Ok(h) => match c.start_window_share(h) {
-                Ok(()) => emit(proxy, UiEvent::ScreenShareState { sharing: true }),
+                Ok(()) => {
+                    emit(proxy, UiEvent::ScreenShareState { sharing: true });
+                    // Per-app audio: capture only this window's process (echo-free).
+                    if audio {
+                        match c.window_pid(h) {
+                            Some(pid) => share_audio(c, proxy, Some(pid)),
+                            None => error_status(
+                                proxy,
+                                "Sharing the window, but could not find its audio".into(),
+                            ),
+                        }
+                    }
+                }
                 Err(e) => error_status(proxy, format!("Could not share window: {e}")),
             },
             Err(_) => error_status(proxy, format!("Bad window id: {id}")),
@@ -474,6 +497,14 @@ fn start_share(c: &mut Client, proxy: &EventLoopProxy<UiEvent>, source: &str) {
             Err(_) => error_status(proxy, format!("Bad camera id: {id}")),
         },
         _ => error_status(proxy, format!("Unknown share kind: {kind}")),
+    }
+}
+
+/// Start system-audio sharing (per-app if `pid` is set, else whole endpoint),
+/// surfacing any failure without tearing down the already-running video share.
+fn share_audio(c: &mut Client, proxy: &EventLoopProxy<UiEvent>, pid: Option<u32>) {
+    if let Err(e) = c.start_system_audio(pid) {
+        error_status(proxy, format!("Sharing screen, but audio failed: {e}"));
     }
 }
 
@@ -772,9 +803,9 @@ async fn handle_command(
                 );
             }
         }
-        UiCommand::StartShare { source } => {
+        UiCommand::StartShare { source, audio } => {
             if let Some(c) = client.as_mut() {
-                start_share(c, proxy, &source);
+                start_share(c, proxy, &source, audio);
             }
         }
         UiCommand::StopScreenShare => {

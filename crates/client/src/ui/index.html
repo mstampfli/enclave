@@ -370,7 +370,8 @@
       <div id="share-windows" class="share-list"><div class="share-empty">Looking for windows...</div></div>
       <div class="share-head">Cameras</div>
       <div id="share-cameras" class="share-list"><div class="share-empty">Looking for cameras...</div></div>
-      <label class="share-audio"><input id="share-audio" type="checkbox" disabled /> Share system audio <span class="hint">(coming soon)</span></label>
+      <label class="share-audio"><input id="share-audio" type="checkbox" /> Also share audio</label>
+      <p class="hint">A window shares only that app's audio. A whole screen shares all system audio, so others may hear the call echo back.</p>
       <div class="modal-actions">
         <button id="share-close" class="primary">Cancel</button>
       </div>
@@ -536,6 +537,7 @@
     $("share-screens").innerHTML = '<div class="share-empty">Looking for displays...</div>';
     $("share-windows").innerHTML = '<div class="share-empty">Looking for windows...</div>';
     $("share-cameras").innerHTML = '<div class="share-empty">Looking for cameras...</div>';
+    $("share-audio").checked = false;
     $("share-modal").hidden = false;
     send({ type: "ListShareSources" });
   }
@@ -557,7 +559,8 @@
       row.title = it.name || it.id;
       row.addEventListener("click", () => {
         $("share-modal").hidden = true;
-        send({ type: "StartShare", source: it.id }); // it.id already encodes the kind
+        // it.id already encodes the kind; audio applies to screens/windows only.
+        send({ type: "StartShare", source: it.id, audio: $("share-audio").checked });
       });
       box.appendChild(row);
     }

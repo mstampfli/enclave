@@ -897,11 +897,46 @@ impl Client {
         call.start_window(hwnd)
     }
 
-    /// Stop sharing the screen or window (the call keeps running).
+    /// Stop sharing the screen or window, including any shared system audio (they
+    /// are one logical share); the call keeps running.
     pub fn stop_screen_share(&mut self) {
         if let Some(call) = self.call.as_mut() {
             call.stop_screen();
+            call.stop_system_audio();
         }
+    }
+
+    /// The process id owning a window, for per-app audio (`None` off Windows).
+    #[cfg(windows)]
+    pub fn window_pid(&self, hwnd: isize) -> Option<u32> {
+        enclave_media::window_pid(hwnd)
+    }
+
+    #[cfg(not(windows))]
+    pub fn window_pid(&self, _hwnd: isize) -> Option<u32> {
+        None
+    }
+
+    /// Start sharing system audio into the call. `pid` = one app (echo-free);
+    /// `None` = the whole endpoint mix.
+    pub fn start_system_audio(&mut self, pid: Option<u32>) -> Result<(), ClientError> {
+        let call = self
+            .call
+            .as_mut()
+            .ok_or_else(|| ClientError::Audio("join the call before sharing audio".into()))?;
+        call.start_system_audio(pid)
+    }
+
+    /// Stop sharing system audio (the call keeps running).
+    pub fn stop_system_audio(&mut self) {
+        if let Some(call) = self.call.as_mut() {
+            call.stop_system_audio();
+        }
+    }
+
+    /// Whether we are currently sharing system audio.
+    pub fn is_sharing_audio(&self) -> bool {
+        self.call.as_ref().is_some_and(|c| c.is_sharing_audio())
     }
 
     /// Whether we are currently sharing our screen.
