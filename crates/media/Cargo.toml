@@ -10,6 +10,9 @@ license.workspace = true
 audiopus = "0.2.0"
 cpal = "0.18.1"
 enclave-protocol = { path = "../protocol" }
+openh264 = "0.9"
 thiserror.workspace = true
-# Phase 3 adds: cpal (capture/playback), opus (audio codec).
-# Phase 5 adds: nokhwa (camera), a video codec (VP9/AV1), scrap (screen).
+
+# Screen capture is Windows-only (Windows Graphics Capture / DXGI duplication).
+[target.'cfg(windows)'.dependencies]
+windows-capture = "2.0.0"

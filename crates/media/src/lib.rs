@@ -17,6 +17,10 @@ pub mod device;
 pub mod error;
 pub mod frame;
 pub mod jitter;
+pub mod video;
+/// Windows screen capture (Windows Graphics Capture / DXGI duplication).
+#[cfg(windows)]
+pub mod screen;
 
 pub use audio::{AudioDecoder, AudioEncoder};
 pub use device::{
@@ -24,3 +28,6 @@ pub use device::{
 };
 pub use error::MediaError;
 pub use jitter::{JitterBuffer, Popped};
+pub use video::H264Encoder;
+#[cfg(windows)]
+pub use screen::{CapturedFrame, ScreenCapture};
