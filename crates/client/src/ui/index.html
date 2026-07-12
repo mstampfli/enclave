@@ -473,6 +473,14 @@
     inCall = false; myCallConv = null; sharing = false;
     renderCall();
   }
+  // Am I in the active conversation's call? Trust the client flag OR the server's
+  // participant list (authoritative), so the Leave button is always reachable
+  // once I have joined -- even if myCallConv drifts.
+  function amInThisCall() {
+    if (!inCall || !activeConv) return false;
+    if (myCallConv === activeConv) return true;
+    return (callPart[activeConv] || []).includes(myDisplay);
+  }
   // Reflect current call state on the header button and the in-conversation banner.
   function renderCall() {
     const conv = convById(activeConv);
@@ -480,7 +488,9 @@
     if (!conv || conv.pending) { btn.hidden = true; banner.hidden = true; return; }
     const parts = callPart[activeConv] || [];
     const active = parts.length > 0;
-    const mineHere = inCall && myCallConv === activeConv;
+    const mineHere = amInThisCall();
+    // Keep myCallConv in sync once the server confirms we are a participant.
+    if (mineHere && myCallConv !== activeConv) myCallConv = activeConv;
     btn.hidden = false;
     btn.textContent = mineHere ? "Leave call" : (active ? "Join call" : "Call");
     btn.classList.toggle("in-call", mineHere);
@@ -577,7 +587,7 @@
     }
   });
   $("call-btn").addEventListener("click", () => {
-    if (inCall && myCallConv === activeConv) leaveCall();
+    if (amInThisCall()) leaveCall();
     else joinCall(activeConv);
   });
   $("call-banner-btn").addEventListener("click", () => joinCall(activeConv));
