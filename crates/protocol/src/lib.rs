@@ -282,6 +282,17 @@ pub enum UdpMsg {
     Hello { device: DeviceId, group: GroupId },
     /// One sealed media frame to fan out to the rest of the group.
     Frame(MediaFrame),
+    /// One fragment of a sealed frame too large for a single datagram (video
+    /// keyframes). `group`/`sender` let the relay route it like a `Frame`; the
+    /// receiver reassembles `count` fragments (by `id`) back into the frame.
+    Fragment {
+        group: GroupId,
+        sender: DeviceId,
+        id: u32,
+        index: u16,
+        count: u16,
+        data: Vec<u8>,
+    },
 }
 
 /// Protocol-level errors shared across crates.

@@ -150,10 +150,15 @@ impl Server {
                         UdpMsg::Frame(frame) => {
                             s.relay.udp_media_targets(src, &frame.group, &frame.sender)
                         }
+                        // A fragment routes exactly like a frame, by its group and
+                        // sender; the relay never reassembles (it stays opaque).
+                        UdpMsg::Fragment { group, sender, .. } => {
+                            s.relay.udp_media_targets(src, group, sender)
+                        }
                     }
                 };
                 // Forward the original datagram unchanged (no re-serialization).
-                if matches!(msg, UdpMsg::Frame(_)) {
+                if matches!(msg, UdpMsg::Frame(_) | UdpMsg::Fragment { .. }) {
                     for target in targets {
                         let _ = sock.send_to(&buf[..n], target).await;
                     }
