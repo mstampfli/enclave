@@ -664,6 +664,16 @@ impl Relay {
                     })
                     .collect()
             }
+
+            ClientMsg::PublishKeyPackages { packages } => {
+                if let Some(user) = self.conn_user.get(&from).cloned() {
+                    let q = self.key_packages.entry(user).or_default();
+                    for kp in packages {
+                        q.push_back(kp);
+                    }
+                }
+                vec![]
+            }
         }
     }
 

@@ -133,6 +133,9 @@ pub enum ClientMsg {
     RequestDm { to: String },
     /// Change our display name (cosmetic); friends are notified.
     SetDisplayName { display: String },
+    /// Publish additional single-use key packages to replenish our pool (each is
+    /// consumed when a peer adds us to a group, so we keep a few available).
+    PublishKeyPackages { packages: Vec<Vec<u8>> },
 }
 
 /// A person in the friend graph: the unique `username` (login/add id) plus the
