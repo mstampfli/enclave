@@ -484,13 +484,17 @@ async fn handle_command(
         }
         UiCommand::SetInputDevice { name } => {
             if let Some(c) = client.as_mut() {
-                c.set_input_device(Some(name));
+                if let Err(e) = c.set_input_device(Some(name)) {
+                    error_status(proxy, format!("Could not switch microphone: {e}"));
+                }
                 emit_audio_devices(proxy, c);
             }
         }
         UiCommand::SetOutputDevice { name } => {
             if let Some(c) = client.as_mut() {
-                c.set_output_device(Some(name));
+                if let Err(e) = c.set_output_device(Some(name)) {
+                    error_status(proxy, format!("Could not switch speaker: {e}"));
+                }
                 emit_audio_devices(proxy, c);
             }
         }

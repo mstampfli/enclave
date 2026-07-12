@@ -736,17 +736,25 @@ impl Client {
     }
 
     /// Choose the microphone. `None` restores the host default. Persisted to the
-    /// machine-local prefs and applied to the next call started.
-    pub fn set_input_device(&mut self, name: Option<String>) {
+    /// machine-local prefs and, if a call is in progress, applied to it live.
+    pub fn set_input_device(&mut self, name: Option<String>) -> Result<(), ClientError> {
         self.input_device = name.filter(|s| !s.is_empty());
         self.save_audio_prefs();
+        if let Some(call) = self.call.as_mut() {
+            call.set_input_device(self.input_device.as_deref())?;
+        }
+        Ok(())
     }
 
     /// Choose the speaker. `None` restores the host default. Persisted to the
-    /// machine-local prefs and applied to the next call started.
-    pub fn set_output_device(&mut self, name: Option<String>) {
+    /// machine-local prefs and, if a call is in progress, applied to it live.
+    pub fn set_output_device(&mut self, name: Option<String>) -> Result<(), ClientError> {
         self.output_device = name.filter(|s| !s.is_empty());
         self.save_audio_prefs();
+        if let Some(call) = self.call.as_mut() {
+            call.set_output_device(self.output_device.as_deref())?;
+        }
+        Ok(())
     }
 
     fn audio_prefs_path(&self) -> PathBuf {

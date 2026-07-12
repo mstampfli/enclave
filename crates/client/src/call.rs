@@ -13,10 +13,10 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use enclave_crypto::{MediaOpener, MediaSealer, MediaSigner};
-use enclave_media::{AudioCapture, AudioDecoder, AudioEncoder, AudioPlayback};
+use enclave_media::{AudioCapture, AudioDecoder, AudioEncoder, AudioPlayback, PlaybackSink};
 use enclave_protocol::{DeviceId, GroupId, MediaFrame, MediaKind};
 use enclave_transport::MediaSocket;
 use tokio::task::JoinHandle;
@@ -44,18 +44,34 @@ pub struct CallParams {
 
 /// An in-progress voice call. Dropping it tears the whole pipeline down.
 pub struct Call {
-    // cpal streams are !Send; they live here, on the controller thread.
-    _capture: AudioCapture,
-    _playback: AudioPlayback,
+    // cpal streams are !Send; they live here, on the controller thread. Both are
+    // swappable while the call runs (live device switching): the capture feeds a
+    // stable channel and the decode thread pushes through a swappable sink slot,
+    // so replacing either device never disturbs the worker threads or the crypto.
+    capture: AudioCapture,
+    playback: AudioPlayback,
+    /// Kept open so the capture device can be swapped without the capture thread
+    /// (which owns the receiving end) ever seeing the channel close.
+    mic_tx: std_mpsc::Sender<Vec<i16>>,
+    /// The decode thread pushes decoded audio through this; swapping the output
+    /// device just replaces the sink inside.
+    sink_slot: Arc<Mutex<PlaybackSink>>,
     send_task: JoinHandle<()>,
     recv_task: JoinHandle<()>,
+    input_device: Option<String>,
+    output_device: Option<String>,
 }
 
 impl Call {
     pub async fn start(p: CallParams) -> Result<Self, ClientError> {
-        let (capture, mic_rx) = AudioCapture::start_on(p.input_device.as_deref()).map_err(audio)?;
+        // A stable mic channel owned by the call: the capture device sends into a
+        // clone of `mic_tx`, and the capture thread reads `mic_rx`. Swapping the
+        // device replaces only the sender clone, so the thread never restarts.
+        let (mic_tx, mic_rx) = std_mpsc::channel::<Vec<i16>>();
+        let capture = AudioCapture::start_on_into(p.input_device.as_deref(), mic_tx.clone())
+            .map_err(audio)?;
         let playback = AudioPlayback::start_on(p.output_device.as_deref()).map_err(audio)?;
-        let sink = playback.sink();
+        let sink_slot = Arc::new(Mutex::new(playback.sink()));
 
         let socket = Arc::new(
             MediaSocket::connect(p.media_addr, DeviceId(p.me.clone()), p.group.clone()).await?,
@@ -120,6 +136,7 @@ impl Call {
         let in_group = p.group;
         let members = p.member_keys;
         let in_me = p.me;
+        let decode_sink = sink_slot.clone();
         std::thread::spawn(move || {
             let Ok(mut decoder) = AudioDecoder::new() else {
                 return;
@@ -145,7 +162,7 @@ impl Call {
                 let opener = openers.get_mut(&entry).expect("just inserted");
                 if let Ok(packet) = opener.open(&frame) {
                     if let Ok(pcm) = decoder.decode(&packet) {
-                        sink.push(&pcm);
+                        decode_sink.lock().unwrap().push(&pcm);
                     }
                 }
             }
@@ -163,18 +180,50 @@ impl Call {
         });
 
         Ok(Self {
-            _capture: capture,
-            _playback: playback,
+            capture,
+            playback,
+            mic_tx,
+            sink_slot,
             send_task,
             recv_task,
+            input_device: p.input_device,
+            output_device: p.output_device,
         })
+    }
+
+    /// Switch the microphone mid-call. Builds the new capture before dropping the
+    /// old one, so a device that fails to open leaves the current call untouched.
+    /// The capture thread and crypto are undisturbed -- only the device feeding
+    /// the stable mic channel changes.
+    pub fn set_input_device(&mut self, name: Option<&str>) -> Result<(), ClientError> {
+        if self.input_device.as_deref() == name {
+            return Ok(());
+        }
+        let new_capture = AudioCapture::start_on_into(name, self.mic_tx.clone()).map_err(audio)?;
+        self.capture = new_capture; // old capture drops -> its input stream stops
+        self.input_device = name.map(str::to_owned);
+        Ok(())
+    }
+
+    /// Switch the speaker mid-call. Builds the new output before dropping the old
+    /// one, then swaps the sink the decode thread pushes through.
+    pub fn set_output_device(&mut self, name: Option<&str>) -> Result<(), ClientError> {
+        if self.output_device.as_deref() == name {
+            return Ok(());
+        }
+        let new_playback = AudioPlayback::start_on(name).map_err(audio)?;
+        *self.sink_slot.lock().unwrap() = new_playback.sink();
+        self.playback = new_playback; // old playback drops -> its output stream stops
+        self.output_device = name.map(str::to_owned);
+        Ok(())
     }
 }
 
 impl Drop for Call {
     fn drop(&mut self) {
-        // Stop the async tasks; dropping the cpal streams stops capture (which
-        // closes the mic channel and ends the capture thread) and playback.
+        // Stop the async tasks; dropping the cpal streams and `mic_tx` closes the
+        // mic channel (ending the capture thread) and stops playback. Aborting
+        // recv_task drops the raw-frame sender, ending the decode thread.
         self.send_task.abort();
         self.recv_task.abort();
     }
