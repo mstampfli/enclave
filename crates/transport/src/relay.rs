@@ -10,7 +10,7 @@
 //! feeds it decoded [`ClientMsg`]s, then ships the [`Outgoing`] results to the
 //! addressed connections.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 use enclave_protocol::{ClientMsg, DeviceId, Friend, GroupId, Presence, ServerMsg, UserId};
@@ -40,8 +40,9 @@ pub struct Relay {
     /// Online devices and their current connection (both directions).
     device_conn: HashMap<DeviceId, ConnId>,
     conn_device: HashMap<ConnId, DeviceId>,
-    /// Published single-use key packages per user (consumed on fetch).
-    key_packages: HashMap<UserId, VecDeque<Vec<u8>>>,
+    /// The one reusable (last-resort) key package published per user, handed out
+    /// on every fetch without being consumed.
+    key_packages: HashMap<UserId, Vec<u8>>,
     /// Last-seen identity public key per user (reference only).
     identities: HashMap<UserId, Vec<u8>>,
     /// Group routing fan-out sets: which devices should receive group traffic.
@@ -153,10 +154,7 @@ impl Relay {
         self.device_conn.insert(device.clone(), conn);
         self.conn_device.insert(conn, device);
         self.conn_user.insert(conn, user.clone());
-        self.key_packages
-            .entry(user.clone())
-            .or_default()
-            .push_back(key_package);
+        self.key_packages.insert(user.clone(), key_package);
 
         let mut out = vec![Outgoing {
             to: conn,
@@ -425,9 +423,9 @@ impl Relay {
             ClientMsg::Logout => self.disconnect(from),
 
             ClientMsg::FetchKeyPackages { user } => {
-                // Key packages are single-use; hand out one per fetch.
-                let package = self.key_packages.get_mut(&user).and_then(|q| q.pop_front());
-                let packages = package.into_iter().collect();
+                // Last-resort key packages are reusable: hand it out without
+                // consuming it, so a peer can be added to unlimited groups.
+                let packages = self.key_packages.get(&user).cloned().into_iter().collect();
                 vec![Outgoing {
                     to: from,
                     msg: ServerMsg::KeyPackages { user, packages },
@@ -663,16 +661,6 @@ impl Relay {
                         msg: self.friends_snapshot(&f),
                     })
                     .collect()
-            }
-
-            ClientMsg::PublishKeyPackages { packages } => {
-                if let Some(user) = self.conn_user.get(&from).cloned() {
-                    let q = self.key_packages.entry(user).or_default();
-                    for kp in packages {
-                        q.push_back(kp);
-                    }
-                }
-                vec![]
             }
         }
     }

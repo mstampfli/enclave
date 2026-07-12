@@ -43,7 +43,7 @@ fn register(r: &mut Relay, name: &str, kp: Vec<u8>) -> (u64, String) {
 }
 
 #[test]
-fn fetch_returns_a_published_key_package_once() {
+fn fetch_returns_the_reusable_key_package() {
     let mut r = Relay::new();
     let (conn, h) = register(&mut r, "u", vec![9, 9, 9]);
 
@@ -59,11 +59,11 @@ fn fetch_returns_a_published_key_package_once() {
         other => panic!("expected KeyPackages, got {other:?}"),
     }
 
-    // Single-use: a second fetch returns nothing.
+    // Last-resort key packages are reusable: a second fetch returns it again.
     let out2 = r.handle(conn, ClientMsg::FetchKeyPackages { user: UserId(h) });
     match &out2[0].msg {
-        ServerMsg::KeyPackages { packages, .. } => assert!(packages.is_empty()),
-        other => panic!("expected empty KeyPackages, got {other:?}"),
+        ServerMsg::KeyPackages { packages, .. } => assert_eq!(packages, &vec![vec![9, 9, 9]]),
+        other => panic!("expected KeyPackages, got {other:?}"),
     }
 }
 

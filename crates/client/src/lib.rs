@@ -19,10 +19,6 @@ use enclave_transport::accounts::MIN_PASSWORD_LEN;
 use enclave_transport::{opaque, Connection};
 use sha2::{Digest, Sha256};
 
-/// How many single-use key packages to keep published so peers can add us to
-/// several groups before the pool needs replenishing.
-const KEY_PACKAGE_POOL: usize = 8;
-
 /// Errors surfaced to the UI.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -198,7 +194,6 @@ impl Client {
         });
         let server_display = self.await_auth().await?;
         self.finish_login(identity, &handle, server_display);
-        self.publish_key_packages(KEY_PACKAGE_POOL);
         Ok(())
     }
 
@@ -229,7 +224,6 @@ impl Client {
         let server_display = self.await_auth().await?;
         let _ = identity.save(&self.identity_path(handle), password);
         self.finish_login(identity, handle, server_display);
-        self.publish_key_packages(KEY_PACKAGE_POOL);
         Ok(())
     }
 
@@ -258,20 +252,6 @@ impl Client {
         self.display_names
             .insert(username.to_string(), display.clone());
         self.display = display;
-    }
-
-    /// Publish `n` extra single-use key packages so peers can add us to several
-    /// groups without exhausting the pool.
-    fn publish_key_packages(&self, n: usize) {
-        let Some(identity) = self.identity.as_ref() else {
-            return;
-        };
-        let packages: Vec<Vec<u8>> = (0..n)
-            .filter_map(|_| identity.new_key_package().ok())
-            .collect();
-        if !packages.is_empty() {
-            self.conn.send(ClientMsg::PublishKeyPackages { packages });
-        }
     }
 
     /// Pump messages until the auth result arrives; queue any other events.
@@ -750,8 +730,6 @@ impl Client {
                         );
                     }
                 }
-                // Joining consumed one of our key packages; replenish the pool.
-                self.publish_key_packages(KEY_PACKAGE_POOL);
                 Some(Event::ConversationsChanged)
             }
             ServerMsg::Text { group, message, .. } => {

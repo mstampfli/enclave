@@ -62,13 +62,15 @@ impl Identity {
         self.signer.to_public_vec()
     }
 
-    /// Produce a fresh, serialized public key package for this identity. Publish
-    /// it so a group owner can add this device. The matching private keys are
-    /// stored in `self.provider`, so this identity must be the one that later
-    /// joins the group the key package was consumed into.
+    /// Produce a serialized **last-resort** public key package for this identity.
+    /// Publish it once; a group owner adds this device by consuming it. Because
+    /// it is marked last-resort, openmls keeps the matching private key after a
+    /// join, so the *same* key package can be reused to join unlimited groups
+    /// (no single-use pool to exhaust). The private keys live in `self.provider`.
     pub fn new_key_package(&self) -> Result<Vec<u8>, CryptoError> {
         let bundle = KeyPackage::builder()
             .leaf_node_capabilities(crate::enclave_capabilities())
+            .mark_as_last_resort()
             .build(
                 CIPHERSUITE,
                 &self.provider,
