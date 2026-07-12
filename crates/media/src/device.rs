@@ -5,19 +5,21 @@
 //! device. It builds on the tested helpers in [`crate::frame`] and the codec in
 //! [`crate::audio`].
 //!
-//! Assumes the device runs at the codec rate (48 kHz). A device that only
-//! offers another rate needs a resampler inserted here (a follow-up); the code
-//! warns loudly rather than silently producing wrong-rate audio.
+//! Each device opens at its own native rate (a shared-mode device often cannot
+//! be forced to another rate), and a [`Resampler`] bridges that rate to the
+//! codec's fixed 48 kHz: native -> 48 kHz on capture, 48 kHz -> native on
+//! playback. Without it, e.g. a 96 kHz speaker would play our 48 kHz audio an
+//! octave high and choppy.
 
 use std::collections::VecDeque;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
 
 use crate::audio::SAMPLE_RATE_HZ;
-use crate::frame::{downmix_to_mono, f32_to_i16, i16_to_f32, FrameAccumulator};
+use crate::frame::{downmix_to_mono, f32_to_i16, i16_to_f32, FrameAccumulator, Resampler};
 use crate::MediaError;
 
 fn codec_err(e: impl std::fmt::Display) -> MediaError {
@@ -91,6 +93,16 @@ impl AudioCapture {
     /// Capture a named input device, or the host default when `name` is `None`
     /// or the named device is not present.
     pub fn start_on(name: Option<&str>) -> Result<(Self, Receiver<Vec<i16>>), MediaError> {
+        let (tx, rx) = mpsc::channel::<Vec<i16>>();
+        Ok((Self::start_on_into(name, tx)?, rx))
+    }
+
+    /// Capture into a caller-owned channel. The caller keeps the [`Sender`]'s
+    /// receiving end open, so the capture device can be swapped underneath a
+    /// running consumer (live device switching) by dropping this [`AudioCapture`]
+    /// and starting a new one into a clone of the same sender -- the consumer
+    /// never sees the channel close.
+    pub fn start_on_into(name: Option<&str>, tx: Sender<Vec<i16>>) -> Result<Self, MediaError> {
         let host = cpal::default_host();
         let device = resolve_input(&host, name)
             .ok_or_else(|| MediaError::Codec("no input device available".into()))?;
@@ -98,16 +110,11 @@ impl AudioCapture {
         let sample_format = supported.sample_format();
         let config = supported.config();
         let channels = config.channels as usize;
+        // Bridge the device's native rate to the codec's 48 kHz.
+        let mut resampler = Resampler::new(config.sample_rate, SAMPLE_RATE_HZ as u32);
 
-        if config.sample_rate as usize != SAMPLE_RATE_HZ {
-            eprintln!(
-                "warning: input device is {} Hz but the codec expects {} Hz; resampling needed",
-                config.sample_rate, SAMPLE_RATE_HZ
-            );
-        }
-
-        let (tx, rx) = mpsc::channel::<Vec<i16>>();
         let mut acc = FrameAccumulator::new();
+        let mut resampled: Vec<i16> = Vec::new();
         let on_error = |e| eprintln!("input stream error: {e}");
 
         let stream = match sample_format {
@@ -115,8 +122,10 @@ impl AudioCapture {
                 config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let mono = downmix_to_mono(data, channels);
-                    let pcm: Vec<i16> = mono.iter().map(|&s| f32_to_i16(s)).collect();
-                    acc.push(&pcm, |frame| {
+                    let native: Vec<i16> = mono.iter().map(|&s| f32_to_i16(s)).collect();
+                    resampled.clear();
+                    resampler.process(&native, &mut resampled);
+                    acc.push(&resampled, |frame| {
                         let _ = tx.send(frame.to_vec());
                     });
                 },
@@ -128,8 +137,10 @@ impl AudioCapture {
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     let floats: Vec<f32> = data.iter().map(|&s| i16_to_f32(s)).collect();
                     let mono = downmix_to_mono(&floats, channels);
-                    let pcm: Vec<i16> = mono.iter().map(|&s| f32_to_i16(s)).collect();
-                    acc.push(&pcm, |frame| {
+                    let native: Vec<i16> = mono.iter().map(|&s| f32_to_i16(s)).collect();
+                    resampled.clear();
+                    resampler.process(&native, &mut resampled);
+                    acc.push(&resampled, |frame| {
                         let _ = tx.send(frame.to_vec());
                     });
                 },
@@ -145,15 +156,35 @@ impl AudioCapture {
         .map_err(codec_err)?;
 
         stream.play().map_err(codec_err)?;
-        Ok((Self { _stream: stream }, rx))
+        Ok(Self { _stream: stream })
     }
 }
 
-/// Plays decoded mono frames on the default output device. Hold it alive to keep
-/// the stream open; feed it with [`AudioPlayback::push`].
+/// The shared playback state: the device-rate sample queue the audio callback
+/// drains, and the 48 kHz -> device-rate resampler that fills it. Both live
+/// behind mutexes because the feeder ([`PlaybackSink::push`]) runs on a
+/// different thread than the audio callback.
+struct PlaybackInner {
+    queue: Mutex<VecDeque<i16>>,
+    resampler: Mutex<Resampler>,
+}
+
+impl PlaybackInner {
+    /// Accept decoded 48 kHz mono samples, resample to the device rate, and
+    /// enqueue them for the audio callback.
+    fn feed(&self, mono48k: &[i16]) {
+        let mut native = Vec::with_capacity(mono48k.len() + 8);
+        self.resampler.lock().unwrap().process(mono48k, &mut native);
+        self.queue.lock().unwrap().extend(native);
+    }
+}
+
+/// Plays decoded 48 kHz mono frames on an output device. Hold it alive to keep
+/// the stream open; feed it 48 kHz mono via [`AudioPlayback::push`] or a
+/// [`PlaybackSink`].
 pub struct AudioPlayback {
     _stream: Stream,
-    queue: Arc<Mutex<VecDeque<i16>>>,
+    inner: Arc<PlaybackInner>,
 }
 
 impl AudioPlayback {
@@ -173,15 +204,19 @@ impl AudioPlayback {
         let config = supported.config();
         let channels = config.channels as usize;
 
-        let queue = Arc::new(Mutex::new(VecDeque::<i16>::new()));
-        let q = queue.clone();
+        let inner = Arc::new(PlaybackInner {
+            queue: Mutex::new(VecDeque::new()),
+            // Decoded audio is 48 kHz; the device consumes at its native rate.
+            resampler: Mutex::new(Resampler::new(SAMPLE_RATE_HZ as u32, config.sample_rate)),
+        });
+        let cb = inner.clone();
         let on_error = |e| eprintln!("output stream error: {e}");
 
         let stream = match sample_format {
             SampleFormat::F32 => device.build_output_stream(
                 config,
                 move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let mut q = q.lock().unwrap();
+                    let mut q = cb.queue.lock().unwrap();
                     for frame in out.chunks_mut(channels) {
                         let sample = q.pop_front().map(i16_to_f32).unwrap_or(0.0);
                         frame.iter_mut().for_each(|slot| *slot = sample);
@@ -193,7 +228,7 @@ impl AudioPlayback {
             SampleFormat::I16 => device.build_output_stream(
                 config,
                 move |out: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                    let mut q = q.lock().unwrap();
+                    let mut q = cb.queue.lock().unwrap();
                     for frame in out.chunks_mut(channels) {
                         let sample = q.pop_front().unwrap_or(0);
                         frame.iter_mut().for_each(|slot| *slot = sample);
@@ -213,34 +248,34 @@ impl AudioPlayback {
         stream.play().map_err(codec_err)?;
         Ok(Self {
             _stream: stream,
-            queue,
+            inner,
         })
     }
 
-    /// Enqueue decoded mono samples for playback.
-    pub fn push(&self, mono: &[i16]) {
-        self.queue.lock().unwrap().extend(mono.iter().copied());
+    /// Enqueue decoded 48 kHz mono samples for playback.
+    pub fn push(&self, mono48k: &[i16]) {
+        self.inner.feed(mono48k);
     }
 
-    /// A `Send` handle to this device's playback queue, so a decode task on
+    /// A `Send` handle to this device's playback feed, so a decode task on
     /// another thread can feed audio while the (non-`Send`) cpal stream stays
     /// on the thread that created it.
     pub fn sink(&self) -> PlaybackSink {
         PlaybackSink {
-            queue: self.queue.clone(),
+            inner: self.inner.clone(),
         }
     }
 }
 
-/// A cloneable, `Send` handle for feeding decoded mono samples to an
+/// A cloneable, `Send` handle for feeding decoded 48 kHz mono samples to an
 /// [`AudioPlayback`] from another thread or async task.
 #[derive(Clone)]
 pub struct PlaybackSink {
-    queue: Arc<Mutex<VecDeque<i16>>>,
+    inner: Arc<PlaybackInner>,
 }
 
 impl PlaybackSink {
-    pub fn push(&self, mono: &[i16]) {
-        self.queue.lock().unwrap().extend(mono.iter().copied());
+    pub fn push(&self, mono48k: &[i16]) {
+        self.inner.feed(mono48k);
     }
 }
