@@ -861,6 +861,18 @@ impl Client {
         self.call.as_ref().is_some_and(|c| c.is_sharing())
     }
 
+    /// Mute or unmute our microphone for the current call.
+    pub fn set_muted(&self, muted: bool) {
+        if let Some(call) = self.call.as_ref() {
+            call.set_muted(muted);
+        }
+    }
+
+    /// Whether our microphone is currently muted.
+    pub fn is_muted(&self) -> bool {
+        self.call.as_ref().is_some_and(|c| c.is_muted())
+    }
+
     /// Decline an incoming call in conversation `conv_hex` (we were rung but will
     /// not join). The caller is notified; the UI falls back to a "call active"
     /// banner so we can still join later.

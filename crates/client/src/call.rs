@@ -86,6 +86,8 @@ pub struct Call {
     input_device: Option<String>,
     output_device: Option<String>,
     screen: Option<ScreenSender>,
+    /// When set, the mic is not transmitted (local mute).
+    muted: Arc<AtomicBool>,
 }
 
 impl Call {
@@ -126,12 +128,18 @@ impl Call {
         // Audio capture thread: Opus-encode mic frames and seal them.
         let audio_sealer = sealer.clone();
         let audio_frame_tx = frame_tx.clone();
+        let muted = Arc::new(AtomicBool::new(false));
+        let audio_muted = muted.clone();
         std::thread::spawn(move || {
             let mut encoder = match AudioEncoder::new() {
                 Ok(e) => e,
                 Err(_) => return,
             };
             while let Ok(pcm) = mic_rx.recv() {
+                // Muted: keep draining the mic but transmit nothing.
+                if audio_muted.load(Ordering::Relaxed) {
+                    continue;
+                }
                 let Ok(packet) = encoder.encode(&pcm) else {
                     continue;
                 };
@@ -230,6 +238,7 @@ impl Call {
             input_device: p.input_device,
             output_device: p.output_device,
             screen: None,
+            muted,
         };
         Ok((call, screen_rx))
     }
@@ -237,6 +246,16 @@ impl Call {
     /// Whether we are currently sharing our screen.
     pub fn is_sharing(&self) -> bool {
         self.screen.is_some()
+    }
+
+    /// Mute or unmute the microphone (stops/resumes transmitting our voice).
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+
+    /// Whether the microphone is currently muted.
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
     }
 
     /// Switch the microphone mid-session (see the device-swap notes on capture).

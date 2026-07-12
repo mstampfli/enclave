@@ -274,7 +274,9 @@
         <span id="chat-title" class="chat-title">No conversation</span>
         <span id="safety" class="safety" title="Compare this with your friend out-of-band to verify no one is in the middle"></span>
         <button id="call-btn" class="hdr-btn small" hidden title="Start or join a voice call in this conversation">Call</button>
+        <button id="mute-btn" class="hdr-btn small" hidden title="Mute or unmute your microphone">Mute</button>
         <button id="share-btn" class="hdr-btn small" hidden title="Share your screen into the call">Share screen</button>
+        <button id="watch-btn" class="hdr-btn small" hidden title="Watch the shared screen">Watch screen</button>
         <button id="add-to-group" class="hdr-btn small" hidden title="Add a friend to this group">Add member</button>
         <button id="remove-member" class="hdr-btn small" hidden title="Remove a member from this group">Remove member</button>
         <button id="leave-conv" class="hdr-btn small" hidden title="Leave and delete this conversation">Leave</button>
@@ -356,6 +358,9 @@
   let ringConv = null;           // conv id currently ringing (incoming)
   const unread = {};             // conv id -> unread message count
   let sharing = false;           // am I sharing my screen
+  let muted = false;             // is my mic muted
+  let watchingStream = true;     // do I want to see an incoming screen share
+  let currentSharer = "";        // who is currently sharing (empty = nobody)
 
   // ---- screen share viewer (WebCodecs H.264 -> canvas) ----
   let svDecoder = null, svGotKey = false, svTs = 0, svTimer = null;
@@ -364,11 +369,25 @@
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     return bytes;
   }
-  function resetViewer() {
+  function closeDecoder() {
     if (svDecoder) { try { svDecoder.close(); } catch (e) {} svDecoder = null; }
     svGotKey = false; svTs = 0;
+  }
+  // The sharer stopped (no frames for a while): forget them and drop the viewer.
+  function streamEnded() {
+    closeDecoder();
     if (svTimer) { clearTimeout(svTimer); svTimer = null; }
+    currentSharer = "";
     $("screen-viewer").hidden = true;
+    renderCall();
+  }
+  // The user closes the viewer but the sharer keeps going: stop watching, keep
+  // the Watch button available to resume.
+  function stopViewing() {
+    watchingStream = false;
+    closeDecoder();
+    $("screen-viewer").hidden = true;
+    renderCall();
   }
   function ensureDecoder() {
     if (svDecoder) return;
@@ -379,13 +398,17 @@
         ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
         frame.close();
       },
-      error: (e) => { console.error("screen decoder", e); resetViewer(); },
+      error: (e) => { console.error("screen decoder", e); closeDecoder(); },
     });
     try { svDecoder.configure({ codec: "avc1.42E01E", optimizeForLatency: true }); }
-    catch (e) { console.error("configure", e); resetViewer(); }
+    catch (e) { console.error("configure", e); closeDecoder(); }
   }
   function handleScreenFrame(ev) {
     if (typeof VideoDecoder === "undefined") return; // no WebCodecs support
+    currentSharer = ev.from;
+    if (svTimer) clearTimeout(svTimer);
+    svTimer = setTimeout(streamEnded, 2500); // the sharer went quiet
+    if (!watchingStream) { renderCall(); return; } // not watching: just offer Watch
     $("sv-title").textContent = ev.from + " is sharing their screen";
     $("screen-viewer").hidden = false;
     ensureDecoder();
@@ -396,8 +419,6 @@
       svDecoder.decode(new EncodedVideoChunk({ type: ev.keyframe ? "key" : "delta", timestamp: svTs, data: b64ToBytes(ev.data) }));
       svTs += 33333;
     } catch (e) { console.error("decode", e); }
-    if (svTimer) clearTimeout(svTimer);
-    svTimer = setTimeout(resetViewer, 2500); // hide if the stream stops
   }
 
   // A short in-app "ding" for a message arriving in a non-focused conversation.
@@ -470,7 +491,7 @@
   }
   function leaveCall() {
     send({ type: "LeaveCall" });
-    inCall = false; myCallConv = null; sharing = false;
+    inCall = false; myCallConv = null; sharing = false; muted = false;
     renderCall();
   }
   // Am I in the active conversation's call? Trust the client flag OR the server's
@@ -494,10 +515,15 @@
     btn.hidden = false;
     btn.textContent = mineHere ? "Leave call" : (active ? "Join call" : "Call");
     btn.classList.toggle("in-call", mineHere);
-    // Screen share is only available once you are in the call.
+    // Mute + screen share are only available once you are in the call.
+    $("mute-btn").hidden = !mineHere;
+    $("mute-btn").textContent = muted ? "Unmute" : "Mute";
+    $("mute-btn").classList.toggle("in-call", muted);
     $("share-btn").hidden = !mineHere;
     $("share-btn").textContent = sharing ? "Stop sharing" : "Share screen";
     $("share-btn").classList.toggle("in-call", sharing);
+    // Offer to (re)watch when someone is sharing but we are not viewing it.
+    $("watch-btn").hidden = !(currentSharer && !watchingStream);
     if (mineHere) {
       const others = parts.filter((p) => p !== myDisplay);
       banner.hidden = false;
@@ -594,7 +620,13 @@
   $("share-btn").addEventListener("click", () => {
     send({ type: sharing ? "StopScreenShare" : "StartScreenShare" });
   });
-  $("sv-close").addEventListener("click", resetViewer);
+  $("mute-btn").addEventListener("click", () => {
+    muted = !muted;
+    send({ type: "SetMuted", muted });
+    renderCall();
+  });
+  $("watch-btn").addEventListener("click", () => { watchingStream = true; renderCall(); });
+  $("sv-close").addEventListener("click", stopViewing);
   $("ring-accept").addEventListener("click", () => { if (ringConv) joinCall(ringConv); });
   $("ring-decline").addEventListener("click", () => {
     if (ringConv) send({ type: "DeclineCall", conv: ringConv });
@@ -758,7 +790,8 @@
   function showLogin() {
     $("app-view").hidden = true; $("login-view").hidden = false;
     myUsername = ""; myDisplay = ""; friends = []; incoming = []; outgoing = []; conversations = []; activeConv = null;
-    inCall = false; myCallConv = null; sharing = false; dismissRing(); resetViewer();
+    inCall = false; myCallConv = null; sharing = false; muted = false;
+    watchingStream = true; currentSharer = ""; dismissRing(); streamEnded();
     for (const k in callPart) delete callPart[k];
     for (const k in unread) delete unread[k];
     $("call-btn").classList.remove("in-call"); $("call-banner").hidden = true;
@@ -799,7 +832,7 @@
         break;
       case "CallState":
         inCall = ev.in_call;
-        if (!inCall) { myCallConv = null; sharing = false; }
+        if (!inCall) { myCallConv = null; sharing = false; muted = false; }
         renderCall();
         break;
       case "CallOffer":
