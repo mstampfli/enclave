@@ -3,12 +3,25 @@
 //! hears clear voice -- each *encoded* audio/video frame is encrypted before it
 //! touches the wire, so there is no lossy stage after encryption.
 //!
-//! ## Keying
+//! ## Keying (confidentiality)
 //! Each sender gets its own key derived from the group's media root secret
 //! (which itself rotates every MLS epoch) via HKDF, bound to the group id, the
 //! epoch, and the sender's identity key. Every member can derive any sender's
 //! key (they know the roster), so anyone can open a frame; only members have
 //! the root secret, so outsiders and the relay cannot.
+//!
+//! ## Source authentication (anti-impersonation)
+//! Because every member can derive every other member's *symmetric* media key,
+//! the AEAD tag alone only proves "some group member made this" -- not who. So
+//! each frame is also signed with the sender's **Ed25519 identity key** (the
+//! same key MLS binds to their credential and the safety number covers). Only
+//! the key owner holds the private half, so no other member can forge a frame
+//! attributed to them. The receiver verifies the signature against the claimed
+//! sender's roster public key ([`MediaOpener`] does this before AEAD), and the
+//! signature is domain-separated ([`MEDIA_SIG_CONTEXT`]) so it can never be
+//! confused with an MLS handshake signature made with the same key. Each frame
+//! carries its own complete signature and is verified independently, so a lost
+//! packet never orphans the authentication of any other.
 //!
 //! ## Nonce safety (unrepresentable reuse)
 //! [`MediaSealer`] owns a monotonic per-sender counter; the AEAD nonce is
@@ -26,13 +39,86 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Key, Nonce,
 };
+use ed25519_dalek::VerifyingKey;
 use hkdf::Hkdf;
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::signatures::Signer as _;
 use sha2::Sha256;
 use zeroize::Zeroize;
 
 use enclave_protocol::{DeviceId, GroupId, MediaFrame, MediaKind, Sealed};
 
 use crate::CryptoError;
+
+/// Domain separator for media-frame signatures. Prefixing the signed bytes with
+/// this label (and a distinct byte layout) means a media signature can never be
+/// reinterpreted as an MLS handshake signature made with the same Ed25519
+/// credential key, or vice versa -- no cross-protocol signature confusion.
+pub const MEDIA_SIG_CONTEXT: &[u8] = b"enclave/media-sig/v1";
+
+/// The exact bytes a frame signature covers: the routing header (AEAD associated
+/// data) and the ciphertext, under the domain-separation prefix. Signing the
+/// ciphertext (encrypt-then-sign) lets a receiver reject a forgery before
+/// spending any work decrypting. The `aad` is length-prefixed so the boundary
+/// between it and the ciphertext is unambiguous.
+fn signing_input(aad: &[u8], ciphertext: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(MEDIA_SIG_CONTEXT.len() + 4 + aad.len() + ciphertext.len());
+    m.extend_from_slice(MEDIA_SIG_CONTEXT);
+    m.extend_from_slice(&(aad.len() as u32).to_be_bytes());
+    m.extend_from_slice(aad);
+    m.extend_from_slice(ciphertext);
+    m
+}
+
+/// Signs outgoing media frames with a sender's Ed25519 identity key. Wraps the
+/// MLS signature keypair and signs through it (the private key is never read
+/// out), and is plain `Send` bytes so it can move onto the capture thread. Build
+/// one from a device [`Identity`](crate::Identity) via
+/// [`Identity::media_signer`](crate::Identity::media_signer).
+pub struct MediaSigner {
+    keypair: SignatureKeyPair,
+}
+
+impl MediaSigner {
+    pub(crate) fn from_keypair(keypair: SignatureKeyPair) -> Self {
+        Self { keypair }
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        self.keypair
+            .sign(message)
+            .map_err(|_| CryptoError::Media("media frame signing failed".into()))
+    }
+}
+
+/// Verifies a sender's media-frame signatures against their Ed25519 identity
+/// (public) key -- the same key the MLS roster and safety number bind to that
+/// member. A frame that does not verify was not produced by that member.
+struct MediaVerifier {
+    key: VerifyingKey,
+}
+
+impl MediaVerifier {
+    fn from_ed25519_public(public_key: &[u8]) -> Result<Self, CryptoError> {
+        let bytes: [u8; 32] = public_key
+            .try_into()
+            .map_err(|_| CryptoError::Media("ed25519 public key must be 32 bytes".into()))?;
+        let key = VerifyingKey::from_bytes(&bytes)
+            .map_err(|_| CryptoError::Media("invalid ed25519 public key".into()))?;
+        Ok(Self { key })
+    }
+
+    /// True only if `sig` is this key's signature over `message`. Uses
+    /// `verify_strict`, which rejects non-canonical signatures and small-order
+    /// public keys (signature-malleability defense).
+    fn verify(&self, message: &[u8], sig: &[u8]) -> bool {
+        let Ok(bytes) = <[u8; 64]>::try_from(sig) else {
+            return false;
+        };
+        let sig = ed25519_dalek::Signature::from_bytes(&bytes);
+        self.key.verify_strict(message, &sig).is_ok()
+    }
+}
 
 /// Derive the 32-byte AEAD key and 4-byte nonce salt for one sender, bound to
 /// the group, epoch, and sender identity.
@@ -89,7 +175,8 @@ fn nonce_bytes(salt: &[u8; 4], counter: u64) -> [u8; 12] {
     nonce
 }
 
-/// Seals outgoing media frames for one sender. Owns the monotonic counter.
+/// Seals outgoing media frames for one sender. Owns the monotonic counter and
+/// the sender's [`MediaSigner`], so every frame is both encrypted and signed.
 pub struct MediaSealer {
     cipher: ChaCha20Poly1305,
     salt: [u8; 4],
@@ -97,15 +184,23 @@ pub struct MediaSealer {
     sender: DeviceId,
     epoch: u64,
     counter: u64,
+    signer: MediaSigner,
 }
 
 impl MediaSealer {
+    /// `sender_identity_key` keys the symmetric layer (per-sender nonce-space
+    /// separation); `signer` is the sender's private Ed25519 key that authorizes
+    /// the frame. In honest use they are the two halves of one identity key --
+    /// they are separate inputs precisely because the impersonation an attacker
+    /// would attempt is to key the symmetric side to a victim (which any member
+    /// can do) while being unable to produce the victim's signature.
     pub fn new(
         root_secret: &[u8],
         group: GroupId,
         sender: DeviceId,
         sender_identity_key: &[u8],
         epoch: u64,
+        signer: MediaSigner,
     ) -> Result<Self, CryptoError> {
         let (mut key, salt) = derive_key_salt(root_secret, &group, epoch, sender_identity_key)?;
         let cipher = ChaCha20Poly1305::new(&Key::from(key));
@@ -117,10 +212,12 @@ impl MediaSealer {
             sender,
             epoch,
             counter: 0,
+            signer,
         })
     }
 
-    /// Seal one encoded frame into a [`MediaFrame`] ready for the wire.
+    /// Seal one encoded frame into a [`MediaFrame`] ready for the wire:
+    /// encrypt-then-sign.
     pub fn seal(&mut self, kind: MediaKind, plaintext: &[u8]) -> Result<MediaFrame, CryptoError> {
         let counter = self.counter;
         // Refuse to reuse a nonce: exhaust rather than wrap.
@@ -142,6 +239,8 @@ impl MediaSealer {
             )
             .map_err(|_| CryptoError::Media("seal failed".into()))?;
 
+        let sig = self.signer.sign(&signing_input(&aad, &ciphertext))?;
+
         Ok(MediaFrame {
             group: self.group.clone(),
             sender: self.sender.clone(),
@@ -149,17 +248,22 @@ impl MediaSealer {
             epoch: self.epoch,
             counter,
             payload: Sealed(ciphertext),
+            sig,
         })
     }
 }
 
-/// Opens incoming media frames from one sender. Authenticates, then enforces
-/// replay protection.
+/// Opens incoming media frames from one sender. Verifies the sender's signature
+/// and the AEAD, then enforces replay protection. `sender_identity_key` is the
+/// claimed sender's roster public key -- it both keys the symmetric layer and is
+/// the verification key, so a frame that names a sender but is not signed by
+/// that sender's private key is rejected.
 pub struct MediaOpener {
     cipher: ChaCha20Poly1305,
     salt: [u8; 4],
     epoch: u64,
     window: ReplayWindow,
+    verifier: MediaVerifier,
 }
 
 impl MediaOpener {
@@ -169,6 +273,7 @@ impl MediaOpener {
         sender_identity_key: &[u8],
         epoch: u64,
     ) -> Result<Self, CryptoError> {
+        let verifier = MediaVerifier::from_ed25519_public(sender_identity_key)?;
         let (mut key, salt) = derive_key_salt(root_secret, group, epoch, sender_identity_key)?;
         let cipher = ChaCha20Poly1305::new(&Key::from(key));
         key.zeroize();
@@ -177,11 +282,13 @@ impl MediaOpener {
             salt,
             epoch,
             window: ReplayWindow::new(),
+            verifier,
         })
     }
 
-    /// Authenticate and decrypt a frame, returning the encoded plaintext.
-    /// Rejects wrong-epoch, tampered, forged, duplicate, and too-old frames.
+    /// Verify, authenticate, and decrypt a frame, returning the encoded
+    /// plaintext. Rejects wrong-epoch, impersonated (bad signature), tampered,
+    /// duplicate, and too-old frames.
     pub fn open(&mut self, frame: &MediaFrame) -> Result<Vec<u8>, CryptoError> {
         if frame.epoch != self.epoch {
             return Err(CryptoError::Media(format!(
@@ -189,7 +296,6 @@ impl MediaOpener {
                 frame.epoch, self.epoch
             )));
         }
-        let nonce = nonce_bytes(&self.salt, frame.counter);
         let aad = media_aad(
             &frame.group,
             &frame.sender,
@@ -197,8 +303,18 @@ impl MediaOpener {
             frame.epoch,
             frame.counter,
         );
-        // Authenticate BEFORE touching replay state, so a forged frame cannot
-        // poison the window and cause a real frame to be dropped.
+        // Source authentication FIRST: only the claimed sender's private key can
+        // sign this. A member who re-derives the (shared) symmetric key and
+        // forges a frame under another sender's identity is caught here, before
+        // any decryption work. Done before the replay window so a forgery cannot
+        // poison it and drop a real frame.
+        if !self
+            .verifier
+            .verify(&signing_input(&aad, &frame.payload.0), &frame.sig)
+        {
+            return Err(CryptoError::Media("sender signature invalid".into()));
+        }
+        let nonce = nonce_bytes(&self.salt, frame.counter);
         let plaintext = self
             .cipher
             .decrypt(

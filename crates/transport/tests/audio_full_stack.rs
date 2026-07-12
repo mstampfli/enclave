@@ -43,6 +43,7 @@ async fn clear_voice_in_garbage_on_wire_clear_voice_out() {
         DeviceId("alice".into()),
         &e.alice.identity_key(),
         1,
+        e.alice.media_signer().unwrap(),
     )
     .unwrap();
     let mut opener = MediaOpener::new(&root_bob, &GROUP, &e.alice.identity_key(), 1).unwrap();

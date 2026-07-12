@@ -23,6 +23,7 @@ async fn media_streams_over_udp_and_far_end_opens_it() {
         DeviceId(e.alice_handle.clone()),
         &e.alice.identity_key(),
         1,
+        e.alice.media_signer().unwrap(),
     )
     .unwrap();
     let mut opener = MediaOpener::new(&root_bob, &GROUP, &e.alice.identity_key(), 1).unwrap();

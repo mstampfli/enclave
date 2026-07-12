@@ -1010,6 +1010,7 @@ version = "0.0.0"
 dependencies = [
  "argon2",
  "chacha20poly1305 0.11.0",
+ "ed25519-dalek",
  "enclave-protocol",
  "getrandom 0.2.17",
  "hex",

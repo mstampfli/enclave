@@ -59,6 +59,12 @@ pub struct MediaFrame {
     /// Per-sender, per-epoch monotonic counter. Never reused. Nonce input.
     pub counter: u64,
     pub payload: Sealed,
+    /// The sender's Ed25519 signature over the header + ciphertext, proving the
+    /// frame was produced by the holder of the claimed sender's identity key.
+    /// Without this, any group member could seal a frame under another member's
+    /// (group-derivable) media key and impersonate them; the receiver verifies
+    /// this against the sender's roster public key and rejects a mismatch.
+    pub sig: Vec<u8>,
 }
 
 /// Client -> server messages over the (TLS) signaling channel.

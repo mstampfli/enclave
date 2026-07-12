@@ -709,6 +709,7 @@ impl Client {
                 me,
                 root_secret: group.media_root_secret(identity)?,
                 my_identity_key: identity.identity_key(),
+                signer: identity.media_signer()?,
                 member_keys: group.member_keys().into_iter().collect(),
                 input_device: self.input_device.clone(),
                 output_device: self.output_device.clone(),

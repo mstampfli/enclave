@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 
-use enclave_crypto::{MediaOpener, MediaSealer};
+use enclave_crypto::{MediaOpener, MediaSealer, MediaSigner};
 use enclave_media::{AudioCapture, AudioDecoder, AudioEncoder, AudioPlayback};
 use enclave_protocol::{DeviceId, GroupId, MediaFrame, MediaKind};
 use enclave_transport::MediaSocket;
@@ -32,6 +32,8 @@ pub struct CallParams {
     pub me: String,
     pub root_secret: Vec<u8>,
     pub my_identity_key: Vec<u8>,
+    /// This sender's private signer, to authenticate every outgoing frame.
+    pub signer: MediaSigner,
     /// username -> identity key, to derive each sender's media key on receive.
     pub member_keys: HashMap<String, Vec<u8>>,
     /// Selected input device name, or `None` for the host default.
@@ -72,12 +74,19 @@ impl Call {
         let out_me = p.me.clone();
         let out_root = p.root_secret.clone();
         let out_key = p.my_identity_key.clone();
+        let out_signer = p.signer;
         std::thread::spawn(move || {
-            let mut sealer =
-                match MediaSealer::new(&out_root, out_group, DeviceId(out_me), &out_key, epoch) {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
+            let mut sealer = match MediaSealer::new(
+                &out_root,
+                out_group,
+                DeviceId(out_me),
+                &out_key,
+                epoch,
+                out_signer,
+            ) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
             let mut encoder = match AudioEncoder::new() {
                 Ok(e) => e,
                 Err(_) => return,

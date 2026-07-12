@@ -26,6 +26,7 @@ async fn two_clients_stream_sealed_audio_through_the_server() {
         DeviceId("alice".into()),
         &e.alice.identity_key(),
         1,
+        e.alice.media_signer().unwrap(),
     )
     .unwrap();
     let mut opener = MediaOpener::new(&root_bob, &GROUP, &e.alice.identity_key(), 1).unwrap();

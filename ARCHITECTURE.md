@@ -9,8 +9,10 @@ verify yourself.
 
 Each call and each DM is an **MLS group**. Members agree on a group secret via
 MLS (`openmls`); from its exporter secret each sender derives a media key and
-seals every *encoded* frame with an AEAD (ChaCha20-Poly1305), SFrame-style. The
-self-hosted server routes those sealed frames (SFU fan-out) and relays MLS
+seals every *encoded* frame with an AEAD (ChaCha20-Poly1305), SFrame-style, then
+**signs it with their Ed25519 identity key** so no other member can impersonate
+them at the media layer (the AEAD key is group-derivable; the signature is not).
+The self-hosted server routes those sealed frames (SFU fan-out) and relays MLS
 handshake messages, encrypted text, and presence -- all opaque to it except
 routing metadata.
 
@@ -132,10 +134,12 @@ window by default and only add the WASM/browser target when we choose to.
    unchanged and never sees the plaintext).
 3. [DONE, minus device I/O] Audio pipeline end to end. `enclave-crypto::media`
    (SFrame-style per-frame ChaCha20-Poly1305 keyed from the media root secret;
-   monotonic-counter `MediaSealer`, anti-replay `MediaOpener`) +
+   monotonic-counter `MediaSealer`, anti-replay `MediaOpener`; every frame also
+   Ed25519-signed by the sender and verified against the roster key, so a member
+   cannot impersonate another sender at the media layer -- see `MediaSigner`) +
    `enclave-media::audio` (Opus 48 kHz/20 ms). Proven by
-   `crates/crypto/tests/media_seal.rs` (14 cases: opaque wire, tamper/forgery/
-   replay/cross-epoch rejected, out-of-order tolerated) and
+   `crates/crypto/tests/media_seal.rs` (opaque wire; tamper/forgery/
+   impersonation/replay/cross-epoch rejected, out-of-order tolerated) and
    `crates/transport/tests/audio_full_stack.rs` (tone -> encode -> seal -> relay
    -> open -> decode -> clear voice; wire carries only ciphertext).
    **Media carrier:** a low-latency UDP path (`serve_media` + `MediaSocket`)

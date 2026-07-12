@@ -63,6 +63,17 @@ impl Identity {
         self.signer.to_public_vec()
     }
 
+    /// A [`MediaSigner`] over this device's Ed25519 identity key, for signing
+    /// outgoing media frames. It signs through a clone of the MLS keypair; the
+    /// private key never leaves the crypto crate. Fails if the identity is not
+    /// Ed25519 (the fixed ciphersuite is, so this only guards a future change).
+    pub fn media_signer(&self) -> Result<crate::MediaSigner, CryptoError> {
+        if self.signer.signature_scheme() != CIPHERSUITE.signature_algorithm() {
+            return Err(CryptoError::Identity("identity is not Ed25519".into()));
+        }
+        Ok(crate::MediaSigner::from_keypair(self.signer.clone()))
+    }
+
     /// Snapshot this device's entire MLS storage (all group states and private
     /// keys) so a session can be persisted. It contains private key material and
     /// MUST be encrypted before it touches disk.

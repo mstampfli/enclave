@@ -24,7 +24,7 @@ pub mod media;
 pub use error::CryptoError;
 pub use group::{Group, MemberAdd, SafetyNumber, TextMessage};
 pub use identity::Identity;
-pub use media::{MediaOpener, MediaSealer};
+pub use media::{MediaOpener, MediaSealer, MediaSigner, MEDIA_SIG_CONTEXT};
 
 /// The single ciphersuite Enclave uses: X25519 KEM, AES-128-GCM, SHA-256, and
 /// Ed25519 signatures. One fixed ciphersuite (not a negotiated set) keeps the

@@ -76,6 +76,7 @@ fn three_members_agree_then_rekey_on_leave() {
         DeviceId("alice-1".into()),
         &alice.identity_key(),
         new_epoch,
+        alice.media_signer().unwrap(),
     )
     .unwrap();
     let frame = sealer
