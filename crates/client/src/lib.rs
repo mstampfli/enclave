@@ -75,12 +75,15 @@ pub enum Event {
     },
     /// `from` (display name) declined our call in conversation `conv`.
     CallDeclined { conv: String, from: String },
-    /// An H.264 screen frame from `from` (display name) to show in the viewer.
-    /// `data` is the Annex-B bytes; the UI decodes it with WebCodecs.
+    /// An H.264 video frame from `from` (display name) to show in the UI.
+    /// `data` is the Annex-B bytes; the UI decodes it with WebCodecs. `camera`
+    /// routes it: a per-user webcam tile (`true`) or the full-screen share
+    /// viewer (`false`).
     ScreenFrame {
         from: String,
         data: Vec<u8>,
         keyframe: bool,
+        camera: bool,
     },
     /// A non-fatal error worth showing.
     Error(String),
@@ -839,14 +842,36 @@ impl Client {
         }
     }
 
-    /// Start sharing this device's screen into the current call. Requires being
-    /// in the call (the media session carries both audio and screen).
-    pub fn start_screen_share(&mut self) -> Result<(), ClientError> {
+    /// The monitors available to share (index + name), for a source picker.
+    #[cfg(windows)]
+    pub fn screen_sources(&self) -> Vec<(usize, String)> {
+        enclave_media::monitor_sources()
+            .into_iter()
+            .map(|s| (s.index, s.name))
+            .collect()
+    }
+
+    #[cfg(not(windows))]
+    pub fn screen_sources(&self) -> Vec<(usize, String)> {
+        Vec::new()
+    }
+
+    /// The cameras available to share (index + name), for a source picker.
+    pub fn camera_sources(&self) -> Vec<(u32, String)> {
+        enclave_media::camera_sources()
+            .into_iter()
+            .map(|s| (s.index, s.name))
+            .collect()
+    }
+
+    /// Start sharing a monitor into the current call. Requires being in the call
+    /// (the media session carries audio, screen, and camera together).
+    pub fn start_screen_share(&mut self, monitor_index: usize) -> Result<(), ClientError> {
         let call = self
             .call
             .as_mut()
             .ok_or_else(|| ClientError::Audio("join the call before sharing".into()))?;
-        call.start_screen()
+        call.start_screen(monitor_index)
     }
 
     /// Stop sharing the screen (the call keeps running).
@@ -859,6 +884,27 @@ impl Client {
     /// Whether we are currently sharing our screen.
     pub fn is_sharing(&self) -> bool {
         self.call.as_ref().is_some_and(|c| c.is_sharing())
+    }
+
+    /// Start sharing a camera into the current call.
+    pub fn start_camera(&mut self, camera_index: u32) -> Result<(), ClientError> {
+        let call = self
+            .call
+            .as_mut()
+            .ok_or_else(|| ClientError::Audio("join the call before sharing camera".into()))?;
+        call.start_camera(camera_index)
+    }
+
+    /// Stop sharing the camera (the call keeps running).
+    pub fn stop_camera(&mut self) {
+        if let Some(call) = self.call.as_mut() {
+            call.stop_camera();
+        }
+    }
+
+    /// Whether our camera is currently being shared.
+    pub fn is_camera_on(&self) -> bool {
+        self.call.as_ref().is_some_and(|c| c.is_camera_on())
     }
 
     /// Mute or unmute our microphone for the current call.
@@ -1114,6 +1160,7 @@ impl Client {
                         from: self.display_of(&sf.from),
                         data: sf.h264,
                         keyframe: sf.keyframe,
+                        camera: sf.camera,
                     });
                 }
                 Src::Msg(msg) => {

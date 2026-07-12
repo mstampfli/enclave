@@ -10,6 +10,7 @@ license.workspace = true
 audiopus = "0.2.0"
 cpal = "0.18.1"
 enclave-protocol = { path = "../protocol" }
+nokhwa = { version = "0.10", default-features = false, features = ["input-native"] }
 openh264 = "0.9"
 thiserror.workspace = true
 

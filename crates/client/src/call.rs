@@ -30,13 +30,16 @@ use tokio::task::JoinHandle;
 
 use crate::ClientError;
 
-/// An H.264 screen frame received from a peer, forwarded to the UI (which
-/// decodes it with WebCodecs).
+/// An H.264 video frame to show in the UI (which decodes it with WebCodecs).
+/// Either a peer's frame (received + opened) or our own camera, looped back for
+/// a local self-preview. `camera` picks the destination: a webcam tile
+/// (`true`) or the full-screen share viewer (`false`).
 #[derive(Debug, Clone)]
 pub struct ScreenFrameOut {
     pub from: String,
     pub h264: Vec<u8>,
     pub keyframe: bool,
+    pub camera: bool,
 }
 
 /// Everything a media session needs, gathered from the live conversation before
@@ -55,13 +58,14 @@ pub struct CallParams {
     pub output_device: Option<String>,
 }
 
-/// A running screen-share sender.
-struct ScreenSender {
+/// A running video sender (screen share or camera). Dropping it stops the
+/// capture thread.
+struct VideoSender {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Drop for ScreenSender {
+impl Drop for VideoSender {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
@@ -85,7 +89,13 @@ pub struct Call {
     recv_task: JoinHandle<()>,
     input_device: Option<String>,
     output_device: Option<String>,
-    screen: Option<ScreenSender>,
+    screen: Option<VideoSender>,
+    camera: Option<VideoSender>,
+    /// Our own username, tagged on locally looped-back camera preview frames.
+    me: String,
+    /// A clone of the UI frame channel so the camera sender can loop our own
+    /// video back for a local self-preview (peers never see themselves).
+    local_frame_tx: UnboundedSender<ScreenFrameOut>,
     /// When set, the mic is not transmitted (local mute).
     muted: Arc<AtomicBool>,
     /// When set, incoming audio is not played (deafen).
@@ -169,10 +179,13 @@ impl Call {
         // speaker, screen to the UI.
         let (raw_tx, raw_rx) = std_mpsc::channel::<MediaFrame>();
         let (screen_tx, screen_rx) = tokio::sync::mpsc::unbounded_channel::<ScreenFrameOut>();
+        // The camera sender loops our own preview back through the same channel.
+        let local_frame_tx = screen_tx.clone();
         let in_root = p.root_secret;
         let in_group = p.group;
         let members = p.member_keys;
         let in_me = p.me;
+        let me = in_me.clone();
         let decode_sink = sink_slot.clone();
         let deafened = Arc::new(AtomicBool::new(false));
         let decode_deafened = deafened.clone();
@@ -217,6 +230,7 @@ impl Call {
                             from: sender.clone(),
                             h264: packet,
                             keyframe,
+                            camera: frame.kind == MediaKind::Video,
                         });
                     }
                 }
@@ -245,6 +259,9 @@ impl Call {
             input_device: p.input_device,
             output_device: p.output_device,
             screen: None,
+            camera: None,
+            me,
+            local_frame_tx,
             muted,
             deafened,
         };
@@ -294,65 +311,37 @@ impl Call {
         Ok(())
     }
 
-    /// Start sharing the primary screen: capture -> H.264 -> seal (via the shared
-    /// sealer) -> send, on a dedicated thread. A keyframe is emitted periodically
-    /// so a viewer who joins mid-share recovers within a couple of seconds.
+    /// Start sharing a monitor (`monitor_index` is a zero-based index from
+    /// [`enclave_media::monitor_sources`]): capture -> H.264 -> seal (via the
+    /// shared sealer) -> send, on a dedicated thread. A keyframe is emitted
+    /// periodically so a viewer who joins mid-share recovers within a couple of
+    /// seconds. Screen frames go out as [`MediaKind::Screen`] (the full-screen
+    /// viewer); camera frames use [`MediaKind::Video`] (per-user tiles), so a
+    /// user may share screen and camera at once without the two streams
+    /// colliding on the receiver's decoder.
     #[cfg(windows)]
-    pub fn start_screen(&mut self) -> Result<(), ClientError> {
-        use enclave_media::{H264Encoder, ScreenCapture};
-        use std::time::{Duration, Instant};
+    pub fn start_screen(&mut self, monitor_index: usize) -> Result<(), ClientError> {
+        use enclave_media::ScreenCapture;
 
         if self.screen.is_some() {
             return Ok(());
         }
-        let capture = ScreenCapture::start_primary().map_err(audio)?;
+        let capture = ScreenCapture::start_index(monitor_index).map_err(audio)?;
         let sealer = self.sealer.clone();
         let frame_tx = self.frame_tx.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
         let thread = std::thread::spawn(move || {
-            let mut encoder = match H264Encoder::new(6_000_000, 30.0) {
-                Ok(e) => e,
-                Err(_) => return,
-            };
-            let target = Duration::from_millis(33); // ~30 fps
-            let mut n: u64 = 0;
-            while !s.load(Ordering::Relaxed) {
-                let started = Instant::now();
-                if let Some(cf) = capture.latest() {
-                    // Crop to even dimensions, de-stride if the width is odd.
-                    let w = cf.width & !1;
-                    let h = cf.height & !1;
-                    let tight = if w == cf.width {
-                        cf.bgra[..w * h * 4].to_vec()
-                    } else {
-                        let mut t = Vec::with_capacity(w * h * 4);
-                        for row in 0..h {
-                            let off = row * cf.width * 4;
-                            t.extend_from_slice(&cf.bgra[off..off + w * 4]);
-                        }
-                        t
-                    };
-                    let force_key = n.is_multiple_of(60); // keyframe every ~2 s and at start
-                    if let Ok((h264, _key)) = encoder.encode(&tight, w, h, force_key) {
-                        if !h264.is_empty() {
-                            let sealed = sealer.lock().unwrap().seal(MediaKind::Screen, &h264);
-                            if let Ok(frame) = sealed {
-                                if frame_tx.send(frame).is_err() {
-                                    break;
-                                }
-                            }
-                            n += 1;
-                        }
-                    }
-                }
-                let elapsed = started.elapsed();
-                if elapsed < target {
-                    std::thread::sleep(target - elapsed);
-                }
-            }
+            video_encode_loop(
+                &s,
+                MediaKind::Screen,
+                &sealer,
+                &frame_tx,
+                None,
+                || capture.latest().map(|cf| (cf.bgra, cf.width, cf.height)),
+            );
         });
-        self.screen = Some(ScreenSender {
+        self.screen = Some(VideoSender {
             stop,
             thread: Some(thread),
         });
@@ -360,7 +349,7 @@ impl Call {
     }
 
     #[cfg(not(windows))]
-    pub fn start_screen(&mut self) -> Result<(), ClientError> {
+    pub fn start_screen(&mut self, _monitor_index: usize) -> Result<(), ClientError> {
         Err(ClientError::Audio("screen share is Windows-only".into()))
     }
 
@@ -368,13 +357,152 @@ impl Call {
     pub fn stop_screen(&mut self) {
         self.screen = None; // Drop stops the thread and the capture.
     }
+
+    /// Whether our camera is currently being shared.
+    pub fn is_camera_on(&self) -> bool {
+        self.camera.is_some()
+    }
+
+    /// Start sharing a camera (`camera_index` from
+    /// [`enclave_media::camera_sources`], 0 = default): capture -> H.264 -> seal
+    /// as [`MediaKind::Video`] -> send, on a dedicated thread. The same frames
+    /// are looped back locally (tagged with our own name) so we see our own
+    /// preview tile without opening the camera twice.
+    pub fn start_camera(&mut self, camera_index: u32) -> Result<(), ClientError> {
+        use enclave_media::CameraCapture;
+
+        if self.camera.is_some() {
+            return Ok(());
+        }
+        let sealer = self.sealer.clone();
+        let frame_tx = self.frame_tx.clone();
+        let preview_tx = self.local_frame_tx.clone();
+        let me = self.me.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        // The camera device is !Send: open and pump it entirely on this thread,
+        // reporting an open failure (bad index / busy device) back to the caller.
+        let (init_tx, init_rx) = std_mpsc::channel::<Result<(), String>>();
+        let thread = std::thread::spawn(move || {
+            let mut capture = match CameraCapture::open(camera_index) {
+                Ok(c) => {
+                    let _ = init_tx.send(Ok(()));
+                    c
+                }
+                Err(e) => {
+                    let _ = init_tx.send(Err(e.to_string()));
+                    return;
+                }
+            };
+            video_encode_loop(
+                &s,
+                MediaKind::Video,
+                &sealer,
+                &frame_tx,
+                Some((preview_tx, me)),
+                move || capture.next_bgra().ok().map(|(b, w, h)| (b.to_vec(), w, h)),
+            );
+        });
+        match init_rx.recv() {
+            Ok(Ok(())) => {
+                self.camera = Some(VideoSender {
+                    stop,
+                    thread: Some(thread),
+                });
+                Ok(())
+            }
+            Ok(Err(e)) => Err(ClientError::Audio(e)),
+            Err(_) => Err(ClientError::Audio("camera thread died".into())),
+        }
+    }
+
+    /// Stop sharing the camera (keeps the call running).
+    pub fn stop_camera(&mut self) {
+        self.camera = None; // Drop stops the thread and closes the device.
+    }
+}
+
+/// The shared video send loop for both screen share and camera. Pulls BGRA
+/// frames from `next_frame`, crops to even dimensions, H.264-encodes with a
+/// periodic keyframe, seals with `kind`, and sends. If `preview` is set (camera
+/// only), each encoded frame is also looped back locally for a self-preview.
+/// Paced to ~30 fps: a source whose read already blocks for the frame interval
+/// (a camera) incurs no extra sleep; an instant source (screen) is throttled.
+fn video_encode_loop<F>(
+    stop: &AtomicBool,
+    kind: MediaKind,
+    sealer: &Arc<Mutex<MediaSealer>>,
+    frame_tx: &UnboundedSender<MediaFrame>,
+    preview: Option<(UnboundedSender<ScreenFrameOut>, String)>,
+    mut next_frame: F,
+) where
+    F: FnMut() -> Option<(Vec<u8>, usize, usize)>,
+{
+    use enclave_media::H264Encoder;
+    use std::time::{Duration, Instant};
+
+    let mut encoder = match H264Encoder::new(6_000_000, 30.0) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let target = Duration::from_millis(33); // ~30 fps
+    let mut n: u64 = 0;
+    while !stop.load(Ordering::Relaxed) {
+        let started = Instant::now();
+        if let Some((bgra, cw, ch)) = next_frame() {
+            // Crop to even dimensions (H.264 needs them); de-stride if odd.
+            let w = cw & !1;
+            let h = ch & !1;
+            if w != 0 && h != 0 && bgra.len() >= cw * ch * 4 {
+                let tight = if w == cw {
+                    bgra[..w * h * 4].to_vec()
+                } else {
+                    let mut t = Vec::with_capacity(w * h * 4);
+                    for row in 0..h {
+                        let off = row * cw * 4;
+                        t.extend_from_slice(&bgra[off..off + w * 4]);
+                    }
+                    t
+                };
+                let force_key = n.is_multiple_of(60); // keyframe every ~2 s and at start
+                if let Ok((h264, key)) = encoder.encode(&tight, w, h, force_key) {
+                    if !h264.is_empty() {
+                        // Camera self-preview: show our own frames locally
+                        // without transmitting them back to ourselves.
+                        if let Some((preview_tx, me)) = &preview {
+                            let _ = preview_tx.send(ScreenFrameOut {
+                                from: me.clone(),
+                                h264: h264.clone(),
+                                keyframe: key,
+                                camera: kind == MediaKind::Video,
+                            });
+                        }
+                        let sealed = sealer.lock().unwrap().seal(kind, &h264);
+                        match sealed {
+                            Ok(frame) => {
+                                if frame_tx.send(frame).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                        n += 1;
+                    }
+                }
+            }
+        }
+        let elapsed = started.elapsed();
+        if elapsed < target {
+            std::thread::sleep(target - elapsed);
+        }
+    }
 }
 
 impl Drop for Call {
     fn drop(&mut self) {
         self.send_task.abort();
         self.recv_task.abort();
-        // Dropping the fields stops capture/playback/screen and closes channels.
+        // Dropping the fields stops capture/playback/screen/camera and channels.
     }
 }
 

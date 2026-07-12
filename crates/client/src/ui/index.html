@@ -197,6 +197,22 @@
   .danger-btn:hover { background: #b02c30; }
   .status { padding: 0 16px 8px; color: var(--muted); font-size: 12px; min-height: 16px; }
   .status.err { color: #f38688; }
+  /* Camera tiles: a live webcam turns the circle into a 16:9 rounded rect. */
+  .call-tile.cam { width: auto; }
+  .call-tile.cam .call-avatar { width: 128px; height: 72px; border-radius: 10px; background: #000; overflow: hidden; padding: 0; }
+  .call-tile.cam .call-letter { display: none; }
+  .call-avatar canvas { display: none; }
+  .call-tile.cam .call-avatar canvas { display: block; width: 100%; height: 100%; object-fit: cover; }
+  .call-tile.cam.self .call-avatar canvas { transform: scaleX(-1); } /* mirror own preview */
+  /* Share-source picker */
+  .share-list { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow-y: auto; }
+  .share-row { display: flex; align-items: center; gap: 10px; padding: 9px 11px; border-radius: 8px; background: var(--sidebar); cursor: pointer; text-align: left; }
+  .share-row:hover { background: var(--hover); }
+  .share-row .ico { font-size: 15px; }
+  .share-empty { color: var(--muted); font-size: 13px; padding: 6px 2px; }
+  .share-head { margin: 12px 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .share-head:first-child { margin-top: 0; }
+  .share-audio { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: var(--muted); font-size: 13px; }
 </style>
 </head>
 <body>
@@ -344,6 +360,21 @@
     </div>
   </div>
 
+  <div id="share-modal" class="overlay" hidden>
+    <div class="modal">
+      <h2>Share to call</h2>
+      <div class="share-head">Screens</div>
+      <div id="share-screens" class="share-list"><div class="share-empty">Looking for displays...</div></div>
+      <div class="share-head">Cameras</div>
+      <div id="share-cameras" class="share-list"><div class="share-empty">Looking for cameras...</div></div>
+      <label class="share-audio"><input id="share-audio" type="checkbox" disabled /> Share system audio <span class="hint">(coming soon)</span></label>
+      <p class="hint">Sharing a specific application window is coming soon.</p>
+      <div class="modal-actions">
+        <button id="share-close" class="primary">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   <div id="screen-viewer" hidden>
     <div class="sv-head">
       <span id="sv-title"></span>
@@ -430,6 +461,7 @@
   }
   function handleScreenFrame(ev) {
     if (typeof VideoDecoder === "undefined") return; // no WebCodecs support
+    if (ev.camera) { handleCameraFrame(ev); return; }
     currentSharer = ev.from;
     if (svTimer) clearTimeout(svTimer);
     svTimer = setTimeout(streamEnded, 2500); // the sharer went quiet
@@ -444,6 +476,86 @@
       svDecoder.decode(new EncodedVideoChunk({ type: ev.keyframe ? "key" : "delta", timestamp: svTs, data: b64ToBytes(ev.data) }));
       svTs += 33333;
     } catch (e) { console.error("decode", e); }
+  }
+
+  // ---- per-participant camera tiles (WebCodecs H.264 -> tile canvas) ----
+  // Each sharer gets a persistent canvas + decoder so the stream survives tile
+  // re-renders; a quiet stream (no frames for 2.5 s) drops the tile.
+  const camCanvas = {};   // display name -> HTMLCanvasElement
+  const camState = {};    // display name -> { decoder, gotKey, ts, timer }
+  function camGone(name) {
+    const st = camState[name];
+    if (st) { if (st.timer) clearTimeout(st.timer); try { st.decoder.close(); } catch (e) {} }
+    delete camState[name];
+    delete camCanvas[name];
+    renderCall();
+  }
+  function handleCameraFrame(ev) {
+    const name = ev.from;
+    const fresh = !camState[name];
+    if (fresh) {
+      const canvas = document.createElement("canvas");
+      camCanvas[name] = canvas;
+      const ctx = canvas.getContext("2d");
+      const decoder = new VideoDecoder({
+        output: (frame) => {
+          if (canvas.width !== frame.displayWidth) { canvas.width = frame.displayWidth; canvas.height = frame.displayHeight; }
+          ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+          frame.close();
+        },
+        error: (e) => { console.error("camera decoder", e); camGone(name); },
+      });
+      try { decoder.configure({ codec: "avc1.42E01E", optimizeForLatency: true }); }
+      catch (e) { console.error("camera configure", e); delete camCanvas[name]; return; }
+      camState[name] = { decoder, gotKey: false, ts: 0, timer: null };
+    }
+    const st = camState[name];
+    if (st.timer) clearTimeout(st.timer);
+    st.timer = setTimeout(() => camGone(name), 2500);
+    if (!st.gotKey && !ev.keyframe) { if (fresh) renderCall(); return; }
+    st.gotKey = true;
+    try {
+      st.decoder.decode(new EncodedVideoChunk({ type: ev.keyframe ? "key" : "delta", timestamp: st.ts, data: b64ToBytes(ev.data) }));
+      st.ts += 33333;
+    } catch (e) { console.error("camera decode", e); }
+    if (fresh) renderCall(); // place the new tile canvas
+  }
+  function clearAllCameras() {
+    for (const name of Object.keys(camState)) {
+      const st = camState[name];
+      if (st.timer) clearTimeout(st.timer);
+      try { st.decoder.close(); } catch (e) {}
+      delete camState[name]; delete camCanvas[name];
+    }
+  }
+
+  // ---- share-source picker ----
+  function openShareModal() {
+    $("share-screens").innerHTML = '<div class="share-empty">Looking for displays...</div>';
+    $("share-cameras").innerHTML = '<div class="share-empty">Looking for cameras...</div>';
+    $("share-modal").hidden = false;
+    send({ type: "ListShareSources" });
+  }
+  function fillShareList(boxId, items, kind) {
+    const box = $(boxId);
+    box.innerHTML = "";
+    if (!items || !items.length) {
+      box.innerHTML = '<div class="share-empty">' + (kind === "screen" ? "No displays found" : "No cameras found") + "</div>";
+      return;
+    }
+    for (const it of items) {
+      const row = document.createElement("button");
+      row.className = "share-row";
+      row.innerHTML = '<span class="ico"></span><span class="lbl"></span>';
+      row.querySelector(".ico").textContent = kind === "screen" ? "[]" : "()";
+      row.querySelector(".lbl").textContent = it.name || (kind === "screen" ? "Display " + it.id : "Camera " + it.id);
+      row.addEventListener("click", () => {
+        $("share-modal").hidden = true;
+        if (kind === "screen") send({ type: "StartScreenShare", monitor: it.id });
+        else send({ type: "StartCamera", camera: it.id });
+      });
+      box.appendChild(row);
+    }
   }
 
   // A short in-app "ding" for a message arriving in a non-focused conversation.
@@ -517,6 +629,7 @@
   function leaveCall() {
     send({ type: "LeaveCall" });
     inCall = false; myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false;
+    clearAllCameras();
     renderCall();
   }
   // Am I in the active conversation's call? Trust the client flag OR the server's
@@ -535,8 +648,12 @@
       const tile = document.createElement("div");
       tile.className = "call-tile";
       if (name === myDisplay && muted) tile.classList.add("muted");
-      tile.innerHTML = '<div class="call-avatar"></div><span class="call-name"></span>';
-      tile.querySelector(".call-avatar").textContent = initial(name);
+      const cam = camCanvas[name];
+      if (cam) { tile.classList.add("cam"); if (name === myDisplay) tile.classList.add("self"); }
+      tile.innerHTML = '<div class="call-avatar"><span class="call-letter"></span></div><span class="call-name"></span>';
+      const avatar = tile.querySelector(".call-avatar");
+      avatar.querySelector(".call-letter").textContent = initial(name);
+      if (cam) avatar.appendChild(cam); // live webcam replaces the letter
       tile.querySelector(".call-name").textContent = name === myDisplay ? (name + " (you)") : name;
       box.appendChild(tile);
     }
@@ -664,7 +781,7 @@
   });
   $("call-banner-btn").addEventListener("click", () => joinCall(activeConv));
   $("share-btn").addEventListener("click", () => {
-    send({ type: sharing ? "StopScreenShare" : "StartScreenShare" });
+    if (sharing) send({ type: "StopScreenShare" }); else openShareModal();
   });
   $("mute-btn").addEventListener("click", () => {
     muted = !muted;
@@ -676,8 +793,9 @@
   // Call-panel controls.
   $("cc-mute").addEventListener("click", () => { muted = !muted; send({ type: "SetMuted", muted }); renderCall(); });
   $("cc-deafen").addEventListener("click", () => { deafened = !deafened; send({ type: "SetDeafened", deafened }); renderCall(); });
-  $("cc-share").addEventListener("click", () => { send({ type: sharing ? "StopScreenShare" : "StartScreenShare" }); });
-  $("cc-camera").addEventListener("click", () => { send({ type: cameraOn ? "StopCamera" : "StartCamera" }); });
+  $("cc-share").addEventListener("click", () => { if (sharing) send({ type: "StopScreenShare" }); else openShareModal(); });
+  $("cc-camera").addEventListener("click", () => { if (cameraOn) { send({ type: "StopCamera" }); camGone(myDisplay); } else openShareModal(); });
+  $("share-close").addEventListener("click", () => { $("share-modal").hidden = true; });
   $("cc-leave").addEventListener("click", leaveCall);
   $("ring-accept").addEventListener("click", () => { if (ringConv) joinCall(ringConv); });
   $("ring-decline").addEventListener("click", () => {
@@ -843,7 +961,7 @@
     $("app-view").hidden = true; $("login-view").hidden = false;
     myUsername = ""; myDisplay = ""; friends = []; incoming = []; outgoing = []; conversations = []; activeConv = null;
     inCall = false; myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false;
-    watchingStream = true; currentSharer = ""; dismissRing(); streamEnded();
+    watchingStream = true; currentSharer = ""; dismissRing(); streamEnded(); clearAllCameras();
     for (const k in callPart) delete callPart[k];
     for (const k in unread) delete unread[k];
     $("call-btn").classList.remove("in-call"); $("call-banner").hidden = true; $("call-panel").hidden = true;
@@ -884,7 +1002,7 @@
         break;
       case "CallState":
         inCall = ev.in_call;
-        if (!inCall) { myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false; }
+        if (!inCall) { myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false; clearAllCameras(); }
         renderCall();
         break;
       case "CallOffer":
@@ -917,6 +1035,15 @@
       case "ScreenShareState":
         sharing = ev.sharing;
         renderCall();
+        break;
+      case "CameraState":
+        cameraOn = ev.on;
+        if (!ev.on) camGone(myDisplay); // drop my own preview immediately
+        renderCall();
+        break;
+      case "ShareSources":
+        fillShareList("share-screens", ev.screens, "screen");
+        fillShareList("share-cameras", ev.cameras, "camera");
         break;
       case "Connection": {
         const b = $("conn-banner");

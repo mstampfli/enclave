@@ -27,6 +27,34 @@ pub struct CapturedFrame {
     pub height: usize,
 }
 
+/// A monitor the user can pick to share: its zero-based `index` (pass to
+/// [`ScreenCapture::start_index`]) and a human-readable `name`.
+#[derive(Debug, Clone)]
+pub struct ScreenSource {
+    pub index: usize,
+    pub name: String,
+}
+
+/// Enumerate the monitors attached to this machine. Best-effort: returns an
+/// empty list if enumeration fails.
+pub fn monitor_sources() -> Vec<ScreenSource> {
+    let Ok(monitors) = Monitor::enumerate() else {
+        return Vec::new();
+    };
+    monitors
+        .into_iter()
+        .filter_map(|m| {
+            let index = m.index().ok()?;
+            // Prefer the friendly device name; fall back to a generic label.
+            let name = m
+                .device_name()
+                .or_else(|_| m.name())
+                .unwrap_or_else(|_| format!("Display {index}"));
+            Some(ScreenSource { index, name })
+        })
+        .collect()
+}
+
 /// Captures the primary monitor on a background thread, exposing the latest
 /// frame. Dropping it stops the capture.
 pub struct ScreenCapture {
@@ -39,8 +67,20 @@ impl ScreenCapture {
     /// Start capturing the primary monitor. Returns once capture has started (or
     /// with an error if the duplication device could not be created).
     pub fn start_primary() -> Result<Self, MediaError> {
-        let monitor =
-            Monitor::primary().map_err(|e| MediaError::Codec(format!("no primary monitor: {e}")))?;
+        let monitor = Monitor::primary()
+            .map_err(|e| MediaError::Codec(format!("no primary monitor: {e}")))?;
+        Self::start_on(monitor)
+    }
+
+    /// Start capturing a specific monitor by its zero-based index (see
+    /// [`monitor_sources`]).
+    pub fn start_index(index: usize) -> Result<Self, MediaError> {
+        let monitor = Monitor::from_index(index)
+            .map_err(|e| MediaError::Codec(format!("no monitor {index}: {e}")))?;
+        Self::start_on(monitor)
+    }
+
+    fn start_on(monitor: Monitor) -> Result<Self, MediaError> {
         let latest: Arc<Mutex<Option<CapturedFrame>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let l = latest.clone();

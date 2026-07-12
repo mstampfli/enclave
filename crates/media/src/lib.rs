@@ -13,21 +13,23 @@
 //! and video (Phase 5) build on top.
 
 pub mod audio;
+pub mod camera;
 pub mod device;
 pub mod error;
 pub mod frame;
 pub mod jitter;
-pub mod video;
 /// Windows screen capture (Windows Graphics Capture / DXGI duplication).
 #[cfg(windows)]
 pub mod screen;
+pub mod video;
 
 pub use audio::{AudioDecoder, AudioEncoder};
+pub use camera::{camera_sources, CameraCapture, CameraSource};
 pub use device::{
     input_device_names, output_device_names, AudioCapture, AudioPlayback, PlaybackSink,
 };
 pub use error::MediaError;
 pub use jitter::{JitterBuffer, Popped};
-pub use video::H264Encoder;
 #[cfg(windows)]
-pub use screen::{CapturedFrame, ScreenCapture};
+pub use screen::{monitor_sources, CapturedFrame, ScreenCapture, ScreenSource};
+pub use video::H264Encoder;

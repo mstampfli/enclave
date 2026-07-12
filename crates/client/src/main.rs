@@ -57,10 +57,20 @@ enum UiCommand {
     DeclineCall {
         conv: String,
     },
-    /// Start sharing this screen into the current call.
-    StartScreenShare,
+    /// Report the shareable screens + cameras, for the source picker.
+    ListShareSources,
+    /// Start sharing monitor `monitor` into the current call.
+    StartScreenShare {
+        monitor: usize,
+    },
     /// Stop sharing the screen.
     StopScreenShare,
+    /// Start sharing camera `camera` into the current call.
+    StartCamera {
+        camera: u32,
+    },
+    /// Stop sharing the camera.
+    StopCamera,
     /// Mute or unmute the microphone.
     SetMuted {
         muted: bool,
@@ -134,6 +144,13 @@ struct Line {
     mine: bool,
 }
 
+/// A shareable video source (monitor or camera) for the share picker.
+#[derive(serde::Serialize, Clone)]
+struct ShareSource {
+    id: u32,
+    name: String,
+}
+
 /// A conversation summary for the sidebar.
 #[derive(serde::Serialize, Clone)]
 struct ConvSummary {
@@ -201,15 +218,26 @@ enum UiEvent {
         conv: String,
         from: String,
     },
-    /// An H.264 screen frame (base64 Annex-B) from `from` to render via WebCodecs.
+    /// An H.264 video frame (base64 Annex-B) from `from` to render via
+    /// WebCodecs. `camera` routes it: a per-user webcam tile or the share viewer.
     ScreenFrame {
         from: String,
         data: String,
         keyframe: bool,
+        camera: bool,
     },
     /// Whether we are currently sharing our own screen.
     ScreenShareState {
         sharing: bool,
+    },
+    /// Whether our own camera is currently on.
+    CameraState {
+        on: bool,
+    },
+    /// The monitors and cameras this machine can share, for the picker.
+    ShareSources {
+        screens: Vec<ShareSource>,
+        cameras: Vec<ShareSource>,
     },
     /// Someone sent us a friend request.
     FriendRequest {
@@ -488,12 +516,14 @@ async fn run_client(
                     from,
                     data,
                     keyframe,
+                    camera,
                 } => emit(
                     &proxy,
                     UiEvent::ScreenFrame {
                         from,
                         data: base64_encode(&data),
                         keyframe,
+                        camera,
                     },
                 ),
                 Event::FriendsChanged => {
@@ -675,9 +705,27 @@ async fn handle_command(
                 c.decline_call(&conv);
             }
         }
-        UiCommand::StartScreenShare => {
+        UiCommand::ListShareSources => {
+            if let Some(c) = client.as_ref() {
+                let screens = c
+                    .screen_sources()
+                    .into_iter()
+                    .map(|(id, name)| ShareSource {
+                        id: id as u32,
+                        name,
+                    })
+                    .collect();
+                let cameras = c
+                    .camera_sources()
+                    .into_iter()
+                    .map(|(id, name)| ShareSource { id, name })
+                    .collect();
+                emit(proxy, UiEvent::ShareSources { screens, cameras });
+            }
+        }
+        UiCommand::StartScreenShare { monitor } => {
             if let Some(c) = client.as_mut() {
-                match c.start_screen_share() {
+                match c.start_screen_share(monitor) {
                     Ok(()) => emit(proxy, UiEvent::ScreenShareState { sharing: true }),
                     Err(e) => error_status(proxy, format!("Could not share screen: {e}")),
                 }
@@ -687,6 +735,20 @@ async fn handle_command(
             if let Some(c) = client.as_mut() {
                 c.stop_screen_share();
                 emit(proxy, UiEvent::ScreenShareState { sharing: false });
+            }
+        }
+        UiCommand::StartCamera { camera } => {
+            if let Some(c) = client.as_mut() {
+                match c.start_camera(camera) {
+                    Ok(()) => emit(proxy, UiEvent::CameraState { on: true }),
+                    Err(e) => error_status(proxy, format!("Could not share camera: {e}")),
+                }
+            }
+        }
+        UiCommand::StopCamera => {
+            if let Some(c) = client.as_mut() {
+                c.stop_camera();
+                emit(proxy, UiEvent::CameraState { on: false });
             }
         }
         UiCommand::SetMuted { muted } => {

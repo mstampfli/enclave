@@ -5,4 +5,6 @@
 pub enum MediaError {
     #[error("audio codec error: {0}")]
     Codec(String),
+    #[error("camera error: {0}")]
+    Camera(String),
 }
