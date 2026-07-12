@@ -88,6 +88,8 @@ pub struct Call {
     screen: Option<ScreenSender>,
     /// When set, the mic is not transmitted (local mute).
     muted: Arc<AtomicBool>,
+    /// When set, incoming audio is not played (deafen).
+    deafened: Arc<AtomicBool>,
 }
 
 impl Call {
@@ -172,6 +174,8 @@ impl Call {
         let members = p.member_keys;
         let in_me = p.me;
         let decode_sink = sink_slot.clone();
+        let deafened = Arc::new(AtomicBool::new(false));
+        let decode_deafened = deafened.clone();
         std::thread::spawn(move || {
             let Ok(mut decoder) = AudioDecoder::new() else {
                 return;
@@ -200,6 +204,9 @@ impl Call {
                 };
                 match frame.kind {
                     MediaKind::Audio => {
+                        if decode_deafened.load(Ordering::Relaxed) {
+                            continue;
+                        }
                         if let Ok(pcm) = decoder.decode(&packet) {
                             decode_sink.lock().unwrap().push(&pcm);
                         }
@@ -239,6 +246,7 @@ impl Call {
             output_device: p.output_device,
             screen: None,
             muted,
+            deafened,
         };
         Ok((call, screen_rx))
     }
@@ -256,6 +264,11 @@ impl Call {
     /// Whether the microphone is currently muted.
     pub fn is_muted(&self) -> bool {
         self.muted.load(Ordering::Relaxed)
+    }
+
+    /// Deafen or undeafen (stop/resume playing incoming audio).
+    pub fn set_deafened(&self, deafened: bool) {
+        self.deafened.store(deafened, Ordering::Relaxed);
     }
 
     /// Switch the microphone mid-session (see the device-swap notes on capture).

@@ -176,6 +176,19 @@
   .call-banner { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 16px; background: rgba(88,101,242,0.16); border-bottom: 1px solid var(--border); font-size: 13px; color: var(--text); }
   .call-banner button { background: var(--accent); }
   .call-banner button:hover { background: var(--accent-hover); }
+  .call-panel { display: flex; flex-direction: column; gap: 14px; padding: 16px; background: var(--rail); border-bottom: 1px solid var(--border); }
+  .call-tiles { display: flex; flex-wrap: wrap; gap: 14px; justify-content: center; }
+  .call-tile { display: flex; flex-direction: column; align-items: center; gap: 6px; width: 92px; }
+  .call-avatar { width: 60px; height: 60px; border-radius: 50%; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: 600; border: 2px solid transparent; }
+  .call-tile.speaking .call-avatar { border-color: #3ba55d; }
+  .call-tile.muted .call-avatar { border-color: var(--danger); }
+  .call-name { font-size: 12px; color: var(--text); max-width: 92px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .call-controls { display: flex; gap: 8px; justify-content: center; }
+  .cc-btn { background: var(--sidebar); color: var(--text); border-radius: 20px; padding: 8px 14px; font-size: 13px; }
+  .cc-btn:hover { background: var(--hover); }
+  .cc-btn.active { background: var(--accent); color: #fff; }
+  .cc-leave { background: var(--danger); color: #fff; }
+  .cc-leave:hover { background: #b02c30; }
   .ring-modal { align-items: center; text-align: center; }
   .ring-modal h2 { text-align: center; margin: 4px 0 0; }
   .ring-avatar { width: 64px; height: 64px; border-radius: 50%; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: 600; margin: 4px auto 0; }
@@ -285,6 +298,16 @@
         <span id="call-banner-text"></span>
         <button id="call-banner-btn" class="small">Join</button>
       </div>
+      <div id="call-panel" class="call-panel" hidden>
+        <div id="call-tiles" class="call-tiles"></div>
+        <div class="call-controls">
+          <button id="cc-mute" class="cc-btn" title="Mute your microphone">Mute</button>
+          <button id="cc-deafen" class="cc-btn" title="Deafen (silence everyone)">Deafen</button>
+          <button id="cc-share" class="cc-btn" title="Share your screen">Share</button>
+          <button id="cc-camera" class="cc-btn" title="Turn on your camera">Camera</button>
+          <button id="cc-leave" class="cc-btn cc-leave" title="Leave the call">Leave</button>
+        </div>
+      </div>
       <div id="empty-chat" class="empty-chat">Pick a friend or group to start talking.</div>
       <div id="log" class="log" hidden></div>
       <div id="status" class="status"></div>
@@ -359,6 +382,8 @@
   const unread = {};             // conv id -> unread message count
   let sharing = false;           // am I sharing my screen
   let muted = false;             // is my mic muted
+  let deafened = false;          // is my incoming audio silenced
+  let cameraOn = false;          // is my camera on
   let watchingStream = true;     // do I want to see an incoming screen share
   let currentSharer = "";        // who is currently sharing (empty = nobody)
 
@@ -491,7 +516,7 @@
   }
   function leaveCall() {
     send({ type: "LeaveCall" });
-    inCall = false; myCallConv = null; sharing = false; muted = false;
+    inCall = false; myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false;
     renderCall();
   }
   // Am I in the active conversation's call? Trust the client flag OR the server's
@@ -502,34 +527,55 @@
     if (myCallConv === activeConv) return true;
     return (callPart[activeConv] || []).includes(myDisplay);
   }
-  // Reflect current call state on the header button and the in-conversation banner.
+  // Build the participant circles for the call panel.
+  function renderCallTiles(parts) {
+    const box = $("call-tiles");
+    box.innerHTML = "";
+    for (const name of parts) {
+      const tile = document.createElement("div");
+      tile.className = "call-tile";
+      if (name === myDisplay && muted) tile.classList.add("muted");
+      tile.innerHTML = '<div class="call-avatar"></div><span class="call-name"></span>';
+      tile.querySelector(".call-avatar").textContent = initial(name);
+      tile.querySelector(".call-name").textContent = name === myDisplay ? (name + " (you)") : name;
+      box.appendChild(tile);
+    }
+  }
+  // Drive the header affordance, the in-call panel, and the join banner.
   function renderCall() {
     const conv = convById(activeConv);
-    const btn = $("call-btn"), banner = $("call-banner");
-    if (!conv || conv.pending) { btn.hidden = true; banner.hidden = true; return; }
+    if (!conv || conv.pending) {
+      for (const id of ["call-btn", "mute-btn", "share-btn", "watch-btn", "call-banner", "call-panel"]) $(id).hidden = true;
+      return;
+    }
     const parts = callPart[activeConv] || [];
     const active = parts.length > 0;
     const mineHere = amInThisCall();
-    // Keep myCallConv in sync once the server confirms we are a participant.
     if (mineHere && myCallConv !== activeConv) myCallConv = activeConv;
-    btn.hidden = false;
-    btn.textContent = mineHere ? "Leave call" : (active ? "Join call" : "Call");
-    btn.classList.toggle("in-call", mineHere);
-    // Mute + screen share are only available once you are in the call.
-    $("mute-btn").hidden = !mineHere;
-    $("mute-btn").textContent = muted ? "Unmute" : "Mute";
-    $("mute-btn").classList.toggle("in-call", muted);
-    $("share-btn").hidden = !mineHere;
-    $("share-btn").textContent = sharing ? "Stop sharing" : "Share screen";
-    $("share-btn").classList.toggle("in-call", sharing);
-    // Offer to (re)watch when someone is sharing but we are not viewing it.
+
+    // Header keeps only the start/join affordance; in-call controls live in the panel.
+    $("call-btn").hidden = mineHere;
+    if (!mineHere) { $("call-btn").textContent = active ? "Join call" : "Call"; $("call-btn").classList.remove("in-call"); }
+    $("mute-btn").hidden = true;
+    $("share-btn").hidden = true;
     $("watch-btn").hidden = !(currentSharer && !watchingStream);
+
+    // The Discord-style call panel while we are in this call.
+    const panel = $("call-panel");
     if (mineHere) {
-      const others = parts.filter((p) => p !== myDisplay);
-      banner.hidden = false;
-      $("call-banner-text").textContent = others.length ? ("In call with " + others.join(", ")) : "Waiting for others to join...";
-      $("call-banner-btn").hidden = true;
-    } else if (active) {
+      panel.hidden = false;
+      renderCallTiles(parts);
+      $("cc-mute").textContent = muted ? "Unmute" : "Mute"; $("cc-mute").classList.toggle("active", muted);
+      $("cc-deafen").textContent = deafened ? "Undeafen" : "Deafen"; $("cc-deafen").classList.toggle("active", deafened);
+      $("cc-share").textContent = sharing ? "Stop share" : "Share"; $("cc-share").classList.toggle("active", sharing);
+      $("cc-camera").textContent = cameraOn ? "Stop cam" : "Camera"; $("cc-camera").classList.toggle("active", cameraOn);
+    } else {
+      panel.hidden = true;
+    }
+
+    // Banner offers Join when there is a call we are not in.
+    const banner = $("call-banner");
+    if (active && !mineHere) {
       banner.hidden = false;
       $("call-banner-text").textContent = "Call in progress - " + parts.join(", ");
       $("call-banner-btn").hidden = false;
@@ -627,6 +673,12 @@
   });
   $("watch-btn").addEventListener("click", () => { watchingStream = true; renderCall(); });
   $("sv-close").addEventListener("click", stopViewing);
+  // Call-panel controls.
+  $("cc-mute").addEventListener("click", () => { muted = !muted; send({ type: "SetMuted", muted }); renderCall(); });
+  $("cc-deafen").addEventListener("click", () => { deafened = !deafened; send({ type: "SetDeafened", deafened }); renderCall(); });
+  $("cc-share").addEventListener("click", () => { send({ type: sharing ? "StopScreenShare" : "StartScreenShare" }); });
+  $("cc-camera").addEventListener("click", () => { send({ type: cameraOn ? "StopCamera" : "StartCamera" }); });
+  $("cc-leave").addEventListener("click", leaveCall);
   $("ring-accept").addEventListener("click", () => { if (ringConv) joinCall(ringConv); });
   $("ring-decline").addEventListener("click", () => {
     if (ringConv) send({ type: "DeclineCall", conv: ringConv });
@@ -790,11 +842,11 @@
   function showLogin() {
     $("app-view").hidden = true; $("login-view").hidden = false;
     myUsername = ""; myDisplay = ""; friends = []; incoming = []; outgoing = []; conversations = []; activeConv = null;
-    inCall = false; myCallConv = null; sharing = false; muted = false;
+    inCall = false; myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false;
     watchingStream = true; currentSharer = ""; dismissRing(); streamEnded();
     for (const k in callPart) delete callPart[k];
     for (const k in unread) delete unread[k];
-    $("call-btn").classList.remove("in-call"); $("call-banner").hidden = true;
+    $("call-btn").classList.remove("in-call"); $("call-banner").hidden = true; $("call-panel").hidden = true;
     $("conn-banner").hidden = true;
     $("audio-modal").hidden = true; $("group-modal").hidden = true;
     for (const k in messages) delete messages[k];
@@ -832,7 +884,7 @@
         break;
       case "CallState":
         inCall = ev.in_call;
-        if (!inCall) { myCallConv = null; sharing = false; muted = false; }
+        if (!inCall) { myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false; }
         renderCall();
         break;
       case "CallOffer":

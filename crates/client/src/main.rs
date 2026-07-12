@@ -65,6 +65,10 @@ enum UiCommand {
     SetMuted {
         muted: bool,
     },
+    /// Deafen or undeafen (mute incoming audio).
+    SetDeafened {
+        deafened: bool,
+    },
     /// Report the available audio devices + current selection (settings modal).
     ListAudioDevices,
     /// Choose the microphone (empty string = host default).
@@ -688,6 +692,11 @@ async fn handle_command(
         UiCommand::SetMuted { muted } => {
             if let Some(c) = client.as_ref() {
                 c.set_muted(muted);
+            }
+        }
+        UiCommand::SetDeafened { deafened } => {
+            if let Some(c) = client.as_ref() {
+                c.set_deafened(deafened);
             }
         }
         UiCommand::ListAudioDevices => {

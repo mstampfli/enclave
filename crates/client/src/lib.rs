@@ -873,6 +873,13 @@ impl Client {
         self.call.as_ref().is_some_and(|c| c.is_muted())
     }
 
+    /// Deafen or undeafen (mute/unmute incoming audio) for the current call.
+    pub fn set_deafened(&self, deafened: bool) {
+        if let Some(call) = self.call.as_ref() {
+            call.set_deafened(deafened);
+        }
+    }
+
     /// Decline an incoming call in conversation `conv_hex` (we were rung but will
     /// not join). The caller is notified; the UI falls back to a "call active"
     /// banner so we can still join later.
