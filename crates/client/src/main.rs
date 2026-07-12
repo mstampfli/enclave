@@ -49,6 +49,10 @@ enum UiCommand {
     StartCall,
     /// Leave the current voice call.
     LeaveCall,
+    /// Decline an incoming call in conversation `conv` (hex id).
+    DeclineCall {
+        conv: String,
+    },
     /// Report the available audio devices + current selection (settings modal).
     ListAudioDevices,
     /// Choose the microphone (empty string = host default).
@@ -156,6 +160,21 @@ enum UiEvent {
         outputs: Vec<String>,
         input: Option<String>,
         output: Option<String>,
+    },
+    /// An incoming call started in `conv`, from display name `from`: ring.
+    CallOffer {
+        conv: String,
+        from: String,
+    },
+    /// The participants of `conv`'s call (display names); empty = call ended.
+    CallParticipants {
+        conv: String,
+        participants: Vec<String>,
+    },
+    /// `from` declined our call in `conv`.
+    CallDeclined {
+        conv: String,
+        from: String,
     },
     /// Someone sent us a friend request.
     FriendRequest {
@@ -341,6 +360,13 @@ async fn run_client(
                     emit(&proxy, UiEvent::Presence { user, status })
                 }
                 Event::FriendRequest { from } => emit(&proxy, UiEvent::FriendRequest { from }),
+                Event::CallOffer { conv, from } => emit(&proxy, UiEvent::CallOffer { conv, from }),
+                Event::CallParticipants { conv, participants } => {
+                    emit(&proxy, UiEvent::CallParticipants { conv, participants })
+                }
+                Event::CallDeclined { conv, from } => {
+                    emit(&proxy, UiEvent::CallDeclined { conv, from })
+                }
                 Event::FriendsChanged => {
                     if let Some(c) = client.as_ref() {
                         emit(
@@ -475,6 +501,11 @@ async fn handle_command(
             if let Some(c) = client.as_mut() {
                 c.leave_call();
                 emit(proxy, UiEvent::CallState { in_call: false });
+            }
+        }
+        UiCommand::DeclineCall { conv } => {
+            if let Some(c) = client.as_mut() {
+                c.decline_call(&conv);
             }
         }
         UiCommand::ListAudioDevices => {

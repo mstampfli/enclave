@@ -49,6 +49,9 @@ pub struct Relay {
     /// Group routing fan-out sets: which devices should receive group traffic.
     /// Persisted, so conversations survive a server restart.
     groups: GroupStore,
+    /// Who is currently in the voice call of each group. Ephemeral (a call is a
+    /// live session): not persisted, and cleared as participants leave/disconnect.
+    active_calls: HashMap<GroupId, HashSet<DeviceId>>,
     /// Learned UDP endpoint per device, for the real-time media channel.
     udp_addrs: HashMap<DeviceId, SocketAddr>,
     /// The user on each connection (from Register), for presence.
@@ -124,6 +127,7 @@ impl Relay {
     /// and (if this was the user's last connection) broadcast that they went
     /// offline. Returns any presence updates to deliver.
     pub fn disconnect(&mut self, conn: ConnId) -> Vec<Outgoing> {
+        let mut out = Vec::new();
         if let Some(device) = self.conn_device.remove(&conn) {
             self.device_conn.remove(&device);
             self.udp_addrs.remove(&device);
@@ -131,6 +135,8 @@ impl Relay {
             // persisted, so a member who reconnects (or comes back after a server
             // restart) stays a routing member. Offline devices are already
             // skipped by fan-out (they are not in device_conn).
+            // But do drop them from any live call and tell the other participants.
+            out.extend(self.drop_from_calls(&device));
         }
         self.login_attempts.remove(&conn);
         self.pending_login.remove(&conn);
@@ -142,10 +148,10 @@ impl Relay {
         }
         if let Some(user) = self.conn_user.remove(&conn) {
             if !self.conn_user.values().any(|u| *u == user) {
-                return self.set_presence(&user, Presence::Offline);
+                out.extend(self.set_presence(&user, Presence::Offline));
             }
         }
-        vec![]
+        out
     }
 
     /// Establish an authenticated session for `conn`: map user/device, publish
@@ -676,7 +682,135 @@ impl Relay {
                     })
                     .collect()
             }
+
+            ClientMsg::JoinCall { group } => {
+                let device = self.device_for(from);
+                // Only a routing member of the group may join its call.
+                if !self.is_member(&group, &device) {
+                    return vec![];
+                }
+                let call = self.active_calls.entry(group.clone()).or_default();
+                let first = call.is_empty();
+                call.insert(device.clone());
+                let mut out = Vec::new();
+                // The first participant starts the call: ring the other members.
+                if first {
+                    let caller = device.0.clone();
+                    out.extend(self.ring_other_members(&group, &device, &caller));
+                }
+                out.extend(self.call_participants_broadcast(&group));
+                out
+            }
+
+            ClientMsg::LeaveCall { group } => {
+                let device = self.device_for(from);
+                if let Some(call) = self.active_calls.get_mut(&group) {
+                    call.remove(&device);
+                    if call.is_empty() {
+                        self.active_calls.remove(&group);
+                    }
+                }
+                self.call_participants_broadcast(&group)
+            }
+
+            ClientMsg::DeclineCall { group } => {
+                let device = self.device_for(from);
+                if !self.is_member(&group, &device) {
+                    return vec![];
+                }
+                self.call_participants(&group)
+                    .into_iter()
+                    .filter(|p| p != &device)
+                    .filter_map(|p| self.device_conn.get(&p).copied())
+                    .map(|conn| Outgoing {
+                        to: conn,
+                        msg: ServerMsg::CallDeclined {
+                            group: group.clone(),
+                            from: device.0.clone(),
+                        },
+                    })
+                    .collect()
+            }
         }
+    }
+
+    /// Deliver a `CallOffer` to every online routing member of `group` except
+    /// the caller, so their clients ring.
+    fn ring_other_members(
+        &self,
+        group: &GroupId,
+        caller_device: &DeviceId,
+        caller: &str,
+    ) -> Vec<Outgoing> {
+        let Some(members) = self.groups.members(group) else {
+            return vec![];
+        };
+        members
+            .iter()
+            .filter(|dev| *dev != caller_device)
+            .filter_map(|dev| self.device_conn.get(dev).copied())
+            .map(|conn| Outgoing {
+                to: conn,
+                msg: ServerMsg::CallOffer {
+                    group: group.clone(),
+                    from: caller.to_string(),
+                },
+            })
+            .collect()
+    }
+
+    /// The devices currently in `group`'s call.
+    fn call_participants(&self, group: &GroupId) -> Vec<DeviceId> {
+        self.active_calls
+            .get(group)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Push the current call participant list of `group` to every online routing
+    /// member (an empty list means the call has ended).
+    fn call_participants_broadcast(&self, group: &GroupId) -> Vec<Outgoing> {
+        let participants: Vec<String> = self
+            .call_participants(group)
+            .into_iter()
+            .map(|d| d.0)
+            .collect();
+        let Some(members) = self.groups.members(group) else {
+            return vec![];
+        };
+        members
+            .iter()
+            .filter_map(|dev| self.device_conn.get(dev).copied())
+            .map(|conn| Outgoing {
+                to: conn,
+                msg: ServerMsg::CallParticipants {
+                    group: group.clone(),
+                    participants: participants.clone(),
+                },
+            })
+            .collect()
+    }
+
+    /// Remove `device` from every call it was in, returning participant-update
+    /// broadcasts for the affected groups (used on disconnect).
+    fn drop_from_calls(&mut self, device: &DeviceId) -> Vec<Outgoing> {
+        let affected: Vec<GroupId> = self
+            .active_calls
+            .iter()
+            .filter(|(_, members)| members.contains(device))
+            .map(|(g, _)| g.clone())
+            .collect();
+        let mut out = Vec::new();
+        for g in affected {
+            if let Some(call) = self.active_calls.get_mut(&g) {
+                call.remove(device);
+                if call.is_empty() {
+                    self.active_calls.remove(&g);
+                }
+            }
+            out.extend(self.call_participants_broadcast(&g));
+        }
+        out
     }
 
     /// Claim `name` as a username if it is free (neither registered nor reserved

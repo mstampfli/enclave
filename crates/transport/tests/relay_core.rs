@@ -118,8 +118,18 @@ fn a_member_can_vouch_a_peer_back_into_a_forgotten_group() {
     let (b, bh) = register(&mut r, "b", vec![2]);
     let group = GroupId([7u8; 32]);
 
-    r.handle(a, ClientMsg::JoinGroup { group: group.clone() }); // a bootstraps
-    r.handle(b, ClientMsg::JoinGroup { group: group.clone() }); // b rejected (non-empty, not a member)
+    r.handle(
+        a,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    ); // a bootstraps
+    r.handle(
+        b,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    ); // b rejected (non-empty, not a member)
 
     // Before the vouch, a's message reaches no one (b is not a routing member).
     let out = r.handle(
@@ -161,7 +171,12 @@ fn a_non_member_cannot_vouch_or_self_join_to_eavesdrop() {
     let (m, mh) = register(&mut r, "m", vec![3]); // mallory
     let group = GroupId([8u8; 32]);
 
-    r.handle(a, ClientMsg::JoinGroup { group: group.clone() });
+    r.handle(
+        a,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    );
     r.handle(
         a,
         ClientMsg::AffirmMember {
@@ -178,7 +193,12 @@ fn a_non_member_cannot_vouch_or_self_join_to_eavesdrop() {
             member: DeviceId(mh),
         },
     );
-    r.handle(m, ClientMsg::JoinGroup { group: group.clone() });
+    r.handle(
+        m,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    );
 
     // a's message reaches b, never mallory.
     let out = r.handle(
@@ -191,6 +211,129 @@ fn a_non_member_cannot_vouch_or_self_join_to_eavesdrop() {
     let recipients: Vec<u64> = out.iter().map(|o| o.to).collect();
     assert_eq!(recipients, vec![b], "only b, never mallory");
     assert_ne!(out.first().map(|o| o.to), Some(m));
+}
+
+#[test]
+fn calling_rings_other_members_then_tracks_participants() {
+    let mut r = Relay::new();
+    let (a, ah) = register(&mut r, "a", vec![1]);
+    let (b, bh) = register(&mut r, "b", vec![2]);
+    let group = GroupId([12u8; 32]);
+    r.handle(
+        a,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    );
+    r.handle(
+        a,
+        ClientMsg::AffirmMember {
+            group: group.clone(),
+            member: DeviceId(bh.clone()),
+        },
+    );
+
+    // a starts the call -> b is rung, and members get the participant list [a].
+    let out = r.handle(
+        a,
+        ClientMsg::JoinCall {
+            group: group.clone(),
+        },
+    );
+    assert!(
+        out.iter().any(
+            |o| o.to == b && matches!(&o.msg, ServerMsg::CallOffer { from, .. } if from == &ah)
+        ),
+        "b must be rung when a starts the call"
+    );
+    let parts_to_b = out.iter().find_map(|o| match &o.msg {
+        ServerMsg::CallParticipants { participants, .. } if o.to == b => Some(participants.clone()),
+        _ => None,
+    });
+    assert_eq!(parts_to_b, Some(vec![ah.clone()]));
+
+    // b joins -> no new ring; participants become {a, b}.
+    let out = r.handle(
+        b,
+        ClientMsg::JoinCall {
+            group: group.clone(),
+        },
+    );
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o.msg, ServerMsg::CallOffer { .. })),
+        "joining an active call does not ring"
+    );
+    let mut parts = out
+        .iter()
+        .find_map(|o| match &o.msg {
+            ServerMsg::CallParticipants { participants, .. } if o.to == a => {
+                Some(participants.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    parts.sort();
+    assert_eq!(parts, vec![ah.clone(), bh.clone()]);
+
+    // a leaves -> [b]; b leaves -> call ended (empty).
+    let out = r.handle(
+        a,
+        ClientMsg::LeaveCall {
+            group: group.clone(),
+        },
+    );
+    assert_eq!(
+        out.iter().find_map(|o| match &o.msg {
+            ServerMsg::CallParticipants { participants, .. } if o.to == b =>
+                Some(participants.clone()),
+            _ => None,
+        }),
+        Some(vec![bh.clone()])
+    );
+    let out = r.handle(b, ClientMsg::LeaveCall { group });
+    assert!(out.iter().any(
+        |o| matches!(&o.msg, ServerMsg::CallParticipants { participants, .. } if participants.is_empty())
+    ));
+}
+
+#[test]
+fn disconnect_drops_the_device_from_its_call() {
+    let mut r = Relay::new();
+    let (a, _ah) = register(&mut r, "a", vec![1]);
+    let (b, bh) = register(&mut r, "b", vec![2]);
+    let group = GroupId([13u8; 32]);
+    r.handle(
+        a,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    );
+    r.handle(
+        a,
+        ClientMsg::AffirmMember {
+            group: group.clone(),
+            member: DeviceId(bh.clone()),
+        },
+    );
+    r.handle(
+        a,
+        ClientMsg::JoinCall {
+            group: group.clone(),
+        },
+    );
+    r.handle(b, ClientMsg::JoinCall { group });
+
+    // a drops -> b is told the call is now just {b}.
+    let out = r.disconnect(a);
+    assert_eq!(
+        out.iter().find_map(|o| match &o.msg {
+            ServerMsg::CallParticipants { participants, .. } if o.to == b =>
+                Some(participants.clone()),
+            _ => None,
+        }),
+        Some(vec![bh])
+    );
 }
 
 #[test]

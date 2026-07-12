@@ -166,6 +166,15 @@
   .pick input { width: auto; }
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
   .hint { margin: 0; color: var(--muted); font-size: 12px; }
+  .call-banner { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 16px; background: rgba(88,101,242,0.16); border-bottom: 1px solid var(--border); font-size: 13px; color: var(--text); }
+  .call-banner button { background: var(--accent); }
+  .call-banner button:hover { background: var(--accent-hover); }
+  .ring-modal { align-items: center; text-align: center; }
+  .ring-modal h2 { text-align: center; margin: 4px 0 0; }
+  .ring-avatar { width: 64px; height: 64px; border-radius: 50%; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: 600; margin: 4px auto 0; }
+  .ring-actions { justify-content: center; margin-top: 8px; }
+  .danger-btn { background: var(--danger); color: #fff; }
+  .danger-btn:hover { background: #b02c30; }
   .status { padding: 0 16px 8px; color: var(--muted); font-size: 12px; min-height: 16px; }
   .status.err { color: #f38688; }
 </style>
@@ -258,6 +267,10 @@
         <button id="call-btn" class="hdr-btn small" hidden title="Start or join a voice call in this conversation">Call</button>
         <button id="add-to-group" class="hdr-btn small" hidden title="Add a friend to this group">Add member</button>
       </header>
+      <div id="call-banner" class="call-banner" hidden>
+        <span id="call-banner-text"></span>
+        <button id="call-banner-btn" class="small">Join</button>
+      </div>
       <div id="empty-chat" class="empty-chat">Pick a friend or group to start talking.</div>
       <div id="log" class="log" hidden></div>
       <div id="status" class="status"></div>
@@ -294,6 +307,18 @@
     </div>
   </div>
 
+  <div id="ring-modal" class="overlay" hidden>
+    <div class="modal ring-modal">
+      <div class="ring-avatar" id="ring-avatar"></div>
+      <h2 id="ring-title">Incoming call</h2>
+      <p class="hint" id="ring-sub"></p>
+      <div class="modal-actions ring-actions">
+        <button id="ring-decline" class="danger-btn">Decline</button>
+        <button id="ring-accept" class="primary">Accept</button>
+      </div>
+    </div>
+  </div>
+
 <script>
   const $ = (id) => document.getElementById(id);
   const send = (cmd) => window.ipc.postMessage(JSON.stringify(cmd));
@@ -305,10 +330,82 @@
   let conversations = [];        // {id, title, is_dm, pending, members}
   let activeConv = null;
   const messages = {};           // conv id -> [{from, text, mine}]
-  let inCall = false;
+  let inCall = false;            // am I in any call
+  let myCallConv = null;         // conv id my call is in
+  const callPart = {};           // conv id -> [participant display names]
+  let ringConv = null;           // conv id currently ringing (incoming)
 
   function serverUrl() { return $("login-server").value.trim() || "ws://127.0.0.1:8443"; }
   const initial = (s) => (s || "?").trim().charAt(0);
+  const convById = (id) => conversations.find((c) => c.id === id);
+
+  // ---- ringtone (WebAudio, no bundled asset) ----
+  let ringCtx = null, ringInterval = null, ringTimeout = null;
+  function ringBeep() {
+    if (!ringCtx) return;
+    const t = ringCtx.currentTime;
+    for (const off of [0, 0.45]) {
+      const o = ringCtx.createOscillator(), g = ringCtx.createGain();
+      o.type = "sine"; o.frequency.value = 480;
+      o.connect(g); g.connect(ringCtx.destination);
+      g.gain.setValueAtTime(0.0001, t + off);
+      g.gain.exponentialRampToValueAtTime(0.16, t + off + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + off + 0.35);
+      o.start(t + off); o.stop(t + off + 0.37);
+    }
+  }
+  function startRing() {
+    if (ringInterval) return;
+    try { ringCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+    ringBeep();
+    ringInterval = setInterval(ringBeep, 2500);
+  }
+  function stopRing() {
+    if (ringInterval) { clearInterval(ringInterval); ringInterval = null; }
+    if (ringTimeout) { clearTimeout(ringTimeout); ringTimeout = null; }
+    if (ringCtx) { try { ringCtx.close(); } catch (e) {} ringCtx = null; }
+  }
+  function dismissRing() { stopRing(); ringConv = null; $("ring-modal").hidden = true; }
+
+  // ---- call control ----
+  function joinCall(convId) {
+    if (!convId) return;
+    if (inCall && myCallConv !== convId) send({ type: "LeaveCall" });
+    if (activeConv !== convId) send({ type: "SwitchConversation", conv: convId });
+    myCallConv = convId; inCall = true;
+    send({ type: "StartCall" });
+    dismissRing();
+    renderCall();
+  }
+  function leaveCall() {
+    send({ type: "LeaveCall" });
+    inCall = false; myCallConv = null;
+    renderCall();
+  }
+  // Reflect current call state on the header button and the in-conversation banner.
+  function renderCall() {
+    const conv = convById(activeConv);
+    const btn = $("call-btn"), banner = $("call-banner");
+    if (!conv || conv.pending) { btn.hidden = true; banner.hidden = true; return; }
+    const parts = callPart[activeConv] || [];
+    const active = parts.length > 0;
+    const mineHere = inCall && myCallConv === activeConv;
+    btn.hidden = false;
+    btn.textContent = mineHere ? "Leave call" : (active ? "Join call" : "Call");
+    btn.classList.toggle("in-call", mineHere);
+    if (mineHere) {
+      const others = parts.filter((p) => p !== myDisplay);
+      banner.hidden = false;
+      $("call-banner-text").textContent = others.length ? ("In call with " + others.join(", ")) : "Waiting for others to join...";
+      $("call-banner-btn").hidden = true;
+    } else if (active) {
+      banner.hidden = false;
+      $("call-banner-text").textContent = "Call in progress - " + parts.join(", ");
+      $("call-banner-btn").hidden = false;
+    } else {
+      banner.hidden = true;
+    }
+  }
 
   function doAuth(create) {
     const username = $("login-username").value.trim();
@@ -373,7 +470,15 @@
     if (handle && handle.trim()) send({ type: "AddToGroup", handle: handle.trim() });
   });
   $("call-btn").addEventListener("click", () => {
-    send({ type: inCall ? "LeaveCall" : "StartCall" });
+    if (inCall && myCallConv === activeConv) leaveCall();
+    else joinCall(activeConv);
+  });
+  $("call-banner-btn").addEventListener("click", () => joinCall(activeConv));
+  $("ring-accept").addEventListener("click", () => { if (ringConv) joinCall(ringConv); });
+  $("ring-decline").addEventListener("click", () => {
+    if (ringConv) send({ type: "DeclineCall", conv: ringConv });
+    dismissRing();
+    renderCall();
   });
 
   // ---- new-group modal ----
@@ -484,7 +589,7 @@
     $("log").hidden = !hasConv;
     $("composer").hidden = !hasConv;
     $("add-to-group").hidden = !(conv && !conv.is_dm);
-    $("call-btn").hidden = !(conv && !conv.pending);
+    renderCall();
     $("chat-title").textContent = conv ? conv.title : "No conversation";
     $("message").disabled = !(conv && !conv.pending);
     $("message").placeholder = conv && conv.pending ? "Starting conversation…" : "Message";
@@ -530,7 +635,9 @@
   function showLogin() {
     $("app-view").hidden = true; $("login-view").hidden = false;
     myUsername = ""; myDisplay = ""; friends = []; incoming = []; outgoing = []; conversations = []; activeConv = null;
-    inCall = false; $("call-btn").textContent = "Call"; $("call-btn").classList.remove("in-call");
+    inCall = false; myCallConv = null; dismissRing();
+    for (const k in callPart) delete callPart[k];
+    $("call-btn").classList.remove("in-call"); $("call-banner").hidden = true;
     $("audio-modal").hidden = true; $("group-modal").hidden = true;
     for (const k in messages) delete messages[k];
     for (const k in presence) delete presence[k];
@@ -560,8 +667,32 @@
         break;
       case "CallState":
         inCall = ev.in_call;
-        $("call-btn").textContent = inCall ? "Leave call" : "Call";
-        $("call-btn").classList.toggle("in-call", inCall);
+        if (!inCall) myCallConv = null;
+        renderCall();
+        break;
+      case "CallOffer":
+        // Someone started a call in ev.conv; ring unless I'm already in it.
+        if (!(inCall && myCallConv === ev.conv)) {
+          ringConv = ev.conv;
+          const c = convById(ev.conv);
+          $("ring-avatar").textContent = initial(ev.from);
+          $("ring-title").textContent = ev.from + " is calling";
+          $("ring-sub").textContent = c ? ("in " + c.title) : "";
+          $("ring-modal").hidden = false;
+          startRing();
+          if (ringTimeout) clearTimeout(ringTimeout);
+          ringTimeout = setTimeout(() => { dismissRing(); renderCall(); }, 30000);
+        }
+        break;
+      case "CallParticipants":
+        if (ev.participants.length === 0) delete callPart[ev.conv];
+        else callPart[ev.conv] = ev.participants;
+        if (ev.participants.length === 0 && ringConv === ev.conv) dismissRing();
+        renderCall();
+        renderSidebar();
+        break;
+      case "CallDeclined":
+        setStatus(ev.from + " declined the call", false);
         break;
       case "AudioDevices":
         fillDevices($("audio-input"), ev.inputs, ev.input);

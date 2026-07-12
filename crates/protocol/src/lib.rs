@@ -147,6 +147,15 @@ pub enum ClientMsg {
     RequestDm { to: String },
     /// Change our display name (cosmetic); friends are notified.
     SetDisplayName { display: String },
+    /// Join (or start) the voice call in `group`. If we are the first participant
+    /// the server rings the other members; otherwise it just adds us. Call
+    /// signaling is metadata (who is calling whom, when), not content.
+    JoinCall { group: GroupId },
+    /// Leave the voice call in `group`.
+    LeaveCall { group: GroupId },
+    /// Decline the incoming call in `group` (we were rung but will not join). The
+    /// caller is told; our client falls back to showing a "call active" banner.
+    DeclineCall { group: GroupId },
 }
 
 /// A person in the friend graph: the unique `username` (login/add id) plus the
@@ -226,6 +235,22 @@ pub enum ServerMsg {
     },
     /// `from` asks us to open the DM (we are the canonical creator).
     DmRequested {
+        from: String,
+    },
+    /// A call just started in `group`, initiated by `from`: ring the user.
+    CallOffer {
+        group: GroupId,
+        from: String,
+    },
+    /// The current participants of the call in `group` (empty = the call ended).
+    /// Drives the "call active" banner and the who-is-in-the-call display.
+    CallParticipants {
+        group: GroupId,
+        participants: Vec<String>,
+    },
+    /// `from` declined the call in `group`.
+    CallDeclined {
+        group: GroupId,
         from: String,
     },
     Error {

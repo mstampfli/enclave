@@ -63,6 +63,17 @@ pub enum Event {
     FriendRequest { from: String },
     /// The friends list or pending requests changed; read them via the getters.
     FriendsChanged,
+    /// An incoming call started in conversation `conv`, initiated by `from`
+    /// (display name). The UI rings.
+    CallOffer { conv: String, from: String },
+    /// The participant list of conversation `conv`'s call changed (display
+    /// names). Empty means the call ended.
+    CallParticipants {
+        conv: String,
+        participants: Vec<String>,
+    },
+    /// `from` (display name) declined our call in conversation `conv`.
+    CallDeclined { conv: String, from: String },
     /// A non-fatal error worth showing.
     Error(String),
 }
@@ -140,6 +151,9 @@ pub struct Client {
     media_addr: Option<SocketAddr>,
     /// The in-progress voice call, if any.
     call: Option<call::Call>,
+    /// The conversation the current call belongs to (for the LeaveCall signal,
+    /// since the user may switch conversations while in a call).
+    call_group: Option<GroupId>,
     /// Selected microphone (input) device name; `None` = host default.
     input_device: Option<String>,
     /// Selected speaker (output) device name; `None` = host default.
@@ -166,6 +180,7 @@ impl Client {
             display_names: HashMap::new(),
             media_addr: media_addr_from(server_url),
             call: None,
+            call_group: None,
             input_device: None,
             output_device: None,
         })
@@ -705,7 +720,7 @@ impl Client {
             let group = conv.group.as_ref().ok_or(ClientError::NoGroup)?;
             call::CallParams {
                 media_addr,
-                group: group_id,
+                group: group_id.clone(),
                 me,
                 root_secret: group.media_root_secret(identity)?,
                 my_identity_key: identity.identity_key(),
@@ -716,12 +731,36 @@ impl Client {
             }
         };
         self.call = Some(call::Call::start(params).await?);
+        self.call_group = Some(group_id.clone());
+        // Signal the call so the server rings other members and tracks who is in.
+        self.conn.send(ClientMsg::JoinCall { group: group_id });
         Ok(())
     }
 
-    /// Leave the current voice call (tears down the audio pipeline).
+    /// Leave the current voice call (tears down the audio pipeline and tells the
+    /// server, so the other participants see us leave).
     pub fn leave_call(&mut self) {
         self.call = None;
+        if let Some(group) = self.call_group.take() {
+            self.conn.send(ClientMsg::LeaveCall { group });
+        }
+    }
+
+    /// Decline an incoming call in conversation `conv_hex` (we were rung but will
+    /// not join). The caller is notified; the UI falls back to a "call active"
+    /// banner so we can still join later.
+    pub fn decline_call(&mut self, conv_hex: &str) {
+        if let Some(group) = self.group_by_hex(conv_hex) {
+            self.conn.send(ClientMsg::DeclineCall { group });
+        }
+    }
+
+    /// Resolve the routing group id behind a hex conversation id from the UI.
+    fn group_by_hex(&self, hex: &str) -> Option<GroupId> {
+        self.conversations
+            .keys()
+            .find(|g| hex_id(g) == hex)
+            .cloned()
     }
 
     /// The available audio devices and the current selection, for the settings
@@ -1069,6 +1108,21 @@ impl Client {
             ServerMsg::FriendAccepted { .. } | ServerMsg::FriendRemoved { .. } => {
                 Some(Event::FriendsChanged)
             }
+            ServerMsg::CallOffer { group, from } => Some(Event::CallOffer {
+                conv: hex_id(&group),
+                from: self.display_of(&from),
+            }),
+            ServerMsg::CallParticipants {
+                group,
+                participants,
+            } => Some(Event::CallParticipants {
+                conv: hex_id(&group),
+                participants: participants.iter().map(|p| self.display_of(p)).collect(),
+            }),
+            ServerMsg::CallDeclined { group, from } => Some(Event::CallDeclined {
+                conv: hex_id(&group),
+                from: self.display_of(&from),
+            }),
             ServerMsg::Auth { .. } => None,
             ServerMsg::Error { detail } => Some(Event::Error(detail)),
             _ => None,
