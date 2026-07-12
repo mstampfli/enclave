@@ -81,15 +81,16 @@ impl Server {
     }
 
     /// Create a server backed by a persistent account store, OPAQUE server
-    /// setup, and friend graph.
+    /// setup, friend graph, and group routing membership.
     pub fn with_auth(
         accounts: crate::accounts::AccountStore,
         opaque: crate::opaque::OpaqueServer,
         friends: crate::friends::FriendStore,
+        groups: crate::groups::GroupStore,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(ServerState {
-                relay: Relay::with_auth(accounts, opaque, friends),
+                relay: Relay::with_auth(accounts, opaque, friends, groups),
                 txs: HashMap::new(),
             })),
         }

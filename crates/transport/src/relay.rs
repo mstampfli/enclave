@@ -17,6 +17,7 @@ use enclave_protocol::{ClientMsg, DeviceId, Friend, GroupId, Presence, ServerMsg
 
 use crate::accounts::{AccountStore, AuthOutcome};
 use crate::friends::{FriendStore, RequestOutcome};
+use crate::groups::GroupStore;
 use crate::opaque::{OpaqueServer, ServerLoginState};
 
 /// Opaque handle for one client connection. Assigned by the relay on connect.
@@ -46,7 +47,8 @@ pub struct Relay {
     /// Last-seen identity public key per user (reference only).
     identities: HashMap<UserId, Vec<u8>>,
     /// Group routing fan-out sets: which devices should receive group traffic.
-    group_members: HashMap<GroupId, HashSet<DeviceId>>,
+    /// Persisted, so conversations survive a server restart.
+    groups: GroupStore,
     /// Learned UDP endpoint per device, for the real-time media channel.
     udp_addrs: HashMap<DeviceId, SocketAddr>,
     /// The user on each connection (from Register), for presence.
@@ -96,11 +98,17 @@ impl Relay {
     /// Create a relay backed by a persistent account store, OPAQUE setup, and
     /// friend graph. The account envelopes are only usable under the OPAQUE
     /// setup they were registered against, so those two must persist together.
-    pub fn with_auth(accounts: AccountStore, opaque: OpaqueServer, friends: FriendStore) -> Self {
+    pub fn with_auth(
+        accounts: AccountStore,
+        opaque: OpaqueServer,
+        friends: FriendStore,
+        groups: GroupStore,
+    ) -> Self {
         Self {
             accounts,
             opaque,
             friends,
+            groups,
             ..Self::default()
         }
     }
@@ -119,10 +127,10 @@ impl Relay {
         if let Some(device) = self.conn_device.remove(&conn) {
             self.device_conn.remove(&device);
             self.udp_addrs.remove(&device);
-            // Keep the device in group_members: membership is account-level, so a
-            // member who reconnects (e.g. after restoring a session) re-affirms
-            // instead of being locked out. Offline devices are already skipped by
-            // fan-out (they are not in device_conn).
+            // Keep the device in `groups`: membership is account-level and
+            // persisted, so a member who reconnects (or comes back after a server
+            // restart) stays a routing member. Offline devices are already
+            // skipped by fan-out (they are not in device_conn).
         }
         self.login_attempts.remove(&conn);
         self.pending_login.remove(&conn);
@@ -244,10 +252,7 @@ impl Relay {
     pub fn udp_hello(&mut self, src: SocketAddr, device: DeviceId, group: GroupId) {
         self.udp_addrs.insert(device.clone(), src);
         // Same deny-by-default rule as JoinGroup: only bootstrap or re-affirm.
-        let members = self.group_members.entry(group).or_default();
-        if members.is_empty() || members.contains(&device) {
-            members.insert(device);
-        }
+        self.groups.join(group, device);
     }
 
     /// Learn `sender`'s current UDP endpoint from an incoming frame, and return
@@ -263,7 +268,7 @@ impl Relay {
         if !self.is_member(group, sender) {
             return vec![];
         }
-        let Some(members) = self.group_members.get(group) else {
+        let Some(members) = self.groups.members(group) else {
             return vec![];
         };
         members
@@ -438,10 +443,7 @@ impl Relay {
                     // Deny-by-default (ASVS V4): a self-join may only bootstrap a
                     // new (empty) group or re-affirm existing membership. Joining
                     // an existing group is done via a Welcome from a member.
-                    let members = self.group_members.entry(group).or_default();
-                    if members.is_empty() || members.contains(&device) {
-                        members.insert(device);
-                    }
+                    self.groups.join(group, device);
                 }
                 vec![]
             }
@@ -457,10 +459,7 @@ impl Relay {
                 if !self.is_member(&group, &from_device) {
                     return vec![];
                 }
-                self.group_members
-                    .entry(group.clone())
-                    .or_default()
-                    .insert(to.clone());
+                self.groups.add(&group, to.clone());
                 match self.device_conn.get(&to) {
                     Some(&conn) => vec![Outgoing {
                         to: conn,
@@ -705,9 +704,7 @@ impl Relay {
 
     /// Whether `device` is a routing member of `group`.
     fn is_member(&self, group: &GroupId, device: &DeviceId) -> bool {
-        self.group_members
-            .get(group)
-            .is_some_and(|members| members.contains(device))
+        self.groups.is_member(group, device)
     }
 
     /// Deliver `make(group)` to every online member of `group` except the
@@ -724,7 +721,7 @@ impl Relay {
             Some(device) if self.is_member(group, device) => {}
             _ => return vec![],
         }
-        let Some(members) = self.group_members.get(group) else {
+        let Some(members) = self.groups.members(group) else {
             return vec![];
         };
         members
