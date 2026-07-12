@@ -87,10 +87,11 @@ impl Server {
         opaque: crate::opaque::OpaqueServer,
         friends: crate::friends::FriendStore,
         groups: crate::groups::GroupStore,
+        queue: crate::msgqueue::MessageQueue,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(ServerState {
-                relay: Relay::with_auth(accounts, opaque, friends, groups),
+                relay: Relay::with_auth(accounts, opaque, friends, groups, queue),
                 txs: HashMap::new(),
             })),
         }

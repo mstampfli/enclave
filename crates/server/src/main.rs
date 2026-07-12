@@ -14,7 +14,7 @@ use std::io::BufReader;
 use std::path::Path;
 
 use enclave_transport::opaque::OpaqueServer;
-use enclave_transport::{AccountStore, FriendStore, GroupStore, Server};
+use enclave_transport::{AccountStore, FriendStore, GroupStore, MessageQueue, Server};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 fn load_certs(path: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
@@ -50,7 +50,9 @@ async fn main() {
     let friends = FriendStore::load("enclave-friends.json");
     // Group routing membership persists too, so conversations survive a restart.
     let groups = GroupStore::load("enclave-groups.json");
-    let server = Server::with_auth(accounts, opaque, friends, groups);
+    // Store-and-forward queue for offline members (opaque ciphertext only).
+    let queue = MessageQueue::load("enclave-queue.json");
+    let server = Server::with_auth(accounts, opaque, friends, groups, queue);
 
     // Signaling: TLS when a cert + key are provided, plaintext otherwise.
     let tls = std::env::var("ENCLAVE_TLS_CERT")

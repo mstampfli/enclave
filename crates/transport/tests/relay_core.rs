@@ -42,6 +42,35 @@ fn register(r: &mut Relay, name: &str, kp: Vec<u8>) -> (u64, String) {
     (conn, handle)
 }
 
+// Log an existing account back in on a fresh connection (real OPAQUE handshake).
+// Returns the new conn and the finish outgoings (Auth + snapshot + any queued).
+fn login(r: &mut Relay, handle: &str, kp: Vec<u8>) -> (u64, Vec<Outgoing>) {
+    let conn = r.connect();
+    let password = "a-sufficiently-long-password";
+    let (request, state) =
+        enclave_transport::opaque::client_login_start(password).expect("login start");
+    let out = r.handle(
+        conn,
+        ClientMsg::LoginStart {
+            handle: handle.into(),
+            request,
+        },
+    );
+    let response = match &out[0].msg {
+        ServerMsg::LoginResponse { response } => response.clone(),
+        other => panic!("expected LoginResponse, got {other:?}"),
+    };
+    let (finalization, _export) = state.finish(password, &response).expect("login finish");
+    let finish = r.handle(
+        conn,
+        ClientMsg::LoginFinish {
+            finalization,
+            key_package: kp,
+        },
+    );
+    (conn, finish)
+}
+
 #[test]
 fn fetch_returns_the_reusable_key_package() {
     let mut r = Relay::new();
@@ -334,6 +363,48 @@ fn disconnect_drops_the_device_from_its_call() {
         }),
         Some(vec![bh])
     );
+}
+
+#[test]
+fn messages_to_an_offline_member_are_queued_and_delivered_on_login() {
+    let mut r = Relay::new();
+    let (a, _ah) = register(&mut r, "a", vec![1]);
+    let (b, bh) = register(&mut r, "b", vec![2]);
+    let group = GroupId([21u8; 32]);
+    r.handle(
+        a,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    );
+    r.handle(
+        a,
+        ClientMsg::AffirmMember {
+            group: group.clone(),
+            member: DeviceId(bh.clone()),
+        },
+    );
+
+    // b goes offline; a's text is queued, not delivered live.
+    r.disconnect(b);
+    let out = r.handle(
+        a,
+        ClientMsg::Text {
+            group,
+            message: Sealed(vec![42]),
+        },
+    );
+    assert!(out.is_empty(), "b is offline: the text is queued, not sent");
+
+    // b logs back in -> the queued text is delivered, exactly once.
+    let has_text = |outs: &[Outgoing]| {
+        outs.iter()
+            .any(|o| matches!(&o.msg, ServerMsg::Text { message, .. } if message.0 == vec![42]))
+    };
+    let (_c1, finish1) = login(&mut r, &bh, vec![2]);
+    assert!(has_text(&finish1), "queued text delivered on next login");
+    let (_c2, finish2) = login(&mut r, &bh, vec![2]);
+    assert!(!has_text(&finish2), "the queue is drained after delivery");
 }
 
 #[test]

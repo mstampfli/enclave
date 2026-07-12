@@ -18,6 +18,7 @@ use enclave_protocol::{ClientMsg, DeviceId, Friend, GroupId, Presence, ServerMsg
 use crate::accounts::{AccountStore, AuthOutcome};
 use crate::friends::{FriendStore, RequestOutcome};
 use crate::groups::GroupStore;
+use crate::msgqueue::MessageQueue;
 use crate::opaque::{OpaqueServer, ServerLoginState};
 
 /// Opaque handle for one client connection. Assigned by the relay on connect.
@@ -52,6 +53,9 @@ pub struct Relay {
     /// Who is currently in the voice call of each group. Ephemeral (a call is a
     /// live session): not persisted, and cleared as participants leave/disconnect.
     active_calls: HashMap<GroupId, HashSet<DeviceId>>,
+    /// Store-and-forward queue for members who are offline; delivered on their
+    /// next login. Persisted, so offline messages survive a restart.
+    queue: MessageQueue,
     /// Learned UDP endpoint per device, for the real-time media channel.
     udp_addrs: HashMap<DeviceId, SocketAddr>,
     /// The user on each connection (from Register), for presence.
@@ -106,12 +110,14 @@ impl Relay {
         opaque: OpaqueServer,
         friends: FriendStore,
         groups: GroupStore,
+        queue: MessageQueue,
     ) -> Self {
         Self {
             accounts,
             opaque,
             friends,
             groups,
+            queue,
             ..Self::default()
         }
     }
@@ -175,6 +181,11 @@ impl Relay {
             to: conn,
             msg: self.friends_snapshot(&handle),
         }];
+        // Deliver anything queued while this device was offline (text, MLS
+        // handshakes, Welcomes), in order, before live traffic resumes.
+        for msg in self.queue.take(&handle) {
+            out.push(Outgoing { to: conn, msg });
+        }
         // Wire mutual friend presence BEFORE announcing, so online friends are
         // already watching us when the Online broadcast goes out.
         out.extend(self.wire_friend_presence(conn, &handle));
@@ -480,17 +491,23 @@ impl Relay {
                     return vec![];
                 }
                 self.groups.add(&group, to.clone());
+                let welcome = ServerMsg::Welcome {
+                    group,
+                    from: from_device,
+                    name,
+                    message,
+                };
                 match self.device_conn.get(&to) {
                     Some(&conn) => vec![Outgoing {
                         to: conn,
-                        msg: ServerMsg::Welcome {
-                            group,
-                            from: from_device,
-                            name,
-                            message,
-                        },
+                        msg: welcome,
                     }],
-                    None => vec![], // target offline; a real DS would queue it
+                    // Target offline: queue the Welcome for their next login, so a
+                    // member added while away still joins the group.
+                    None => {
+                        self.queue.enqueue(&to.0, welcome);
+                        vec![]
+                    }
                 }
             }
 
@@ -858,29 +875,36 @@ impl Relay {
     /// Deliver `make(group)` to every online member of `group` except the
     /// sender's own device. Deny-by-default: a non-member cannot inject.
     fn fanout(
-        &self,
+        &mut self,
         from: ConnId,
         group: &GroupId,
         make: impl Fn(GroupId) -> ServerMsg,
     ) -> Vec<Outgoing> {
-        let sender_device = self.conn_device.get(&from);
+        let sender_device = self.conn_device.get(&from).cloned();
         // Only a member of the group may fan traffic to it (ASVS V4).
-        match sender_device {
+        match &sender_device {
             Some(device) if self.is_member(group, device) => {}
             _ => return vec![],
         }
-        let Some(members) = self.groups.members(group) else {
-            return vec![];
+        // Snapshot the recipient set so we can also mutate the offline queue.
+        let recipients: Vec<DeviceId> = match self.groups.members(group) {
+            Some(members) => members.iter().cloned().collect(),
+            None => return vec![],
         };
-        members
-            .iter()
-            .filter(|dev| Some(*dev) != sender_device)
-            .filter_map(|dev| self.device_conn.get(dev))
-            .map(|&conn| Outgoing {
-                to: conn,
-                msg: make(group.clone()),
-            })
-            .collect()
+        let mut out = Vec::new();
+        for dev in recipients {
+            if Some(&dev) == sender_device.as_ref() {
+                continue;
+            }
+            let msg = make(group.clone());
+            match self.device_conn.get(&dev) {
+                // Online: deliver now.
+                Some(&conn) => out.push(Outgoing { to: conn, msg }),
+                // Offline: park it for delivery on their next login.
+                None => self.queue.enqueue(&dev.0, msg),
+            }
+        }
+        out
     }
 }
 
