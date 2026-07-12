@@ -101,6 +101,14 @@ pub enum ClientMsg {
     /// creating or joining it). Lets the server fan group traffic out to it.
     /// Membership is routing metadata, visible to the server by design.
     JoinGroup { group: GroupId },
+    /// Vouch that `member` is a routing member of `group`. The server honors it
+    /// only when the *sender* is already a routing member, so a reconnecting
+    /// member can rebuild the routing set the server lost (e.g. after a restart)
+    /// by re-adding peers that the bootstrap-or-reaffirm rule would otherwise
+    /// lock out. A member only grants routing it already holds; a non-member's
+    /// vouch is ignored, so this cannot be used to subscribe to a stranger's
+    /// group (even one with a guessable DM id).
+    AffirmMember { group: GroupId, member: DeviceId },
     /// Deliver a Welcome directly to a new member's device. The server also
     /// records `to` as a routing member of `group`. The payload is opaque. The
     /// `name` labels the conversation (empty for a 1:1 DM, where the recipient

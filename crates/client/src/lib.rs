@@ -872,8 +872,21 @@ impl Client {
             ));
         }
         for (gid, conv) in loaded {
-            // Re-announce routing membership so the server fans traffic to us.
+            // Re-announce our own routing membership so the server fans traffic
+            // to us (bootstraps or re-affirms).
             self.conn.send(ClientMsg::JoinGroup { group: gid.clone() });
+            // Then vouch for the peers we know share this conversation, so the
+            // server can rebuild routing it lost (e.g. across a restart) instead
+            // of locking them out of their own group. The server only honors this
+            // because we just (re)affirmed membership; a non-member cannot use it.
+            for member in &conv.members {
+                if Some(member.as_str()) != self.username.as_deref() {
+                    self.conn.send(ClientMsg::AffirmMember {
+                        group: gid.clone(),
+                        member: DeviceId(member.clone()),
+                    });
+                }
+            }
             self.conversations.insert(gid, conv);
         }
     }

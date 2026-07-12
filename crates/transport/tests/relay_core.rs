@@ -108,6 +108,92 @@ fn text_fans_out_to_other_members_only_and_relays_bytes_unchanged() {
 }
 
 #[test]
+fn a_member_can_vouch_a_peer_back_into_a_forgotten_group() {
+    // Recovery path: after a server state loss, only the first re-affirmer
+    // bootstraps the group and the peer's self-join is rejected. A vouch from the
+    // (now sole) member re-adds the peer, so their shared conversation routes
+    // again -- without either recreating it.
+    let mut r = Relay::new();
+    let (a, _ah) = register(&mut r, "a", vec![1]);
+    let (b, bh) = register(&mut r, "b", vec![2]);
+    let group = GroupId([7u8; 32]);
+
+    r.handle(a, ClientMsg::JoinGroup { group: group.clone() }); // a bootstraps
+    r.handle(b, ClientMsg::JoinGroup { group: group.clone() }); // b rejected (non-empty, not a member)
+
+    // Before the vouch, a's message reaches no one (b is not a routing member).
+    let out = r.handle(
+        a,
+        ClientMsg::Text {
+            group: group.clone(),
+            message: Sealed(vec![1]),
+        },
+    );
+    assert!(out.is_empty(), "b is not a routing member yet");
+
+    // a (a member) vouches b in; now a's message fans out to b.
+    r.handle(
+        a,
+        ClientMsg::AffirmMember {
+            group: group.clone(),
+            member: DeviceId(bh),
+        },
+    );
+    let out = r.handle(
+        a,
+        ClientMsg::Text {
+            group: group.clone(),
+            message: Sealed(vec![2]),
+        },
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].to, b);
+}
+
+#[test]
+fn a_non_member_cannot_vouch_or_self_join_to_eavesdrop() {
+    // A vouch is only honored from an existing member, and a stranger cannot
+    // self-join a non-empty group -- so a guessable (DM) group id cannot be used
+    // to subscribe to a conversation you are not in.
+    let mut r = Relay::new();
+    let (a, _ah) = register(&mut r, "a", vec![1]);
+    let (b, bh) = register(&mut r, "b", vec![2]);
+    let (m, mh) = register(&mut r, "m", vec![3]); // mallory
+    let group = GroupId([8u8; 32]);
+
+    r.handle(a, ClientMsg::JoinGroup { group: group.clone() });
+    r.handle(
+        a,
+        ClientMsg::AffirmMember {
+            group: group.clone(),
+            member: DeviceId(bh),
+        },
+    ); // group is now {a, b}
+
+    // Mallory (not a member) cannot vouch herself in, nor self-join.
+    r.handle(
+        m,
+        ClientMsg::AffirmMember {
+            group: group.clone(),
+            member: DeviceId(mh),
+        },
+    );
+    r.handle(m, ClientMsg::JoinGroup { group: group.clone() });
+
+    // a's message reaches b, never mallory.
+    let out = r.handle(
+        a,
+        ClientMsg::Text {
+            group: group.clone(),
+            message: Sealed(vec![9]),
+        },
+    );
+    let recipients: Vec<u64> = out.iter().map(|o| o.to).collect();
+    assert_eq!(recipients, vec![b], "only b, never mallory");
+    assert_ne!(out.first().map(|o| o.to), Some(m));
+}
+
+#[test]
 fn text_fans_out_to_all_other_members_in_a_larger_group() {
     let mut r = Relay::new();
     let (a, _ah) = register(&mut r, "a", vec![1]);

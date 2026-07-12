@@ -448,6 +448,20 @@ impl Relay {
                 vec![]
             }
 
+            ClientMsg::AffirmMember { group, member } => {
+                // Only an existing routing member may vouch another device into a
+                // group (deny-by-default, ASVS V4). This lets a reconnecting
+                // member rebuild routing the server lost, re-adding peers the
+                // bootstrap-or-reaffirm rule would reject; a non-member's vouch is
+                // ignored, so a guessable (DM) group id cannot be used to
+                // subscribe to a conversation you are not in.
+                let voucher = self.device_for(from);
+                if self.is_member(&group, &voucher) {
+                    self.groups.add(&group, member);
+                }
+                vec![]
+            }
+
             ClientMsg::Welcome {
                 to,
                 group,
