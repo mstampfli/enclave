@@ -21,6 +21,9 @@ struct Account {
     /// forces a memory-hard (Argon2id) per-account offline attack, no more.
     envelope: Vec<u8>,
     identity_pub: Vec<u8>,
+    /// Cosmetic display name; the username stays the unique login/add id.
+    #[serde(default)]
+    display: String,
 }
 
 /// The result of a create-account attempt. Login is handled by the OPAQUE
@@ -61,13 +64,15 @@ impl AccountStore {
         }
     }
 
-    /// Register a new account: store its OPAQUE envelope and identity key. The
-    /// envelope was produced without the server ever seeing the password.
+    /// Register a new account: store its OPAQUE envelope, identity key, and
+    /// display name. The envelope was produced without the server ever seeing
+    /// the password. An empty `display` defaults to the username.
     pub fn create_account(
         &mut self,
         username: &str,
         envelope: Vec<u8>,
         identity_pub: Vec<u8>,
+        display: String,
     ) -> AuthOutcome {
         if username.trim().is_empty() {
             return AuthOutcome::InvalidUsername;
@@ -75,15 +80,46 @@ impl AccountStore {
         if self.accounts.contains_key(username) {
             return AuthOutcome::UsernameTaken;
         }
+        let display = if display.trim().is_empty() {
+            username.to_string()
+        } else {
+            display
+        };
         self.accounts.insert(
             username.to_string(),
             Account {
                 envelope,
                 identity_pub,
+                display,
             },
         );
         self.save();
         AuthOutcome::Created
+    }
+
+    /// The display name for `username` (falls back to the username itself).
+    pub fn display(&self, username: &str) -> String {
+        self.accounts
+            .get(username)
+            .map(|a| a.display.clone())
+            .unwrap_or_else(|| username.to_string())
+    }
+
+    /// Change a user's display name. Returns false if there is no such account.
+    pub fn set_display(&mut self, username: &str, display: &str) -> bool {
+        let display = if display.trim().is_empty() {
+            username.to_string()
+        } else {
+            display.to_string()
+        };
+        match self.accounts.get_mut(username) {
+            Some(a) => {
+                a.display = display;
+                self.save();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Whether a username is registered.
@@ -119,32 +155,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn create_stores_envelope_and_identity() {
+    fn create_stores_envelope_identity_and_display() {
         let mut store = AccountStore::new();
         assert_eq!(
-            store.create_account("alice", vec![1, 2, 3], vec![4, 5, 6]),
+            store.create_account("alice", vec![1, 2, 3], vec![4, 5, 6], "Alice A".into()),
             AuthOutcome::Created
         );
         assert!(store.contains("alice"));
         assert_eq!(store.envelope("alice"), Some(&[1, 2, 3][..]));
         assert_eq!(store.identity_pub("alice"), Some(&[4, 5, 6][..]));
-        assert!(!store.contains("nobody"));
-        assert_eq!(store.envelope("nobody"), None);
+        assert_eq!(store.display("alice"), "Alice A");
+        // An empty display defaults to the username.
+        store.create_account("bob", vec![], vec![], String::new());
+        assert_eq!(store.display("bob"), "bob");
+        // Changing it takes effect.
+        assert!(store.set_display("bob", "Bobby"));
+        assert_eq!(store.display("bob"), "Bobby");
+        assert!(!store.set_display("nobody", "x"));
+        // Unknown users fall back to their username.
+        assert_eq!(store.display("nobody"), "nobody");
     }
 
     #[test]
     fn rejects_duplicate_and_empty() {
         let mut store = AccountStore::new();
         assert_eq!(
-            store.create_account("bob", vec![1], vec![]),
+            store.create_account("bob", vec![1], vec![], String::new()),
             AuthOutcome::Created
         );
         assert_eq!(
-            store.create_account("bob", vec![2], vec![]),
+            store.create_account("bob", vec![2], vec![], String::new()),
             AuthOutcome::UsernameTaken
         );
         assert_eq!(
-            store.create_account("  ", vec![3], vec![]),
+            store.create_account("  ", vec![3], vec![], String::new()),
             AuthOutcome::InvalidUsername
         );
     }
@@ -158,7 +202,7 @@ mod tests {
         {
             let mut store = AccountStore::load(&path);
             assert_eq!(
-                store.create_account("dave", vec![9, 9], vec![7]),
+                store.create_account("dave", vec![9, 9], vec![7], "Dave".into()),
                 AuthOutcome::Created
             );
         }
@@ -167,6 +211,7 @@ mod tests {
         assert!(store.contains("dave"));
         assert_eq!(store.envelope("dave"), Some(&[9, 9][..]));
         assert_eq!(store.identity_pub("dave"), Some(&[7][..]));
+        assert_eq!(store.display("dave"), "Dave");
 
         let _ = std::fs::remove_file(&path);
     }

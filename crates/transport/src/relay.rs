@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 
-use enclave_protocol::{ClientMsg, DeviceId, GroupId, Presence, ServerMsg, UserId};
+use enclave_protocol::{ClientMsg, DeviceId, Friend, GroupId, Presence, ServerMsg, UserId};
 
 use crate::accounts::{AccountStore, AuthOutcome};
 use crate::friends::{FriendStore, RequestOutcome};
@@ -169,15 +169,6 @@ impl Relay {
         out
     }
 
-    /// The friends + pending-requests snapshot for `handle`.
-    fn friends_snapshot(&self, handle: &str) -> ServerMsg {
-        ServerMsg::Friends {
-            friends: self.friends.friends_of(handle),
-            incoming: self.friends.incoming(handle),
-            outgoing: self.friends.outgoing(handle),
-        }
-    }
-
     /// Set up mutual presence watching between `handle` (on `conn`) and each of
     /// its friends, returning each friend's current presence for `conn`.
     fn wire_friend_presence(&mut self, conn: ConnId, handle: &str) -> Vec<Outgoing> {
@@ -304,11 +295,20 @@ impl Relay {
                     self.reserved.remove(&prev);
                 }
                 let name = name.trim().to_string();
-                if name.is_empty() || name.contains('#') || name.chars().count() > 32 {
-                    return auth_fail(from, String::new(), "please choose a valid name (no #)");
+                let valid = !name.is_empty()
+                    && name.chars().count() <= 24
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
+                if !valid {
+                    return auth_fail(
+                        from,
+                        String::new(),
+                        "usernames are 1-24 chars: letters, digits, . _ -",
+                    );
                 }
-                let Some(handle) = self.assign_handle(&name) else {
-                    return auth_fail(from, name, "that name is full; try another");
+                let Some(handle) = self.claim_username(&name) else {
+                    return auth_fail(from, name, "that username is taken");
                 };
                 match self.opaque.register_start(&handle, &request) {
                     Ok(response) => {
@@ -327,8 +327,9 @@ impl Relay {
                 upload,
                 identity_pub,
                 key_package,
+                display,
             } => {
-                // The handle was assigned and reserved at RegisterStart.
+                // The username was claimed and reserved at RegisterStart.
                 let Some(handle) = self.pending_register.remove(&from) else {
                     return auth_fail(from, String::new(), "registration expired; start over");
                 };
@@ -339,14 +340,16 @@ impl Relay {
                 };
                 match self
                     .accounts
-                    .create_account(&handle, envelope, identity_pub.clone())
+                    .create_account(&handle, envelope, identity_pub.clone(), display)
                 {
                     AuthOutcome::Created => {
+                        let display = self.accounts.display(&handle);
                         let mut out = vec![Outgoing {
                             to: from,
                             msg: ServerMsg::Auth {
                                 ok: true,
                                 handle: handle.clone(),
+                                display,
                                 detail: "account created".into(),
                             },
                         }];
@@ -399,11 +402,13 @@ impl Relay {
                             .identity_pub(&handle)
                             .map(|s| s.to_vec())
                             .unwrap_or_default();
+                        let display = self.accounts.display(&handle);
                         let mut out = vec![Outgoing {
                             to: from,
                             msg: ServerMsg::Auth {
                                 ok: true,
                                 handle: handle.clone(),
+                                display,
                                 detail: "logged in".into(),
                             },
                         }];
@@ -412,7 +417,7 @@ impl Relay {
                     }
                     Err(_) => {
                         *self.login_attempts.entry(from).or_insert(0) += 1;
-                        auth_fail(from, handle, "wrong handle or password")
+                        auth_fail(from, handle, "wrong username or password")
                     }
                 }
             }
@@ -641,25 +646,54 @@ impl Relay {
                     None => vec![],
                 }
             }
+
+            ClientMsg::SetDisplayName { display } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                self.accounts.set_display(&me, &display);
+                // Push each online friend a refreshed snapshot so they see the
+                // new display name for us.
+                self.friends
+                    .friends_of(&me)
+                    .into_iter()
+                    .filter_map(|f| self.device_conn.get(&DeviceId(f.clone())).map(|&c| (c, f)))
+                    .map(|(conn, f)| Outgoing {
+                        to: conn,
+                        msg: self.friends_snapshot(&f),
+                    })
+                    .collect()
+            }
         }
     }
 
-    /// Assign an unused `name#1234` handle, or `None` if every discriminator for
-    /// `name` is taken. Tries random slots first (cheap when the name is rare),
-    /// then scans exhaustively (correct when it is crowded).
-    fn assign_handle(&self, name: &str) -> Option<String> {
-        use rand::Rng;
-        let taken = |h: &str| self.accounts.contains(h) || self.reserved.contains(h);
-        let mut rng = rand::thread_rng();
-        for _ in 0..48 {
-            let handle = format!("{name}#{:04}", rng.gen_range(1..=9999));
-            if !taken(&handle) {
-                return Some(handle);
-            }
+    /// Claim `name` as a username if it is free (neither registered nor reserved
+    /// by an in-flight sign-up). Usernames are globally unique -- no suffix.
+    fn claim_username(&self, name: &str) -> Option<String> {
+        if self.accounts.contains(name) || self.reserved.contains(name) {
+            None
+        } else {
+            Some(name.to_string())
         }
-        (1..=9999u16)
-            .map(|d| format!("{name}#{d:04}"))
-            .find(|h| !taken(h))
+    }
+
+    /// The friends + pending-requests snapshot for `handle`, each entry carrying
+    /// the person's current display name.
+    fn friends_snapshot(&self, handle: &str) -> ServerMsg {
+        let with_display = |names: Vec<String>| -> Vec<Friend> {
+            names
+                .into_iter()
+                .map(|u| Friend {
+                    display: self.accounts.display(&u),
+                    username: u,
+                })
+                .collect()
+        };
+        ServerMsg::Friends {
+            friends: with_display(self.friends.friends_of(handle)),
+            incoming: with_display(self.friends.incoming(handle)),
+            outgoing: with_display(self.friends.outgoing(handle)),
+        }
     }
 
     /// The device currently on `conn`, or an empty id if unregistered.
@@ -715,6 +749,7 @@ fn auth_fail(conn: ConnId, handle: String, detail: &str) -> Vec<Outgoing> {
         msg: ServerMsg::Auth {
             ok: false,
             handle,
+            display: String::new(),
             detail: detail.into(),
         },
     }]

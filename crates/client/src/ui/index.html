@@ -123,11 +123,17 @@
   .muted-empty { color: var(--muted); font-size: 12px; padding: 4px 8px; }
 
   .user-panel {
-    display: flex; align-items: center; gap: 8px; padding: 8px;
+    display: flex; flex-direction: column; gap: 8px; padding: 10px;
     background: rgba(0,0,0,0.15); border-top: 1px solid var(--border);
   }
-  .user-name { font-weight: 600; font-size: 13px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .user-panel select { width: auto; padding: 5px 6px; font-size: 12px; }
+  .user-id { display: flex; align-items: center; gap: 8px; padding: 4px; min-width: 0; }
+  .user-meta { min-width: 0; flex: 1; }
+  .user-name { font-weight: 600; font-size: 14px; color: var(--bright); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+  .user-name:hover { text-decoration: underline; }
+  .user-handle { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+  .user-handle:hover { color: var(--text); }
+  .user-controls { display: flex; gap: 8px; }
+  .user-controls select { flex: 1; padding: 6px; font-size: 12px; }
 
   /* Chat area */
   .chat { display: flex; flex-direction: column; min-width: 0; }
@@ -166,8 +172,10 @@
     <div class="login-card">
       <h1>Enclave</h1>
       <p class="sub">End-to-end encrypted. The server never sees your password or messages.</p>
-      <label for="login-username">Name</label>
-      <input id="login-username" autocomplete="off" spellcheck="false" placeholder="name (to register) or name#1234 (to log in)" />
+      <label for="login-username">Username</label>
+      <input id="login-username" autocomplete="off" spellcheck="false" placeholder="unique username (letters, digits, . _ -)" />
+      <label for="login-display">Display name <span style="text-transform:none;font-weight:400">(optional, for sign up)</span></label>
+      <input id="login-display" autocomplete="off" spellcheck="false" placeholder="shown to friends; defaults to your username" />
       <label for="login-password">Password</label>
       <input id="login-password" type="password" autocomplete="off" placeholder="at least 12 characters" />
       <div class="login-row">
@@ -190,7 +198,7 @@
     <aside class="sidebar">
       <div class="side-scroll">
         <div class="add-row">
-          <input id="friend" placeholder="Add friend by name#1234" spellcheck="false" />
+          <input id="friend" placeholder="Add friend by username" spellcheck="false" />
           <button id="add-friend" class="small" title="Send friend request">Add</button>
         </div>
 
@@ -213,14 +221,21 @@
       </div>
 
       <div class="user-panel">
-        <div class="avatar" id="avatar"></div>
-        <div class="user-name" id="me-name"></div>
-        <select id="presence" title="Set your status">
-          <option value="online">Online</option>
-          <option value="away">Away</option>
-          <option value="offline">Invisible</option>
-        </select>
-        <button id="logout" class="small">Log out</button>
+        <div class="user-id">
+          <div class="avatar" id="avatar"></div>
+          <div class="user-meta">
+            <div class="user-name" id="me-name" title="Click to change your display name"></div>
+            <div class="user-handle" id="me-handle" title="Click to copy your username so friends can add you"></div>
+          </div>
+        </div>
+        <div class="user-controls">
+          <select id="presence" title="Set your status">
+            <option value="online">Online</option>
+            <option value="away">Away</option>
+            <option value="offline">Invisible</option>
+          </select>
+          <button id="logout" class="small">Log out</button>
+        </div>
       </div>
     </aside>
 
@@ -257,10 +272,10 @@
   const send = (cmd) => window.ipc.postMessage(JSON.stringify(cmd));
 
   // ---- client state (mirrors the controller) ----
-  let me = "";
-  let friends = [], incoming = [], outgoing = [];
-  const presence = {};           // handle -> "online"/"away"/"offline"
-  let conversations = [];        // {id, title, is_dm, pending}
+  let myUsername = "", myDisplay = "";
+  let friends = [], incoming = [], outgoing = [];   // arrays of {username, display}
+  const presence = {};           // username -> "online"/"away"/"offline"
+  let conversations = [];        // {id, title, is_dm, pending, members}
   let activeConv = null;
   const messages = {};           // conv id -> [{from, text, mine}]
 
@@ -269,11 +284,14 @@
 
   function doAuth(create) {
     const username = $("login-username").value.trim();
+    const display = $("login-display").value.trim();
     const password = $("login-password").value;
     $("login-error").textContent = "";
-    if (!username || !password) { $("login-error").textContent = "Enter a name and password."; return; }
+    if (!username || !password) { $("login-error").textContent = "Enter a username and password."; return; }
     if (create && password.length < 12) { $("login-error").textContent = "Password must be at least 12 characters."; return; }
-    send({ type: create ? "CreateAccount" : "Login", server: serverUrl(), username, password });
+    const cmd = { type: create ? "CreateAccount" : "Login", server: serverUrl(), username, password };
+    if (create) cmd.display = display;
+    send(cmd);
   }
   $("login-btn").addEventListener("click", () => doAuth(false));
   $("register-btn").addEventListener("click", () => doAuth(true));
@@ -281,6 +299,27 @@
 
   $("logout").addEventListener("click", () => send({ type: "Logout" }));
   $("presence").addEventListener("change", (e) => send({ type: "SetPresence", status: e.target.value }));
+
+  function copyText(t) {
+    try { navigator.clipboard.writeText(t); return; } catch (e) {}
+    const ta = document.createElement("textarea");
+    ta.value = t; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+  $("me-handle").addEventListener("click", () => {
+    if (myUsername) { copyText(myUsername); setStatus("Copied your username: " + myUsername, false); }
+  });
+  $("me-name").addEventListener("click", () => {
+    const name = prompt("Display name", myDisplay);
+    if (name !== null && name.trim()) {
+      myDisplay = name.trim();
+      $("me-name").textContent = myDisplay;
+      $("avatar").textContent = initial(myDisplay);
+      send({ type: "SetDisplayName", display: myDisplay });
+    }
+  });
 
   $("add-friend").addEventListener("click", () => {
     const user = $("friend").value.trim();
@@ -297,7 +336,7 @@
   $("add-to-group").addEventListener("click", () => {
     const conv = conversations.find((c) => c.id === activeConv);
     if (!conv) return;
-    const handle = prompt("Add which friend? (their name#1234)");
+    const handle = prompt("Add which friend? (their username)");
     if (handle && handle.trim()) send({ type: "AddToGroup", handle: handle.trim() });
   });
 
@@ -319,8 +358,8 @@
     for (const f of friends) {
       const row = document.createElement("label");
       row.className = "pick";
-      row.innerHTML = '<input type="checkbox" value="' + f + '"><span class="avatar">' + initial(f) + '</span><span class="row-name"></span>';
-      row.querySelector(".row-name").textContent = f;
+      row.innerHTML = '<input type="checkbox" value="' + f.username + '"><span class="avatar">' + initial(f.display) + '</span><span class="row-name"></span>';
+      row.querySelector(".row-name").textContent = f.display;
       box.appendChild(row);
     }
     $("group-modal").hidden = false;
@@ -330,39 +369,38 @@
   function statusOf(h) { return presence[h] || "offline"; }
 
   function renderSidebar() {
-    // Requests
+    // Requests (incoming get accept/decline; outgoing show as pending)
     const reqSec = $("requests-section"), reqUl = $("requests");
     reqUl.innerHTML = "";
-    const anyReq = incoming.length + outgoing.length > 0;
-    reqSec.hidden = !anyReq;
-    for (const h of incoming) {
+    reqSec.hidden = incoming.length + outgoing.length === 0;
+    for (const f of incoming) {
       const li = document.createElement("li");
-      li.innerHTML = '<span class="avatar">' + initial(h) + '</span><span class="row-name"></span>' +
+      li.innerHTML = '<span class="avatar">' + initial(f.display) + '</span><span class="row-name"></span>' +
         '<span class="req-actions"><button class="icon-btn ok" title="Accept">✓</button>' +
         '<button class="icon-btn no" title="Decline">✕</button></span>';
-      li.querySelector(".row-name").textContent = h;
-      li.querySelector(".ok").addEventListener("click", (e) => { e.stopPropagation(); send({ type: "AcceptFriend", handle: h }); });
-      li.querySelector(".no").addEventListener("click", (e) => { e.stopPropagation(); send({ type: "DeclineFriend", handle: h }); });
+      li.querySelector(".row-name").textContent = f.display;
+      li.querySelector(".ok").addEventListener("click", (e) => { e.stopPropagation(); send({ type: "AcceptFriend", handle: f.username }); });
+      li.querySelector(".no").addEventListener("click", (e) => { e.stopPropagation(); send({ type: "DeclineFriend", handle: f.username }); });
       reqUl.appendChild(li);
     }
-    for (const h of outgoing) {
+    for (const f of outgoing) {
       const li = document.createElement("li");
-      li.innerHTML = '<span class="avatar">' + initial(h) + '</span><span class="row-name"></span><span class="muted-empty">pending</span>';
-      li.querySelector(".row-name").textContent = h;
+      li.innerHTML = '<span class="avatar">' + initial(f.display) + '</span><span class="row-name"></span><span class="muted-empty">pending</span>';
+      li.querySelector(".row-name").textContent = f.display;
       reqUl.appendChild(li);
     }
 
-    // Friends (DMs)
+    // Friends (open a DM on click)
     const ul = $("friends");
     ul.innerHTML = "";
     $("friends-empty").hidden = friends.length > 0;
-    for (const h of friends) {
-      const dm = conversations.find((c) => c.is_dm && c.title === h);
+    for (const f of friends) {
+      const dm = conversations.find((c) => c.is_dm && c.members && c.members.includes(f.username));
       const li = document.createElement("li");
       if (dm && dm.id === activeConv) li.className = "active";
-      li.innerHTML = '<span class="avatar">' + initial(h) + '</span><span class="row-name"></span><span class="dot ' + statusOf(h) + '"></span>';
-      li.querySelector(".row-name").textContent = h;
-      li.addEventListener("click", () => send({ type: "OpenDm", handle: h }));
+      li.innerHTML = '<span class="avatar">' + initial(f.display) + '</span><span class="row-name"></span><span class="dot ' + statusOf(f.username) + '"></span>';
+      li.querySelector(".row-name").textContent = f.display;
+      li.addEventListener("click", () => send({ type: "OpenDm", handle: f.username }));
       ul.appendChild(li);
     }
 
@@ -420,14 +458,17 @@
     const s = $("status"); s.textContent = message || ""; s.className = "status" + (isError ? " err" : "");
   }
 
-  function showApp(handle) {
+  function showApp(username, display) {
     $("login-view").hidden = true; $("app-view").hidden = false;
-    $("me-name").textContent = handle; $("avatar").textContent = initial(handle);
+    myUsername = username; myDisplay = display || username;
+    $("me-name").textContent = myDisplay;
+    $("me-handle").textContent = "@" + username;
+    $("avatar").textContent = initial(myDisplay);
     $("login-password").value = "";
   }
   function showLogin() {
     $("app-view").hidden = true; $("login-view").hidden = false;
-    me = ""; friends = []; incoming = []; outgoing = []; conversations = []; activeConv = null;
+    myUsername = ""; myDisplay = ""; friends = []; incoming = []; outgoing = []; conversations = []; activeConv = null;
     for (const k in messages) delete messages[k];
     for (const k in presence) delete presence[k];
   }
@@ -435,7 +476,7 @@
   window.onEnclaveEvent = (ev) => {
     switch (ev.type) {
       case "LoggedIn":
-        me = ev.username; showApp(ev.username); renderSidebar(); renderChat();
+        showApp(ev.username, ev.display); renderSidebar(); renderChat();
         break;
       case "LoggedOut":
         showLogin();

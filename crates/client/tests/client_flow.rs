@@ -19,7 +19,7 @@ async fn account(url: &str, name: &str) -> Client {
     let mut client = Client::connect(url).await.expect("connect");
     client.set_keystore_dir(std::env::temp_dir());
     client
-        .create_account(name, "test-password-1234")
+        .create_account(name, "", "test-password-1234")
         .await
         .expect("create account");
     client
@@ -64,7 +64,7 @@ async fn friend_request_accept_and_presence() {
         }
     }
     // Having drained the stream, Alice lists Bob as a friend.
-    assert!(alice.friends().contains(&bob_handle));
+    assert!(alice.friends().iter().any(|f| f.username == bob_handle));
 }
 
 #[tokio::test]
@@ -129,7 +129,7 @@ async fn wrong_password_is_rejected() {
     // Create the account and learn the assigned handle.
     let mut zara = Client::connect(&url).await.unwrap();
     zara.set_keystore_dir(std::env::temp_dir());
-    zara.create_account("zara", "the-right-password")
+    zara.create_account("zara", "", "the-right-password")
         .await
         .unwrap();
     let zara_handle = zara.name().to_string();

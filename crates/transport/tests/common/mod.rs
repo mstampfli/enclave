@@ -41,6 +41,7 @@ pub async fn register_account(
         upload,
         identity_pub,
         key_package,
+        display: String::new(),
     });
     loop {
         match tokio::time::timeout(RECV_TIMEOUT, conn.recv()).await {

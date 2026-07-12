@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use enclave_client::{Client, Event};
-use enclave_protocol::Presence;
+use enclave_protocol::{Friend, Presence};
 use tao::event::{Event as TaoEvent, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
@@ -26,6 +26,7 @@ enum UiCommand {
     CreateAccount {
         server: String,
         username: String,
+        display: String,
         password: String,
     },
     Login {
@@ -34,6 +35,10 @@ enum UiCommand {
         password: String,
     },
     Logout,
+    /// Change our display name.
+    SetDisplayName {
+        display: String,
+    },
     /// Open (or focus) a 1:1 DM with a friend handle.
     OpenDm {
         handle: String,
@@ -87,6 +92,7 @@ struct ConvSummary {
     title: String,
     is_dm: bool,
     pending: bool,
+    members: Vec<String>,
 }
 
 /// Events the core sends to the UI (serialized straight into `onEnclaveEvent`).
@@ -95,6 +101,7 @@ struct ConvSummary {
 enum UiEvent {
     LoggedIn {
         username: String,
+        display: String,
     },
     LoggedOut,
     /// The full conversation list for the sidebar.
@@ -123,11 +130,11 @@ enum UiEvent {
     FriendRequest {
         from: String,
     },
-    /// The current friends + pending-requests snapshot.
+    /// The current friends + pending-requests snapshot (username + display).
     Friends {
-        friends: Vec<String>,
-        incoming: Vec<String>,
-        outgoing: Vec<String>,
+        friends: Vec<Friend>,
+        incoming: Vec<Friend>,
+        outgoing: Vec<Friend>,
     },
     Status {
         message: String,
@@ -201,6 +208,7 @@ fn conv_summaries(c: &Client) -> Vec<ConvSummary> {
             title: i.title,
             is_dm: i.is_dm,
             pending: i.pending,
+            members: i.members,
         })
         .collect()
 }
@@ -320,6 +328,7 @@ async fn authenticate(
     proxy: &EventLoopProxy<UiEvent>,
     server: &str,
     username: &str,
+    display: &str,
     password: &str,
     create: bool,
 ) {
@@ -332,7 +341,7 @@ async fn authenticate(
     };
     c.set_keystore_dir(app_dir());
     let result = if create {
-        c.create_account(username, password).await
+        c.create_account(username, display, password).await
     } else {
         c.login(username, password).await
     };
@@ -340,8 +349,9 @@ async fn authenticate(
         Ok(()) => {
             // The server pushes our friends + presence automatically on login.
             let username = c.name().to_string();
+            let display = c.display_name().to_string();
             *client = Some(c);
-            emit(proxy, UiEvent::LoggedIn { username });
+            emit(proxy, UiEvent::LoggedIn { username, display });
         }
         Err(e) => error_status(proxy, e.to_string()),
     }
@@ -356,19 +366,26 @@ async fn handle_command(
         UiCommand::CreateAccount {
             server,
             username,
+            display,
             password,
-        } => authenticate(client, proxy, &server, &username, &password, true).await,
+        } => authenticate(client, proxy, &server, &username, &display, &password, true).await,
         UiCommand::Login {
             server,
             username,
             password,
-        } => authenticate(client, proxy, &server, &username, &password, false).await,
+        } => authenticate(client, proxy, &server, &username, "", &password, false).await,
         UiCommand::Logout => {
             if let Some(c) = client.as_mut() {
                 c.logout();
             }
             *client = None;
             emit(proxy, UiEvent::LoggedOut);
+        }
+        UiCommand::SetDisplayName { display } => {
+            if let Some(c) = client.as_mut() {
+                c.set_display_name(&display);
+                emit_conversations(proxy, c);
+            }
         }
         UiCommand::OpenDm { handle } => {
             if let Some(c) = client.as_mut() {
@@ -403,7 +420,7 @@ async fn handle_command(
         UiCommand::SendText { text } => {
             if let Some(c) = client.as_mut() {
                 let conv = c.active_id();
-                let from = c.name().to_string();
+                let from = c.display_name().to_string();
                 match c.send_text(&text).await {
                     Ok(()) => {
                         if let Some(conv) = conv {

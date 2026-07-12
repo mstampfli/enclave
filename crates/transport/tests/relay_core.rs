@@ -28,6 +28,7 @@ fn authenticate(r: &mut Relay, conn: u64, name: &str, kp: Vec<u8>) -> (String, V
             upload,
             identity_pub: vec![],
             key_package: kp,
+            display: String::new(),
         },
     );
     (handle, finish)

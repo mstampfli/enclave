@@ -64,18 +64,18 @@ pub struct MediaFrame {
 /// Client -> server messages over the (TLS) signaling channel.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
-    /// OPAQUE registration, step 1: a desired display `name` plus a blinded
-    /// registration request. The server assigns a `name#1234` handle and returns
-    /// it. The password is never sent -- not here, not anywhere.
+    /// OPAQUE registration, step 1: a desired unique `name` (username) plus a
+    /// blinded registration request. The server accepts it if the username is
+    /// free. The password is never sent -- not here, not anywhere.
     RegisterStart { name: String, request: Vec<u8> },
     /// OPAQUE registration, step 2: the client's upload (the future stored
-    /// envelope), plus this device's identity public key and signed KeyPackage.
-    /// The handle was fixed by the server in step 1 (kept per-connection). On
-    /// success the server stores the account and authenticates the session.
+    /// envelope), this device's identity public key and signed KeyPackage, and
+    /// the chosen `display` name (cosmetic; empty defaults to the username).
     RegisterFinish {
         upload: Vec<u8>,
         identity_pub: Vec<u8>,
         key_package: Vec<u8>,
+        display: String,
     },
     /// OPAQUE login, step 1: a blinded credential request for the full `handle`
     /// (`name#1234`).
@@ -128,9 +128,19 @@ pub enum ClientMsg {
     FriendRemove { handle: String },
     /// Ask for the current friends + pending-requests snapshot.
     ListFriends,
-    /// Ask `to` to open a DM with us (used when we are the larger handle, so the
-    /// smaller handle is the canonical creator of the shared MLS group).
+    /// Ask `to` to open a DM with us (used when we are the lexicographically
+    /// larger username, so the smaller one creates the shared MLS group).
     RequestDm { to: String },
+    /// Change our display name (cosmetic); friends are notified.
+    SetDisplayName { display: String },
+}
+
+/// A person in the friend graph: the unique `username` (login/add id) plus the
+/// current cosmetic `display` name.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Friend {
+    pub username: String,
+    pub display: String,
 }
 
 /// Server -> client messages.
@@ -147,11 +157,13 @@ pub enum ServerMsg {
     LoginResponse {
         response: Vec<u8>,
     },
-    /// Final result of a registration or login exchange. `handle` is the full
-    /// `name#1234` the session is authenticated as.
+    /// Final result of a registration or login exchange. `handle` is the unique
+    /// username the session is authenticated as; `display` is its current
+    /// display name (empty on failure).
     Auth {
         ok: bool,
         handle: String,
+        display: String,
         detail: String,
     },
     KeyPackages {
@@ -191,11 +203,12 @@ pub enum ServerMsg {
     FriendRemoved {
         handle: String,
     },
-    /// The current friends + pending-requests snapshot for this session.
+    /// The current friends + pending-requests snapshot for this session, each
+    /// carrying the person's current display name.
     Friends {
-        friends: Vec<String>,
-        incoming: Vec<String>,
-        outgoing: Vec<String>,
+        friends: Vec<Friend>,
+        incoming: Vec<Friend>,
+        outgoing: Vec<Friend>,
     },
     /// `from` asks us to open the DM (we are the canonical creator).
     DmRequested {

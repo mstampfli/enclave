@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use enclave_crypto::{Group, Identity};
-use enclave_protocol::{ClientMsg, DeviceId, GroupId, Presence, Sealed, ServerMsg, UserId};
+use enclave_protocol::{ClientMsg, DeviceId, Friend, GroupId, Presence, Sealed, ServerMsg, UserId};
 use enclave_transport::accounts::MIN_PASSWORD_LEN;
 use enclave_transport::{opaque, Connection};
 use sha2::{Digest, Sha256};
@@ -118,10 +118,14 @@ pub struct Client {
     /// The conversation currently shown / targeted by send_text.
     active: Option<GroupId>,
     pending: VecDeque<Event>,
+    /// Our own display name (cosmetic; the username is the unique id).
+    display: String,
     /// Accepted friends and pending requests, mirrored from the server.
-    friends: Vec<String>,
-    incoming: Vec<String>,
-    outgoing: Vec<String>,
+    friends: Vec<Friend>,
+    incoming: Vec<Friend>,
+    outgoing: Vec<Friend>,
+    /// username -> current display name, learned from friend snapshots.
+    display_names: HashMap<String, String>,
 }
 
 impl Client {
@@ -136,9 +140,11 @@ impl Client {
             conversations: HashMap::new(),
             active: None,
             pending: VecDeque::new(),
+            display: String::new(),
             friends: Vec::new(),
             incoming: Vec::new(),
             outgoing: Vec::new(),
+            display_names: HashMap::new(),
         })
     }
 
@@ -151,7 +157,12 @@ impl Client {
     /// password is used only locally and never sent to the server. The server
     /// assigns a full `name#1234` handle; the new identity is bound to it and
     /// saved (encrypted) to this device.
-    pub async fn create_account(&mut self, name: &str, password: &str) -> Result<(), ClientError> {
+    pub async fn create_account(
+        &mut self,
+        username: &str,
+        display: &str,
+        password: &str,
+    ) -> Result<(), ClientError> {
         // The zero-knowledge server cannot measure the password, so the policy
         // is enforced here.
         if password.len() < MIN_PASSWORD_LEN {
@@ -163,10 +174,10 @@ impl Client {
         let (request, reg_state) = opaque::client_register_start(password)
             .map_err(|e| ClientError::Auth(e.to_string()))?;
         self.conn.send(ClientMsg::RegisterStart {
-            name: name.to_string(),
+            name: username.to_string(),
             request,
         });
-        // The server assigns our full handle (name#1234); bind the identity to it.
+        // The server confirms our unique username; bind the identity to it.
         let (handle, response) = self.await_register_response().await?;
 
         let identity = Identity::generate(&handle)?;
@@ -179,9 +190,10 @@ impl Client {
             upload,
             identity_pub: identity.identity_key(),
             key_package,
+            display: display.to_string(),
         });
-        self.await_auth().await?;
-        self.finish_login(identity, &handle);
+        let server_display = self.await_auth().await?;
+        self.finish_login(identity, &handle, server_display);
         Ok(())
     }
 
@@ -209,9 +221,9 @@ impl Client {
             finalization,
             key_package,
         });
-        self.await_auth().await?;
+        let server_display = self.await_auth().await?;
         let _ = identity.save(&self.identity_path(handle), password);
-        self.finish_login(identity, handle);
+        self.finish_login(identity, handle, server_display);
         Ok(())
     }
 
@@ -222,21 +234,34 @@ impl Client {
         self.username = None;
         self.conversations.clear();
         self.active = None;
+        self.display.clear();
         self.friends.clear();
         self.incoming.clear();
         self.outgoing.clear();
+        self.display_names.clear();
     }
 
-    fn finish_login(&mut self, identity: Identity, username: &str) {
+    fn finish_login(&mut self, identity: Identity, username: &str, display: String) {
         self.identity = Some(identity);
         self.username = Some(username.to_string());
+        let display = if display.trim().is_empty() {
+            username.to_string()
+        } else {
+            display
+        };
+        self.display_names
+            .insert(username.to_string(), display.clone());
+        self.display = display;
     }
 
     /// Pump messages until the auth result arrives; queue any other events.
-    async fn await_auth(&mut self) -> Result<(), ClientError> {
+    /// Returns the server's stored display name for us on success.
+    async fn await_auth(&mut self) -> Result<String, ClientError> {
         loop {
             match tokio::time::timeout(Duration::from_secs(10), self.conn.recv()).await {
-                Ok(Some(ServerMsg::Auth { ok: true, .. })) => return Ok(()),
+                Ok(Some(ServerMsg::Auth {
+                    ok: true, display, ..
+                })) => return Ok(display),
                 Ok(Some(ServerMsg::Auth {
                     ok: false, detail, ..
                 })) => return Err(ClientError::Auth(detail)),
@@ -318,23 +343,47 @@ impl Client {
         self.conn.send(ClientMsg::Presence { status });
     }
 
-    /// Accepted friends (full handles), mirrored from the server.
-    pub fn friends(&self) -> &[String] {
+    /// Our own display name.
+    pub fn display_name(&self) -> &str {
+        &self.display
+    }
+
+    /// The display name for a username (falls back to the username).
+    pub fn display_of(&self, username: &str) -> String {
+        self.display_names
+            .get(username)
+            .cloned()
+            .unwrap_or_else(|| username.to_string())
+    }
+
+    /// Accepted friends (username + display), mirrored from the server.
+    pub fn friends(&self) -> &[Friend] {
         &self.friends
     }
 
     /// Incoming friend requests awaiting our accept/decline.
-    pub fn incoming_requests(&self) -> &[String] {
+    pub fn incoming_requests(&self) -> &[Friend] {
         &self.incoming
     }
 
     /// Friend requests we have sent that are not yet accepted.
-    pub fn outgoing_requests(&self) -> &[String] {
+    pub fn outgoing_requests(&self) -> &[Friend] {
         &self.outgoing
     }
 
-    /// Send a friend request to a full handle (`name#1234`). If they had already
-    /// requested us, the server makes us friends immediately.
+    /// Change our display name (cosmetic); friends are notified by the server.
+    pub fn set_display_name(&mut self, display: &str) {
+        self.display = display.to_string();
+        if let Some(u) = self.username.clone() {
+            self.display_names.insert(u, display.to_string());
+        }
+        self.conn.send(ClientMsg::SetDisplayName {
+            display: display.to_string(),
+        });
+    }
+
+    /// Send a friend request to a unique username. If they had already requested
+    /// us, the server makes us friends immediately.
     pub fn send_friend_request(&self, handle: &str) {
         self.conn.send(ClientMsg::FriendRequest {
             to: handle.to_string(),
@@ -532,16 +581,32 @@ impl Client {
         Ok(())
     }
 
-    /// A summary of every conversation, for the sidebar.
+    /// A summary of every conversation, for the sidebar. DM titles resolve to the
+    /// peer's current display name.
     pub fn conversations(&self) -> Vec<ConversationInfo> {
+        let me = self.username.clone().unwrap_or_default();
         self.conversations
             .iter()
-            .map(|(id, c)| ConversationInfo {
-                id: hex_id(id),
-                title: c.title.clone(),
-                is_dm: c.kind == ConvKind::Dm,
-                members: c.members.clone(),
-                pending: c.group.is_none(),
+            .map(|(id, c)| {
+                let title = match c.kind {
+                    ConvKind::Dm => {
+                        let peer = c
+                            .members
+                            .iter()
+                            .find(|m| **m != me)
+                            .cloned()
+                            .unwrap_or_else(|| c.title.clone());
+                        self.display_of(&peer)
+                    }
+                    ConvKind::Group => c.title.clone(),
+                };
+                ConversationInfo {
+                    id: hex_id(id),
+                    title,
+                    is_dm: c.kind == ConvKind::Dm,
+                    members: c.members.clone(),
+                    pending: c.group.is_none(),
+                }
             })
             .collect()
     }
@@ -559,7 +624,7 @@ impl Client {
             .map(|(_, c)| {
                 c.history
                     .iter()
-                    .map(|l| (l.from.clone(), l.text.clone(), l.mine))
+                    .map(|l| (self.display_of(&l.from), l.text.clone(), l.mine))
                     .collect()
             })
             .unwrap_or_default()
@@ -673,13 +738,18 @@ impl Client {
                 let g = conv.group.as_mut()?;
                 match g.decrypt_text(identity, &message.0) {
                     Ok(tm) => {
-                        let from = String::from_utf8_lossy(&tm.sender).into_owned();
+                        let username = String::from_utf8_lossy(&tm.sender).into_owned();
                         let text = String::from_utf8_lossy(&tm.plaintext).into_owned();
                         conv.history.push(ChatLine {
-                            from: from.clone(),
+                            from: username.clone(),
                             text: text.clone(),
                             mine: false,
                         });
+                        let from = self
+                            .display_names
+                            .get(&username)
+                            .cloned()
+                            .unwrap_or(username);
                         Some(Event::Message {
                             conv: hex_id(&group),
                             from,
@@ -708,6 +778,10 @@ impl Client {
                 incoming,
                 outgoing,
             } => {
+                for f in friends.iter().chain(&incoming).chain(&outgoing) {
+                    self.display_names
+                        .insert(f.username.clone(), f.display.clone());
+                }
                 self.friends = friends;
                 self.incoming = incoming;
                 self.outgoing = outgoing;
