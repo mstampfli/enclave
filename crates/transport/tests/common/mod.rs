@@ -7,11 +7,55 @@ use std::time::Duration;
 
 use enclave_crypto::{Group, Identity};
 use enclave_protocol::{ClientMsg, DeviceId, GroupId, MediaFrame, Sealed, ServerMsg, UserId};
-use enclave_transport::{Connection, Server};
+use enclave_transport::{opaque, Connection, Server};
 
 /// App-level routing group id (independent of MLS's internal group id).
 pub const GROUP: GroupId = GroupId([7u8; 32]);
 pub const RECV_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Register `username` over a live connection via the full OPAQUE handshake and
+/// wait for the authenticated `Auth { ok }`. Panics on failure (test helper).
+pub async fn register_account(
+    conn: &mut Connection,
+    username: &str,
+    identity_pub: Vec<u8>,
+    key_package: Vec<u8>,
+) {
+    let password = "a-sufficiently-long-password";
+    let (request, state) = opaque::client_register_start(password).expect("client register start");
+    conn.send(ClientMsg::RegisterStart {
+        username: username.into(),
+        request,
+    });
+    let response = loop {
+        match tokio::time::timeout(RECV_TIMEOUT, conn.recv()).await {
+            Ok(Some(ServerMsg::RegisterResponse { response })) => break response,
+            Ok(Some(_)) => continue,
+            _ => panic!("no register response for {username}"),
+        }
+    };
+    let upload = state
+        .finish(password, &response)
+        .expect("client register finish");
+    conn.send(ClientMsg::RegisterFinish {
+        username: username.into(),
+        upload,
+        identity_pub,
+        key_package,
+    });
+    loop {
+        match tokio::time::timeout(RECV_TIMEOUT, conn.recv()).await {
+            Ok(Some(ServerMsg::Auth { ok: true, .. })) => break,
+            Ok(Some(ServerMsg::Auth {
+                ok: false, detail, ..
+            })) => {
+                panic!("registration failed for {username}: {detail}")
+            }
+            Ok(Some(_)) => continue,
+            _ => panic!("no auth for {username}"),
+        }
+    }
+}
 
 pub async fn fetch_key_package(conn: &mut Connection, user: &str) -> Vec<u8> {
     for _ in 0..100 {
@@ -95,18 +139,20 @@ pub async fn establish() -> Established {
     let mut alice_conn = Connection::connect(&url).await.expect("alice connects");
     let mut bob_conn = Connection::connect(&url).await.expect("bob connects");
 
-    alice_conn.send(ClientMsg::CreateAccount {
-        username: "alice".into(),
-        password: "alice-password-12".into(),
-        identity_pub: alice.identity_key(),
-        key_package: alice.new_key_package().expect("alice kp"),
-    });
-    bob_conn.send(ClientMsg::CreateAccount {
-        username: "bob".into(),
-        password: "bob-password-1234".into(),
-        identity_pub: bob.identity_key(),
-        key_package: bob.new_key_package().expect("bob kp"),
-    });
+    register_account(
+        &mut alice_conn,
+        "alice",
+        alice.identity_key(),
+        alice.new_key_package().expect("alice kp"),
+    )
+    .await;
+    register_account(
+        &mut bob_conn,
+        "bob",
+        bob.identity_key(),
+        bob.new_key_package().expect("bob kp"),
+    )
+    .await;
 
     let bob_kp = fetch_key_package(&mut alice_conn, "bob").await;
 

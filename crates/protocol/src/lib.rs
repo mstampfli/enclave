@@ -64,18 +64,25 @@ pub struct MediaFrame {
 /// Client -> server messages over the (TLS) signaling channel.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
-    /// Create a new account (username + password, no email) and authenticate.
-    /// Carries this device's identity public key and a signed MLS KeyPackage.
-    CreateAccount {
+    /// OPAQUE registration, step 1: a blinded registration request. The password
+    /// is never sent -- not here, not anywhere. See `enclave-transport::opaque`.
+    RegisterStart { username: String, request: Vec<u8> },
+    /// OPAQUE registration, step 2: the client's upload (the future stored
+    /// envelope), plus this device's identity public key and signed KeyPackage.
+    /// On success the server stores the account and authenticates the session.
+    RegisterFinish {
         username: String,
-        password: String,
+        upload: Vec<u8>,
         identity_pub: Vec<u8>,
         key_package: Vec<u8>,
     },
-    /// Log in to an existing account and publish a fresh KeyPackage.
-    Login {
-        username: String,
-        password: String,
+    /// OPAQUE login, step 1: a blinded credential request for `username`.
+    LoginStart { username: String, request: Vec<u8> },
+    /// OPAQUE login, step 2: the client's credential finalization proving
+    /// knowledge of the password, plus a fresh KeyPackage to publish. The server
+    /// verifies the proof and authenticates (or rejects) the session.
+    LoginFinish {
+        finalization: Vec<u8>,
         key_package: Vec<u8>,
     },
     /// End the authenticated session (go offline).
@@ -110,7 +117,16 @@ pub enum ClientMsg {
 /// Server -> client messages.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerMsg {
-    /// Result of a CreateAccount or Login attempt.
+    /// OPAQUE registration, step 1 reply: the server's registration response.
+    RegisterResponse {
+        response: Vec<u8>,
+    },
+    /// OPAQUE login, step 1 reply: the server's credential response (a challenge
+    /// the client can only answer with the right password).
+    LoginResponse {
+        response: Vec<u8>,
+    },
+    /// Final result of a registration or login exchange.
     Auth {
         ok: bool,
         username: String,

@@ -71,9 +71,9 @@ Target level L2 (private communications). Chapters touched and status:
   at 1 MiB. The crypto parsers reject malformed/truncated input with errors, not
   panics -- fuzzed by `crates/crypto/tests/robustness.rs`.
 - **V6 Stored Cryptography** [OK]: approved AEADs only (ChaCha20-Poly1305 for
-  media, AES-128-GCM via MLS); media-key derivation intermediates are zeroized;
-  private identity/MLS keys live only in the in-memory provider for the session
-  and are never written to disk.
+  media, AES-128-GCM via MLS); media-key derivation intermediates are zeroized.
+  The long-term identity key is written to disk only encrypted under a
+  password-derived key (Argon2id -> ChaCha20-Poly1305); see the account section.
 - **V7 Error Handling & Logging** [OK]: the server drops bad input silently and
   logs no key material; errors carry no secrets.
 - **V9 Communications** [FIXED]: optional TLS (wss) on the signaling hop via
@@ -112,50 +112,89 @@ Target level L2 (private communications). Chapters touched and status:
   latest and exact-pin `libcrux-aead 0.0.7`. Waived in CI with this
   justification; re-checked on every build.
 
-## Account authentication (STRIDE + ASVS L2)
+## Account authentication (STRIDE + ASVS L2) -- zero-knowledge via OPAQUE
 
 Target level **L2**. Scope: account create / login / logout, credential storage,
 and the identity key at rest.
 
+Auth uses **OPAQUE** (RFC 9807), an augmented PAKE, via the `opaque-ke` crate
+(Meta's reference implementation; protocol audited by NCC Group). The server
+stores only a per-account **envelope** it cannot reverse, and the password never
+leaves the client -- not at login and not even at registration. Cipher suite:
+Ristretto255 OPRF + Triple-DH (SHA-512) + **Argon2id** as the key-stretching
+function. Implemented as one tested primitive in `enclave-transport::opaque`.
+
 ### Data flow and trust boundaries
 
-- **External entity:** the user (knows their password).
-- **Process:** the relay's auth handler (`AccountStore` + relay).
-- **Data stores:** server account file (`enclave-accounts.json`); client identity
-  file (`enclave-<user>.id`).
-- **Flows crossing the client->server trust boundary:** the login credential and
-  the create-account credential.
+- **External entity:** the user. The password never leaves their device.
+- **Process:** the relay's OPAQUE handler (`AccountStore` + `OpaqueServer`).
+- **Data stores:** server account file (`enclave-accounts.json`: OPAQUE envelope +
+  identity pubkey per user); server OPAQUE setup (`enclave-opaque.setup`: the
+  server's long-term OPRF seed + keypair); client identity file
+  (`enclave-<user>.id`: the Ed25519 signing key, encrypted at rest).
+- **Flows crossing the client->server boundary:** the OPAQUE registration
+  (request/response/upload) and login (credential request/response/finalization).
+  None reveal the password to the server.
+
+### What the server sees (and does not)
+
+- **Never:** the password, nor any reversible/replayable function of it.
+  Registration blinds the password through an OPRF; the server contributes its
+  seed without learning the input. This is the core zero-knowledge property.
+- **Sees (metadata):** the username, the identity pubkey, connection timing --
+  the accepted routing-metadata tradeoff.
 
 ### STRIDE
 
 | Threat | Concrete risk | Status / mitigation |
 |---|---|---|
-| **S** Spoofing | Impersonate a user | Password auth; identity key pinned per account. **GAP: MFA not offered.** |
-| **T** Tampering | Alter the account/identity file | AEAD/integrity on the identity file (below); server file is server-trusted. |
+| **S** Spoofing | Impersonate a user | OPAQUE mutual auth: only the password holder completes login (the key-confirmation MAC only validates on the true password). Identity pubkey pinned per account. **GAP: MFA not offered.** |
+| **T** Tampering | Alter account / identity / setup file | Identity file is AEAD-sealed (below). Server files are server-trusted; tampering an envelope or the setup only breaks login (fails closed), never leaks the password. |
 | **R** Repudiation | Deny an action | Not a goal (private-comms); accepted. |
-| **I** Info disclosure (password) | Server learns the password | **CURRENT GAP: not zero-knowledge -- the client sends the plaintext password and the server hashes it, so the server sees the password at login.** Fix: a PAKE (server never sees it). |
-| **I** Info disclosure (identity at rest) | Private key read off disk | **CURRENT GAP: `enclave-<user>.id` is unencrypted.** Fix: encrypt with a password-derived key. |
-| **I** Info disclosure (stored verifier) | Server DB leak -> offline crack | Argon2id verifier resists it; a PAKE verifier is stronger. |
-| **D** Denial of service | Login flooding / brute force | Per-connection lockout after 5 failures (ASVS V2); coarse. |
-| **E** Elevation | Act before/without auth | Deny-by-default auth gate: nothing routes before login (ASVS V4). |
+| **I** Info disclosure (password) | Server learns the password | **CLOSED: OPAQUE -- the password never crosses the trust boundary, at registration or login.** |
+| **I** Info disclosure (server DB leak) | Offline crack after envelope theft | Forces a per-account, Argon2id-hard offline attack. OPAQUE is precomputation-resistant (unlike SRP): no shared salt to precompute against. |
+| **I** Info disclosure (identity at rest) | Private key read off disk | **CLOSED: `enclave-<user>.id` is Argon2id + ChaCha20-Poly1305 sealed under the password.** |
+| **D** Denial of service | Login flooding / online guessing | Per-connection lockout after 5 failures + per-connection rate limit; each guess costs a full OPAQUE round trip + Argon2id. |
+| **E** Elevation | Act before/without auth | Deny-by-default auth gate: only OPAQUE handshake messages route before a session exists (ASVS V4). |
 
-### ASVS L2 status (honest)
+### Accepted / residual risks
 
-- **V2 Authentication** [PARTIAL]: Argon2id + per-password salt + 12-char min +
-  lockout are in place. **Missing: the server sees the password (not ZK); no
-  breach-corpus check; no MFA.**
-- **V6 Stored Cryptography** [PARTIAL]: password stored as an Argon2id verifier
-  (good). **Identity private key stored unencrypted (gap).**
-- **V8 Data Protection** [GAP]: the identity key at rest is not encrypted.
-- **V9 Communications** [PARTIAL]: TLS is available (`serve_signaling_tls`) but the
-  default run is plaintext `ws://`.
+- **Password policy is client-enforced.** A zero-knowledge server cannot measure a
+  password it never receives; the client enforces the 12-char minimum before
+  registration. A patched client could bypass it, weakening only that user's own
+  account. Accepted (inherent to ZK auth).
+- **Registration reveals username existence** ("that name is taken"). Unavoidable
+  without email/confirmation; accepted. **Login does not:** unknown users take the
+  same path via OPAQUE dummy mode, so a login attempt cannot enumerate usernames.
+- **The OPAQUE `ServerSetup` is critical persistent state.** Lose it and every
+  envelope becomes unusable (no one can log in); leak it and the per-account
+  offline attack above becomes possible (still Argon2id-hard). Treated like a
+  server private key: generated once, persisted, gitignored.
 
-### Remediation (in progress)
+### ASVS L2 status
 
-1. **Zero-knowledge auth (PAKE):** replace send-password-and-hash with a PAKE so
-   the server never sees the password. Closes the V2/STRIDE-I credential gap.
-2. **Encrypt the identity at rest** with a password-derived key. Closes the
-   V8/STRIDE-I identity gap.
+- **V2 Authentication** [MET]: password never sent (OPAQUE); Argon2id KSF; 12-char
+  minimum (client-enforced); per-connection lockout. Remaining, tracked, not
+  L2-blocking: no breach-corpus check, no MFA.
+- **V6 Stored Cryptography** [MET]: credential stored as an irreversible OPAQUE
+  envelope (not a reversible or replayable secret); identity key AEAD-sealed at
+  rest; Argon2id KSF; approved AEADs only.
+- **V8 Data Protection** [MET]: the identity key at rest is encrypted under a
+  password-derived key.
+- **V9 Communications** [PARTIAL]: TLS is available (`serve_signaling_tls`); the
+  default local run is `ws://`. OPAQUE does not rely on TLS for password secrecy,
+  but TLS still protects metadata and gives channel binding -- use `wss` in
+  production.
+
+### Validation
+
+- OPAQUE round trip authenticates; a wrong password and an unknown user (dummy
+  mode) both fail; the server setup survives a serialize/restore. See
+  `crates/transport/src/opaque.rs` tests.
+- End-to-end over a live relay: a wrong password is rejected by the controller.
+  See `crates/client/tests/client_flow.rs::wrong_password_is_rejected`.
+- Identity key is unreadable on disk without the password. See
+  `crates/crypto/tests/identity_persistence.rs`.
 
 ## Deferred mitigations (scheduled, not skipped)
 

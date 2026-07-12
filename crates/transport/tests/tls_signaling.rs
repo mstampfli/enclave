@@ -7,6 +7,8 @@ use std::time::Duration;
 use enclave_protocol::{ClientMsg, ServerMsg, UserId};
 use enclave_transport::{Connection, Server};
 
+mod common;
+
 #[tokio::test]
 async fn signaling_works_over_tls() {
     // A self-signed certificate for "localhost".
@@ -35,13 +37,9 @@ async fn signaling_works_over_tls() {
     let url = format!("wss://localhost:{}", addr.port());
     let mut conn = Connection::connect_tls(&url, config).await.unwrap();
 
-    // A create-account + fetch round-trip proves the protocol rides the hop.
-    conn.send(ClientMsg::CreateAccount {
-        username: "a".into(),
-        password: "a-long-enough-password".into(),
-        identity_pub: vec![],
-        key_package: vec![9, 9],
-    });
+    // A full OPAQUE registration + fetch round-trip proves the protocol (and the
+    // multi-round handshake) rides the TLS hop.
+    common::register_account(&mut conn, "a", vec![], vec![9, 9]).await;
     conn.send(ClientMsg::FetchKeyPackages {
         user: UserId("a".into()),
     });

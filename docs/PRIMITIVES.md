@@ -9,6 +9,8 @@ here; if it is not in this table, we do not use it.
 | Group key agreement | MLS | `openmls` | Scalable rekey, forward secrecy, post-compromise security, authenticated membership |
 | Media/text AEAD | ChaCha20-Poly1305 | `chacha20poly1305` | Fast in software, no timing-side-channel table lookups, nonce-misuse-visible |
 | Key derivation | HKDF-SHA256 | `hkdf` + `sha2` | Standard exporter->media-key derivation |
+| Password authentication | OPAQUE (RFC 9807) aPAKE | `opaque-ke` | Server never sees the password; precomputation-resistant; audited reference impl (Ristretto255 + Triple-DH) |
+| Password key-stretching | Argon2id | `argon2` | Memory-hard; the OPAQUE KSF and the at-rest identity-key wrap |
 | Safety number | SHA-256 over sorted member identity keys | `sha2` | Deterministic, comparable out-of-band |
 | Secret zeroing | `zeroize` | `zeroize` | Wipe key material on drop |
 
@@ -21,8 +23,10 @@ here; if it is not in this table, we do not use it.
   `MediaOpener` accepts out-of-order real-time frames once and rejects
   duplicates / too-old frames. Authenticate first, then update the window, so a
   forged frame cannot poison it.
-- **Keys:** private identity + MLS secrets never leave the client; wrapped in
-  `zeroize` types; never logged, never serialized to the server.
+- **Keys:** private identity + MLS secrets never leave the client, are never
+  logged, and are never serialized to the server. The long-term identity key,
+  when persisted on the device, is encrypted under a password-derived key
+  (Argon2id -> ChaCha20-Poly1305); session secrets are wrapped in `zeroize` types.
 - **Frame layout:** encrypt the *encoded* frame (Opus/video), never raw samples
   -- there is no lossy stage after encryption to corrupt ciphertext.
 - **No new primitive** without adding it here first, with a justification.

@@ -26,6 +26,9 @@ carries opaque bytes end to end.
 - **Peers: authenticated, then verified.** Identity = Ed25519 long-term key.
   Keys pinned on first use; a safety-number lets users confirm out-of-band that
   the server did not insert a ghost member.
+- **Accounts: zero-knowledge.** Registration and login use OPAQUE (RFC 9807): the
+  server stores only an irreversible per-account envelope and never sees the
+  password, even at signup. See THREAT_MODEL.md ("Account authentication").
 - **No hand-rolled crypto.** We assemble audited primitives (see
   `docs/PRIMITIVES.md`) and wire them together correctly.
 
@@ -49,8 +52,9 @@ crypto  media  transport
 - `enclave-transport` -- signaling + media transport. A pure `relay` routing
   core (metadata only; every payload opaque) drives both a reliable WebSocket
   signaling channel and a low-latency UDP media channel (`Server` runs both over
-  shared state; `Connection` and `MediaSocket` are the client sides). TLS on the
-  signaling hop is deferred to Phase 7 hardening.
+  shared state; `Connection` and `MediaSocket` are the client sides). TLS (wss)
+  on the signaling hop and zero-knowledge account auth (OPAQUE, the `opaque`
+  module) are implemented here.
 - `enclave-client` -- lib + bin. The lib is the high-level `Client` controller
   (the app-logic API the UI drives); the bin is the self-contained WebView
   window (see "UI" below) that bridges IPC to the controller.

@@ -16,6 +16,7 @@ use std::net::SocketAddr;
 use enclave_protocol::{ClientMsg, DeviceId, GroupId, Presence, ServerMsg, UserId};
 
 use crate::accounts::{AccountStore, AuthOutcome};
+use crate::opaque::{OpaqueServer, ServerLoginState};
 
 /// Opaque handle for one client connection. Assigned by the relay on connect.
 pub type ConnId = u64;
@@ -52,10 +53,20 @@ pub struct Relay {
     presence: HashMap<UserId, Presence>,
     /// Connections that want presence updates about a given user (friends).
     presence_watchers: HashMap<UserId, HashSet<ConnId>>,
-    /// Accounts (username + Argon2id password + identity key).
+    /// Accounts (OPAQUE envelope + identity key). Server never sees passwords.
     accounts: AccountStore,
+    /// The server's long-term OPAQUE state (OPRF seed + static keypair).
+    opaque: OpaqueServer,
+    /// In-flight OPAQUE logins, keyed by connection, between the two round-trips.
+    pending_login: HashMap<ConnId, PendingLogin>,
     /// Failed login attempts per connection, for lockout.
     login_attempts: HashMap<ConnId, u32>,
+}
+
+/// Server-side state for an OPAQUE login in progress on one connection.
+struct PendingLogin {
+    username: String,
+    state: ServerLoginState,
 }
 
 impl Relay {
@@ -63,10 +74,23 @@ impl Relay {
         Self::default()
     }
 
-    /// Create a relay backed by a specific (e.g. persistent) account store.
+    /// Create a relay backed by a specific (e.g. persistent) account store, with
+    /// a fresh ephemeral OPAQUE setup. Use [`Relay::with_auth`] to also supply a
+    /// persistent OPAQUE setup (required so accounts survive a restart).
     pub fn with_accounts(accounts: AccountStore) -> Self {
         Self {
             accounts,
+            ..Self::default()
+        }
+    }
+
+    /// Create a relay backed by a persistent account store *and* a persistent
+    /// OPAQUE server setup. Both must persist together: the envelopes in the
+    /// store are only usable under the setup they were registered against.
+    pub fn with_auth(accounts: AccountStore, opaque: OpaqueServer) -> Self {
+        Self {
+            accounts,
+            opaque,
             ..Self::default()
         }
     }
@@ -90,6 +114,7 @@ impl Relay {
             }
         }
         self.login_attempts.remove(&conn);
+        self.pending_login.remove(&conn);
         for watchers in self.presence_watchers.values_mut() {
             watchers.remove(&conn);
         }
@@ -179,47 +204,104 @@ impl Relay {
     /// Handle one client message, returning messages to deliver. Pure: the only
     /// effect is on `self`'s routing state.
     pub fn handle(&mut self, from: ConnId, msg: ClientMsg) -> Vec<Outgoing> {
-        // Auth gate (ASVS V4): only account messages are allowed before login.
+        // Auth gate (ASVS V4): only the OPAQUE handshake messages are allowed
+        // before a session is established.
         match &msg {
-            ClientMsg::CreateAccount { .. } | ClientMsg::Login { .. } | ClientMsg::Logout => {}
+            ClientMsg::RegisterStart { .. }
+            | ClientMsg::RegisterFinish { .. }
+            | ClientMsg::LoginStart { .. }
+            | ClientMsg::LoginFinish { .. }
+            | ClientMsg::Logout => {}
             _ if self.conn_user.contains_key(&from) => {}
             _ => return vec![],
         }
         match msg {
-            ClientMsg::CreateAccount {
+            ClientMsg::RegisterStart { username, request } => {
+                // Refuse to begin registering over an existing name (re-checked
+                // atomically at finish). This does reveal name existence, which
+                // is unavoidable without email confirmation (accepted risk).
+                if self.accounts.contains(&username) {
+                    return auth_fail(from, username, "that username is taken");
+                }
+                match self.opaque.register_start(&username, &request) {
+                    Ok(response) => vec![Outgoing {
+                        to: from,
+                        msg: ServerMsg::RegisterResponse { response },
+                    }],
+                    Err(_) => auth_fail(from, username, "registration failed"),
+                }
+            }
+
+            ClientMsg::RegisterFinish {
                 username,
-                password,
+                upload,
                 identity_pub,
                 key_package,
-            } => match self
-                .accounts
-                .create_account(&username, &password, identity_pub.clone())
-            {
-                AuthOutcome::Created => {
-                    let mut out = vec![Outgoing {
-                        to: from,
-                        msg: ServerMsg::Auth {
-                            ok: true,
-                            username: username.clone(),
-                            detail: "account created".into(),
-                        },
-                    }];
-                    out.extend(self.setup_session(from, username, identity_pub, key_package));
-                    out
+            } => {
+                let envelope = match self.opaque.register_finish(&upload) {
+                    Ok(env) => env,
+                    Err(_) => return auth_fail(from, username, "registration failed"),
+                };
+                match self
+                    .accounts
+                    .create_account(&username, envelope, identity_pub.clone())
+                {
+                    AuthOutcome::Created => {
+                        let mut out = vec![Outgoing {
+                            to: from,
+                            msg: ServerMsg::Auth {
+                                ok: true,
+                                username: username.clone(),
+                                detail: "account created".into(),
+                            },
+                        }];
+                        out.extend(self.setup_session(from, username, identity_pub, key_package));
+                        out
+                    }
+                    AuthOutcome::UsernameTaken => {
+                        auth_fail(from, username, "that username is taken")
+                    }
+                    AuthOutcome::InvalidUsername => {
+                        auth_fail(from, username, "please enter a username")
+                    }
                 }
-                other => auth_error(from, username, other),
-            },
+            }
 
-            ClientMsg::Login {
-                username,
-                password,
+            ClientMsg::LoginStart { username, request } => {
+                if *self.login_attempts.get(&from).unwrap_or(&0) >= MAX_LOGIN_ATTEMPTS {
+                    return auth_fail(from, username, "too many attempts; reconnect to retry");
+                }
+                // Unknown users take the same path via OPAQUE dummy mode (a
+                // `None` envelope), so a login attempt cannot enumerate usernames.
+                let envelope = self.accounts.envelope(&username).map(|e| e.to_vec());
+                match self
+                    .opaque
+                    .login_start(&username, envelope.as_deref(), &request)
+                {
+                    Ok((response, state)) => {
+                        self.pending_login
+                            .insert(from, PendingLogin { username, state });
+                        vec![Outgoing {
+                            to: from,
+                            msg: ServerMsg::LoginResponse { response },
+                        }]
+                    }
+                    Err(_) => auth_fail(from, username, "wrong username or password"),
+                }
+            }
+
+            ClientMsg::LoginFinish {
+                finalization,
                 key_package,
             } => {
-                if *self.login_attempts.get(&from).unwrap_or(&0) >= MAX_LOGIN_ATTEMPTS {
-                    return auth_error(from, username, AuthOutcome::WrongPassword);
-                }
-                match self.accounts.verify_login(&username, &password) {
-                    AuthOutcome::LoggedIn => {
+                let Some(PendingLogin { username, state }) = self.pending_login.remove(&from)
+                else {
+                    return vec![];
+                };
+                match state.finish(&finalization) {
+                    // Dummy mode never yields Ok, so a success implies the account
+                    // exists and the password was correct.
+                    Ok(()) => {
                         self.login_attempts.remove(&from);
                         let identity_pub = self
                             .accounts
@@ -237,9 +319,9 @@ impl Relay {
                         out.extend(self.setup_session(from, username, identity_pub, key_package));
                         out
                     }
-                    other => {
+                    Err(_) => {
                         *self.login_attempts.entry(from).or_insert(0) += 1;
-                        auth_error(from, username, other)
+                        auth_fail(from, username, "wrong username or password")
                     }
                 }
             }
@@ -384,16 +466,10 @@ impl Relay {
     }
 }
 
-/// Build an auth-failure reply. The message is intentionally coarse so it does
-/// not leak whether a username exists (ASVS V2).
-fn auth_error(conn: ConnId, username: String, outcome: AuthOutcome) -> Vec<Outgoing> {
-    let detail = match outcome {
-        AuthOutcome::UsernameTaken => "that username is taken",
-        AuthOutcome::UnknownUser | AuthOutcome::WrongPassword => "wrong username or password",
-        AuthOutcome::PasswordTooShort => "password must be at least 12 characters",
-        AuthOutcome::InvalidUsername => "please enter a username",
-        AuthOutcome::Created | AuthOutcome::LoggedIn => "ok",
-    };
+/// Build an auth-failure reply. Login failures use a single coarse message so
+/// they do not leak whether a username exists (ASVS V2); OPAQUE dummy mode makes
+/// the crypto path indistinguishable too.
+fn auth_fail(conn: ConnId, username: String, detail: &str) -> Vec<Outgoing> {
     vec![Outgoing {
         to: conn,
         msg: ServerMsg::Auth {

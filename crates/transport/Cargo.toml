@@ -18,6 +18,9 @@ rustls = { version = "0.23.41", default-features = false, features = ["ring", "s
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 argon2 = "0.5.3"
 serde = { workspace = true, features = ["derive"] }
+opaque-ke = { version = "4.0.1", features = ["argon2"] }
+sha2 = "0.10"
+rand = "0.8"
 
 [dev-dependencies]
 enclave-crypto = { path = "../crypto" }

@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use enclave_crypto::{Group, Identity};
 use enclave_protocol::{ClientMsg, DeviceId, GroupId, Presence, Sealed, ServerMsg, UserId};
-use enclave_transport::Connection;
+use enclave_transport::accounts::MIN_PASSWORD_LEN;
+use enclave_transport::{opaque, Connection};
 
 /// Errors surfaced to the UI.
 #[derive(Debug, thiserror::Error)]
@@ -93,19 +94,39 @@ impl Client {
         self.keystore_dir = dir.into();
     }
 
-    /// Create a new account (username + password, no email) and log in. The new
-    /// identity is generated and saved to this device.
+    /// Create a new account (username + password, no email) and log in via
+    /// OPAQUE: the password is used only locally and never sent to the server.
+    /// The new identity is generated and saved (encrypted) to this device.
     pub async fn create_account(
         &mut self,
         username: &str,
         password: &str,
     ) -> Result<(), ClientError> {
+        // The zero-knowledge server cannot measure the password, so the policy
+        // is enforced here.
+        if password.len() < MIN_PASSWORD_LEN {
+            return Err(ClientError::Auth(format!(
+                "password must be at least {MIN_PASSWORD_LEN} characters"
+            )));
+        }
         let identity = Identity::generate(username)?;
         let _ = identity.save(&self.identity_path(username), password);
         let key_package = identity.new_key_package()?;
-        self.conn.send(ClientMsg::CreateAccount {
+
+        // OPAQUE registration (2 round-trips). The password stays in this method.
+        let (request, reg_state) = opaque::client_register_start(password)
+            .map_err(|e| ClientError::Auth(e.to_string()))?;
+        self.conn.send(ClientMsg::RegisterStart {
             username: username.to_string(),
-            password: password.to_string(),
+            request,
+        });
+        let response = self.await_register_response().await?;
+        let upload = reg_state
+            .finish(password, &response)
+            .map_err(|e| ClientError::Auth(e.to_string()))?;
+        self.conn.send(ClientMsg::RegisterFinish {
+            username: username.to_string(),
+            upload,
             identity_pub: identity.identity_key(),
             key_package,
         });
@@ -114,15 +135,28 @@ impl Client {
         Ok(())
     }
 
-    /// Log in to an existing account, restoring the saved identity on this
-    /// device (a fresh one is generated if none is saved here).
+    /// Log in to an existing account via OPAQUE, restoring the saved identity on
+    /// this device (a fresh one is generated if none is saved here). The password
+    /// never leaves this device.
     pub async fn login(&mut self, username: &str, password: &str) -> Result<(), ClientError> {
         let identity = Identity::load(username, &self.identity_path(username), password)
             .or_else(|_| Identity::generate(username))?;
         let key_package = identity.new_key_package()?;
-        self.conn.send(ClientMsg::Login {
+
+        // OPAQUE login (2 round-trips): prove knowledge of the password without
+        // sending it. A wrong password fails the client-side finish below.
+        let (request, login_state) =
+            opaque::client_login_start(password).map_err(|e| ClientError::Auth(e.to_string()))?;
+        self.conn.send(ClientMsg::LoginStart {
             username: username.to_string(),
-            password: password.to_string(),
+            request,
+        });
+        let response = self.await_login_response().await?;
+        let finalization = login_state
+            .finish(password, &response)
+            .map_err(|_| ClientError::Auth("wrong username or password".into()))?;
+        self.conn.send(ClientMsg::LoginFinish {
+            finalization,
             key_package,
         });
         self.await_auth().await?;
@@ -152,6 +186,46 @@ impl Client {
         loop {
             match tokio::time::timeout(Duration::from_secs(10), self.conn.recv()).await {
                 Ok(Some(ServerMsg::Auth { ok: true, .. })) => return Ok(()),
+                Ok(Some(ServerMsg::Auth {
+                    ok: false, detail, ..
+                })) => return Err(ClientError::Auth(detail)),
+                Ok(Some(other)) => {
+                    if let Some(event) = self.handle(other) {
+                        self.pending.push_back(event);
+                    }
+                }
+                Ok(None) => return Err(ClientError::Disconnected),
+                Err(_) => return Err(ClientError::Auth("server did not respond".into())),
+            }
+        }
+    }
+
+    /// Pump messages until the OPAQUE registration response arrives. A failure
+    /// (e.g. username taken) comes back as an `Auth { ok: false }` instead.
+    async fn await_register_response(&mut self) -> Result<Vec<u8>, ClientError> {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), self.conn.recv()).await {
+                Ok(Some(ServerMsg::RegisterResponse { response })) => return Ok(response),
+                Ok(Some(ServerMsg::Auth {
+                    ok: false, detail, ..
+                })) => return Err(ClientError::Auth(detail)),
+                Ok(Some(other)) => {
+                    if let Some(event) = self.handle(other) {
+                        self.pending.push_back(event);
+                    }
+                }
+                Ok(None) => return Err(ClientError::Disconnected),
+                Err(_) => return Err(ClientError::Auth("server did not respond".into())),
+            }
+        }
+    }
+
+    /// Pump messages until the OPAQUE login (credential) response arrives. A
+    /// rejection (e.g. lockout) comes back as an `Auth { ok: false }` instead.
+    async fn await_login_response(&mut self) -> Result<Vec<u8>, ClientError> {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), self.conn.recv()).await {
+                Ok(Some(ServerMsg::LoginResponse { response })) => return Ok(response),
                 Ok(Some(ServerMsg::Auth {
                     ok: false, detail, ..
                 })) => return Err(ClientError::Auth(detail)),

@@ -68,11 +68,27 @@ impl Server {
         }
     }
 
-    /// Create a server backed by a persistent account store.
+    /// Create a server backed by a persistent account store (ephemeral OPAQUE
+    /// setup). Prefer [`Server::with_auth`] for a real deployment so accounts
+    /// survive a restart.
     pub fn with_accounts(accounts: crate::accounts::AccountStore) -> Self {
         Self {
             state: Arc::new(Mutex::new(ServerState {
                 relay: Relay::with_accounts(accounts),
+                txs: HashMap::new(),
+            })),
+        }
+    }
+
+    /// Create a server backed by a persistent account store *and* a persistent
+    /// OPAQUE server setup. Both must be persisted together.
+    pub fn with_auth(
+        accounts: crate::accounts::AccountStore,
+        opaque: crate::opaque::OpaqueServer,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ServerState {
+                relay: Relay::with_auth(accounts, opaque),
                 txs: HashMap::new(),
             })),
         }

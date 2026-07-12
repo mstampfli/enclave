@@ -1,21 +1,43 @@
 //! Unit tests for the pure relay routing core (no network).
 
 use enclave_protocol::{ClientMsg, DeviceId, GroupId, Presence, Sealed, ServerMsg, UserId};
-use enclave_transport::Relay;
+use enclave_transport::{Outgoing, Relay};
 
-// Create an account and authenticate a connection. The device id is the
-// username in the account model.
-fn register(r: &mut Relay, user: &str, kp: Vec<u8>) -> u64 {
-    let conn = r.connect();
+// Drive a full OPAQUE registration against the relay on `conn`, returning the
+// finish outgoings (Auth + any presence). Uses the real handshake -- no test
+// backdoor into the auth path.
+fn authenticate(r: &mut Relay, conn: u64, user: &str, kp: Vec<u8>) -> Vec<Outgoing> {
+    let password = "a-sufficiently-long-password";
+    let (request, state) =
+        enclave_transport::opaque::client_register_start(password).expect("register start");
+    let out = r.handle(
+        conn,
+        ClientMsg::RegisterStart {
+            username: user.into(),
+            request,
+        },
+    );
+    let response = match &out[0].msg {
+        ServerMsg::RegisterResponse { response } => response.clone(),
+        other => panic!("expected RegisterResponse, got {other:?}"),
+    };
+    let upload = state.finish(password, &response).expect("register finish");
     r.handle(
         conn,
-        ClientMsg::CreateAccount {
+        ClientMsg::RegisterFinish {
             username: user.into(),
-            password: "a-sufficiently-long-password".into(),
+            upload,
             identity_pub: vec![],
             key_package: kp,
         },
-    );
+    )
+}
+
+// Create an account and authenticate a fresh connection. The device id is the
+// username in the account model.
+fn register(r: &mut Relay, user: &str, kp: Vec<u8>) -> u64 {
+    let conn = r.connect();
+    authenticate(r, conn, user, kp);
     conn
 }
 
@@ -276,15 +298,7 @@ fn presence_reaches_watchers_on_connect_and_disconnect() {
 
     // Alice connects and watches Bob before Bob is online.
     let a = r.connect();
-    r.handle(
-        a,
-        ClientMsg::CreateAccount {
-            username: "alice".into(),
-            password: "alice-password-12".into(),
-            identity_pub: vec![],
-            key_package: vec![1],
-        },
-    );
+    authenticate(&mut r, a, "alice", vec![1]);
     let out = r.handle(
         a,
         ClientMsg::WatchPresence {
@@ -295,15 +309,7 @@ fn presence_reaches_watchers_on_connect_and_disconnect() {
 
     // Bob registers -> Alice (watching Bob) is told he is online.
     let b = r.connect();
-    let out = r.handle(
-        b,
-        ClientMsg::CreateAccount {
-            username: "bob".into(),
-            password: "bob-password-1234".into(),
-            identity_pub: vec![],
-            key_package: vec![2],
-        },
-    );
+    let out = authenticate(&mut r, b, "bob", vec![2]);
     // (CreateAccount also returns an Auth reply to Bob, so look for the presence.)
     assert!(out.iter().any(|o| o.to == a
         && matches!(

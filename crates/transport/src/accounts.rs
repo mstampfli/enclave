@@ -1,43 +1,36 @@
-//! Server-side accounts: username + password (Argon2id, no email) plus the
-//! user's public identity key. This is auth state the server legitimately holds
-//! (password verifiers, not E2E keys); call content stays sealed and unreadable.
+//! Server-side accounts: the OPAQUE **envelope** (password file) plus the user's
+//! public identity key. Zero-knowledge: the server never sees the password, only
+//! an irreversible envelope produced by [`crate::opaque`]. Call content stays
+//! sealed and unreadable regardless.
 //!
-//! ASVS V2: Argon2id with a per-password salt, a 12-char minimum, all characters
-//! allowed, no composition rules, no forced rotation. Login rate limiting lives
-//! at the connection layer.
+//! The 12-char password minimum (ASVS V2) is enforced on the *client*: a
+//! zero-knowledge server cannot measure a password it never receives. Login rate
+//! limiting lives at the connection layer.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
 use serde::{Deserialize, Serialize};
 
-/// Minimum password length (ASVS V2).
+/// Minimum password length (ASVS V2). Enforced client-side (see module docs).
 pub const MIN_PASSWORD_LEN: usize = 12;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Account {
-    password_hash: String,
+    /// Serialized OPAQUE `ServerRegistration` -- opaque and irreversible; a leak
+    /// forces a memory-hard (Argon2id) per-account offline attack, no more.
+    envelope: Vec<u8>,
     identity_pub: Vec<u8>,
 }
 
-/// The result of a create-account or login attempt.
+/// The result of a create-account attempt. Login is handled by the OPAQUE
+/// handshake in the relay, not here, so there is no password-verify outcome.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthOutcome {
     /// Account created and the caller is authenticated.
     Created,
-    /// Password verified; the caller is authenticated.
-    LoggedIn,
     /// The username is already registered.
     UsernameTaken,
-    /// No such account.
-    UnknownUser,
-    /// The password did not match.
-    WrongPassword,
-    /// The password is shorter than [`MIN_PASSWORD_LEN`].
-    PasswordTooShort,
     /// The username was empty or otherwise invalid.
     InvalidUsername,
 }
@@ -68,28 +61,24 @@ impl AccountStore {
         }
     }
 
-    /// Create a new account and authenticate. The password is stored as an
-    /// Argon2id verifier, never in the clear.
+    /// Register a new account: store its OPAQUE envelope and identity key. The
+    /// envelope was produced without the server ever seeing the password.
     pub fn create_account(
         &mut self,
         username: &str,
-        password: &str,
+        envelope: Vec<u8>,
         identity_pub: Vec<u8>,
     ) -> AuthOutcome {
         if username.trim().is_empty() {
             return AuthOutcome::InvalidUsername;
         }
-        if password.len() < MIN_PASSWORD_LEN {
-            return AuthOutcome::PasswordTooShort;
-        }
         if self.accounts.contains_key(username) {
             return AuthOutcome::UsernameTaken;
         }
-        let password_hash = hash_password(password);
         self.accounts.insert(
             username.to_string(),
             Account {
-                password_hash,
+                envelope,
                 identity_pub,
             },
         );
@@ -97,19 +86,15 @@ impl AccountStore {
         AuthOutcome::Created
     }
 
-    /// Verify a login. Does not reveal whether the username exists to a timing
-    /// observer beyond the coarse outcome enum.
-    pub fn verify_login(&self, username: &str, password: &str) -> AuthOutcome {
-        match self.accounts.get(username) {
-            None => AuthOutcome::UnknownUser,
-            Some(account) => {
-                if verify_password(password, &account.password_hash) {
-                    AuthOutcome::LoggedIn
-                } else {
-                    AuthOutcome::WrongPassword
-                }
-            }
-        }
+    /// Whether a username is registered.
+    pub fn contains(&self, username: &str) -> bool {
+        self.accounts.contains_key(username)
+    }
+
+    /// The stored OPAQUE envelope for a user, if any. `None` drives OPAQUE dummy
+    /// mode so a login attempt cannot reveal whether the username exists.
+    pub fn envelope(&self, username: &str) -> Option<&[u8]> {
+        self.accounts.get(username).map(|a| a.envelope.as_slice())
     }
 
     /// The stored public identity key for a user, if any.
@@ -129,66 +114,37 @@ impl AccountStore {
     }
 }
 
-fn hash_password(password: &str) -> String {
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .expect("argon2 hash")
-        .to_string()
-}
-
-fn verify_password(password: &str, hash: &str) -> bool {
-    match PasswordHash::new(hash) {
-        Ok(parsed) => Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok(),
-        Err(_) => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn create_then_login() {
+    fn create_stores_envelope_and_identity() {
         let mut store = AccountStore::new();
         assert_eq!(
-            store.create_account("alice", "correcthorsebattery", vec![1, 2, 3]),
+            store.create_account("alice", vec![1, 2, 3], vec![4, 5, 6]),
             AuthOutcome::Created
         );
-        assert_eq!(
-            store.verify_login("alice", "correcthorsebattery"),
-            AuthOutcome::LoggedIn
-        );
-        assert_eq!(
-            store.verify_login("alice", "wrong-password"),
-            AuthOutcome::WrongPassword
-        );
-        assert_eq!(
-            store.verify_login("nobody", "whatever12345"),
-            AuthOutcome::UnknownUser
-        );
-        assert_eq!(store.identity_pub("alice"), Some(&[1, 2, 3][..]));
+        assert!(store.contains("alice"));
+        assert_eq!(store.envelope("alice"), Some(&[1, 2, 3][..]));
+        assert_eq!(store.identity_pub("alice"), Some(&[4, 5, 6][..]));
+        assert!(!store.contains("nobody"));
+        assert_eq!(store.envelope("nobody"), None);
     }
 
     #[test]
-    fn rejects_duplicate_and_short_and_empty() {
+    fn rejects_duplicate_and_empty() {
         let mut store = AccountStore::new();
         assert_eq!(
-            store.create_account("bob", "longenoughpass", vec![]),
+            store.create_account("bob", vec![1], vec![]),
             AuthOutcome::Created
         );
         assert_eq!(
-            store.create_account("bob", "anotherlongone", vec![]),
+            store.create_account("bob", vec![2], vec![]),
             AuthOutcome::UsernameTaken
         );
         assert_eq!(
-            store.create_account("carol", "short", vec![]),
-            AuthOutcome::PasswordTooShort
-        );
-        assert_eq!(
-            store.create_account("  ", "longenoughpass", vec![]),
+            store.create_account("  ", vec![3], vec![]),
             AuthOutcome::InvalidUsername
         );
     }
@@ -202,17 +158,15 @@ mod tests {
         {
             let mut store = AccountStore::load(&path);
             assert_eq!(
-                store.create_account("dave", "longenoughpassword", vec![9]),
+                store.create_account("dave", vec![9, 9], vec![7]),
                 AuthOutcome::Created
             );
         }
         // A fresh store loading the same file sees the account.
         let store = AccountStore::load(&path);
-        assert_eq!(
-            store.verify_login("dave", "longenoughpassword"),
-            AuthOutcome::LoggedIn
-        );
-        assert_eq!(store.identity_pub("dave"), Some(&[9][..]));
+        assert!(store.contains("dave"));
+        assert_eq!(store.envelope("dave"), Some(&[9, 9][..]));
+        assert_eq!(store.identity_pub("dave"), Some(&[7][..]));
 
         let _ = std::fs::remove_file(&path);
     }

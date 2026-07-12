@@ -7,7 +7,6 @@
 
 use std::path::Path;
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
 use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -93,9 +92,9 @@ impl Identity {
             .map_err(|e| CryptoError::Identity(format!("serialize: {e}")))?;
 
         let mut salt = [0u8; 16];
-        OsRng.fill_bytes(&mut salt);
+        getrandom::getrandom(&mut salt).map_err(|e| CryptoError::Identity(format!("rng: {e}")))?;
         let mut nonce = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce);
+        getrandom::getrandom(&mut nonce).map_err(|e| CryptoError::Identity(format!("rng: {e}")))?;
 
         let mut key = [0u8; 32];
         Argon2::default()

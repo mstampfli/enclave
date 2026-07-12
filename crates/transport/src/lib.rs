@@ -19,6 +19,7 @@ pub mod accounts;
 pub mod client;
 pub mod error;
 pub mod media_socket;
+pub mod opaque;
 pub mod ratelimit;
 pub mod relay;
 pub mod server;

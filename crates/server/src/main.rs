@@ -11,6 +11,9 @@
 use std::fs::File;
 use std::io::BufReader;
 
+use std::path::Path;
+
+use enclave_transport::opaque::OpaqueServer;
 use enclave_transport::{AccountStore, Server};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -40,7 +43,11 @@ async fn main() {
         .nth(2)
         .unwrap_or_else(|| "127.0.0.1:8444".to_string());
 
-    let server = Server::with_accounts(AccountStore::load("enclave-accounts.json"));
+    // Accounts and the OPAQUE server setup persist together: an envelope in the
+    // account store is only usable under the setup it was registered against.
+    let accounts = AccountStore::load("enclave-accounts.json");
+    let opaque = OpaqueServer::load_or_generate(Path::new("enclave-opaque.setup"));
+    let server = Server::with_auth(accounts, opaque);
 
     // Signaling: TLS when a cert + key are provided, plaintext otherwise.
     let tls = std::env::var("ENCLAVE_TLS_CERT")
