@@ -34,6 +34,10 @@ pub struct CallParams {
     pub my_identity_key: Vec<u8>,
     /// username -> identity key, to derive each sender's media key on receive.
     pub member_keys: HashMap<String, Vec<u8>>,
+    /// Selected input device name, or `None` for the host default.
+    pub input_device: Option<String>,
+    /// Selected output device name, or `None` for the host default.
+    pub output_device: Option<String>,
 }
 
 /// An in-progress voice call. Dropping it tears the whole pipeline down.
@@ -47,8 +51,8 @@ pub struct Call {
 
 impl Call {
     pub async fn start(p: CallParams) -> Result<Self, ClientError> {
-        let (capture, mic_rx) = AudioCapture::start().map_err(audio)?;
-        let playback = AudioPlayback::start().map_err(audio)?;
+        let (capture, mic_rx) = AudioCapture::start_on(p.input_device.as_deref()).map_err(audio)?;
+        let playback = AudioPlayback::start_on(p.output_device.as_deref()).map_err(audio)?;
         let sink = playback.sink();
 
         let socket = Arc::new(

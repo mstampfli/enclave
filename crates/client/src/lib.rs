@@ -140,6 +140,10 @@ pub struct Client {
     media_addr: Option<SocketAddr>,
     /// The in-progress voice call, if any.
     call: Option<call::Call>,
+    /// Selected microphone (input) device name; `None` = host default.
+    input_device: Option<String>,
+    /// Selected speaker (output) device name; `None` = host default.
+    output_device: Option<String>,
 }
 
 impl Client {
@@ -162,12 +166,18 @@ impl Client {
             display_names: HashMap::new(),
             media_addr: media_addr_from(server_url),
             call: None,
+            input_device: None,
+            output_device: None,
         })
     }
 
     /// Where identity key files and rosters are stored (default: current dir).
+    /// Also the home of the machine-local audio device preferences, loaded here.
     pub fn set_keystore_dir(&mut self, dir: impl Into<PathBuf>) {
         self.keystore_dir = dir.into();
+        let prefs = AudioPrefs::load(&self.audio_prefs_path());
+        self.input_device = prefs.input;
+        self.output_device = prefs.output;
     }
 
     /// Create a new account from a display `name` and log in via OPAQUE: the
@@ -700,6 +710,8 @@ impl Client {
                 root_secret: group.media_root_secret(identity)?,
                 my_identity_key: identity.identity_key(),
                 member_keys: group.member_keys().into_iter().collect(),
+                input_device: self.input_device.clone(),
+                output_device: self.output_device.clone(),
             }
         };
         self.call = Some(call::Call::start(params).await?);
@@ -709,6 +721,43 @@ impl Client {
     /// Leave the current voice call (tears down the audio pipeline).
     pub fn leave_call(&mut self) {
         self.call = None;
+    }
+
+    /// The available audio devices and the current selection, for the settings
+    /// picker. An empty selection means the host default is in use.
+    pub fn audio_devices(&self) -> AudioDeviceInfo {
+        AudioDeviceInfo {
+            inputs: enclave_media::input_device_names(),
+            outputs: enclave_media::output_device_names(),
+            input: self.input_device.clone(),
+            output: self.output_device.clone(),
+        }
+    }
+
+    /// Choose the microphone. `None` restores the host default. Persisted to the
+    /// machine-local prefs and applied to the next call started.
+    pub fn set_input_device(&mut self, name: Option<String>) {
+        self.input_device = name.filter(|s| !s.is_empty());
+        self.save_audio_prefs();
+    }
+
+    /// Choose the speaker. `None` restores the host default. Persisted to the
+    /// machine-local prefs and applied to the next call started.
+    pub fn set_output_device(&mut self, name: Option<String>) {
+        self.output_device = name.filter(|s| !s.is_empty());
+        self.save_audio_prefs();
+    }
+
+    fn audio_prefs_path(&self) -> PathBuf {
+        self.keystore_dir.join("enclave-audio.json")
+    }
+
+    fn save_audio_prefs(&self) {
+        AudioPrefs {
+            input: self.input_device.clone(),
+            output: self.output_device.clone(),
+        }
+        .save(&self.audio_prefs_path());
     }
 
     /// The logged-in handle, or an error if not logged in.
@@ -1034,6 +1083,44 @@ fn hex_id(id: &GroupId) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// The available audio devices plus the current selection, for the settings
+/// picker. An empty `input`/`output` means the host default is in use.
+#[derive(Debug, Clone)]
+pub struct AudioDeviceInfo {
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    pub input: Option<String>,
+    pub output: Option<String>,
+}
+
+/// Machine-local audio device preferences: which mic and speaker to use for
+/// calls on this device. This is not account data; it holds no secrets, is the
+/// same regardless of which account logs in here, and never leaves the machine,
+/// so it is stored as plain JSON next to the keystore rather than in the
+/// encrypted session.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct AudioPrefs {
+    #[serde(default)]
+    input: Option<String>,
+    #[serde(default)]
+    output: Option<String>,
+}
+
+impl AudioPrefs {
+    fn load(path: &std::path::Path) -> Self {
+        std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, path: &std::path::Path) {
+        if let Ok(json) = serde_json::to_vec_pretty(self) {
+            let _ = std::fs::write(path, json);
+        }
+    }
 }
 
 /// Derive the UDP media address from the `ws(s)://host:port` signaling URL: the

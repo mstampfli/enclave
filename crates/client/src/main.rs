@@ -49,6 +49,16 @@ enum UiCommand {
     StartCall,
     /// Leave the current voice call.
     LeaveCall,
+    /// Report the available audio devices + current selection (settings modal).
+    ListAudioDevices,
+    /// Choose the microphone (empty string = host default).
+    SetInputDevice {
+        name: String,
+    },
+    /// Choose the speaker (empty string = host default).
+    SetOutputDevice {
+        name: String,
+    },
     /// Open (or focus) a 1:1 DM with a friend handle.
     OpenDm {
         handle: String,
@@ -139,6 +149,13 @@ enum UiEvent {
     /// Whether a voice call is currently active.
     CallState {
         in_call: bool,
+    },
+    /// The available audio devices and current selection for the settings modal.
+    AudioDevices {
+        inputs: Vec<String>,
+        outputs: Vec<String>,
+        input: Option<String>,
+        output: Option<String>,
     },
     /// Someone sent us a friend request.
     FriendRequest {
@@ -264,6 +281,19 @@ fn emit_conversations(proxy: &EventLoopProxy<UiEvent>, c: &Client) {
         },
     );
     emit(proxy, active_conversation_event(c));
+}
+
+fn emit_audio_devices(proxy: &EventLoopProxy<UiEvent>, c: &Client) {
+    let info = c.audio_devices();
+    emit(
+        proxy,
+        UiEvent::AudioDevices {
+            inputs: info.inputs,
+            outputs: info.outputs,
+            input: info.input,
+            output: info.output,
+        },
+    );
 }
 
 fn app_dir() -> PathBuf {
@@ -445,6 +475,23 @@ async fn handle_command(
             if let Some(c) = client.as_mut() {
                 c.leave_call();
                 emit(proxy, UiEvent::CallState { in_call: false });
+            }
+        }
+        UiCommand::ListAudioDevices => {
+            if let Some(c) = client.as_ref() {
+                emit_audio_devices(proxy, c);
+            }
+        }
+        UiCommand::SetInputDevice { name } => {
+            if let Some(c) = client.as_mut() {
+                c.set_input_device(Some(name));
+                emit_audio_devices(proxy, c);
+            }
+        }
+        UiCommand::SetOutputDevice { name } => {
+            if let Some(c) = client.as_mut() {
+                c.set_output_device(Some(name));
+                emit_audio_devices(proxy, c);
             }
         }
         UiCommand::OpenDm { handle } => {

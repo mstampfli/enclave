@@ -165,6 +165,7 @@
   .pick:hover { background: var(--hover); }
   .pick input { width: auto; }
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
+  .hint { margin: 0; color: var(--muted); font-size: 12px; }
   .status { padding: 0 16px 8px; color: var(--muted); font-size: 12px; min-height: 16px; }
   .status.err { color: #f38688; }
 </style>
@@ -244,6 +245,7 @@
             <option value="away">Away</option>
             <option value="offline">Invisible</option>
           </select>
+          <button id="audio-btn" class="small" title="Choose your microphone and speaker">Audio</button>
           <button id="logout" class="small">Log out</button>
         </div>
       </div>
@@ -274,6 +276,20 @@
       <div class="modal-actions">
         <button id="group-cancel">Cancel</button>
         <button id="group-create" class="primary">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="audio-modal" class="overlay" hidden>
+    <div class="modal">
+      <h2>Audio settings</h2>
+      <label for="audio-input">Microphone</label>
+      <select id="audio-input" class="device-select"></select>
+      <label for="audio-output">Speaker</label>
+      <select id="audio-output" class="device-select"></select>
+      <p class="hint">Changes apply to your next call.</p>
+      <div class="modal-actions">
+        <button id="audio-close" class="primary">Done</button>
       </div>
     </div>
   </div>
@@ -385,6 +401,30 @@
     $("group-modal").hidden = false;
   }
 
+  // ---- audio settings modal ----
+  $("audio-btn").addEventListener("click", () => {
+    send({ type: "ListAudioDevices" });
+    $("audio-modal").hidden = false;
+  });
+  $("audio-close").addEventListener("click", () => $("audio-modal").hidden = true);
+  $("audio-input").addEventListener("change", (e) => send({ type: "SetInputDevice", name: e.target.value }));
+  $("audio-output").addEventListener("change", (e) => send({ type: "SetOutputDevice", name: e.target.value }));
+
+  // Fill a device <select> with a "System default" option plus each device,
+  // marking the current selection ("" means the host default is in use).
+  function fillDevices(sel, names, current) {
+    sel.innerHTML = "";
+    const def = document.createElement("option");
+    def.value = ""; def.textContent = "System default";
+    sel.appendChild(def);
+    for (const name of names) {
+      const opt = document.createElement("option");
+      opt.value = name; opt.textContent = name;
+      sel.appendChild(opt);
+    }
+    sel.value = current || "";
+  }
+
   // ---- rendering ----
   function statusOf(h) { return presence[h] || "offline"; }
 
@@ -491,6 +531,7 @@
     $("app-view").hidden = true; $("login-view").hidden = false;
     myUsername = ""; myDisplay = ""; friends = []; incoming = []; outgoing = []; conversations = []; activeConv = null;
     inCall = false; $("call-btn").textContent = "Call"; $("call-btn").classList.remove("in-call");
+    $("audio-modal").hidden = true; $("group-modal").hidden = true;
     for (const k in messages) delete messages[k];
     for (const k in presence) delete presence[k];
   }
@@ -521,6 +562,10 @@
         inCall = ev.in_call;
         $("call-btn").textContent = inCall ? "Leave call" : "Call";
         $("call-btn").classList.toggle("in-call", inCall);
+        break;
+      case "AudioDevices":
+        fillDevices($("audio-input"), ev.inputs, ev.input);
+        fillDevices($("audio-output"), ev.outputs, ev.output);
         break;
       case "Presence":
         presence[ev.user] = ev.status; renderSidebar();

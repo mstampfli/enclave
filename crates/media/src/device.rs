@@ -24,18 +24,76 @@ fn codec_err(e: impl std::fmt::Display) -> MediaError {
     MediaError::Codec(e.to_string())
 }
 
-/// Captures the default input device, emitting mono 48 kHz i16 frames over the
-/// returned receiver. Hold the [`AudioCapture`] alive to keep the stream open.
+/// Names of the available input (microphone) devices, for a settings picker.
+/// Empty if the host cannot enumerate; the default device is always usable
+/// regardless of whether it appears here.
+pub fn input_device_names() -> Vec<String> {
+    let host = cpal::default_host();
+    match host.input_devices() {
+        Ok(devs) => devs.filter_map(|d| device_name(&d)).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Names of the available output (speaker) devices, for a settings picker.
+pub fn output_device_names() -> Vec<String> {
+    let host = cpal::default_host();
+    match host.output_devices() {
+        Ok(devs) => devs.filter_map(|d| device_name(&d)).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The human-readable name of a device, or `None` if it cannot be described
+/// (e.g. it was disconnected mid-enumeration). cpal 0.18 exposes the name via
+/// the structured [`DeviceDescription`](cpal::DeviceDescription).
+fn device_name(device: &cpal::Device) -> Option<String> {
+    device.description().ok().map(|d| d.name().to_string())
+}
+
+/// Resolve an input device by name, falling back to the host default when the
+/// name is `None` or no longer present (e.g. the device was unplugged).
+fn resolve_input(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
+    if let Some(want) = name {
+        if let Ok(mut devs) = host.input_devices() {
+            if let Some(d) = devs.find(|d| device_name(d).as_deref() == Some(want)) {
+                return Some(d);
+            }
+        }
+    }
+    host.default_input_device()
+}
+
+/// Resolve an output device by name, falling back to the host default.
+fn resolve_output(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
+    if let Some(want) = name {
+        if let Ok(mut devs) = host.output_devices() {
+            if let Some(d) = devs.find(|d| device_name(d).as_deref() == Some(want)) {
+                return Some(d);
+            }
+        }
+    }
+    host.default_output_device()
+}
+
+/// Captures an input device, emitting mono 48 kHz i16 frames over the returned
+/// receiver. Hold the [`AudioCapture`] alive to keep the stream open.
 pub struct AudioCapture {
     _stream: Stream,
 }
 
 impl AudioCapture {
+    /// Capture the host default input device.
     pub fn start() -> Result<(Self, Receiver<Vec<i16>>), MediaError> {
+        Self::start_on(None)
+    }
+
+    /// Capture a named input device, or the host default when `name` is `None`
+    /// or the named device is not present.
+    pub fn start_on(name: Option<&str>) -> Result<(Self, Receiver<Vec<i16>>), MediaError> {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| MediaError::Codec("no default input device".into()))?;
+        let device = resolve_input(&host, name)
+            .ok_or_else(|| MediaError::Codec("no input device available".into()))?;
         let supported = device.default_input_config().map_err(codec_err)?;
         let sample_format = supported.sample_format();
         let config = supported.config();
@@ -99,11 +157,17 @@ pub struct AudioPlayback {
 }
 
 impl AudioPlayback {
+    /// Play on the host default output device.
     pub fn start() -> Result<Self, MediaError> {
+        Self::start_on(None)
+    }
+
+    /// Play on a named output device, or the host default when `name` is `None`
+    /// or the named device is not present.
+    pub fn start_on(name: Option<&str>) -> Result<Self, MediaError> {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| MediaError::Codec("no default output device".into()))?;
+        let device = resolve_output(&host, name)
+            .ok_or_else(|| MediaError::Codec("no output device available".into()))?;
         let supported = device.default_output_config().map_err(codec_err)?;
         let sample_format = supported.sample_format();
         let config = supported.config();
