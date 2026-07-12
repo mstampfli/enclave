@@ -10,6 +10,7 @@
 //! MLS group never crosses a thread boundary.
 
 use std::collections::{HashMap, VecDeque};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ use enclave_transport::accounts::MIN_PASSWORD_LEN;
 use enclave_transport::{opaque, Connection};
 use sha2::{Digest, Sha256};
 
+mod call;
 mod session;
 
 /// Errors surfaced to the UI.
@@ -38,6 +40,8 @@ pub enum ClientError {
     NoKeyPackage,
     #[error("disconnected from server")]
     Disconnected,
+    #[error("audio: {0}")]
+    Audio(String),
 }
 
 /// Something the UI should react to.
@@ -132,6 +136,10 @@ pub struct Client {
     outgoing: Vec<Friend>,
     /// username -> current display name, learned from friend snapshots.
     display_names: HashMap<String, String>,
+    /// The server's UDP media address (derived from the signaling URL).
+    media_addr: Option<SocketAddr>,
+    /// The in-progress voice call, if any.
+    call: Option<call::Call>,
 }
 
 impl Client {
@@ -152,6 +160,8 @@ impl Client {
             incoming: Vec::new(),
             outgoing: Vec::new(),
             display_names: HashMap::new(),
+            media_addr: media_addr_from(server_url),
+            call: None,
         })
     }
 
@@ -242,6 +252,7 @@ impl Client {
         self.conn.send(ClientMsg::Logout);
         self.identity = None;
         self.username = None;
+        self.call = None;
         self.conversations.clear();
         self.active = None;
         self.export_key.clear();
@@ -658,6 +669,48 @@ impl Client {
         conv.group.as_ref().map(|g| g.safety_number().to_string())
     }
 
+    /// Whether a voice call is currently active.
+    pub fn in_call(&self) -> bool {
+        self.call.is_some()
+    }
+
+    /// Join a voice call in the active conversation: derive the group media key,
+    /// open the UDP media channel, and start mic capture + speaker playback. All
+    /// members who join the same conversation's call hear each other.
+    pub async fn start_call(&mut self) -> Result<(), ClientError> {
+        if self.call.is_some() {
+            return Ok(());
+        }
+        let media_addr = self
+            .media_addr
+            .ok_or_else(|| ClientError::Audio("no media address for this server".into()))?;
+        let group_id = self.active.clone().ok_or(ClientError::NoGroup)?;
+        let me = self.me()?;
+        let params = {
+            let identity = self.identity()?;
+            let conv = self
+                .conversations
+                .get(&group_id)
+                .ok_or(ClientError::NoGroup)?;
+            let group = conv.group.as_ref().ok_or(ClientError::NoGroup)?;
+            call::CallParams {
+                media_addr,
+                group: group_id,
+                me,
+                root_secret: group.media_root_secret(identity)?,
+                my_identity_key: identity.identity_key(),
+                member_keys: group.member_keys().into_iter().collect(),
+            }
+        };
+        self.call = Some(call::Call::start(params).await?);
+        Ok(())
+    }
+
+    /// Leave the current voice call (tears down the audio pipeline).
+    pub fn leave_call(&mut self) {
+        self.call = None;
+    }
+
     /// The logged-in handle, or an error if not logged in.
     fn me(&self) -> Result<String, ClientError> {
         self.username.clone().ok_or(ClientError::NotLoggedIn)
@@ -981,4 +1034,18 @@ fn hex_id(id: &GroupId) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// Derive the UDP media address from the `ws(s)://host:port` signaling URL: the
+/// same host, on the server's media port (8444 by default).
+fn media_addr_from(server_url: &str) -> Option<SocketAddr> {
+    let rest = server_url
+        .strip_prefix("ws://")
+        .or_else(|| server_url.strip_prefix("wss://"))?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority);
+    format!("{host}:8444").to_socket_addrs().ok()?.next()
 }

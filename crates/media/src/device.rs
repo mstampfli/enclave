@@ -157,4 +157,26 @@ impl AudioPlayback {
     pub fn push(&self, mono: &[i16]) {
         self.queue.lock().unwrap().extend(mono.iter().copied());
     }
+
+    /// A `Send` handle to this device's playback queue, so a decode task on
+    /// another thread can feed audio while the (non-`Send`) cpal stream stays
+    /// on the thread that created it.
+    pub fn sink(&self) -> PlaybackSink {
+        PlaybackSink {
+            queue: self.queue.clone(),
+        }
+    }
+}
+
+/// A cloneable, `Send` handle for feeding decoded mono samples to an
+/// [`AudioPlayback`] from another thread or async task.
+#[derive(Clone)]
+pub struct PlaybackSink {
+    queue: Arc<Mutex<VecDeque<i16>>>,
+}
+
+impl PlaybackSink {
+    pub fn push(&self, mono: &[i16]) {
+        self.queue.lock().unwrap().extend(mono.iter().copied());
+    }
 }

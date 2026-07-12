@@ -212,6 +212,19 @@ impl Group {
         self.inner.members().count()
     }
 
+    /// Each member's (credential label, identity/signature key). Used to key a
+    /// media opener per sender: a received frame names its sender, and this maps
+    /// that sender to the identity key their media key is derived from.
+    pub fn member_keys(&self) -> Vec<(String, Vec<u8>)> {
+        self.inner
+            .members()
+            .map(|m| {
+                let label = String::from_utf8_lossy(m.credential.serialized_content()).into_owned();
+                (label, m.signature_key.as_slice().to_vec())
+            })
+            .collect()
+    }
+
     /// Encrypt a text message as an MLS application message. Returns opaque
     /// bytes to relay through the server, which cannot read them.
     pub fn encrypt_text(

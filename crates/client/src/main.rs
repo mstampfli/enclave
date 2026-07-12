@@ -45,6 +45,10 @@ enum UiCommand {
     ImportSession {
         path: String,
     },
+    /// Join the active conversation's voice call.
+    StartCall,
+    /// Leave the current voice call.
+    LeaveCall,
     /// Open (or focus) a 1:1 DM with a friend handle.
     OpenDm {
         handle: String,
@@ -131,6 +135,10 @@ enum UiEvent {
     Presence {
         user: String,
         status: String,
+    },
+    /// Whether a voice call is currently active.
+    CallState {
+        in_call: bool,
     },
     /// Someone sent us a friend request.
     FriendRequest {
@@ -423,6 +431,20 @@ async fn handle_command(
                     }
                     Err(e) => error_status(proxy, format!("Import failed: {e}")),
                 }
+            }
+        }
+        UiCommand::StartCall => {
+            if let Some(c) = client.as_mut() {
+                match c.start_call().await {
+                    Ok(()) => emit(proxy, UiEvent::CallState { in_call: true }),
+                    Err(e) => error_status(proxy, format!("Could not start call: {e}")),
+                }
+            }
+        }
+        UiCommand::LeaveCall => {
+            if let Some(c) = client.as_mut() {
+                c.leave_call();
+                emit(proxy, UiEvent::CallState { in_call: false });
             }
         }
         UiCommand::OpenDm { handle } => {

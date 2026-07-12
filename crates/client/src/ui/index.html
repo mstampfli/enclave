@@ -144,6 +144,8 @@
   .chat-title { font-weight: 600; color: var(--bright); }
   .safety { margin-left: auto; color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; }
   .chat-header .hdr-btn { margin-left: 8px; }
+  .hdr-btn.in-call { background: var(--danger); }
+  .hdr-btn.in-call:hover { background: #a12b2f; }
   .log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 2px; }
   .msg { padding: 2px 0; max-width: 80%; }
   .msg .who { font-size: 12px; color: var(--muted); font-weight: 600; margin-top: 8px; }
@@ -251,6 +253,7 @@
       <header class="chat-header">
         <span id="chat-title" class="chat-title">No conversation</span>
         <span id="safety" class="safety" title="Compare this with your friend out-of-band to verify no one is in the middle"></span>
+        <button id="call-btn" class="hdr-btn small" hidden title="Start or join a voice call in this conversation">Call</button>
         <button id="add-to-group" class="hdr-btn small" hidden title="Add a friend to this group">Add member</button>
       </header>
       <div id="empty-chat" class="empty-chat">Pick a friend or group to start talking.</div>
@@ -286,6 +289,7 @@
   let conversations = [];        // {id, title, is_dm, pending, members}
   let activeConv = null;
   const messages = {};           // conv id -> [{from, text, mine}]
+  let inCall = false;
 
   function serverUrl() { return $("login-server").value.trim() || "ws://127.0.0.1:8443"; }
   const initial = (s) => (s || "?").trim().charAt(0);
@@ -351,6 +355,9 @@
     if (!conv) return;
     const handle = prompt("Add which friend? (their username)");
     if (handle && handle.trim()) send({ type: "AddToGroup", handle: handle.trim() });
+  });
+  $("call-btn").addEventListener("click", () => {
+    send({ type: inCall ? "LeaveCall" : "StartCall" });
   });
 
   // ---- new-group modal ----
@@ -437,6 +444,7 @@
     $("log").hidden = !hasConv;
     $("composer").hidden = !hasConv;
     $("add-to-group").hidden = !(conv && !conv.is_dm);
+    $("call-btn").hidden = !(conv && !conv.pending);
     $("chat-title").textContent = conv ? conv.title : "No conversation";
     $("message").disabled = !(conv && !conv.pending);
     $("message").placeholder = conv && conv.pending ? "Starting conversation…" : "Message";
@@ -482,6 +490,7 @@
   function showLogin() {
     $("app-view").hidden = true; $("login-view").hidden = false;
     myUsername = ""; myDisplay = ""; friends = []; incoming = []; outgoing = []; conversations = []; activeConv = null;
+    inCall = false; $("call-btn").textContent = "Call"; $("call-btn").classList.remove("in-call");
     for (const k in messages) delete messages[k];
     for (const k in presence) delete presence[k];
   }
@@ -507,6 +516,11 @@
         if (!messages[ev.conv]) messages[ev.conv] = [];
         messages[ev.conv].push({ from: ev.from, text: ev.text, mine: ev.mine });
         if (ev.conv === activeConv) appendMessage({ from: ev.from, text: ev.text, mine: ev.mine });
+        break;
+      case "CallState":
+        inCall = ev.in_call;
+        $("call-btn").textContent = inCall ? "Leave call" : "Call";
+        $("call-btn").classList.toggle("in-call", inCall);
         break;
       case "Presence":
         presence[ev.user] = ev.status; renderSidebar();

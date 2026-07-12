@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 enclave-protocol = { path = "../protocol" }
 enclave-crypto = { path = "../crypto" }
-enclave-media = { path = "../media" }
+enclave-media = { version = "0.0.0", path = "../media" }
 enclave-transport = { path = "../transport" }
 thiserror.workspace = true
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
