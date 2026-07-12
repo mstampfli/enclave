@@ -96,10 +96,13 @@ pub enum ClientMsg {
     /// Membership is routing metadata, visible to the server by design.
     JoinGroup { group: GroupId },
     /// Deliver a Welcome directly to a new member's device. The server also
-    /// records `to` as a routing member of `group`. The payload is opaque.
+    /// records `to` as a routing member of `group`. The payload is opaque. The
+    /// `name` labels the conversation (empty for a 1:1 DM, where the recipient
+    /// labels it by the sender); group names are low-sensitivity metadata.
     Welcome {
         to: DeviceId,
         group: GroupId,
+        name: String,
         message: Sealed,
     },
     /// An MLS handshake message (Proposal/Commit) the server blindly relays to
@@ -125,6 +128,9 @@ pub enum ClientMsg {
     FriendRemove { handle: String },
     /// Ask for the current friends + pending-requests snapshot.
     ListFriends,
+    /// Ask `to` to open a DM with us (used when we are the larger handle, so the
+    /// smaller handle is the canonical creator of the shared MLS group).
+    RequestDm { to: String },
 }
 
 /// Server -> client messages.
@@ -155,6 +161,7 @@ pub enum ServerMsg {
     Welcome {
         group: GroupId,
         from: DeviceId,
+        name: String,
         message: Sealed,
     },
     Mls {
@@ -189,6 +196,10 @@ pub enum ServerMsg {
         friends: Vec<String>,
         incoming: Vec<String>,
         outgoing: Vec<String>,
+    },
+    /// `from` asks us to open the DM (we are the canonical creator).
+    DmRequested {
+        from: String,
     },
     Error {
         detail: String,

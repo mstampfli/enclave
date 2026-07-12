@@ -82,6 +82,7 @@ fn text_fans_out_to_other_members_only_and_relays_bytes_unchanged() {
         a,
         ClientMsg::Welcome {
             to: DeviceId(bh),
+            name: String::new(),
             group: group.clone(),
             message: Sealed(vec![]),
         },
@@ -123,6 +124,7 @@ fn text_fans_out_to_all_other_members_in_a_larger_group() {
             a,
             ClientMsg::Welcome {
                 to: DeviceId(peer),
+                name: String::new(),
                 group: group.clone(),
                 message: Sealed(vec![]),
             },
@@ -162,6 +164,7 @@ fn welcome_is_directed_and_adds_the_recipient_to_routing() {
         a,
         ClientMsg::Welcome {
             to: DeviceId(bh),
+            name: String::new(),
             group: group.clone(),
             message: Sealed(vec![4, 2]),
         },
@@ -199,6 +202,7 @@ fn disconnect_removes_the_device_from_routing() {
         a,
         ClientMsg::Welcome {
             to: DeviceId(bh),
+            name: String::new(),
             group: group.clone(),
             message: Sealed(vec![]),
         },
@@ -238,6 +242,7 @@ fn non_member_cannot_join_or_inject() {
         a,
         ClientMsg::Welcome {
             to: DeviceId(bh),
+            name: String::new(),
             group: group.clone(),
             message: Sealed(vec![]),
         },
@@ -269,6 +274,7 @@ fn non_member_cannot_join_or_inject() {
         mallory,
         ClientMsg::Welcome {
             to: DeviceId(mallory_h),
+            name: String::new(),
             group: group.clone(),
             message: Sealed(vec![]),
         },

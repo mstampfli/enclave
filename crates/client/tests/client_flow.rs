@@ -77,25 +77,33 @@ async fn two_clients_chat_through_the_controller() {
     let alice_handle = alice.name().to_string();
     let bob_handle = bob.name().to_string();
 
-    // Alice starts a group and invites Bob by his handle.
-    alice.start_group().unwrap();
-    alice.invite(&bob_handle).await.unwrap();
+    // Alice creates a named group with Bob.
+    alice
+        .create_group("hangout", std::slice::from_ref(&bob_handle))
+        .await
+        .unwrap();
 
-    // Bob learns he joined (skipping any login friend-list chatter).
+    // Bob learns he joined (skipping login friend-list chatter), then focuses it.
     loop {
-        if matches!(next_event(&mut bob).await, Event::MembershipChanged) {
+        if matches!(next_event(&mut bob).await, Event::ConversationsChanged) {
             break;
         }
     }
+    let gid = bob
+        .conversations()
+        .first()
+        .map(|c| c.id.clone())
+        .expect("bob has the group");
+    bob.switch(&gid);
 
-    // Both sides show the same safety number.
+    // Both sides show the same safety number for the active conversation.
     assert!(alice.safety_number().is_some());
     assert_eq!(alice.safety_number(), bob.safety_number());
 
     // Alice sends text; Bob receives it decrypted, authenticated as Alice's handle.
     alice.send_text("hello bob").await.unwrap();
     loop {
-        if let Event::Text { from, text } = next_event(&mut bob).await {
+        if let Event::Message { from, text, .. } = next_event(&mut bob).await {
             assert_eq!(from, alice_handle);
             assert_eq!(text, "hello bob");
             break;
@@ -105,7 +113,7 @@ async fn two_clients_chat_through_the_controller() {
     // And the reverse direction works too.
     bob.send_text("hi alice").await.unwrap();
     loop {
-        if let Event::Text { from, text } = next_event(&mut alice).await {
+        if let Event::Message { from, text, .. } = next_event(&mut alice).await {
             assert_eq!(from, bob_handle);
             assert_eq!(text, "hi alice");
             break;

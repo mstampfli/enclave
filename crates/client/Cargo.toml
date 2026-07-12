@@ -25,6 +25,8 @@ wry = "0.55.1"
 tao = "0.35.3"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2 = "0.10"
+getrandom = "0.2"
 # Phase 6 adds: wry/tao (self-contained WebView window; HTML/CSS/JS front end).
 
 [dev-dependencies]

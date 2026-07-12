@@ -168,6 +168,7 @@ pub async fn establish() -> Established {
     alice_conn.send(ClientMsg::Welcome {
         to: DeviceId(bob_handle.clone()),
         group: GROUP,
+        name: String::new(),
         message: Sealed(welcome),
     });
 

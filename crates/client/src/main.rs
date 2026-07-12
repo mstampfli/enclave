@@ -34,9 +34,22 @@ enum UiCommand {
         password: String,
     },
     Logout,
-    StartGroup,
-    Invite {
-        peer: String,
+    /// Open (or focus) a 1:1 DM with a friend handle.
+    OpenDm {
+        handle: String,
+    },
+    /// Create a named group with the given member handles.
+    CreateGroup {
+        name: String,
+        members: Vec<String>,
+    },
+    /// Add a friend to the active named group.
+    AddToGroup {
+        handle: String,
+    },
+    /// Focus a conversation by its id.
+    SwitchConversation {
+        conv: String,
     },
     SendText {
         text: String,
@@ -59,19 +72,45 @@ enum UiCommand {
     },
 }
 
+/// A message line for the UI.
+#[derive(serde::Serialize, Clone)]
+struct Line {
+    from: String,
+    text: String,
+    mine: bool,
+}
+
+/// A conversation summary for the sidebar.
+#[derive(serde::Serialize, Clone)]
+struct ConvSummary {
+    id: String,
+    title: String,
+    is_dm: bool,
+    pending: bool,
+}
+
 /// Events the core sends to the UI (serialized straight into `onEnclaveEvent`).
 #[derive(serde::Serialize, Clone)]
 #[serde(tag = "type")]
 enum UiEvent {
     LoggedIn {
         username: String,
-        safety_number: Option<String>,
     },
     LoggedOut,
-    Membership {
-        safety_number: Option<String>,
+    /// The full conversation list for the sidebar.
+    Conversations {
+        conversations: Vec<ConvSummary>,
     },
-    Text {
+    /// The active conversation changed: its id, title, safety number, and history.
+    ActiveConversation {
+        conv: Option<String>,
+        title: String,
+        safety: Option<String>,
+        history: Vec<Line>,
+    },
+    /// A single message arrived (or was sent) in conversation `conv`.
+    Message {
+        conv: String,
         from: String,
         text: String,
         mine: bool,
@@ -153,6 +192,58 @@ fn error_status(proxy: &EventLoopProxy<UiEvent>, message: String) {
     );
 }
 
+/// The sidebar conversation list.
+fn conv_summaries(c: &Client) -> Vec<ConvSummary> {
+    c.conversations()
+        .into_iter()
+        .map(|i| ConvSummary {
+            id: i.id,
+            title: i.title,
+            is_dm: i.is_dm,
+            pending: i.pending,
+        })
+        .collect()
+}
+
+/// The active-conversation snapshot (id, title, safety number, scoped history).
+fn active_conversation_event(c: &Client) -> UiEvent {
+    let conv = c.active_id();
+    let (title, history) = match &conv {
+        Some(id) => {
+            let title = c
+                .conversations()
+                .into_iter()
+                .find(|i| &i.id == id)
+                .map(|i| i.title)
+                .unwrap_or_default();
+            let history = c
+                .conversation_history(id)
+                .into_iter()
+                .map(|(from, text, mine)| Line { from, text, mine })
+                .collect();
+            (title, history)
+        }
+        None => (String::new(), Vec::new()),
+    };
+    UiEvent::ActiveConversation {
+        conv,
+        title,
+        safety: c.safety_number(),
+        history,
+    }
+}
+
+/// Push both the sidebar list and the active-conversation snapshot.
+fn emit_conversations(proxy: &EventLoopProxy<UiEvent>, c: &Client) {
+    emit(
+        proxy,
+        UiEvent::Conversations {
+            conversations: conv_summaries(c),
+        },
+    );
+    emit(proxy, active_conversation_event(c));
+}
+
 fn app_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
@@ -175,17 +266,24 @@ async fn run_client(
         };
         match tokio::time::timeout(Duration::from_millis(50), next).await {
             Ok(Some(event)) => match event {
-                Event::Text { from, text } => emit(
+                Event::Message {
+                    conv,
+                    from,
+                    text,
+                    mine,
+                } => emit(
                     &proxy,
-                    UiEvent::Text {
+                    UiEvent::Message {
+                        conv,
                         from,
                         text,
-                        mine: false,
+                        mine,
                     },
                 ),
-                Event::MembershipChanged => {
-                    let safety_number = client.as_ref().and_then(|c| c.safety_number());
-                    emit(&proxy, UiEvent::Membership { safety_number });
+                Event::ConversationsChanged => {
+                    if let Some(c) = client.as_ref() {
+                        emit_conversations(&proxy, c);
+                    }
                 }
                 Event::Presence { user, status } => {
                     emit(&proxy, UiEvent::Presence { user, status })
@@ -241,16 +339,9 @@ async fn authenticate(
     match result {
         Ok(()) => {
             // The server pushes our friends + presence automatically on login.
-            let safety_number = c.safety_number();
             let username = c.name().to_string();
             *client = Some(c);
-            emit(
-                proxy,
-                UiEvent::LoggedIn {
-                    username,
-                    safety_number,
-                },
-            );
+            emit(proxy, UiEvent::LoggedIn { username });
         }
         Err(e) => error_status(proxy, e.to_string()),
     }
@@ -279,43 +370,54 @@ async fn handle_command(
             *client = None;
             emit(proxy, UiEvent::LoggedOut);
         }
-        UiCommand::StartGroup => {
+        UiCommand::OpenDm { handle } => {
             if let Some(c) = client.as_mut() {
-                match c.start_group() {
-                    Ok(()) => emit(
-                        proxy,
-                        UiEvent::Membership {
-                            safety_number: c.safety_number(),
-                        },
-                    ),
-                    Err(e) => error_status(proxy, format!("Could not start group: {e}")),
+                match c.open_dm(&handle).await {
+                    Ok(_) => emit_conversations(proxy, c),
+                    Err(e) => error_status(proxy, format!("Could not open DM: {e}")),
                 }
             }
         }
-        UiCommand::Invite { peer } => {
+        UiCommand::CreateGroup { name, members } => {
             if let Some(c) = client.as_mut() {
-                match c.invite(&peer).await {
-                    Ok(()) => emit(
-                        proxy,
-                        UiEvent::Membership {
-                            safety_number: c.safety_number(),
-                        },
-                    ),
-                    Err(e) => error_status(proxy, format!("Invite failed: {e}")),
+                match c.create_group(&name, &members).await {
+                    Ok(_) => emit_conversations(proxy, c),
+                    Err(e) => error_status(proxy, format!("Could not create group: {e}")),
                 }
+            }
+        }
+        UiCommand::AddToGroup { handle } => {
+            if let Some(c) = client.as_mut() {
+                match c.add_to_active_group(&handle).await {
+                    Ok(()) => emit_conversations(proxy, c),
+                    Err(e) => error_status(proxy, format!("Could not add to group: {e}")),
+                }
+            }
+        }
+        UiCommand::SwitchConversation { conv } => {
+            if let Some(c) = client.as_mut() {
+                c.switch(&conv);
+                emit(proxy, active_conversation_event(c));
             }
         }
         UiCommand::SendText { text } => {
             if let Some(c) = client.as_mut() {
+                let conv = c.active_id();
+                let from = c.name().to_string();
                 match c.send_text(&text).await {
-                    Ok(()) => emit(
-                        proxy,
-                        UiEvent::Text {
-                            from: c.name().to_string(),
-                            text,
-                            mine: true,
-                        },
-                    ),
+                    Ok(()) => {
+                        if let Some(conv) = conv {
+                            emit(
+                                proxy,
+                                UiEvent::Message {
+                                    conv,
+                                    from,
+                                    text,
+                                    mine: true,
+                                },
+                            );
+                        }
+                    }
                     Err(e) => error_status(proxy, format!("Send failed: {e}")),
                 }
             }

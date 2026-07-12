@@ -11,6 +11,7 @@
     --chat: #313338;
     --input: #383a40;
     --hover: #35373c;
+    --active: #404249;
     --text: #dbdee1;
     --muted: #949ba4;
     --bright: #f2f3f5;
@@ -18,14 +19,13 @@
     --accent-hover: #4752c4;
     --online: #23a55a;
     --away: #f0b232;
+    --offline: #80848e;
     --danger: #da373c;
+    --green: #248046;
     --border: rgba(255, 255, 255, 0.06);
     --radius: 8px;
   }
   * { box-sizing: border-box; }
-  /* Make the `hidden` attribute authoritative: the view containers set an
-     ID-specificity `display`, which would otherwise beat the UA `[hidden]`
-     rule and leave a "hidden" view visible (login/app view never switch). */
   [hidden] { display: none !important; }
   html, body { height: 100%; margin: 0; }
   body {
@@ -47,6 +47,7 @@
   button:hover { background: var(--hover); }
   button.primary { background: var(--accent); }
   button.primary:hover { background: var(--accent-hover); }
+  button.small { padding: 5px 10px; font-size: 13px; }
   button:disabled { opacity: 0.5; cursor: default; }
   input, select {
     font: inherit;
@@ -64,69 +65,99 @@
   /* Login view */
   #login-view { height: 100%; display: flex; align-items: center; justify-content: center; }
   .login-card {
-    width: 420px;
-    max-width: calc(100% - 32px);
+    width: 420px; max-width: calc(100% - 32px);
     background: var(--sidebar);
     border: 1px solid var(--border);
     border-radius: 10px;
     padding: 28px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
+    display: flex; flex-direction: column; gap: 8px;
   }
   .login-card h1 { margin: 0; font-size: 22px; letter-spacing: -0.01em; }
   .login-card .sub { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
   .login-card label { margin-top: 8px; }
-  .login-card .row { display: flex; gap: 8px; margin-top: 14px; }
-  .login-card .row button { flex: 1; }
-  .server-adv { margin-top: 14px; }
-  .server-adv summary { cursor: pointer; color: var(--muted); font-size: 12px; }
-  .server-adv input { margin-top: 6px; }
+  .login-row { display: flex; gap: 8px; margin-top: 12px; }
+  .login-row button { flex: 1; }
+  .login-card details { margin-top: 10px; }
+  .login-card summary { color: var(--muted); font-size: 12px; cursor: pointer; }
+  .login-card details input { margin-top: 6px; }
 
-  /* App view */
-  #app-view { height: 100%; display: flex; }
-  .sidebar {
-    width: 260px;
-    background: var(--sidebar);
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
+  /* App: three columns */
+  #app-view { height: 100%; display: grid; grid-template-columns: 72px 260px 1fr; }
+
+  .rail { background: var(--rail); display: flex; flex-direction: column; align-items: center; padding: 12px 0; gap: 10px; }
+  .rail .home {
+    width: 48px; height: 48px; border-radius: 16px; background: var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; color: #fff; font-size: 18px;
   }
-  .sidebar-header { padding: 16px; font-weight: 700; font-size: 15px; border-bottom: 1px solid var(--border); }
-  .sidebar-actions { padding: 12px; display: flex; flex-direction: column; gap: 8px; }
-  .sidebar-actions #start-group { width: 100%; }
-  .add-friend-row { display: flex; gap: 6px; }
-  .add-friend-row input { flex: 1; }
-  .add-friend-row button { width: 40px; padding: 0; }
 
-  .friends { list-style: none; margin: 0; padding: 4px 8px; flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
-  .friends li { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 4px; font-size: 14px; }
-  .friends li:hover { background: var(--hover); }
-  .friends .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
-  .friends li.online .dot { background: var(--online); }
-  .friends li.away .dot { background: var(--away); }
-  .friends .status { margin-left: auto; color: var(--muted); font-size: 12px; }
+  .sidebar { background: var(--sidebar); display: flex; flex-direction: column; min-height: 0; }
+  .side-scroll { flex: 1; overflow-y: auto; padding: 8px; }
+  .side-head { display: flex; align-items: center; justify-content: space-between; padding: 4px 6px; }
+  .side-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+  .add-row { display: flex; gap: 6px; padding: 6px; }
+  .add-row input { flex: 1; }
+  ul.list { list-style: none; margin: 6px 0; padding: 0; }
+  ul.list li {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 8px; border-radius: 6px; cursor: pointer; color: var(--muted);
+  }
+  ul.list li:hover { background: var(--hover); color: var(--text); }
+  ul.list li.active { background: var(--active); color: var(--bright); }
+  .avatar {
+    width: 30px; height: 30px; border-radius: 50%; background: var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-weight: 600; font-size: 13px; flex: none; text-transform: uppercase;
+  }
+  .avatar.group { border-radius: 30%; background: #5c6069; }
+  .row-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--offline); flex: none; }
+  .dot.online { background: var(--online); }
+  .dot.away { background: var(--away); }
+  .dot.offline { background: var(--offline); }
+  .req-actions { display: flex; gap: 4px; }
+  .icon-btn { background: transparent; padding: 4px 7px; color: var(--muted); border-radius: 4px; }
+  .icon-btn:hover { background: var(--hover); color: var(--bright); }
+  .icon-btn.ok:hover { color: var(--online); }
+  .icon-btn.no:hover { color: var(--danger); }
+  .muted-empty { color: var(--muted); font-size: 12px; padding: 4px 8px; }
 
-  .user-panel { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: var(--rail); }
-  .avatar { width: 32px; height: 32px; border-radius: 50%; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; flex: none; text-transform: uppercase; }
-  .user-name { font-weight: 600; font-size: 14px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .status-select { width: auto; padding: 5px 6px; font-size: 12px; }
-  .user-panel #logout { padding: 6px 10px; font-size: 12px; }
+  .user-panel {
+    display: flex; align-items: center; gap: 8px; padding: 8px;
+    background: rgba(0,0,0,0.15); border-top: 1px solid var(--border);
+  }
+  .user-name { font-weight: 600; font-size: 13px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .user-panel select { width: auto; padding: 5px 6px; font-size: 12px; }
 
-  .chat { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--chat); }
-  .chat-header { height: 48px; display: flex; align-items: center; gap: 12px; padding: 0 16px; border-bottom: 1px solid var(--border); font-weight: 600; }
-  .chat-header .safety { margin-left: auto; font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 11px; color: var(--muted); }
-  .log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
-  .msg { max-width: 70ch; }
-  .msg .who { font-size: 13px; color: var(--muted); margin-bottom: 2px; }
+  /* Chat area */
+  .chat { display: flex; flex-direction: column; min-width: 0; }
+  .chat-header {
+    height: 48px; display: flex; align-items: center; gap: 10px;
+    padding: 0 16px; border-bottom: 1px solid var(--border); flex: none;
+  }
+  .chat-title { font-weight: 600; color: var(--bright); }
+  .safety { margin-left: auto; color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; }
+  .chat-header .hdr-btn { margin-left: 8px; }
+  .log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 2px; }
+  .msg { padding: 2px 0; max-width: 80%; }
+  .msg .who { font-size: 12px; color: var(--muted); font-weight: 600; margin-top: 8px; }
+  .msg .body { background: var(--input); padding: 8px 11px; border-radius: 10px; display: inline-block; white-space: pre-wrap; word-break: break-word; }
   .msg.self { align-self: flex-end; text-align: right; }
-  .msg .body { display: inline-block; padding: 8px 12px; background: var(--input); border-radius: var(--radius); white-space: pre-wrap; word-break: break-word; }
   .msg.self .body { background: var(--accent); color: #fff; }
-  .msg.system .body { background: transparent; padding: 0; color: var(--muted); font-size: 13px; }
+  .composer { padding: 0 16px 16px; flex: none; }
+  .composer input:disabled { opacity: 0.6; }
+  .empty-chat { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--muted); }
 
-  .composer { padding: 12px 16px 16px; }
-  .composer input { background: var(--input); border-radius: var(--radius); padding: 12px 14px; }
-  .status { padding: 0 16px 8px; font-size: 12px; color: var(--muted); min-height: 16px; }
+  /* Modal */
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; }
+  .modal { width: 400px; max-width: calc(100% - 32px); background: var(--sidebar); border-radius: 10px; padding: 20px; display: flex; flex-direction: column; gap: 10px; }
+  .modal h2 { margin: 0; font-size: 18px; }
+  .pick-list { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+  .pick { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-radius: 6px; cursor: pointer; }
+  .pick:hover { background: var(--hover); }
+  .pick input { width: auto; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
+  .status { padding: 0 16px 8px; color: var(--muted); font-size: 12px; min-height: 16px; }
   .status.err { color: #f38688; }
 </style>
 </head>
@@ -134,16 +165,16 @@
   <div id="login-view">
     <div class="login-card">
       <h1>Enclave</h1>
-      <p class="sub">end-to-end encrypted</p>
-      <label for="login-username">Username</label>
-      <input id="login-username" spellcheck="false" autocomplete="off" />
+      <p class="sub">End-to-end encrypted. The server never sees your password or messages.</p>
+      <label for="login-username">Name</label>
+      <input id="login-username" autocomplete="off" spellcheck="false" placeholder="name (to register) or name#1234 (to log in)" />
       <label for="login-password">Password</label>
-      <input id="login-password" type="password" />
-      <div class="row">
-        <button id="login-btn" class="primary">Log in</button>
-        <button id="register-btn">Create account</button>
+      <input id="login-password" type="password" autocomplete="off" placeholder="at least 12 characters" />
+      <div class="login-row">
+        <button id="login-btn">Log in</button>
+        <button id="register-btn" class="primary">Create account</button>
       </div>
-      <details class="server-adv">
+      <details>
         <summary>Server</summary>
         <input id="login-server" value="ws://127.0.0.1:8443" spellcheck="false" />
       </details>
@@ -152,54 +183,95 @@
   </div>
 
   <div id="app-view" hidden>
+    <nav class="rail">
+      <div class="home" title="Enclave">E</div>
+    </nav>
+
     <aside class="sidebar">
-      <div class="sidebar-header">Direct messages</div>
-      <div class="sidebar-actions">
-        <button id="start-group">Start a group</button>
-        <div class="add-friend-row">
-          <input id="friend" placeholder="Add friend by name" spellcheck="false" />
-          <button id="add-friend" title="Add friend">+</button>
+      <div class="side-scroll">
+        <div class="add-row">
+          <input id="friend" placeholder="Add friend by name#1234" spellcheck="false" />
+          <button id="add-friend" class="small" title="Send friend request">Add</button>
         </div>
+
+        <div id="requests-section" hidden>
+          <div class="side-head"><span class="side-title">Requests</span></div>
+          <ul id="requests" class="list"></ul>
+        </div>
+
+        <div class="side-head">
+          <span class="side-title">Direct Messages</span>
+        </div>
+        <ul id="friends" class="list"></ul>
+        <div id="friends-empty" class="muted-empty">No friends yet. Add someone by their handle.</div>
+
+        <div class="side-head">
+          <span class="side-title">Groups</span>
+          <button id="new-group" class="icon-btn" title="New group">+</button>
+        </div>
+        <ul id="groups" class="list"></ul>
       </div>
-      <ul id="friends" class="friends"></ul>
+
       <div class="user-panel">
         <div class="avatar" id="avatar"></div>
         <div class="user-name" id="me-name"></div>
-        <select id="presence" class="status-select">
+        <select id="presence" title="Set your status">
           <option value="online">Online</option>
           <option value="away">Away</option>
           <option value="offline">Invisible</option>
         </select>
-        <button id="logout">Log out</button>
+        <button id="logout" class="small">Log out</button>
       </div>
     </aside>
 
     <main class="chat">
       <header class="chat-header">
-        <span id="chat-title">No conversation yet</span>
-        <span class="safety" id="safety" title="Read this aloud with your friends to verify no one is listening"></span>
+        <span id="chat-title" class="chat-title">No conversation</span>
+        <span id="safety" class="safety" title="Compare this with your friend out-of-band to verify no one is in the middle"></span>
+        <button id="add-to-group" class="hdr-btn small" hidden title="Add a friend to this group">Add member</button>
       </header>
-      <div id="log" class="log"></div>
-      <form id="composer" class="composer">
-        <input id="message" placeholder="Message" autocomplete="off" disabled />
-      </form>
+      <div id="empty-chat" class="empty-chat">Pick a friend or group to start talking.</div>
+      <div id="log" class="log" hidden></div>
       <div id="status" class="status"></div>
+      <form id="composer" class="composer" hidden>
+        <input id="message" placeholder="Message" autocomplete="off" />
+      </form>
     </main>
+  </div>
+
+  <div id="group-modal" class="overlay" hidden>
+    <div class="modal">
+      <h2>New group</h2>
+      <input id="group-name" placeholder="Group name" autocomplete="off" />
+      <label>Members</label>
+      <div id="group-picks" class="pick-list"></div>
+      <div class="modal-actions">
+        <button id="group-cancel">Cancel</button>
+        <button id="group-create" class="primary">Create</button>
+      </div>
+    </div>
   </div>
 
 <script>
   const $ = (id) => document.getElementById(id);
   const send = (cmd) => window.ipc.postMessage(JSON.stringify(cmd));
 
-  let inGroup = false;
+  // ---- client state (mirrors the controller) ----
+  let me = "";
+  let friends = [], incoming = [], outgoing = [];
+  const presence = {};           // handle -> "online"/"away"/"offline"
+  let conversations = [];        // {id, title, is_dm, pending}
+  let activeConv = null;
+  const messages = {};           // conv id -> [{from, text, mine}]
 
   function serverUrl() { return $("login-server").value.trim() || "ws://127.0.0.1:8443"; }
+  const initial = (s) => (s || "?").trim().charAt(0);
 
   function doAuth(create) {
     const username = $("login-username").value.trim();
     const password = $("login-password").value;
     $("login-error").textContent = "";
-    if (!username || !password) { $("login-error").textContent = "Enter a username and password."; return; }
+    if (!username || !password) { $("login-error").textContent = "Enter a name and password."; return; }
     if (create && password.length < 12) { $("login-error").textContent = "Password must be at least 12 characters."; return; }
     send({ type: create ? "CreateAccount" : "Login", server: serverUrl(), username, password });
   }
@@ -208,86 +280,190 @@
   $("login-password").addEventListener("keydown", (e) => { if (e.key === "Enter") doAuth(false); });
 
   $("logout").addEventListener("click", () => send({ type: "Logout" }));
-  $("start-group").addEventListener("click", () => send({ type: "StartGroup" }));
+  $("presence").addEventListener("change", (e) => send({ type: "SetPresence", status: e.target.value }));
+
   $("add-friend").addEventListener("click", () => {
     const user = $("friend").value.trim();
-    if (user) { send({ type: "AddFriend", user }); upsertFriend(user, "offline"); $("friend").value = ""; }
+    if (user) { send({ type: "AddFriend", user }); $("friend").value = ""; setStatus("Friend request sent to " + user, false); }
   });
-  $("presence").addEventListener("change", (e) => send({ type: "SetPresence", status: e.target.value }));
+  $("friend").addEventListener("keydown", (e) => { if (e.key === "Enter") $("add-friend").click(); });
+
   $("composer").addEventListener("submit", (e) => {
     e.preventDefault();
     const input = $("message");
-    if (input.value.trim()) { send({ type: "SendText", text: input.value }); input.value = ""; }
+    if (input.value.trim() && activeConv) { send({ type: "SendText", text: input.value }); input.value = ""; }
   });
 
-  function addMessage(kind, who, text) {
-    const el = document.createElement("div");
-    el.className = "msg " + kind;
-    if (who) { const w = document.createElement("div"); w.className = "who"; w.textContent = who; el.appendChild(w); }
-    const b = document.createElement("div"); b.className = "body"; b.textContent = text; el.appendChild(b);
-    const log = $("log"); log.appendChild(el); log.scrollTop = log.scrollHeight;
+  $("add-to-group").addEventListener("click", () => {
+    const conv = conversations.find((c) => c.id === activeConv);
+    if (!conv) return;
+    const handle = prompt("Add which friend? (their name#1234)");
+    if (handle && handle.trim()) send({ type: "AddToGroup", handle: handle.trim() });
+  });
+
+  // ---- new-group modal ----
+  $("new-group").addEventListener("click", openGroupModal);
+  $("group-cancel").addEventListener("click", () => $("group-modal").hidden = true);
+  $("group-create").addEventListener("click", () => {
+    const name = $("group-name").value.trim() || "New group";
+    const members = Array.from(document.querySelectorAll("#group-picks input:checked")).map((el) => el.value);
+    if (members.length === 0) { return; }
+    send({ type: "CreateGroup", name, members });
+    $("group-modal").hidden = true;
+  });
+  function openGroupModal() {
+    $("group-name").value = "";
+    const box = $("group-picks");
+    box.innerHTML = "";
+    if (friends.length === 0) { box.innerHTML = '<div class="muted-empty">Add friends first.</div>'; }
+    for (const f of friends) {
+      const row = document.createElement("label");
+      row.className = "pick";
+      row.innerHTML = '<input type="checkbox" value="' + f + '"><span class="avatar">' + initial(f) + '</span><span class="row-name"></span>';
+      row.querySelector(".row-name").textContent = f;
+      box.appendChild(row);
+    }
+    $("group-modal").hidden = false;
   }
 
-  function upsertFriend(user, status) {
-    let li = document.querySelector('#friends li[data-user="' + CSS.escape(user) + '"]');
-    if (!li) {
-      li = document.createElement("li");
-      li.dataset.user = user;
-      li.innerHTML = '<span class="dot"></span><span class="fname"></span><span class="status"></span>';
-      li.querySelector(".fname").textContent = user;
-      $("friends").appendChild(li);
+  // ---- rendering ----
+  function statusOf(h) { return presence[h] || "offline"; }
+
+  function renderSidebar() {
+    // Requests
+    const reqSec = $("requests-section"), reqUl = $("requests");
+    reqUl.innerHTML = "";
+    const anyReq = incoming.length + outgoing.length > 0;
+    reqSec.hidden = !anyReq;
+    for (const h of incoming) {
+      const li = document.createElement("li");
+      li.innerHTML = '<span class="avatar">' + initial(h) + '</span><span class="row-name"></span>' +
+        '<span class="req-actions"><button class="icon-btn ok" title="Accept">✓</button>' +
+        '<button class="icon-btn no" title="Decline">✕</button></span>';
+      li.querySelector(".row-name").textContent = h;
+      li.querySelector(".ok").addEventListener("click", (e) => { e.stopPropagation(); send({ type: "AcceptFriend", handle: h }); });
+      li.querySelector(".no").addEventListener("click", (e) => { e.stopPropagation(); send({ type: "DeclineFriend", handle: h }); });
+      reqUl.appendChild(li);
     }
-    li.className = status;
-    li.querySelector(".status").textContent = status;
+    for (const h of outgoing) {
+      const li = document.createElement("li");
+      li.innerHTML = '<span class="avatar">' + initial(h) + '</span><span class="row-name"></span><span class="muted-empty">pending</span>';
+      li.querySelector(".row-name").textContent = h;
+      reqUl.appendChild(li);
+    }
+
+    // Friends (DMs)
+    const ul = $("friends");
+    ul.innerHTML = "";
+    $("friends-empty").hidden = friends.length > 0;
+    for (const h of friends) {
+      const dm = conversations.find((c) => c.is_dm && c.title === h);
+      const li = document.createElement("li");
+      if (dm && dm.id === activeConv) li.className = "active";
+      li.innerHTML = '<span class="avatar">' + initial(h) + '</span><span class="row-name"></span><span class="dot ' + statusOf(h) + '"></span>';
+      li.querySelector(".row-name").textContent = h;
+      li.addEventListener("click", () => send({ type: "OpenDm", handle: h }));
+      ul.appendChild(li);
+    }
+
+    // Groups
+    const gul = $("groups");
+    gul.innerHTML = "";
+    for (const c of conversations.filter((c) => !c.is_dm)) {
+      const li = document.createElement("li");
+      if (c.id === activeConv) li.className = "active";
+      li.innerHTML = '<span class="avatar group">' + initial(c.title) + '</span><span class="row-name"></span>';
+      li.querySelector(".row-name").textContent = c.title;
+      li.addEventListener("click", () => send({ type: "SwitchConversation", conv: c.id }));
+      gul.appendChild(li);
+    }
+  }
+
+  function renderChat() {
+    const conv = conversations.find((c) => c.id === activeConv);
+    const hasConv = !!conv;
+    $("empty-chat").hidden = hasConv;
+    $("log").hidden = !hasConv;
+    $("composer").hidden = !hasConv;
+    $("add-to-group").hidden = !(conv && !conv.is_dm);
+    $("chat-title").textContent = conv ? conv.title : "No conversation";
+    $("message").disabled = !(conv && !conv.pending);
+    $("message").placeholder = conv && conv.pending ? "Starting conversation…" : "Message";
+    const log = $("log");
+    log.innerHTML = "";
+    const list = messages[activeConv] || [];
+    let lastFrom = null;
+    for (const m of list) {
+      const el = document.createElement("div");
+      el.className = "msg" + (m.mine ? " self" : "");
+      if (!m.mine && m.from !== lastFrom) {
+        const w = document.createElement("div"); w.className = "who"; w.textContent = m.from; el.appendChild(w);
+      }
+      const b = document.createElement("div"); b.className = "body"; b.textContent = m.text; el.appendChild(b);
+      log.appendChild(el);
+      lastFrom = m.from;
+    }
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function appendMessage(m) {
+    const log = $("log");
+    const el = document.createElement("div");
+    el.className = "msg" + (m.mine ? " self" : "");
+    if (!m.mine) { const w = document.createElement("div"); w.className = "who"; w.textContent = m.from; el.appendChild(w); }
+    const b = document.createElement("div"); b.className = "body"; b.textContent = m.text; el.appendChild(b);
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
   }
 
   function setStatus(message, isError) {
-    const s = $("status");
-    s.textContent = message || "";
-    s.className = "status" + (isError ? " err" : "");
+    const s = $("status"); s.textContent = message || ""; s.className = "status" + (isError ? " err" : "");
   }
 
-  function showApp(username) {
-    $("login-view").hidden = true;
-    $("app-view").hidden = false;
-    $("me-name").textContent = username;
-    $("avatar").textContent = username.slice(0, 1);
+  function showApp(handle) {
+    $("login-view").hidden = true; $("app-view").hidden = false;
+    $("me-name").textContent = handle; $("avatar").textContent = initial(handle);
+    $("login-password").value = "";
   }
   function showLogin() {
-    $("app-view").hidden = true;
-    $("login-view").hidden = false;
-    inGroup = false;
-    $("friends").innerHTML = "";
-    $("log").innerHTML = "";
-    $("safety").textContent = "";
-    $("chat-title").textContent = "No conversation yet";
-    $("message").disabled = true;
-    $("login-password").value = "";
+    $("app-view").hidden = true; $("login-view").hidden = false;
+    me = ""; friends = []; incoming = []; outgoing = []; conversations = []; activeConv = null;
+    for (const k in messages) delete messages[k];
+    for (const k in presence) delete presence[k];
   }
 
   window.onEnclaveEvent = (ev) => {
     switch (ev.type) {
       case "LoggedIn":
-        showApp(ev.username);
-        if (ev.safety_number) { inGroup = true; $("safety").textContent = ev.safety_number; }
+        me = ev.username; showApp(ev.username); renderSidebar(); renderChat();
         break;
       case "LoggedOut":
         showLogin();
         break;
-      case "Membership":
-        inGroup = true;
-        $("message").disabled = false;
-        $("chat-title").textContent = "Group";
-        if (ev.safety_number) $("safety").textContent = ev.safety_number;
+      case "Conversations":
+        conversations = ev.conversations; renderSidebar();
         break;
-      case "Text":
-        addMessage(ev.mine ? "self" : "", ev.mine ? null : ev.from, ev.text);
+      case "ActiveConversation":
+        activeConv = ev.conv;
+        if (ev.conv) messages[ev.conv] = ev.history.slice();
+        $("safety").textContent = ev.safety || "";
+        renderSidebar(); renderChat();
+        break;
+      case "Message":
+        if (!messages[ev.conv]) messages[ev.conv] = [];
+        messages[ev.conv].push({ from: ev.from, text: ev.text, mine: ev.mine });
+        if (ev.conv === activeConv) appendMessage({ from: ev.from, text: ev.text, mine: ev.mine });
         break;
       case "Presence":
-        upsertFriend(ev.user, ev.status);
+        presence[ev.user] = ev.status; renderSidebar();
+        break;
+      case "FriendRequest":
+        setStatus("Friend request from " + ev.from, false);
+        break;
+      case "Friends":
+        friends = ev.friends; incoming = ev.incoming; outgoing = ev.outgoing; renderSidebar();
         break;
       case "Status":
-        // Auth errors show on the login card; in-app errors on the status bar.
         if ($("login-view").hidden) setStatus(ev.message, ev.error);
         else $("login-error").textContent = ev.message;
         break;

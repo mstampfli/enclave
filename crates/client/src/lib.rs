@@ -9,7 +9,7 @@
 //! Single-task and caller-driven: there is no background task, so the non-`Send`
 //! MLS group never crosses a thread boundary.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ use enclave_crypto::{Group, Identity};
 use enclave_protocol::{ClientMsg, DeviceId, GroupId, Presence, Sealed, ServerMsg, UserId};
 use enclave_transport::accounts::MIN_PASSWORD_LEN;
 use enclave_transport::{opaque, Connection};
+use sha2::{Digest, Sha256};
 
 /// Errors surfaced to the UI.
 #[derive(Debug, thiserror::Error)]
@@ -40,10 +41,16 @@ pub enum ClientError {
 /// Something the UI should react to.
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// A text message arrived from `from`.
-    Text { from: String, text: String },
-    /// Group membership changed (someone joined, or we joined).
-    MembershipChanged,
+    /// A text message arrived in conversation `conv` (hex group id).
+    Message {
+        conv: String,
+        from: String,
+        text: String,
+        mine: bool,
+    },
+    /// The set of conversations changed (a DM or group was created or joined);
+    /// the UI re-reads them via `conversations()`.
+    ConversationsChanged,
     /// A watched friend's presence changed ("online" / "away" / "offline").
     Presence { user: String, status: String },
     /// Someone sent us a friend request (their full handle).
@@ -52,6 +59,43 @@ pub enum Event {
     FriendsChanged,
     /// A non-fatal error worth showing.
     Error(String),
+}
+
+/// Whether a conversation is a 1:1 DM or a named group.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ConvKind {
+    Dm,
+    Group,
+}
+
+/// A conversation summary handed to the UI.
+#[derive(Clone)]
+pub struct ConversationInfo {
+    /// Hex group id (stable conversation key).
+    pub id: String,
+    pub title: String,
+    pub is_dm: bool,
+    pub members: Vec<String>,
+    /// A DM whose MLS group is not established yet (waiting on the peer).
+    pub pending: bool,
+}
+
+/// One live conversation and its scoped history.
+struct Conversation {
+    /// `None` while a DM we initiated waits for the peer (smaller handle) to
+    /// create the MLS group and send us the Welcome.
+    group: Option<Group>,
+    kind: ConvKind,
+    title: String,
+    members: Vec<String>,
+    history: Vec<ChatLine>,
+}
+
+#[derive(Clone)]
+struct ChatLine {
+    from: String,
+    text: String,
+    mine: bool,
 }
 
 fn presence_label(status: Presence) -> String {
@@ -69,8 +113,10 @@ pub struct Client {
     identity: Option<Identity>,
     username: Option<String>,
     keystore_dir: PathBuf,
-    group: Option<Group>,
-    group_id: Option<GroupId>,
+    /// All live conversations, keyed by routing group id.
+    conversations: HashMap<GroupId, Conversation>,
+    /// The conversation currently shown / targeted by send_text.
+    active: Option<GroupId>,
     pending: VecDeque<Event>,
     /// Accepted friends and pending requests, mirrored from the server.
     friends: Vec<String>,
@@ -87,8 +133,8 @@ impl Client {
             identity: None,
             username: None,
             keystore_dir: PathBuf::from("."),
-            group: None,
-            group_id: None,
+            conversations: HashMap::new(),
+            active: None,
             pending: VecDeque::new(),
             friends: Vec::new(),
             incoming: Vec::new(),
@@ -174,8 +220,8 @@ impl Client {
         self.conn.send(ClientMsg::Logout);
         self.identity = None;
         self.username = None;
-        self.group = None;
-        self.group_id = None;
+        self.conversations.clear();
+        self.active = None;
         self.friends.clear();
         self.incoming.clear();
         self.outgoing.clear();
@@ -321,48 +367,164 @@ impl Client {
         self.conn.send(ClientMsg::ListFriends);
     }
 
-    /// Start a fresh group that we own. The routing id is derived from our
-    /// identity key (unique per user).
-    pub fn start_group(&mut self) -> Result<(), ClientError> {
+    /// Open (or focus) a 1:1 DM with a friend. The lexicographically-smaller
+    /// handle is the canonical creator of the shared MLS group; if we are the
+    /// larger handle we nudge them to create it and show a pending conversation
+    /// until their Welcome arrives. Returns the conversation id (hex).
+    pub async fn open_dm(&mut self, friend: &str) -> Result<String, ClientError> {
+        let me = self.me()?;
+        let dm_id = derive_dm_id(&me, friend);
+        if self.conversations.contains_key(&dm_id) {
+            self.active = Some(dm_id.clone());
+            return Ok(hex_id(&dm_id));
+        }
+        if me.as_str() < friend {
+            // We create the group and invite them.
+            let identity = self.identity()?;
+            let group = Group::create(identity)?;
+            self.conn.send(ClientMsg::JoinGroup {
+                group: dm_id.clone(),
+            });
+            self.conversations.insert(
+                dm_id.clone(),
+                Conversation {
+                    group: Some(group),
+                    kind: ConvKind::Dm,
+                    title: friend.to_string(),
+                    members: vec![me, friend.to_string()],
+                    history: Vec::new(),
+                },
+            );
+            self.invite_peer(&dm_id, friend, "").await?;
+        } else {
+            // They are the creator; ask them to open it, and show it as pending.
+            self.conn.send(ClientMsg::RequestDm {
+                to: friend.to_string(),
+            });
+            self.conversations.insert(
+                dm_id.clone(),
+                Conversation {
+                    group: None,
+                    kind: ConvKind::Dm,
+                    title: friend.to_string(),
+                    members: vec![me, friend.to_string()],
+                    history: Vec::new(),
+                },
+            );
+        }
+        self.active = Some(dm_id.clone());
+        Ok(hex_id(&dm_id))
+    }
+
+    /// Create a named group with `members` (full handles) and focus it. We own
+    /// the MLS group; a fresh random routing id keeps it distinct from any DM.
+    pub async fn create_group(
+        &mut self,
+        name: &str,
+        members: &[String],
+    ) -> Result<String, ClientError> {
+        let me = self.me()?;
         let identity = self.identity()?;
         let group = Group::create(identity)?;
-        let group_id = derive_group_id(identity);
+        let group_id = random_group_id();
         self.conn.send(ClientMsg::JoinGroup {
             group: group_id.clone(),
         });
-        self.group = Some(group);
-        self.group_id = Some(group_id);
-        Ok(())
+        self.conversations.insert(
+            group_id.clone(),
+            Conversation {
+                group: Some(group),
+                kind: ConvKind::Group,
+                title: name.to_string(),
+                members: vec![me],
+                history: Vec::new(),
+            },
+        );
+        for member in members {
+            self.invite_peer(&group_id, member, name).await?;
+        }
+        self.active = Some(group_id.clone());
+        Ok(hex_id(&group_id))
     }
 
-    /// Invite a peer by name: fetch their key package, add them, and deliver the
-    /// Welcome (plus the commit for existing members) through the server.
-    pub async fn invite(&mut self, peer: &str) -> Result<(), ClientError> {
-        let group_id = self.group_id.clone().ok_or(ClientError::NoGroup)?;
-        let key_package = self.fetch_key_package(peer).await?;
+    /// Add a friend to the active named group (no effect on a DM -- to grow a
+    /// DM, create a new group instead).
+    pub async fn add_to_active_group(&mut self, friend: &str) -> Result<(), ClientError> {
+        let group_id = self.active.clone().ok_or(ClientError::NoGroup)?;
+        let name = {
+            let conv = self
+                .conversations
+                .get(&group_id)
+                .ok_or(ClientError::NoGroup)?;
+            if conv.kind != ConvKind::Group {
+                return Err(ClientError::NoGroup);
+            }
+            conv.title.clone()
+        };
+        self.invite_peer(&group_id, friend, &name).await
+    }
 
+    /// Fetch `friend`'s key package, add them to the conversation's MLS group,
+    /// and deliver the Welcome (with the conversation `name`) plus the commit.
+    async fn invite_peer(
+        &mut self,
+        group_id: &GroupId,
+        friend: &str,
+        name: &str,
+    ) -> Result<(), ClientError> {
+        let key_package = self.fetch_key_package(friend).await?;
         let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
-        let group = self.group.as_mut().ok_or(ClientError::NoGroup)?;
+        let conv = self
+            .conversations
+            .get_mut(group_id)
+            .ok_or(ClientError::NoGroup)?;
+        let group = conv.group.as_mut().ok_or(ClientError::NoGroup)?;
         let add = group.add_member(identity, &key_package)?;
-
+        if !conv.members.iter().any(|m| m == friend) {
+            conv.members.push(friend.to_string());
+        }
         self.conn.send(ClientMsg::Welcome {
-            to: DeviceId(peer.into()),
+            to: DeviceId(friend.into()),
             group: group_id.clone(),
+            name: name.to_string(),
             message: Sealed(add.welcome),
         });
         self.conn.send(ClientMsg::Mls {
-            group: group_id,
+            group: group_id.clone(),
             message: Sealed(add.commit),
         });
         Ok(())
     }
 
-    /// Encrypt and send a text message to the group.
+    /// Focus a conversation by its hex id.
+    pub fn switch(&mut self, conv: &str) {
+        if let Some(id) = self
+            .conversations
+            .keys()
+            .find(|k| hex_id(k) == conv)
+            .cloned()
+        {
+            self.active = Some(id);
+        }
+    }
+
+    /// Encrypt and send a text message to the active conversation. Also records
+    /// it in that conversation's local history.
     pub async fn send_text(&mut self, text: &str) -> Result<(), ClientError> {
-        let group_id = self.group_id.clone().ok_or(ClientError::NoGroup)?;
+        let group_id = self.active.clone().ok_or(ClientError::NoGroup)?;
+        let me = self.me()?;
         let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
-        let group = self.group.as_mut().ok_or(ClientError::NoGroup)?;
+        let conv = self
+            .conversations
+            .get_mut(&group_id)
+            .ok_or(ClientError::NoGroup)?;
+        let group = conv.group.as_mut().ok_or(ClientError::NoGroup)?;
         let sealed = group.encrypt_text(identity, text.as_bytes())?;
+        conv.history.push(ChatLine {
+            from: me,
+            text: text.to_string(),
+            mine: true,
+        });
         self.conn.send(ClientMsg::Text {
             group: group_id,
             message: Sealed(sealed),
@@ -370,9 +532,49 @@ impl Client {
         Ok(())
     }
 
-    /// The group's safety number, if we are in a group.
+    /// A summary of every conversation, for the sidebar.
+    pub fn conversations(&self) -> Vec<ConversationInfo> {
+        self.conversations
+            .iter()
+            .map(|(id, c)| ConversationInfo {
+                id: hex_id(id),
+                title: c.title.clone(),
+                is_dm: c.kind == ConvKind::Dm,
+                members: c.members.clone(),
+                pending: c.group.is_none(),
+            })
+            .collect()
+    }
+
+    /// The active conversation's id (hex), if any.
+    pub fn active_id(&self) -> Option<String> {
+        self.active.as_ref().map(hex_id)
+    }
+
+    /// The scoped history (from, text, mine) of a conversation by hex id.
+    pub fn conversation_history(&self, conv: &str) -> Vec<(String, String, bool)> {
+        self.conversations
+            .iter()
+            .find(|(id, _)| hex_id(id) == conv)
+            .map(|(_, c)| {
+                c.history
+                    .iter()
+                    .map(|l| (l.from.clone(), l.text.clone(), l.mine))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The active conversation's safety number, if it has an established group.
     pub fn safety_number(&self) -> Option<String> {
-        self.group.as_ref().map(|g| g.safety_number().to_string())
+        let id = self.active.as_ref()?;
+        let conv = self.conversations.get(id)?;
+        conv.group.as_ref().map(|g| g.safety_number().to_string())
+    }
+
+    /// The logged-in handle, or an error if not logged in.
+    fn me(&self) -> Result<String, ClientError> {
+        self.username.clone().ok_or(ClientError::NotLoggedIn)
     }
 
     /// Await the next event, processing incoming server messages until one
@@ -383,6 +585,16 @@ impl Client {
         }
         loop {
             let msg = self.conn.recv().await?;
+            // A DM nudge needs an async follow-up (create the group + invite),
+            // which the sync `handle` cannot do -- so service it here. It must
+            // not steal focus, so the active conversation is preserved.
+            if let ServerMsg::DmRequested { from } = &msg {
+                let from = from.clone();
+                let prev = self.active.clone();
+                let _ = self.open_dm(&from).await;
+                self.active = prev;
+                return Some(Event::ConversationsChanged);
+            }
             if let Some(event) = self.handle(msg) {
                 return Some(event);
             }
@@ -420,34 +632,70 @@ impl Client {
     /// Turn one server message into an optional UI event, updating group state.
     fn handle(&mut self, msg: ServerMsg) -> Option<Event> {
         match msg {
-            ServerMsg::Welcome { group, message, .. } => {
+            ServerMsg::Welcome {
+                group,
+                from,
+                name,
+                message,
+            } => {
                 let identity = self.identity.as_ref()?;
-                match Group::join(identity, &message.0) {
-                    Ok(joined) => {
-                        self.group = Some(joined);
-                        self.group_id = Some(group.clone());
-                        self.conn.send(ClientMsg::JoinGroup { group });
-                        Some(Event::MembershipChanged)
+                let joined = match Group::join(identity, &message.0) {
+                    Ok(j) => j,
+                    Err(e) => return Some(Event::Error(format!("join failed: {e}"))),
+                };
+                self.conn.send(ClientMsg::JoinGroup {
+                    group: group.clone(),
+                });
+                let is_dm = name.is_empty();
+                match self.conversations.get_mut(&group) {
+                    // Populate a pending DM (or re-affirm) by adopting the group.
+                    Some(conv) => conv.group = Some(joined),
+                    None => {
+                        let me = self.username.clone().unwrap_or_default();
+                        let title = if is_dm { from.0.clone() } else { name };
+                        self.conversations.insert(
+                            group,
+                            Conversation {
+                                group: Some(joined),
+                                kind: if is_dm { ConvKind::Dm } else { ConvKind::Group },
+                                title,
+                                members: vec![me, from.0],
+                                history: Vec::new(),
+                            },
+                        );
                     }
-                    Err(e) => Some(Event::Error(format!("join failed: {e}"))),
                 }
+                Some(Event::ConversationsChanged)
             }
-            ServerMsg::Text { message, .. } => {
+            ServerMsg::Text { group, message, .. } => {
                 let identity = self.identity.as_ref()?;
-                let group = self.group.as_mut()?;
-                match group.decrypt_text(identity, &message.0) {
-                    Ok(tm) => Some(Event::Text {
-                        from: String::from_utf8_lossy(&tm.sender).into_owned(),
-                        text: String::from_utf8_lossy(&tm.plaintext).into_owned(),
-                    }),
+                let conv = self.conversations.get_mut(&group)?;
+                let g = conv.group.as_mut()?;
+                match g.decrypt_text(identity, &message.0) {
+                    Ok(tm) => {
+                        let from = String::from_utf8_lossy(&tm.sender).into_owned();
+                        let text = String::from_utf8_lossy(&tm.plaintext).into_owned();
+                        conv.history.push(ChatLine {
+                            from: from.clone(),
+                            text: text.clone(),
+                            mine: false,
+                        });
+                        Some(Event::Message {
+                            conv: hex_id(&group),
+                            from,
+                            text,
+                            mine: false,
+                        })
+                    }
                     Err(e) => Some(Event::Error(format!("decrypt failed: {e}"))),
                 }
             }
-            ServerMsg::Mls { message, .. } => {
+            ServerMsg::Mls { group, message, .. } => {
                 let identity = self.identity.as_ref()?;
-                let group = self.group.as_mut()?;
-                match group.apply_commit(identity, &message.0) {
-                    Ok(()) => Some(Event::MembershipChanged),
+                let conv = self.conversations.get_mut(&group)?;
+                let g = conv.group.as_mut()?;
+                match g.apply_commit(identity, &message.0) {
+                    Ok(()) => Some(Event::ConversationsChanged),
                     Err(_) => None,
                 }
             }
@@ -478,11 +726,33 @@ impl Client {
     }
 }
 
-/// Routing group id derived from a 32-byte Ed25519 identity key.
-fn derive_group_id(identity: &Identity) -> GroupId {
-    let key = identity.identity_key();
+/// Deterministic routing id for the 1:1 DM between two handles: the same for
+/// both sides regardless of who opens it first.
+fn derive_dm_id(a: &str, b: &str) -> GroupId {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let mut h = Sha256::new();
+    h.update(b"enclave-dm\0");
+    h.update(lo.as_bytes());
+    h.update([0u8]);
+    h.update(hi.as_bytes());
+    let digest = h.finalize();
     let mut id = [0u8; 32];
-    let n = key.len().min(32);
-    id[..n].copy_from_slice(&key[..n]);
+    id.copy_from_slice(&digest);
     GroupId(id)
+}
+
+/// A fresh random routing id for a named group.
+fn random_group_id() -> GroupId {
+    let mut id = [0u8; 32];
+    let _ = getrandom::getrandom(&mut id);
+    GroupId(id)
+}
+
+/// Hex encoding of a routing group id -- the stable conversation key the UI uses.
+fn hex_id(id: &GroupId) -> String {
+    let mut s = String::with_capacity(64);
+    for b in id.0 {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }

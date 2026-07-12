@@ -442,7 +442,12 @@ impl Relay {
                 vec![]
             }
 
-            ClientMsg::Welcome { to, group, message } => {
+            ClientMsg::Welcome {
+                to,
+                group,
+                name,
+                message,
+            } => {
                 let from_device = self.device_for(from);
                 // Only a current member may invite (ASVS V4, deny-by-default).
                 if !self.is_member(&group, &from_device) {
@@ -458,6 +463,7 @@ impl Relay {
                         msg: ServerMsg::Welcome {
                             group,
                             from: from_device,
+                            name,
                             message,
                         },
                     }],
@@ -621,6 +627,19 @@ impl Relay {
                 }];
                 out.extend(self.wire_friend_presence(from, &me));
                 out
+            }
+
+            ClientMsg::RequestDm { to } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                match self.device_conn.get(&DeviceId(to)) {
+                    Some(&to_conn) => vec![Outgoing {
+                        to: to_conn,
+                        msg: ServerMsg::DmRequested { from: me },
+                    }],
+                    None => vec![],
+                }
             }
         }
     }
