@@ -5,6 +5,7 @@
 //! storage and never leave the device. What goes on the wire is only the
 //! *public* key package produced by [`Identity::new_key_package`].
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use argon2::Argon2;
@@ -60,6 +61,32 @@ impl Identity {
     /// peer pins and what the safety number is computed over.
     pub fn identity_key(&self) -> Vec<u8> {
         self.signer.to_public_vec()
+    }
+
+    /// Snapshot this device's entire MLS storage (all group states and private
+    /// keys) so a session can be persisted. It contains private key material and
+    /// MUST be encrypted before it touches disk.
+    pub fn storage_snapshot(&self) -> HashMap<Vec<u8>, Vec<u8>> {
+        self.provider
+            .storage()
+            .values
+            .read()
+            .expect("storage lock")
+            .clone()
+    }
+
+    /// Merge a previously captured MLS storage snapshot back in, so groups can be
+    /// reloaded (see [`crate::Group::load`]). Called once after login.
+    pub fn restore_storage(&self, snapshot: HashMap<Vec<u8>, Vec<u8>>) {
+        let mut values = self
+            .provider
+            .storage()
+            .values
+            .write()
+            .expect("storage lock");
+        for (k, v) in snapshot {
+            values.insert(k, v);
+        }
     }
 
     /// Produce a serialized **last-resort** public key package for this identity.

@@ -39,6 +39,12 @@ enum UiCommand {
     SetDisplayName {
         display: String,
     },
+    /// Back up the encrypted session to a discoverable file.
+    ExportSession,
+    /// Import a session file (same account + password) from `path`.
+    ImportSession {
+        path: String,
+    },
     /// Open (or focus) a 1:1 DM with a friend handle.
     OpenDm {
         handle: String,
@@ -385,6 +391,38 @@ async fn handle_command(
             if let Some(c) = client.as_mut() {
                 c.set_display_name(&display);
                 emit_conversations(proxy, c);
+            }
+        }
+        UiCommand::ExportSession => {
+            if let Some(c) = client.as_ref() {
+                let dst = app_dir().join(format!("enclave-{}-backup.enc", c.name()));
+                match c.export_session(&dst) {
+                    Ok(()) => emit(
+                        proxy,
+                        UiEvent::Status {
+                            message: format!("Exported your encrypted chats to {}", dst.display()),
+                            error: false,
+                        },
+                    ),
+                    Err(e) => error_status(proxy, format!("Export failed: {e}")),
+                }
+            }
+        }
+        UiCommand::ImportSession { path } => {
+            if let Some(c) = client.as_mut() {
+                match c.import_session(&path) {
+                    Ok(()) => {
+                        emit_conversations(proxy, c);
+                        emit(
+                            proxy,
+                            UiEvent::Status {
+                                message: "Imported chats from backup.".into(),
+                                error: false,
+                            },
+                        );
+                    }
+                    Err(e) => error_status(proxy, format!("Import failed: {e}")),
+                }
             }
         }
         UiCommand::OpenDm { handle } => {

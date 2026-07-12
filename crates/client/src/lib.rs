@@ -19,6 +19,8 @@ use enclave_transport::accounts::MIN_PASSWORD_LEN;
 use enclave_transport::{opaque, Connection};
 use sha2::{Digest, Sha256};
 
+mod session;
+
 /// Errors surfaced to the UI.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -85,6 +87,8 @@ struct Conversation {
     /// `None` while a DM we initiated waits for the peer (smaller handle) to
     /// create the MLS group and send us the Welcome.
     group: Option<Group>,
+    /// The MLS-internal group id, for persisting/reloading (empty until live).
+    mls_group_id: Vec<u8>,
     kind: ConvKind,
     title: String,
     members: Vec<String>,
@@ -118,6 +122,8 @@ pub struct Client {
     /// The conversation currently shown / targeted by send_text.
     active: Option<GroupId>,
     pending: VecDeque<Event>,
+    /// OPAQUE export key (password-derived): the at-rest key for the session file.
+    export_key: Vec<u8>,
     /// Our own display name (cosmetic; the username is the unique id).
     display: String,
     /// Accepted friends and pending requests, mirrored from the server.
@@ -140,6 +146,7 @@ impl Client {
             conversations: HashMap::new(),
             active: None,
             pending: VecDeque::new(),
+            export_key: Vec::new(),
             display: String::new(),
             friends: Vec::new(),
             incoming: Vec::new(),
@@ -183,7 +190,7 @@ impl Client {
         let identity = Identity::generate(&handle)?;
         let _ = identity.save(&self.identity_path(&handle), password);
         let key_package = identity.new_key_package()?;
-        let upload = reg_state
+        let (upload, export_key) = reg_state
             .finish(password, &response)
             .map_err(|e| ClientError::Auth(e.to_string()))?;
         self.conn.send(ClientMsg::RegisterFinish {
@@ -194,6 +201,7 @@ impl Client {
         });
         let server_display = self.await_auth().await?;
         self.finish_login(identity, &handle, server_display);
+        self.export_key = export_key;
         Ok(())
     }
 
@@ -214,7 +222,7 @@ impl Client {
             request,
         });
         let response = self.await_login_response().await?;
-        let finalization = login_state
+        let (finalization, export_key) = login_state
             .finish(password, &response)
             .map_err(|_| ClientError::Auth("wrong handle or password".into()))?;
         self.conn.send(ClientMsg::LoginFinish {
@@ -224,6 +232,8 @@ impl Client {
         let server_display = self.await_auth().await?;
         let _ = identity.save(&self.identity_path(handle), password);
         self.finish_login(identity, handle, server_display);
+        self.export_key = export_key;
+        self.load_session();
         Ok(())
     }
 
@@ -234,6 +244,7 @@ impl Client {
         self.username = None;
         self.conversations.clear();
         self.active = None;
+        self.export_key.clear();
         self.display.clear();
         self.friends.clear();
         self.incoming.clear();
@@ -431,6 +442,7 @@ impl Client {
             // We create the group and invite them.
             let identity = self.identity()?;
             let group = Group::create(identity)?;
+            let mls_group_id = group.mls_group_id();
             self.conn.send(ClientMsg::JoinGroup {
                 group: dm_id.clone(),
             });
@@ -438,6 +450,7 @@ impl Client {
                 dm_id.clone(),
                 Conversation {
                     group: Some(group),
+                    mls_group_id,
                     kind: ConvKind::Dm,
                     title: friend.to_string(),
                     members: vec![me, friend.to_string()],
@@ -445,6 +458,7 @@ impl Client {
                 },
             );
             self.invite_peer(&dm_id, friend, "").await?;
+            self.save_session();
         } else {
             // They are the creator; ask them to open it, and show it as pending.
             self.conn.send(ClientMsg::RequestDm {
@@ -454,6 +468,7 @@ impl Client {
                 dm_id.clone(),
                 Conversation {
                     group: None,
+                    mls_group_id: Vec::new(),
                     kind: ConvKind::Dm,
                     title: friend.to_string(),
                     members: vec![me, friend.to_string()],
@@ -475,6 +490,7 @@ impl Client {
         let me = self.me()?;
         let identity = self.identity()?;
         let group = Group::create(identity)?;
+        let mls_group_id = group.mls_group_id();
         let group_id = random_group_id();
         self.conn.send(ClientMsg::JoinGroup {
             group: group_id.clone(),
@@ -483,6 +499,7 @@ impl Client {
             group_id.clone(),
             Conversation {
                 group: Some(group),
+                mls_group_id,
                 kind: ConvKind::Group,
                 title: name.to_string(),
                 members: vec![me],
@@ -492,6 +509,7 @@ impl Client {
         for member in members {
             self.invite_peer(&group_id, member, name).await?;
         }
+        self.save_session();
         self.active = Some(group_id.clone());
         Ok(hex_id(&group_id))
     }
@@ -510,7 +528,9 @@ impl Client {
             }
             conv.title.clone()
         };
-        self.invite_peer(&group_id, friend, &name).await
+        self.invite_peer(&group_id, friend, &name).await?;
+        self.save_session();
+        Ok(())
     }
 
     /// Fetch `friend`'s key package, add them to the conversation's MLS group,
@@ -578,6 +598,7 @@ impl Client {
             group: group_id,
             message: Sealed(sealed),
         });
+        self.save_session();
         Ok(())
     }
 
@@ -640,6 +661,126 @@ impl Client {
     /// The logged-in handle, or an error if not logged in.
     fn me(&self) -> Result<String, ClientError> {
         self.username.clone().ok_or(ClientError::NotLoggedIn)
+    }
+
+    /// The per-account session file (encrypted MLS state + conversations).
+    fn session_path(&self) -> PathBuf {
+        let user = self.username.as_deref().unwrap_or("unknown");
+        let safe: String = user
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        self.keystore_dir.join(format!("enclave-{safe}.session"))
+    }
+
+    /// Persist the live conversations (MLS group state + scoped history)
+    /// encrypted at rest under the OPAQUE export key.
+    fn save_session(&self) {
+        if self.export_key.is_empty() {
+            return;
+        }
+        let Some(identity) = self.identity.as_ref() else {
+            return;
+        };
+        let conversations = self
+            .conversations
+            .iter()
+            .filter(|(_, c)| c.group.is_some())
+            .map(|(routing, c)| session::PersistConv {
+                routing_id: routing.0,
+                mls_group_id: c.mls_group_id.clone(),
+                is_dm: c.kind == ConvKind::Dm,
+                title: c.title.clone(),
+                members: c.members.clone(),
+                history: c
+                    .history
+                    .iter()
+                    .map(|l| session::PersistLine {
+                        from: l.from.clone(),
+                        text: l.text.clone(),
+                        mine: l.mine,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let data = session::SessionData {
+            mls: identity.storage_snapshot(),
+            conversations,
+        };
+        session::save(&self.session_path(), &self.export_key, &data);
+    }
+
+    /// Restore conversations (MLS state + history) from the encrypted session
+    /// file, reloading each group so past chats are back after a restart.
+    fn load_session(&mut self) {
+        if self.export_key.is_empty() {
+            return;
+        }
+        let data = session::load(&self.session_path(), &self.export_key);
+        if data.conversations.is_empty() {
+            return;
+        }
+        let Some(identity) = self.identity.as_ref() else {
+            return;
+        };
+        identity.restore_storage(data.mls);
+        let mut loaded: Vec<(GroupId, Conversation)> = Vec::new();
+        for pc in data.conversations {
+            let Ok(group) = Group::load(identity, &pc.mls_group_id) else {
+                continue; // group state missing/corrupt; skip it
+            };
+            let history = pc
+                .history
+                .into_iter()
+                .map(|l| ChatLine {
+                    from: l.from,
+                    text: l.text,
+                    mine: l.mine,
+                })
+                .collect();
+            loaded.push((
+                GroupId(pc.routing_id),
+                Conversation {
+                    group: Some(group),
+                    mls_group_id: pc.mls_group_id,
+                    kind: if pc.is_dm {
+                        ConvKind::Dm
+                    } else {
+                        ConvKind::Group
+                    },
+                    title: pc.title,
+                    members: pc.members,
+                    history,
+                },
+            ));
+        }
+        for (gid, conv) in loaded {
+            // Re-announce routing membership so the server fans traffic to us.
+            self.conn.send(ClientMsg::JoinGroup { group: gid.clone() });
+            self.conversations.insert(gid, conv);
+        }
+    }
+
+    /// Copy the encrypted session file to `dst` for backup or transfer. It opens
+    /// only with the same account + password (export key) elsewhere.
+    pub fn export_session(&self, dst: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        std::fs::copy(self.session_path(), dst).map(|_| ())
+    }
+
+    /// Import a session file exported elsewhere, replacing the local one, and
+    /// reload it into live conversations.
+    pub fn import_session(&mut self, src: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        std::fs::copy(src, self.session_path())?;
+        self.conversations.clear();
+        self.active = None;
+        self.load_session();
+        Ok(())
     }
 
     /// Await the next event, processing incoming server messages until one
@@ -708,13 +849,17 @@ impl Client {
                     Ok(j) => j,
                     Err(e) => return Some(Event::Error(format!("join failed: {e}"))),
                 };
+                let mls_group_id = joined.mls_group_id();
                 self.conn.send(ClientMsg::JoinGroup {
                     group: group.clone(),
                 });
                 let is_dm = name.is_empty();
                 match self.conversations.get_mut(&group) {
                     // Populate a pending DM (or re-affirm) by adopting the group.
-                    Some(conv) => conv.group = Some(joined),
+                    Some(conv) => {
+                        conv.group = Some(joined);
+                        conv.mls_group_id = mls_group_id;
+                    }
                     None => {
                         let me = self.username.clone().unwrap_or_default();
                         let title = if is_dm { from.0.clone() } else { name };
@@ -722,6 +867,7 @@ impl Client {
                             group,
                             Conversation {
                                 group: Some(joined),
+                                mls_group_id,
                                 kind: if is_dm { ConvKind::Dm } else { ConvKind::Group },
                                 title,
                                 members: vec![me, from.0],
@@ -730,6 +876,7 @@ impl Client {
                         );
                     }
                 }
+                self.save_session();
                 Some(Event::ConversationsChanged)
             }
             ServerMsg::Text { group, message, .. } => {
@@ -750,12 +897,14 @@ impl Client {
                             .get(&username)
                             .cloned()
                             .unwrap_or(username);
-                        Some(Event::Message {
+                        let event = Event::Message {
                             conv: hex_id(&group),
                             from,
                             text,
                             mine: false,
-                        })
+                        };
+                        self.save_session();
+                        Some(event)
                     }
                     Err(e) => Some(Event::Error(format!("decrypt failed: {e}"))),
                 }
@@ -765,7 +914,10 @@ impl Client {
                 let conv = self.conversations.get_mut(&group)?;
                 let g = conv.group.as_mut()?;
                 match g.apply_commit(identity, &message.0) {
-                    Ok(()) => Some(Event::ConversationsChanged),
+                    Ok(()) => {
+                        self.save_session();
+                        Some(Event::ConversationsChanged)
+                    }
                     Err(_) => None,
                 }
             }

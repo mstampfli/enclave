@@ -160,6 +160,21 @@ impl Group {
         Ok(Self { inner })
     }
 
+    /// This group's MLS-internal id, used to reload it from persisted storage.
+    pub fn mls_group_id(&self) -> Vec<u8> {
+        self.inner.group_id().as_slice().to_vec()
+    }
+
+    /// Reload a group from `member`'s (already restored) MLS storage by its
+    /// MLS-internal id. Used to bring conversations back after a restart.
+    pub fn load(member: &Identity, mls_group_id: &[u8]) -> Result<Self, CryptoError> {
+        let group_id = GroupId::from_slice(mls_group_id);
+        let inner = MlsGroup::load(member.provider.storage(), &group_id)
+            .map_err(|e| CryptoError::Join(format!("load: {e}")))?
+            .ok_or_else(|| CryptoError::Join("group not present in storage".into()))?;
+        Ok(Self { inner })
+    }
+
     /// Derive this epoch's media root secret. Every member of the same epoch
     /// derives the identical value; Phase 3 derives per-sender AEAD keys from
     /// it. `member` supplies the crypto backend.

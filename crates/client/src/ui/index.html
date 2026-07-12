@@ -218,6 +218,14 @@
           <button id="new-group" class="icon-btn" title="New group">+</button>
         </div>
         <ul id="groups" class="list"></ul>
+
+        <div class="side-head" style="margin-top:12px">
+          <span class="side-title">Backup</span>
+        </div>
+        <div class="add-row">
+          <button id="export-btn" class="small">Export chats</button>
+          <button id="import-btn" class="small">Import</button>
+        </div>
       </div>
 
       <div class="user-panel">
@@ -324,6 +332,11 @@
   $("add-friend").addEventListener("click", () => {
     const user = $("friend").value.trim();
     if (user) { send({ type: "AddFriend", user }); $("friend").value = ""; setStatus("Friend request sent to " + user, false); }
+  });
+  $("export-btn").addEventListener("click", () => send({ type: "ExportSession" }));
+  $("import-btn").addEventListener("click", () => {
+    const path = prompt("Full path to your exported backup file:");
+    if (path && path.trim()) send({ type: "ImportSession", path: path.trim() });
   });
   $("friend").addEventListener("keydown", (e) => { if (e.key === "Enter") $("add-friend").click(); });
 

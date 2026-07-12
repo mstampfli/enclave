@@ -21,7 +21,7 @@ fn authenticate(r: &mut Relay, conn: u64, name: &str, kp: Vec<u8>) -> (String, V
         ServerMsg::RegisterResponse { handle, response } => (handle.clone(), response.clone()),
         other => panic!("expected RegisterResponse, got {other:?}"),
     };
-    let upload = state.finish(password, &response).expect("register finish");
+    let (upload, _export) = state.finish(password, &response).expect("register finish");
     let finish = r.handle(
         conn,
         ClientMsg::RegisterFinish {

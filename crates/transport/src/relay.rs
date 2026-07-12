@@ -119,9 +119,10 @@ impl Relay {
         if let Some(device) = self.conn_device.remove(&conn) {
             self.device_conn.remove(&device);
             self.udp_addrs.remove(&device);
-            for members in self.group_members.values_mut() {
-                members.remove(&device);
-            }
+            // Keep the device in group_members: membership is account-level, so a
+            // member who reconnects (e.g. after restoring a session) re-affirms
+            // instead of being locked out. Offline devices are already skipped by
+            // fan-out (they are not in device_conn).
         }
         self.login_attempts.remove(&conn);
         self.pending_login.remove(&conn);

@@ -196,8 +196,14 @@ pub fn client_register_start(
 
 impl ClientRegisterState {
     /// Registration step 2 (client): finalize against the server response,
-    /// producing the upload the server will store as the envelope.
-    pub fn finish(self, password: &str, response: &[u8]) -> Result<Vec<u8>, OpaqueError> {
+    /// producing `(upload, export_key)`. The upload becomes the server's stored
+    /// envelope; the export key is a stable password-derived secret (the server
+    /// never sees it) used locally to encrypt at-rest data.
+    pub fn finish(
+        self,
+        password: &str,
+        response: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), OpaqueError> {
         let response = RegistrationResponse::<Suite>::deserialize(response).map_err(err)?;
         let mut rng = OsRng;
         let result = self
@@ -209,7 +215,7 @@ impl ClientRegisterState {
                 ClientRegistrationFinishParameters::default(),
             )
             .map_err(err)?;
-        Ok(bytes(result.message.serialize()))
+        Ok((bytes(result.message.serialize()), bytes(result.export_key)))
     }
 }
 
@@ -229,9 +235,14 @@ pub fn client_login_start(password: &str) -> Result<(Vec<u8>, ClientLoginState),
 impl ClientLoginState {
     /// Login step 2 (client): finalize against the server response. Fails if the
     /// password was wrong (the server response will not validate), which is how
-    /// the client learns its own auth outcome. Returns the finalization the
-    /// server needs to confirm.
-    pub fn finish(self, password: &str, response: &[u8]) -> Result<Vec<u8>, OpaqueError> {
+    /// the client learns its own auth outcome. Returns `(finalization,
+    /// export_key)`; the finalization confirms to the server, the export key is
+    /// the same stable password-derived secret as at registration.
+    pub fn finish(
+        self,
+        password: &str,
+        response: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), OpaqueError> {
         let response = CredentialResponse::<Suite>::deserialize(response).map_err(err)?;
         let mut rng = OsRng;
         let result = self
@@ -243,7 +254,7 @@ impl ClientLoginState {
                 ClientLoginFinishParameters::default(),
             )
             .map_err(err)?;
-        Ok(bytes(result.message.serialize()))
+        Ok((bytes(result.message.serialize()), bytes(result.export_key)))
     }
 }
 
@@ -256,7 +267,7 @@ mod tests {
     fn register(server: &OpaqueServer, username: &str, password: &str) -> Vec<u8> {
         let (req, state) = client_register_start(password).unwrap();
         let resp = server.register_start(username, &req).unwrap();
-        let upload = state.finish(password, &resp).unwrap();
+        let (upload, _export) = state.finish(password, &resp).unwrap();
         server.register_finish(&upload).unwrap()
     }
 
@@ -268,8 +279,24 @@ mod tests {
     ) -> Result<(), OpaqueError> {
         let (req, cstate) = client_login_start(password).unwrap();
         let (resp, sstate) = server.login_start(username, envelope, &req)?;
-        let finalization = cstate.finish(password, &resp)?;
+        let (finalization, _export) = cstate.finish(password, &resp)?;
         sstate.finish(&finalization)
+    }
+
+    #[test]
+    fn export_key_is_stable_across_register_and_login() {
+        let server = OpaqueServer::generate();
+        let (req, state) = client_register_start("pw-correct-horse").unwrap();
+        let resp = server.register_start("alice", &req).unwrap();
+        let (upload, reg_export) = state.finish("pw-correct-horse", &resp).unwrap();
+        let envelope = server.register_finish(&upload).unwrap();
+
+        let (req, cstate) = client_login_start("pw-correct-horse").unwrap();
+        let (resp, _sstate) = server.login_start("alice", Some(&envelope), &req).unwrap();
+        let (_final, login_export) = cstate.finish("pw-correct-horse", &resp).unwrap();
+        // Same password -> same export key, so at-rest data re-decrypts on login.
+        assert_eq!(reg_export, login_export);
+        assert!(!reg_export.is_empty());
     }
 
     #[test]

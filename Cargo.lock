@@ -988,6 +988,8 @@ dependencies = [
 name = "enclave-client"
 version = "0.0.0"
 dependencies = [
+ "bincode",
+ "chacha20poly1305 0.11.0",
  "enclave-crypto",
  "enclave-media",
  "enclave-protocol",

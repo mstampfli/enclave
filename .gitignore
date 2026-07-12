@@ -7,6 +7,8 @@
 .env
 # Per-user runtime state written by the client and server.
 enclave-*.id
+enclave-*.session
+enclave-*-backup.enc
 enclave-*-friends.json
 enclave-accounts.json
 enclave-friends.json

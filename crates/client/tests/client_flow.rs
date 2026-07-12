@@ -122,6 +122,87 @@ async fn two_clients_chat_through_the_controller() {
 }
 
 #[tokio::test]
+async fn conversations_and_history_survive_restart() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+
+    let dir = std::env::temp_dir().join(format!("enclave-persist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    async fn account_in(url: &str, dir: &std::path::Path, name: &str) -> Client {
+        let mut c = Client::connect(url).await.expect("connect");
+        c.set_keystore_dir(dir);
+        c.create_account(name, "", "test-password-1234")
+            .await
+            .expect("create");
+        c
+    }
+
+    let mut alice = account_in(&url, &dir, "alice").await;
+    let mut bob = account_in(&url, &dir, "bob").await;
+    let alice_user = alice.name().to_string();
+    let bob_user = bob.name().to_string();
+
+    // Alice makes a group with Bob and sends a message.
+    alice
+        .create_group("plans", std::slice::from_ref(&bob_user))
+        .await
+        .unwrap();
+    loop {
+        if matches!(next_event(&mut bob).await, Event::ConversationsChanged) {
+            break;
+        }
+    }
+    let gid = alice.active_id().unwrap();
+    let bob_gid = bob.conversations().first().unwrap().id.clone();
+    bob.switch(&bob_gid);
+    alice.send_text("before restart").await.unwrap();
+    loop {
+        if let Event::Message { text, .. } = next_event(&mut bob).await {
+            if text == "before restart" {
+                break;
+            }
+        }
+    }
+
+    // Restart Alice: drop the client, then log back in on the same device.
+    drop(alice);
+    let mut alice2 = Client::connect(&url).await.unwrap();
+    alice2.set_keystore_dir(&dir);
+    alice2
+        .login(&alice_user, "test-password-1234")
+        .await
+        .unwrap();
+
+    // The conversation and its history are restored from the encrypted session.
+    assert!(
+        alice2.conversations().iter().any(|c| c.id == gid),
+        "group restored after restart"
+    );
+    assert!(
+        alice2
+            .conversation_history(&gid)
+            .iter()
+            .any(|(_, t, mine)| t == "before restart" && *mine),
+        "history restored after restart"
+    );
+
+    // The MLS group is genuinely live: Alice can still send and Bob receives.
+    alice2.switch(&gid);
+    alice2.send_text("after restart").await.unwrap();
+    loop {
+        if let Event::Message { text, .. } = next_event(&mut bob).await {
+            if text == "after restart" {
+                break;
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn wrong_password_is_rejected() {
     let handle = serve("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", handle.addr);

@@ -34,7 +34,7 @@ pub async fn register_account(
             _ => panic!("no register response for {username}"),
         }
     };
-    let upload = state
+    let (upload, _export) = state
         .finish(password, &response)
         .expect("client register finish");
     conn.send(ClientMsg::RegisterFinish {
