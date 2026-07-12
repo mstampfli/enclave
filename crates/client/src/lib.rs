@@ -601,6 +601,59 @@ impl Client {
         Ok(())
     }
 
+    /// Leave / delete a conversation: stop receiving its traffic and drop it
+    /// locally. If a call is active in it, leave that first.
+    pub fn leave_conversation(&mut self, conv_hex: &str) {
+        let Some(group_id) = self.group_by_hex(conv_hex) else {
+            return;
+        };
+        if self.call_group.as_ref() == Some(&group_id) {
+            self.leave_call();
+        }
+        self.conn.send(ClientMsg::LeaveGroup {
+            group: group_id.clone(),
+        });
+        self.conversations.remove(&group_id);
+        if self.active.as_ref() == Some(&group_id) {
+            self.active = None;
+        }
+        self.save_session();
+    }
+
+    /// Remove a member from a group: MLS-rekey so they cannot read the new epoch,
+    /// drop them from the server's routing set, and fan the commit to the rest.
+    pub fn remove_member(&mut self, conv_hex: &str, member: &str) -> Result<(), ClientError> {
+        let group_id = self.group_by_hex(conv_hex).ok_or(ClientError::NoGroup)?;
+        let commit = {
+            let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
+            let conv = self
+                .conversations
+                .get_mut(&group_id)
+                .ok_or(ClientError::NoGroup)?;
+            let group = conv.group.as_mut().ok_or(ClientError::NoGroup)?;
+            // The roster maps a member's username (credential label) to their key.
+            let target_key = group
+                .member_keys()
+                .into_iter()
+                .find(|(label, _)| label == member)
+                .map(|(_, key)| key)
+                .ok_or(ClientError::NoGroup)?;
+            let commit = group.remove_member(identity, &target_key)?;
+            conv.members.retain(|m| m != member);
+            commit
+        };
+        self.conn.send(ClientMsg::RemoveMember {
+            group: group_id.clone(),
+            member: DeviceId(member.into()),
+        });
+        self.conn.send(ClientMsg::Mls {
+            group: group_id,
+            message: Sealed(commit),
+        });
+        self.save_session();
+        Ok(())
+    }
+
     /// Focus a conversation by its hex id.
     pub fn switch(&mut self, conv: &str) {
         if let Some(id) = self

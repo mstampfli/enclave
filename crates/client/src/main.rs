@@ -78,6 +78,15 @@ enum UiCommand {
     AddToGroup {
         handle: String,
     },
+    /// Leave / delete a conversation (hex id).
+    LeaveConversation {
+        conv: String,
+    },
+    /// Remove a member (username) from a group (hex id).
+    RemoveMember {
+        conv: String,
+        member: String,
+    },
     /// Focus a conversation by its id.
     SwitchConversation {
         conv: String,
@@ -586,6 +595,20 @@ async fn handle_command(
                 match c.add_to_active_group(&handle).await {
                     Ok(()) => emit_conversations(proxy, c),
                     Err(e) => error_status(proxy, format!("Could not add to group: {e}")),
+                }
+            }
+        }
+        UiCommand::LeaveConversation { conv } => {
+            if let Some(c) = client.as_mut() {
+                c.leave_conversation(&conv);
+                emit_conversations(proxy, c);
+            }
+        }
+        UiCommand::RemoveMember { conv, member } => {
+            if let Some(c) = client.as_mut() {
+                match c.remove_member(&conv, &member) {
+                    Ok(()) => emit_conversations(proxy, c),
+                    Err(e) => error_status(proxy, format!("Could not remove member: {e}")),
                 }
             }
         }

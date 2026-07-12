@@ -479,6 +479,22 @@ impl Relay {
                 vec![]
             }
 
+            ClientMsg::LeaveGroup { group } => {
+                let device = self.device_for(from);
+                self.groups.remove(&group, &device);
+                // Also drop them from the group's live call, if any.
+                self.drop_from_calls(&device)
+            }
+
+            ClientMsg::RemoveMember { group, member } => {
+                // Only a current member may remove another from routing (ASVS V4).
+                let remover = self.device_for(from);
+                if self.is_member(&group, &remover) {
+                    self.groups.remove(&group, &member);
+                }
+                vec![]
+            }
+
             ClientMsg::Welcome {
                 to,
                 group,

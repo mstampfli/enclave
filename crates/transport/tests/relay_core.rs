@@ -408,6 +408,120 @@ fn messages_to_an_offline_member_are_queued_and_delivered_on_login() {
 }
 
 #[test]
+fn leaving_and_removing_drop_routing_membership() {
+    let mut r = Relay::new();
+    let (a, _ah) = register(&mut r, "a", vec![1]);
+    let (b, bh) = register(&mut r, "b", vec![2]);
+    let (c, ch) = register(&mut r, "c", vec![3]);
+    let group = GroupId([31u8; 32]);
+    r.handle(
+        a,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    );
+    r.handle(
+        a,
+        ClientMsg::AffirmMember {
+            group: group.clone(),
+            member: DeviceId(bh),
+        },
+    );
+    r.handle(
+        a,
+        ClientMsg::AffirmMember {
+            group: group.clone(),
+            member: DeviceId(ch.clone()),
+        },
+    ); // {a, b, c}
+
+    // c leaves -> a's message no longer reaches c.
+    r.handle(
+        c,
+        ClientMsg::LeaveGroup {
+            group: group.clone(),
+        },
+    );
+    let recips: Vec<u64> = r
+        .handle(
+            a,
+            ClientMsg::Text {
+                group: group.clone(),
+                message: Sealed(vec![1]),
+            },
+        )
+        .iter()
+        .map(|o| o.to)
+        .collect();
+    assert_eq!(recips, vec![b], "c left: only b remains");
+
+    // a removes b -> now a's message reaches no one.
+    r.handle(
+        a,
+        ClientMsg::RemoveMember {
+            group: group.clone(),
+            member: DeviceId("b".into()),
+        },
+    );
+    assert!(r
+        .handle(
+            a,
+            ClientMsg::Text {
+                group,
+                message: Sealed(vec![2]),
+            },
+        )
+        .is_empty());
+}
+
+#[test]
+fn a_non_member_cannot_remove_anyone() {
+    let mut r = Relay::new();
+    let (a, _ah) = register(&mut r, "a", vec![1]);
+    let (b, bh) = register(&mut r, "b", vec![2]);
+    let (m, _mh) = register(&mut r, "m", vec![3]); // outsider
+    let group = GroupId([32u8; 32]);
+    r.handle(
+        a,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    );
+    r.handle(
+        a,
+        ClientMsg::AffirmMember {
+            group: group.clone(),
+            member: DeviceId(bh),
+        },
+    );
+
+    // Mallory (not a member) tries to remove b -> ignored.
+    r.handle(
+        m,
+        ClientMsg::RemoveMember {
+            group: group.clone(),
+            member: DeviceId("b".into()),
+        },
+    );
+    let recips: Vec<u64> = r
+        .handle(
+            a,
+            ClientMsg::Text {
+                group,
+                message: Sealed(vec![1]),
+            },
+        )
+        .iter()
+        .map(|o| o.to)
+        .collect();
+    assert_eq!(
+        recips,
+        vec![b],
+        "b is still a member; mallory's removal ignored"
+    );
+}
+
+#[test]
 fn text_fans_out_to_all_other_members_in_a_larger_group() {
     let mut r = Relay::new();
     let (a, _ah) = register(&mut r, "a", vec![1]);

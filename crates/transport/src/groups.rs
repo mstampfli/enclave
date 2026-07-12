@@ -79,6 +79,17 @@ impl GroupStore {
         self.save();
     }
 
+    /// Remove `device` from `group`'s routing set (leaving, or being removed).
+    pub fn remove(&mut self, group: &GroupId, device: &DeviceId) {
+        if let Some(set) = self.members.get_mut(group) {
+            set.remove(device);
+            if set.is_empty() {
+                self.members.remove(group);
+            }
+            self.save();
+        }
+    }
+
     /// Whether `device` is a routing member of `group`.
     pub fn is_member(&self, group: &GroupId, device: &DeviceId) -> bool {
         self.members.get(group).is_some_and(|m| m.contains(device))

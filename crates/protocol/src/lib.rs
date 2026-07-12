@@ -109,6 +109,13 @@ pub enum ClientMsg {
     /// vouch is ignored, so this cannot be used to subscribe to a stranger's
     /// group (even one with a guessable DM id).
     AffirmMember { group: GroupId, member: DeviceId },
+    /// Leave `group`: drop this device from the group's routing set (used when
+    /// deleting/leaving a conversation, so the server stops fanning it to us).
+    LeaveGroup { group: GroupId },
+    /// Remove `member` from `group`'s routing set. Honored only from a current
+    /// member. The MLS rekey that actually locks the removed member out of future
+    /// epochs travels separately as an Mls commit to the remaining members.
+    RemoveMember { group: GroupId, member: DeviceId },
     /// Deliver a Welcome directly to a new member's device. The server also
     /// records `to` as a routing member of `group`. The payload is opaque. The
     /// `name` labels the conversation (empty for a 1:1 DM, where the recipient

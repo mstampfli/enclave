@@ -268,6 +268,8 @@
         <span id="safety" class="safety" title="Compare this with your friend out-of-band to verify no one is in the middle"></span>
         <button id="call-btn" class="hdr-btn small" hidden title="Start or join a voice call in this conversation">Call</button>
         <button id="add-to-group" class="hdr-btn small" hidden title="Add a friend to this group">Add member</button>
+        <button id="remove-member" class="hdr-btn small" hidden title="Remove a member from this group">Remove member</button>
+        <button id="leave-conv" class="hdr-btn small" hidden title="Leave and delete this conversation">Leave</button>
       </header>
       <div id="call-banner" class="call-banner" hidden>
         <span id="call-banner-text"></span>
@@ -498,6 +500,18 @@
     const handle = prompt("Add which friend? (their username)");
     if (handle && handle.trim()) send({ type: "AddToGroup", handle: handle.trim() });
   });
+  $("remove-member").addEventListener("click", () => {
+    if (!activeConv) return;
+    const member = prompt("Remove which member? (their username)");
+    if (member && member.trim()) send({ type: "RemoveMember", conv: activeConv, member: member.trim() });
+  });
+  $("leave-conv").addEventListener("click", () => {
+    if (!activeConv) return;
+    const conv = convById(activeConv);
+    if (confirm("Leave and delete " + (conv ? conv.title : "this conversation") + "? It is removed from this device.")) {
+      send({ type: "LeaveConversation", conv: activeConv });
+    }
+  });
   $("call-btn").addEventListener("click", () => {
     if (inCall && myCallConv === activeConv) leaveCall();
     else joinCall(activeConv);
@@ -618,6 +632,8 @@
     $("log").hidden = !hasConv;
     $("composer").hidden = !hasConv;
     $("add-to-group").hidden = !(conv && !conv.is_dm);
+    $("remove-member").hidden = !(conv && !conv.is_dm);
+    $("leave-conv").hidden = !(conv && !conv.pending);
     renderCall();
     $("chat-title").textContent = conv ? conv.title : "No conversation";
     $("message").disabled = !(conv && !conv.pending);
