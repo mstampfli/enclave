@@ -31,5 +31,7 @@ pub use device::{
 pub use error::MediaError;
 pub use jitter::{JitterBuffer, Popped};
 #[cfg(windows)]
-pub use screen::{monitor_sources, CapturedFrame, ScreenCapture, ScreenSource};
+pub use screen::{
+    monitor_sources, window_sources, CapturedFrame, ScreenCapture, ScreenSource, WindowSource,
+};
 pub use video::H264Encoder;

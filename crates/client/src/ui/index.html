@@ -208,7 +208,8 @@
   .share-list { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow-y: auto; }
   .share-row { display: flex; align-items: center; gap: 10px; padding: 9px 11px; border-radius: 8px; background: var(--sidebar); cursor: pointer; text-align: left; }
   .share-row:hover { background: var(--hover); }
-  .share-row .ico { font-size: 15px; }
+  .share-row .ico { font-size: 13px; font-family: monospace; color: var(--muted); flex: none; }
+  .share-row .lbl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .share-empty { color: var(--muted); font-size: 13px; padding: 6px 2px; }
   .share-head { margin: 12px 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
   .share-head:first-child { margin-top: 0; }
@@ -365,10 +366,11 @@
       <h2>Share to call</h2>
       <div class="share-head">Screens</div>
       <div id="share-screens" class="share-list"><div class="share-empty">Looking for displays...</div></div>
+      <div class="share-head">Windows</div>
+      <div id="share-windows" class="share-list"><div class="share-empty">Looking for windows...</div></div>
       <div class="share-head">Cameras</div>
       <div id="share-cameras" class="share-list"><div class="share-empty">Looking for cameras...</div></div>
       <label class="share-audio"><input id="share-audio" type="checkbox" disabled /> Share system audio <span class="hint">(coming soon)</span></label>
-      <p class="hint">Sharing a specific application window is coming soon.</p>
       <div class="modal-actions">
         <button id="share-close" class="primary">Cancel</button>
       </div>
@@ -532,27 +534,30 @@
   // ---- share-source picker ----
   function openShareModal() {
     $("share-screens").innerHTML = '<div class="share-empty">Looking for displays...</div>';
+    $("share-windows").innerHTML = '<div class="share-empty">Looking for windows...</div>';
     $("share-cameras").innerHTML = '<div class="share-empty">Looking for cameras...</div>';
     $("share-modal").hidden = false;
     send({ type: "ListShareSources" });
   }
+  const SHARE_ICON = { screen: "[ ]", window: "[_]", camera: "( )" };
+  const SHARE_EMPTY = { screen: "No displays found", window: "No windows found", camera: "No cameras found" };
   function fillShareList(boxId, items, kind) {
     const box = $(boxId);
     box.innerHTML = "";
     if (!items || !items.length) {
-      box.innerHTML = '<div class="share-empty">' + (kind === "screen" ? "No displays found" : "No cameras found") + "</div>";
+      box.innerHTML = '<div class="share-empty">' + SHARE_EMPTY[kind] + "</div>";
       return;
     }
     for (const it of items) {
       const row = document.createElement("button");
       row.className = "share-row";
       row.innerHTML = '<span class="ico"></span><span class="lbl"></span>';
-      row.querySelector(".ico").textContent = kind === "screen" ? "[]" : "()";
-      row.querySelector(".lbl").textContent = it.name || (kind === "screen" ? "Display " + it.id : "Camera " + it.id);
+      row.querySelector(".ico").textContent = SHARE_ICON[kind];
+      row.querySelector(".lbl").textContent = it.name || it.id;
+      row.title = it.name || it.id;
       row.addEventListener("click", () => {
         $("share-modal").hidden = true;
-        if (kind === "screen") send({ type: "StartScreenShare", monitor: it.id });
-        else send({ type: "StartCamera", camera: it.id });
+        send({ type: "StartShare", source: it.id }); // it.id already encodes the kind
       });
       box.appendChild(row);
     }
@@ -1043,6 +1048,7 @@
         break;
       case "ShareSources":
         fillShareList("share-screens", ev.screens, "screen");
+        fillShareList("share-windows", ev.windows, "window");
         fillShareList("share-cameras", ev.cameras, "camera");
         break;
       case "Connection": {

@@ -856,6 +856,20 @@ impl Client {
         Vec::new()
     }
 
+    /// The windows available to share (hwnd + title), for a source picker.
+    #[cfg(windows)]
+    pub fn window_sources(&self) -> Vec<(isize, String)> {
+        enclave_media::window_sources()
+            .into_iter()
+            .map(|s| (s.hwnd, s.name))
+            .collect()
+    }
+
+    #[cfg(not(windows))]
+    pub fn window_sources(&self) -> Vec<(isize, String)> {
+        Vec::new()
+    }
+
     /// The cameras available to share (index + name), for a source picker.
     pub fn camera_sources(&self) -> Vec<(u32, String)> {
         enclave_media::camera_sources()
@@ -874,7 +888,16 @@ impl Client {
         call.start_screen(monitor_index)
     }
 
-    /// Stop sharing the screen (the call keeps running).
+    /// Start sharing a single window into the current call.
+    pub fn start_window_share(&mut self, hwnd: isize) -> Result<(), ClientError> {
+        let call = self
+            .call
+            .as_mut()
+            .ok_or_else(|| ClientError::Audio("join the call before sharing".into()))?;
+        call.start_window(hwnd)
+    }
+
+    /// Stop sharing the screen or window (the call keeps running).
     pub fn stop_screen_share(&mut self) {
         if let Some(call) = self.call.as_mut() {
             call.stop_screen();

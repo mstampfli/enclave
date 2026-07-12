@@ -57,18 +57,14 @@ enum UiCommand {
     DeclineCall {
         conv: String,
     },
-    /// Report the shareable screens + cameras, for the source picker.
+    /// Report the shareable screens, windows, and cameras for the source picker.
     ListShareSources,
-    /// Start sharing monitor `monitor` into the current call.
-    StartScreenShare {
-        monitor: usize,
+    /// Start sharing a chosen source: "monitor:N", "window:HWND", or "camera:N".
+    StartShare {
+        source: String,
     },
-    /// Stop sharing the screen.
+    /// Stop sharing the screen or window.
     StopScreenShare,
-    /// Start sharing camera `camera` into the current call.
-    StartCamera {
-        camera: u32,
-    },
     /// Stop sharing the camera.
     StopCamera,
     /// Mute or unmute the microphone.
@@ -144,10 +140,11 @@ struct Line {
     mine: bool,
 }
 
-/// A shareable video source (monitor or camera) for the share picker.
+/// A shareable video source for the picker. `id` is an opaque token the UI
+/// echoes back in `StartShare`: "monitor:N", "window:HWND", or "camera:N".
 #[derive(serde::Serialize, Clone)]
 struct ShareSource {
-    id: u32,
+    id: String,
     name: String,
 }
 
@@ -234,9 +231,10 @@ enum UiEvent {
     CameraState {
         on: bool,
     },
-    /// The monitors and cameras this machine can share, for the picker.
+    /// The monitors, windows, and cameras this machine can share, for the picker.
     ShareSources {
         screens: Vec<ShareSource>,
+        windows: Vec<ShareSource>,
         cameras: Vec<ShareSource>,
     },
     /// Someone sent us a friend request.
@@ -444,6 +442,39 @@ fn emit_audio_devices(proxy: &EventLoopProxy<UiEvent>, c: &Client) {
             output: info.output,
         },
     );
+}
+
+/// Parse a share-source token ("monitor:N", "window:HWND", or "camera:N") and
+/// start that share, reporting the new state or an error to the UI.
+fn start_share(c: &mut Client, proxy: &EventLoopProxy<UiEvent>, source: &str) {
+    let Some((kind, id)) = source.split_once(':') else {
+        error_status(proxy, format!("Bad share source: {source}"));
+        return;
+    };
+    match kind {
+        "monitor" => match id.parse::<usize>() {
+            Ok(m) => match c.start_screen_share(m) {
+                Ok(()) => emit(proxy, UiEvent::ScreenShareState { sharing: true }),
+                Err(e) => error_status(proxy, format!("Could not share screen: {e}")),
+            },
+            Err(_) => error_status(proxy, format!("Bad monitor id: {id}")),
+        },
+        "window" => match id.parse::<isize>() {
+            Ok(h) => match c.start_window_share(h) {
+                Ok(()) => emit(proxy, UiEvent::ScreenShareState { sharing: true }),
+                Err(e) => error_status(proxy, format!("Could not share window: {e}")),
+            },
+            Err(_) => error_status(proxy, format!("Bad window id: {id}")),
+        },
+        "camera" => match id.parse::<u32>() {
+            Ok(n) => match c.start_camera(n) {
+                Ok(()) => emit(proxy, UiEvent::CameraState { on: true }),
+                Err(e) => error_status(proxy, format!("Could not share camera: {e}")),
+            },
+            Err(_) => error_status(proxy, format!("Bad camera id: {id}")),
+        },
+        _ => error_status(proxy, format!("Unknown share kind: {kind}")),
+    }
 }
 
 fn app_dir() -> PathBuf {
@@ -711,38 +742,45 @@ async fn handle_command(
                     .screen_sources()
                     .into_iter()
                     .map(|(id, name)| ShareSource {
-                        id: id as u32,
+                        id: format!("monitor:{id}"),
+                        name,
+                    })
+                    .collect();
+                let windows = c
+                    .window_sources()
+                    .into_iter()
+                    .map(|(id, name)| ShareSource {
+                        id: format!("window:{id}"),
                         name,
                     })
                     .collect();
                 let cameras = c
                     .camera_sources()
                     .into_iter()
-                    .map(|(id, name)| ShareSource { id, name })
+                    .map(|(id, name)| ShareSource {
+                        id: format!("camera:{id}"),
+                        name,
+                    })
                     .collect();
-                emit(proxy, UiEvent::ShareSources { screens, cameras });
+                emit(
+                    proxy,
+                    UiEvent::ShareSources {
+                        screens,
+                        windows,
+                        cameras,
+                    },
+                );
             }
         }
-        UiCommand::StartScreenShare { monitor } => {
+        UiCommand::StartShare { source } => {
             if let Some(c) = client.as_mut() {
-                match c.start_screen_share(monitor) {
-                    Ok(()) => emit(proxy, UiEvent::ScreenShareState { sharing: true }),
-                    Err(e) => error_status(proxy, format!("Could not share screen: {e}")),
-                }
+                start_share(c, proxy, &source);
             }
         }
         UiCommand::StopScreenShare => {
             if let Some(c) = client.as_mut() {
                 c.stop_screen_share();
                 emit(proxy, UiEvent::ScreenShareState { sharing: false });
-            }
-        }
-        UiCommand::StartCamera { camera } => {
-            if let Some(c) = client.as_mut() {
-                match c.start_camera(camera) {
-                    Ok(()) => emit(proxy, UiEvent::CameraState { on: true }),
-                    Err(e) => error_status(proxy, format!("Could not share camera: {e}")),
-                }
             }
         }
         UiCommand::StopCamera => {

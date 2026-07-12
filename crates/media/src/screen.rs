@@ -1,10 +1,17 @@
-//! Primary-monitor screen capture via DXGI Desktop Duplication (Windows).
+//! Screen and window capture (Windows).
 //!
-//! A background thread owns the (`!Send`) D3D duplication device and keeps the
-//! most recent frame in a slot; the encoder loop pulls the latest frame at its
-//! own cadence and drops anything it could not keep up with, which is the right
-//! behavior for real-time screen share. Frames are de-padded to a tight BGRA
-//! buffer ready for [`crate::H264Encoder`].
+//! Two backends feed one shared "latest frame" slot that the encoder loop pulls
+//! at its own cadence, dropping anything it cannot keep up with -- the right
+//! behavior for real-time sharing:
+//!
+//! - Monitors use DXGI Desktop Duplication (`DxgiDuplicationApi`): a background
+//!   thread owns the (`!Send`) device and pushes each frame into the slot. Low
+//!   latency, no capture border.
+//! - Specific windows use Windows Graphics Capture (`GraphicsCaptureApiHandler`):
+//!   a callback delivers frames on its own thread; WGC is the only API that can
+//!   target a single window (DXGI is monitor-only).
+//!
+//! Both de-pad to a tight BGRA buffer ready for [`crate::H264Encoder`].
 //!
 //! HARDWARE PATH: capture cannot be exercised headlessly (no display / DXGI in
 //! CI); it is compile-verified and validated on a real machine.
@@ -14,8 +21,16 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::dxgi_duplication_api::DxgiDuplicationApi;
+use windows_capture::frame::Frame;
+use windows_capture::graphics_capture_api::InternalCaptureControl;
 use windows_capture::monitor::Monitor;
+use windows_capture::settings::{
+    ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+    MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+};
+use windows_capture::window::Window;
 
 use crate::MediaError;
 
@@ -25,6 +40,19 @@ pub struct CapturedFrame {
     pub bgra: Vec<u8>,
     pub width: usize,
     pub height: usize,
+}
+
+type Slot = Arc<Mutex<Option<CapturedFrame>>>;
+
+/// Store a de-padded BGRA frame into the shared slot, dropping malformed ones.
+fn store(slot: &Slot, w: usize, h: usize, tight: &[u8]) {
+    if tight.len() == w * h * 4 {
+        *slot.lock().unwrap() = Some(CapturedFrame {
+            bgra: tight.to_vec(),
+            width: w,
+            height: h,
+        });
+    }
 }
 
 /// A monitor the user can pick to share: its zero-based `index` (pass to
@@ -55,21 +83,104 @@ pub fn monitor_sources() -> Vec<ScreenSource> {
         .collect()
 }
 
-/// Captures the primary monitor on a background thread, exposing the latest
+/// A window the user can pick to share: its `hwnd` (an opaque handle, pass to
+/// [`ScreenCapture::start_window`]) and its title.
+#[derive(Debug, Clone)]
+pub struct WindowSource {
+    pub hwnd: isize,
+    pub name: String,
+}
+
+/// Enumerate the shareable top-level windows (visible, titled, not our own).
+/// Best-effort: returns an empty list if enumeration fails.
+pub fn window_sources() -> Vec<WindowSource> {
+    let Ok(windows) = Window::enumerate() else {
+        return Vec::new();
+    };
+    windows
+        .into_iter()
+        .filter_map(|w| {
+            let name = w.title().ok()?;
+            if name.trim().is_empty() {
+                return None; // untitled helper windows are not useful to share
+            }
+            Some(WindowSource {
+                hwnd: w.as_raw_hwnd() as isize,
+                name,
+            })
+        })
+        .collect()
+}
+
+/// The WGC handler's associated error. We never actually fail a frame (bad ones
+/// are skipped), but the trait needs an error type that is `Display` so the
+/// crate's `GraphicsCaptureApiError<E>` can format it.
+#[derive(Debug)]
+struct HandlerError;
+
+impl std::fmt::Display for HandlerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "window capture handler error")
+    }
+}
+
+impl std::error::Error for HandlerError {}
+
+/// Delivers WGC window frames into the shared slot. `Flags` carries the slot in.
+struct WindowCapture {
+    slot: Slot,
+    scratch: Vec<u8>,
+}
+
+impl GraphicsCaptureApiHandler for WindowCapture {
+    type Flags = Slot;
+    type Error = HandlerError;
+
+    fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+        Ok(Self {
+            slot: ctx.flags,
+            scratch: Vec::new(),
+        })
+    }
+
+    fn on_frame_arrived(
+        &mut self,
+        frame: &mut Frame,
+        _ctl: InternalCaptureControl,
+    ) -> Result<(), Self::Error> {
+        if let Ok(buf) = frame.buffer() {
+            let (w, h) = (buf.width() as usize, buf.height() as usize);
+            let tight = buf.as_nopadding_buffer(&mut self.scratch);
+            store(&self.slot, w, h, tight);
+        }
+        Ok(())
+    }
+}
+
+/// Which capture backend a [`ScreenCapture`] is running.
+enum Backend {
+    /// DXGI duplication of a monitor: a polling thread we stop via `stop`.
+    Dxgi {
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    },
+    /// WGC capture of a window: a control handle we stop by consuming it.
+    Window(Option<CaptureControl<WindowCapture, HandlerError>>),
+}
+
+/// Captures a monitor or a window on a background thread, exposing the latest
 /// frame. Dropping it stops the capture.
 pub struct ScreenCapture {
-    latest: Arc<Mutex<Option<CapturedFrame>>>,
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    latest: Slot,
+    backend: Backend,
 }
 
 impl ScreenCapture {
-    /// Start capturing the primary monitor. Returns once capture has started (or
-    /// with an error if the duplication device could not be created).
+    /// Start capturing the primary monitor.
     pub fn start_primary() -> Result<Self, MediaError> {
         let monitor = Monitor::primary()
             .map_err(|e| MediaError::Codec(format!("no primary monitor: {e}")))?;
-        Self::start_on(monitor)
+        Self::start_monitor(monitor)
     }
 
     /// Start capturing a specific monitor by its zero-based index (see
@@ -77,11 +188,11 @@ impl ScreenCapture {
     pub fn start_index(index: usize) -> Result<Self, MediaError> {
         let monitor = Monitor::from_index(index)
             .map_err(|e| MediaError::Codec(format!("no monitor {index}: {e}")))?;
-        Self::start_on(monitor)
+        Self::start_monitor(monitor)
     }
 
-    fn start_on(monitor: Monitor) -> Result<Self, MediaError> {
-        let latest: Arc<Mutex<Option<CapturedFrame>>> = Arc::new(Mutex::new(None));
+    fn start_monitor(monitor: Monitor) -> Result<Self, MediaError> {
+        let latest: Slot = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let l = latest.clone();
         let s = stop.clone();
@@ -112,24 +223,45 @@ impl ScreenCapture {
                 };
                 let (w, h) = (buf.width() as usize, buf.height() as usize);
                 let tight = buf.as_nopadding_buffer(&mut scratch);
-                if tight.len() == w * h * 4 {
-                    *l.lock().unwrap() = Some(CapturedFrame {
-                        bgra: tight.to_vec(),
-                        width: w,
-                        height: h,
-                    });
-                }
+                store(&l, w, h, tight);
             }
         });
         match init_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 latest,
-                stop,
-                thread: Some(thread),
+                backend: Backend::Dxgi {
+                    stop,
+                    thread: Some(thread),
+                },
             }),
             Ok(Err(e)) => Err(MediaError::Codec(format!("screen capture: {e}"))),
             Err(_) => Err(MediaError::Codec("screen capture thread died".into())),
         }
+    }
+
+    /// Start capturing a specific window by its handle (see [`window_sources`]).
+    pub fn start_window(hwnd: isize) -> Result<Self, MediaError> {
+        let window = Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void);
+        if !window.is_valid() {
+            return Err(MediaError::Codec("that window is no longer available".into()));
+        }
+        let latest: Slot = Arc::new(Mutex::new(None));
+        let settings = Settings::new(
+            window,
+            CursorCaptureSettings::WithoutCursor,
+            DrawBorderSettings::Default,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
+            ColorFormat::Bgra8,
+            latest.clone(),
+        );
+        let control = WindowCapture::start_free_threaded(settings)
+            .map_err(|e| MediaError::Codec(format!("window capture: {e}")))?;
+        Ok(Self {
+            latest,
+            backend: Backend::Window(Some(control)),
+        })
     }
 
     /// The most recently captured frame, if any has arrived yet.
@@ -140,9 +272,18 @@ impl ScreenCapture {
 
 impl Drop for ScreenCapture {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        match &mut self.backend {
+            Backend::Dxgi { stop, thread } => {
+                stop.store(true, Ordering::Relaxed);
+                if let Some(t) = thread.take() {
+                    let _ = t.join();
+                }
+            }
+            Backend::Window(control) => {
+                if let Some(c) = control.take() {
+                    let _ = c.stop();
+                }
+            }
         }
     }
 }

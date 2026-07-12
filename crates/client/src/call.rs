@@ -312,21 +312,36 @@ impl Call {
     }
 
     /// Start sharing a monitor (`monitor_index` is a zero-based index from
-    /// [`enclave_media::monitor_sources`]): capture -> H.264 -> seal (via the
-    /// shared sealer) -> send, on a dedicated thread. A keyframe is emitted
-    /// periodically so a viewer who joins mid-share recovers within a couple of
-    /// seconds. Screen frames go out as [`MediaKind::Screen`] (the full-screen
-    /// viewer); camera frames use [`MediaKind::Video`] (per-user tiles), so a
-    /// user may share screen and camera at once without the two streams
-    /// colliding on the receiver's decoder.
+    /// [`enclave_media::monitor_sources`]).
     #[cfg(windows)]
     pub fn start_screen(&mut self, monitor_index: usize) -> Result<(), ClientError> {
-        use enclave_media::ScreenCapture;
-
         if self.screen.is_some() {
             return Ok(());
         }
-        let capture = ScreenCapture::start_index(monitor_index).map_err(audio)?;
+        let capture = enclave_media::ScreenCapture::start_index(monitor_index).map_err(audio)?;
+        self.spawn_screen(capture);
+        Ok(())
+    }
+
+    /// Start sharing a single window (`hwnd` from [`enclave_media::window_sources`]).
+    #[cfg(windows)]
+    pub fn start_window(&mut self, hwnd: isize) -> Result<(), ClientError> {
+        if self.screen.is_some() {
+            return Ok(());
+        }
+        let capture = enclave_media::ScreenCapture::start_window(hwnd).map_err(audio)?;
+        self.spawn_screen(capture);
+        Ok(())
+    }
+
+    /// Drive a screen/window capture -> H.264 -> seal (via the shared sealer) ->
+    /// send, on a dedicated thread. Frames go out as [`MediaKind::Screen`] (the
+    /// full-screen viewer); camera uses [`MediaKind::Video`] (per-user tiles), so
+    /// a user may share screen and camera at once without the two streams
+    /// colliding on the receiver's decoder. A keyframe is emitted periodically so
+    /// a viewer who joins mid-share recovers within a couple of seconds.
+    #[cfg(windows)]
+    fn spawn_screen(&mut self, capture: enclave_media::ScreenCapture) {
         let sealer = self.sealer.clone();
         let frame_tx = self.frame_tx.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -345,7 +360,6 @@ impl Call {
             stop,
             thread: Some(thread),
         });
-        Ok(())
     }
 
     #[cfg(not(windows))]
@@ -353,7 +367,12 @@ impl Call {
         Err(ClientError::Audio("screen share is Windows-only".into()))
     }
 
-    /// Stop sharing the screen (keeps the call running).
+    #[cfg(not(windows))]
+    pub fn start_window(&mut self, _hwnd: isize) -> Result<(), ClientError> {
+        Err(ClientError::Audio("window share is Windows-only".into()))
+    }
+
+    /// Stop sharing the screen or window (keeps the call running).
     pub fn stop_screen(&mut self) {
         self.screen = None; // Drop stops the thread and the capture.
     }
