@@ -35,10 +35,12 @@ const SIGNALING_MSG_LIMIT: usize = 1 << 20; // 1 MiB
 const SIGNALING_BURST: f64 = 40.0;
 const SIGNALING_RATE_PER_SEC: f64 = 25.0;
 
-/// Per-source UDP media rate limit (ASVS V11). Audio is ~50 frames/sec; this
-/// allows bursts and several concurrent streams while capping a flood.
-const MEDIA_BURST: f64 = 400.0;
-const MEDIA_RATE_PER_SEC: f64 = 250.0;
+/// Per-source UDP media rate limit (ASVS V11). Audio is ~50 datagrams/sec, but
+/// a screen-share stream is fragmented video: ~30 fps at several Mbps is many
+/// hundreds of ~1 KB fragments per second, with larger keyframe bursts. This
+/// allows a healthy video stream plus audio while still capping a flood.
+const MEDIA_BURST: f64 = 8000.0;
+const MEDIA_RATE_PER_SEC: f64 = 4000.0;
 
 /// Shared server state: the routing brain plus a per-connection outbound queue.
 struct ServerState {

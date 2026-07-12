@@ -22,26 +22,37 @@ use tokio::net::UdpSocket;
 
 use crate::error::TransportError;
 
-/// Max size of a UDP media datagram. A frame is a small Opus packet plus a
-/// header; this cap keeps a malicious datagram from triggering a huge
-/// allocation on deserialize (ASVS V5/V12). Used on both ends so encode and
-/// decode agree.
+/// Max size of a single UDP media *datagram*. A datagram is one small frame
+/// (Opus) or one fragment, so this cap bounds a malicious datagram's allocation
+/// on deserialize (ASVS V5/V12). A whole video frame can be much larger than
+/// this -- it is fragmented across many datagrams and reassembled.
 pub(crate) const MEDIA_DATAGRAM_LIMIT: u64 = 64 * 1024;
+
+/// Max size of a whole (possibly reassembled) media frame -- large enough for a
+/// video keyframe. Bounds the reassembly buffer and the whole-frame codec.
+const MAX_FRAME_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Serialized frames at or below this go in one datagram; larger ones are
 /// fragmented. Kept well under a typical MTU so fragments are not IP-fragmented.
 const FRAGMENT_THRESHOLD: usize = 1100;
 /// Payload bytes per fragment (leaves room for the fragment header).
 const FRAGMENT_PAYLOAD: usize = 1024;
-/// A reassembled frame may not exceed the datagram limit either.
-const MAX_REASSEMBLED: usize = MEDIA_DATAGRAM_LIMIT as usize;
+/// A reassembled frame may not exceed the whole-frame limit.
+const MAX_REASSEMBLED: usize = MAX_FRAME_BYTES as usize;
 /// How many partially received frames to track before evicting the oldest --
 /// bounds memory against a sender who never completes a frame.
 const MAX_INFLIGHT: usize = 32;
 
-/// Size-limited bincode config for the UDP media channel.
+/// Size-limited bincode config for one UDP datagram (a small frame or fragment).
 pub(crate) fn media_codec() -> impl Options {
     bincode::DefaultOptions::new().with_limit(MEDIA_DATAGRAM_LIMIT)
+}
+
+/// Bincode config for a whole media frame (may be a large video frame that is
+/// fragmented over the wire), used to serialize on send and to deserialize the
+/// reassembled bytes on receive.
+fn frame_codec() -> impl Options {
+    bincode::DefaultOptions::new().with_limit(MAX_FRAME_BYTES)
 }
 
 /// Reassembles fragmented frames per (sender, frame id). Pure and testable.
@@ -146,12 +157,14 @@ impl MediaSocket {
     /// Send one sealed frame to the relay for fan-out to the group. Small frames
     /// go in one datagram; a large frame (video) is split into fragments.
     pub async fn send_frame(&self, frame: &MediaFrame) -> Result<(), TransportError> {
-        let one = media_codec().serialize(&UdpMsg::Frame(frame.clone()))?;
+        // Whole-frame codec: a video frame can exceed the per-datagram limit; if
+        // it fits one datagram we send it as-is, otherwise we fragment it.
+        let one = frame_codec().serialize(&UdpMsg::Frame(frame.clone()))?;
         if one.len() <= FRAGMENT_THRESHOLD {
             self.sock.send(&one).await?;
             return Ok(());
         }
-        let frame_bytes = media_codec().serialize(frame)?;
+        let frame_bytes = frame_codec().serialize(frame)?;
         let id = self.next_frag_id.fetch_add(1, Ordering::Relaxed);
         let count = frame_bytes.len().div_ceil(FRAGMENT_PAYLOAD) as u16;
         for (i, chunk) in frame_bytes.chunks(FRAGMENT_PAYLOAD).enumerate() {
@@ -191,7 +204,7 @@ impl MediaSocket {
                         .unwrap()
                         .add(sender.0, id, index, count, data);
                     if let Some(bytes) = done {
-                        if let Ok(frame) = media_codec().deserialize::<MediaFrame>(&bytes) {
+                        if let Ok(frame) = frame_codec().deserialize::<MediaFrame>(&bytes) {
                             return Ok(frame);
                         }
                     }

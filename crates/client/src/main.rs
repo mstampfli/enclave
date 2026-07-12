@@ -12,12 +12,14 @@ use std::time::Duration;
 
 use enclave_client::{Client, Event};
 use enclave_protocol::{Friend, Presence};
+use std::borrow::Cow;
+
 use tao::event::{Event as TaoEvent, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
 use tokio::sync::mpsc;
 use wry::http::Request;
-use wry::WebViewBuilder;
+use wry::{WebViewBuilder, WebViewBuilderExtWindows};
 
 const UI_HTML: &str = include_str!("ui/index.html");
 
@@ -59,6 +61,10 @@ enum UiCommand {
     StartScreenShare,
     /// Stop sharing the screen.
     StopScreenShare,
+    /// Mute or unmute the microphone.
+    SetMuted {
+        muted: bool,
+    },
     /// Report the available audio devices + current selection (settings modal).
     ListAudioDevices,
     /// Choose the microphone (empty string = host default).
@@ -237,8 +243,24 @@ fn main() -> wry::Result<()> {
     // user is not already looking at Enclave.
     let focused = Arc::new(AtomicBool::new(true));
 
-    let webview = WebViewBuilder::new()
-        .with_html(UI_HTML)
+    // Each process gets its own WebView2 user-data folder. Two instances sharing
+    // the default folder collide with a WebView2 "invalid parameter" error, so
+    // running multiple windows (e.g. two accounts on one machine) would fail.
+    let wv_data = std::env::temp_dir().join(format!("enclave-webview-{}", std::process::id()));
+    let mut web_context = wry::WebContext::new(Some(wv_data));
+    // Serve the UI from a custom-protocol origin (https://enclave.localhost/)
+    // instead of NavigateToString. That origin is a *secure context*, which the
+    // opaque about:blank origin of with_html is not -- and WebCodecs (the H.264
+    // screen-share decoder) is only available in a secure context.
+    let webview = WebViewBuilder::new_with_web_context(&mut web_context)
+        .with_https_scheme(true)
+        .with_custom_protocol("enclave".to_string(), |_id, _req| {
+            wry::http::Response::builder()
+                .header("Content-Type", "text/html")
+                .body(Cow::Borrowed(UI_HTML.as_bytes()))
+                .unwrap()
+        })
+        .with_url("enclave://localhost/")
         .with_ipc_handler(move |req: Request<String>| {
             if let Ok(cmd) = serde_json::from_str::<UiCommand>(req.body()) {
                 let _ = cmd_tx.send(cmd);
@@ -661,6 +683,11 @@ async fn handle_command(
             if let Some(c) = client.as_mut() {
                 c.stop_screen_share();
                 emit(proxy, UiEvent::ScreenShareState { sharing: false });
+            }
+        }
+        UiCommand::SetMuted { muted } => {
+            if let Some(c) = client.as_ref() {
+                c.set_muted(muted);
             }
         }
         UiCommand::ListAudioDevices => {
