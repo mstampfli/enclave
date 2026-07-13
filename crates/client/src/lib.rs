@@ -217,6 +217,10 @@ struct IncomingFile {
     from: String,
     name: String,
     size: u64,
+    /// Set only once the user explicitly accepts. Chunks are written to disk
+    /// only for an accepted offer, so a malicious server cannot bypass the
+    /// consent gate by streaming an un-accepted file's bytes at us.
+    accepted: bool,
     /// The streaming disk sink, created when we accept and the first chunk lands.
     sink: Option<FileSink>,
 }
@@ -907,8 +911,9 @@ impl Client {
     /// its chunks. `offer_id` is the hex id from an [`Event::FileOffered`].
     pub fn accept_file(&mut self, offer_id: &str) -> Result<(), ClientError> {
         let id = decode_offer_id(offer_id).ok_or(ClientError::NoGroup)?;
-        if !self.incoming_files.contains_key(&id) {
-            return Ok(()); // already gone; nothing to do
+        match self.incoming_files.get_mut(&id) {
+            Some(inc) => inc.accepted = true,
+            None => return Ok(()), // already gone; nothing to do
         }
         self.conn.send(ClientMsg::FileAccept { offer_id: id });
         Ok(())
@@ -1048,6 +1053,7 @@ impl Client {
                 from: from.0.clone(),
                 name: safe.clone(),
                 size: m.size,
+                accepted: false,
                 sink: None,
             },
         );
@@ -1135,7 +1141,13 @@ impl Client {
     /// on the first chunk (sized from the offered manifest), write the part, and
     /// finalize when the last one lands. The whole file is never held in memory.
     fn handle_file_chunk(&mut self, offer_id: [u8; 16], data: Sealed) -> Option<Event> {
-        let group = self.incoming_files.get(&offer_id)?.group.clone();
+        // Consent gate (defense in depth): write chunks only for an offer the
+        // user explicitly accepted. A malicious server that streams an
+        // un-accepted file's bytes at us gets them dropped, never written.
+        let group = match self.incoming_files.get(&offer_id) {
+            Some(inc) if inc.accepted => inc.group.clone(),
+            _ => return None,
+        };
         // Decrypt the sealed part.
         let part = {
             let identity = self.identity.as_ref()?;
