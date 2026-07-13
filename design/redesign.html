@@ -198,7 +198,7 @@ input, select, textarea { font: inherit; }
 .side-tabs .count { font-size: 11px; margin-left: 4px; color: var(--muted); }
 .side-tabs .count.attention { color: var(--accent-ink); }
 
-.side-scroll { flex: 1; overflow-y: auto; min-height: 0; padding: 10px 8px; }
+.side-scroll { flex: 1; overflow-y: auto; min-height: 0; padding: 8px; }
 
 .side-section { margin-bottom: 14px; }
 .side-section > .head {
@@ -254,7 +254,7 @@ input, select, textarea { font: inherit; }
 
 /* The scroll pane already insets its contents by 8px; adding more here
    would push this row inward of the search bar above it. */
-.add-friend { display: flex; gap: 6px; padding: 4px 0 10px; }
+.add-friend { display: flex; gap: 6px; padding: 0 0 10px; }
 .add-friend input { flex: 1; padding: 8px 11px; font-size: 13.5px;
   background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
   color: var(--ink); }
@@ -463,6 +463,8 @@ input, select, textarea { font: inherit; }
   border: 1px solid transparent;
   transition: background 120ms ease-out, border-color 120ms ease-out; }
 .pick-row:hover { background: var(--raised); }
+.pick-row.current { background: var(--accent-bg); }
+.pick-row .now { margin-left: auto; font-size: 12px; color: var(--accent-ink); flex: none; }
 .pick-row .icon { color: var(--muted); }
 .pick-row .lbl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; font-size: 14px; }
@@ -486,7 +488,7 @@ input, select, textarea { font: inherit; }
 .verify-state.pending { color: var(--muted); }
 
 /* sidebar + modal search */
-.side-search { padding: 8px 8px 4px; }
+.side-search { padding: 8px 8px 0; }
 .side-search input, .modal-search input {
   width: 100%; padding: 7px 10px; border-radius: var(--radius);
   background: var(--bg); border: 1px solid var(--border); color: var(--ink);
@@ -814,7 +816,7 @@ label.member-row:hover { background: var(--raised); }
 <div class="overlay" id="modal-share" hidden>
   <div class="modal wide">
     <div class="m-head">
-      <h2>Share to the call</h2>
+      <h2 id="share-title">Share to the call</h2>
       <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     </div>
     <div class="m-section">
@@ -834,17 +836,23 @@ label.member-row:hover { background: var(--raised); }
           shares everything, so others may hear the call echo back.</div>
       </div>
     </div>
+    <div class="m-actions" id="share-stop-row" hidden style="justify-content:flex-start">
+      <button class="btn danger" id="share-stop">Stop sharing</button>
+    </div>
   </div>
 </div>
 
 <div class="overlay" id="modal-camera" hidden>
   <div class="modal">
     <div class="m-head">
-      <h2>Turn on a camera</h2>
+      <h2 id="camera-title">Turn on a camera</h2>
       <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     </div>
     <div class="m-section">
       <div class="pick-list" id="pick-cameras"></div>
+    </div>
+    <div class="m-actions" id="camera-stop-row" hidden style="justify-content:flex-start">
+      <button class="btn danger" id="camera-stop">Turn off camera</button>
     </div>
   </div>
 </div>
@@ -1015,6 +1023,7 @@ const state = {
   inCall: false,
   callConvo: null,
   muted: false, deafened: false, camera: false, sharing: false,
+  shareSource: null, cameraSource: null,
   remoteSharing: false, watching: false,
   ringing: false,
   connection: "online",
@@ -1368,8 +1377,8 @@ function renderStage() {
   // controls
   setCtl("ctl-mic", state.muted, state.muted ? "Unmute" : "Mute", "off");
   setCtl("ctl-deafen", state.deafened, state.deafened ? "Undeafen" : "Deafen", "off");
-  setCtl("ctl-camera", state.camera, state.camera ? "Camera off" : "Camera", "engaged");
-  setCtl("ctl-share", state.sharing, state.sharing ? "Stop sharing" : "Share", "engaged");
+  setCtl("ctl-camera", state.camera, state.camera ? "Camera on" : "Camera", "engaged");
+  setCtl("ctl-share", state.sharing, state.sharing ? "Sharing" : "Share", "engaged");
   const watchBtn = $("btn-watch");
   watchBtn.textContent = state.watching ? "Stop watching" : "Watch";
 }
@@ -1402,7 +1411,9 @@ const WAYLAND = false;   // flip to preview the Wayland variant of the picker
 // Sharing a screen and turning on a camera are separate acts, so they get
 // separate dialogs.
 function openCameraPicker() {
-  fillPicks("pick-cameras", [{ label: "HD Webcam" }], "camera");
+  fillPicks("pick-cameras", [{ label: "HD Webcam" }, { label: "USB Camera" }], "camera");
+  $("camera-title").textContent = state.camera ? "Change camera" : "Turn on a camera";
+  $("camera-stop-row").hidden = !state.camera;
   openModal("modal-camera");
 }
 
@@ -1416,6 +1427,8 @@ function openSharePicker() {
 
   fillPicks("pick-screens", screens, "monitor");
   fillPicks("pick-windows", windows, "window");
+  $("share-title").textContent = state.sharing ? "Change what you share" : "Share to the call";
+  $("share-stop-row").hidden = !state.sharing;
   $("share-audio-hint").textContent = WAYLAND
     ? "Shared audio is the whole system mix, so others may hear the call echo back unless it plays on another device."
     : "A window shares only that app's audio. A whole screen shares everything, so others may hear the call echo back.";
@@ -1438,13 +1451,23 @@ function fillPicks(id, items, kind) {
     b.className = "pick-row";
     b.innerHTML = `<svg class="icon" viewBox="0 0 24 24">${icons[kind]}</svg>
       <span class="lbl">${it.label}</span>`;
+    // The core replaces a running capture, so picking another source while
+    // one is live switches to it rather than needing a stop first.
+    const live = it.label === (kind === "camera" ? state.cameraSource : state.shareSource);
+    if (live) {
+      b.classList.add("current");
+      const tag = document.createElement("span");
+      tag.className = "now"; tag.textContent = "sending";
+      b.appendChild(tag);
+    }
     b.onclick = () => {
       closeModals();
-      if (kind === "camera") { state.camera = true; }
-      else { state.sharing = true; }
-      renderStage();
+      if (live) return; // already the live source
       const audio = $("share-audio-check").checked && kind !== "camera";
-      toast(kind === "camera" ? "Camera is on" :
+      if (kind === "camera") { state.camera = true; state.cameraSource = it.label; }
+      else { state.sharing = true; state.shareSource = it.label; }
+      renderStage();
+      toast(kind === "camera" ? `Camera: ${it.label}` :
         audio ? `Sharing ${it.label} with audio` : `Sharing ${it.label}`);
     };
     el.appendChild(b);
@@ -1659,13 +1682,15 @@ $("callbar-leave").onclick = leaveCall;
 $("callbar-return").onclick = () => switchConvo(state.callConvo);
 $("ctl-mic").onclick = () => { state.muted = !state.muted; renderStage(); };
 $("ctl-deafen").onclick = () => { state.deafened = !state.deafened; renderStage(); };
-$("ctl-camera").onclick = () => {
-  if (state.camera) { state.camera = false; renderStage(); }
-  else openCameraPicker();
+$("ctl-camera").onclick = openCameraPicker;
+$("ctl-share").onclick = openSharePicker;
+$("share-stop").onclick = () => {
+  state.sharing = false; state.shareSource = null;
+  closeModals(); renderStage(); toast("Stopped sharing");
 };
-$("ctl-share").onclick = () => {
-  if (state.sharing) { state.sharing = false; renderStage(); toast("Stopped sharing"); }
-  else openSharePicker();
+$("camera-stop").onclick = () => {
+  state.camera = false; state.cameraSource = null;
+  closeModals(); renderStage(); toast("Camera off");
 };
 $("btn-watch").onclick = () => { state.watching = !state.watching; renderStage(); };
 $("ring-join").onclick = joinCall;

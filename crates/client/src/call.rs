@@ -335,9 +335,10 @@ impl Call {
     /// [`enclave_media::monitor_sources`]; on Linux the index is nominal and
     /// the system picker chooses the actual monitor or window).
     pub fn start_screen(&mut self, monitor_index: usize) -> Result<(), ClientError> {
-        if self.screen.is_some() {
-            return Ok(());
-        }
+        // Starting a source while one is live *switches* to it. The old capture
+        // is torn down first: a capture device can be exclusive (a camera, a
+        // portal session), so two must never overlap.
+        self.screen = None;
         let capture = enclave_media::ScreenCapture::start_index(monitor_index).map_err(audio)?;
         self.spawn_screen(capture);
         Ok(())
@@ -345,9 +346,7 @@ impl Call {
 
     /// Start sharing a single window (`hwnd` from [`enclave_media::window_sources`]).
     pub fn start_window(&mut self, hwnd: isize) -> Result<(), ClientError> {
-        if self.screen.is_some() {
-            return Ok(());
-        }
+        self.screen = None; // switch: see start_screen
         let capture = enclave_media::ScreenCapture::start_window(hwnd).map_err(audio)?;
         self.spawn_screen(capture);
         Ok(())
@@ -409,9 +408,10 @@ impl Call {
     pub fn start_camera(&mut self, camera_index: u32) -> Result<(), ClientError> {
         use enclave_media::CameraCapture;
 
-        if self.camera.is_some() {
-            return Ok(());
-        }
+        // Switching cameras: close the current device before opening the next.
+        // V4L2 and Media Foundation both hand out a camera exclusively, so an
+        // overlapping open would fail with "device busy".
+        self.camera = None;
         let sealer = self.sealer.clone();
         let frame_tx = self.frame_tx.clone();
         let preview_tx = self.local_frame_tx.clone();

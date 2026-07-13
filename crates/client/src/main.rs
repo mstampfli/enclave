@@ -480,6 +480,10 @@ fn emit_audio_devices(proxy: &EventLoopProxy<UiEvent>, c: &Client) {
 /// Parse a share-source token ("monitor:N", "window:HWND", or "camera:N") and
 /// start that share, optionally also sharing its audio, reporting the new state
 /// or an error to the UI.
+///
+/// Picking a source while one is already live switches to it: the core replaces
+/// the capture, and any shared audio is restarted, because the new source has a
+/// different owning process (or none at all).
 fn start_share(c: &mut Client, proxy: &EventLoopProxy<UiEvent>, source: &str, audio: bool) {
     let Some((kind, id)) = source.split_once(':') else {
         error_status(proxy, format!("Bad share source: {source}"));
@@ -492,6 +496,7 @@ fn start_share(c: &mut Client, proxy: &EventLoopProxy<UiEvent>, source: &str, au
                     emit(proxy, UiEvent::ScreenShareState { sharing: true });
                     // A monitor has no single owning process: whole-endpoint
                     // loopback (the UI already warned about the echo).
+                    c.stop_system_audio();
                     if audio {
                         share_audio(c, proxy, None);
                     }
@@ -505,6 +510,7 @@ fn start_share(c: &mut Client, proxy: &EventLoopProxy<UiEvent>, source: &str, au
                 Ok(()) => {
                     emit(proxy, UiEvent::ScreenShareState { sharing: true });
                     // Per-app audio: capture only this window's process (echo-free).
+                    c.stop_system_audio();
                     if audio {
                         match c.window_pid(h) {
                             Some(pid) => share_audio(c, proxy, Some(pid)),
