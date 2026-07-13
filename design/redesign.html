@@ -534,12 +534,7 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--raised);
 <div id="login-view">
   <div class="login-card">
     <div class="login-brand">
-      <svg viewBox="0 0 34 34" aria-hidden="true">
-        <circle cx="17" cy="17" r="15" fill="none" stroke="#d9d9d9" stroke-width="1.5"/>
-        <circle cx="17" cy="17" r="8.5" fill="none" stroke="#909090" stroke-width="1.2"
-                stroke-dasharray="4 3"/>
-        <circle cx="17" cy="17" r="3" fill="#62ad6a"/>
-      </svg>
+      <span id="brand-seal" aria-hidden="true"></span>
       <span class="name">ENCLAVE</span>
     </div>
     <div class="login-tagline">Your server. Your keys. Your people.</div>
@@ -1605,6 +1600,11 @@ document.querySelectorAll("#proto [data-proto]").forEach(b => b.onclick = () => 
 });
 
 /* ---------------- boot ---------------- */
+
+// The logo is a seal: the same glyph that marks a verified conversation,
+// keyed by the name itself ("ENCLAVE" as character codes).
+const BRAND_SAFETY = "ENCLAVE".split("").map(c => c.charCodeAt(0)).join("");
+$("brand-seal").innerHTML = sealSVG(BRAND_SAFETY, true, 32);
 
 showLogin(false);
 setTab("chats");
