@@ -40,7 +40,6 @@
   --radius-lg: 4px;
 
   --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", "Fira Code", "DejaVu Sans Mono", monospace;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -106,12 +105,10 @@ input, select, textarea { font: inherit; }
 .field input::placeholder { color: var(--faint); }
 .field .hint { font-size: 12.5px; color: var(--muted); }
 
-.mono { font-family: var(--mono); }
-
 .avatar {
   width: 32px; height: 32px; border-radius: 3px; flex: none;
   display: grid; place-items: center;
-  font-family: var(--mono); font-size: 12px; font-weight: 600;
+  font-size: 12px; font-weight: 600;
   background: var(--raised);
   color: var(--muted);
 }
@@ -134,8 +131,7 @@ input, select, textarea { font: inherit; }
 .login-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 2px; }
 .login-brand svg { width: 30px; height: 30px; }
 .login-brand .name {
-  font-family: var(--mono); font-size: 19px; font-weight: 600;
-  letter-spacing: 0.16em; color: var(--ink-strong);
+  font-size: 19px; font-weight: 650; color: var(--ink-strong);
 }
 .login-tagline { font-size: 13.5px; color: var(--muted); margin-top: -10px; }
 .login-tabs { display: flex; border: 1px solid var(--border); border-radius: var(--radius); }
@@ -198,7 +194,7 @@ input, select, textarea { font: inherit; }
 }
 .side-tabs button:hover { color: var(--ink); }
 .side-tabs button.active { color: var(--ink-strong); border-bottom-color: var(--ink-strong); }
-.side-tabs .count { font-family: var(--mono); font-size: 11px; margin-left: 4px; color: var(--muted); }
+.side-tabs .count { font-size: 11px; margin-left: 4px; color: var(--muted); }
 .side-tabs .count.attention { color: var(--accent-ink); }
 
 .side-scroll { flex: 1; overflow-y: auto; min-height: 0; padding: 10px 8px; }
@@ -228,7 +224,8 @@ input, select, textarea { font: inherit; }
 .convo-row .last { font-size: 12.5px; color: var(--muted);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .convo-row .unread {
-  font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--ink-strong);
+  font-size: 12px; font-weight: 600; color: var(--ink-strong);
+  font-variant-numeric: tabular-nums;
 }
 .convo-row .live {
   display: inline-flex; align-items: center; gap: 5px;
@@ -246,7 +243,7 @@ input, select, textarea { font: inherit; }
 .person-row:hover { background: var(--raised); }
 .person-row .meta { flex: 1; min-width: 0; text-align: left; }
 .person-row .display { font-size: 14px; color: var(--ink); }
-.person-row .handle { font-family: var(--mono); font-size: 11.5px; color: var(--faint); }
+.person-row .handle { font-size: 11.5px; color: var(--faint); }
 .person-row .row-actions { display: flex; gap: 4px; opacity: 0; }
 .person-row:hover .row-actions, .person-row:focus-within .row-actions { opacity: 1; }
 .row-actions button { width: 26px; height: 26px; display: grid; place-items: center;
@@ -286,9 +283,9 @@ input, select, textarea { font: inherit; }
 .server-card.reconnecting .state-dot { background: var(--warn); }
 .server-card.offline .state-dot { background: var(--danger); }
 .server-card .meta { flex: 1; min-width: 0; }
-.server-card .host { font-family: var(--mono); font-size: 12px; color: var(--ink);
+.server-card .host { font-size: 12px; color: var(--ink);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.server-card .sub { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+.server-card .sub { font-size: 11px; color: var(--faint); }
 .server-card button { color: var(--muted); width: 28px; height: 28px;
   display: grid; place-items: center; border-radius: var(--radius); }
 .server-card button:hover { background: var(--raised); color: var(--ink); }
@@ -399,7 +396,7 @@ input, select, textarea { font: inherit; }
 .msg-group .byline { display: flex; align-items: baseline; gap: 8px; }
 .msg-group .author { font-weight: 600; font-size: 14px; color: var(--ink-strong); }
 .msg-group .author.me { color: var(--muted); }
-.msg-group .time { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+.msg-group .time { font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
 .msg-group p { color: var(--ink); font-size: 14.5px; margin-top: 1px;
   overflow-wrap: anywhere; }
 .msg-group p + p { margin-top: 3px; }
@@ -474,7 +471,7 @@ input, select, textarea { font: inherit; }
 .verify-hero { display: flex; flex-direction: column; align-items: center; gap: 14px;
   padding: 8px 0 2px; }
 .safety-number {
-  font-family: var(--mono); font-size: 15.5px; letter-spacing: 0.05em;
+  font-size: 16px; font-weight: 550; font-variant-numeric: tabular-nums;
   color: var(--ink-strong); text-align: center; line-height: 1.9;
   user-select: all;
 }
@@ -487,7 +484,7 @@ input, select, textarea { font: inherit; }
 .member-row { display: flex; align-items: center; gap: 10px; padding: 6px 4px; }
 .member-row .meta { flex: 1; }
 .member-row .display { font-size: 14px; }
-.member-row .handle { font-family: var(--mono); font-size: 11.5px; color: var(--faint); }
+.member-row .handle { font-size: 11.5px; color: var(--faint); }
 .member-row .kick { opacity: 0; color: var(--muted); width: 26px; height: 26px;
   display: grid; place-items: center; border-radius: var(--radius); }
 .member-row:hover .kick { opacity: 1; }
@@ -510,7 +507,7 @@ input, select, textarea { font: inherit; }
 .palette .p-row.sel { background: var(--hover); }
 .palette .p-hint { padding: 8px 16px; font-size: 12px; color: var(--faint);
   border-top: 1px solid var(--border); display: flex; gap: 14px; }
-kbd { font-family: var(--mono); font-size: 11px; background: var(--raised);
+kbd { font-size: 11px; background: var(--raised);
   border: 1px solid var(--border); border-radius: var(--radius); padding: 0 5px; }
 
 /* toasts */
@@ -534,11 +531,10 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--raised);
 #proto .drawer button { text-align: left; padding: 3px 7px; border-radius: var(--radius);
   color: var(--muted); font-size: 12px; }
 #proto .drawer button:hover { background: var(--raised); color: var(--ink); }
-#proto .drawer .d-head { font-family: var(--mono); font-weight: 500; letter-spacing: 0.08em;
-  text-transform: uppercase; font-size: 10px; color: var(--faint); margin-top: 4px; }
+#proto .drawer .d-head { font-weight: 550; font-size: 11px; color: var(--faint); margin-top: 4px; }
 #proto > .tab { background: var(--panel); border: 1px dashed var(--border-strong);
   color: var(--muted); border-radius: var(--radius); padding: 4px 10px;
-  font-family: var(--mono); font-size: 11px; }
+  font-size: 11px; }
 #proto > .tab:hover { color: var(--ink); }
 
 [hidden] { display: none !important; }
@@ -551,7 +547,7 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--raised);
   <div class="login-card">
     <div class="login-brand">
       <span id="brand-seal" aria-hidden="true"></span>
-      <span class="name">ENCLAVE</span>
+      <span class="name">Enclave</span>
     </div>
     <div class="login-tagline">Your server. Your keys. Your people.</div>
 
@@ -582,7 +578,7 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--raised);
     <button class="btn primary" id="login-go" style="justify-content:center">Sign in</button>
     <div class="login-footer">
       <button id="import-session">Restore from backup…</button>
-      <span class="hint mono" style="font-size:11.5px">v0.1 · AGPL</span>
+      <span class="hint" style="font-size:11.5px">v0.1 · AGPL</span>
     </div>
   </div>
 </div>
@@ -1699,7 +1695,7 @@ document.querySelectorAll("#proto [data-proto]").forEach(b => b.onclick = () => 
 /* ---------------- boot ---------------- */
 
 // The logo is a seal: the same glyph that marks a verified conversation,
-// keyed by the name itself ("ENCLAVE" as character codes).
+// keyed by the name itself (its character codes).
 const BRAND_SAFETY = "ENCLAVE".split("").map(c => c.charCodeAt(0)).join("");
 $("brand-seal").innerHTML = sealSVG(BRAND_SAFETY, true, 32);
 
