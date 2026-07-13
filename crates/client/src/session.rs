@@ -26,6 +26,12 @@ pub struct PersistConv {
     pub title: String,
     pub members: Vec<String>,
     pub history: Vec<PersistLine>,
+    /// The safety number the user confirmed out of band, if any. Stored as the
+    /// number itself, not a flag: a rekey changes the number, which correctly
+    /// drops the conversation back to unverified rather than carrying a stale
+    /// "trusted" mark across a membership change.
+    #[serde(default)]
+    pub verified: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

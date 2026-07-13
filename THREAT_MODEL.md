@@ -228,16 +228,9 @@ function. Implemented as one tested primitive in `enclave-transport::opaque`.
 
 The ASVS L2 chapters above are addressed (TLS and rate limiting are
 implemented), and the only tracked upstream item is the waived,
-verified-non-exploitable advisory above. Two security-relevant gaps remain, both
-in the client:
+verified-non-exploitable advisory above. One security-relevant gap remains in
+the client:
 
-- **Verification marks do not persist.** Confirming a peer's safety number is
-  recorded per conversation and per number (so a rekey correctly resets it), but
-  it lives in the WebView's storage, whose directory is per-process today. The
-  mark therefore lasts one run: after a restart a verified peer shows as
-  unverified again. That fails safe (it under-claims trust, never over-claims
-  it) but it trains users to ignore the indicator, which is the real risk. The
-  mark belongs in the Rust keystore, alongside the pinned identity keys.
 - **Presence rules are enforced in the UI, not the core.** Idle-to-away, status
   durations, and the invariant that a set status never upgrades (a disconnect
   always shows offline) are implemented in the front end. They are privacy
@@ -245,5 +238,43 @@ in the client:
   rather than content to strangers. They still belong in the controller, where
   the front end cannot get them wrong, with idle measured at the OS level.
 
-Neither weakens the sealed-frame or MLS invariants: the server still never
-possesses a key or a plaintext.
+Verification persistence, previously listed here, is now done: a confirmed
+safety number is stored with the encrypted session (`enclave-crypto` keys it to
+the number itself, so a rekey resets it) and survives a restart.
+
+Neither the above nor anything below weakens the sealed-frame or MLS
+invariants: the server still never possesses a key or a plaintext.
+
+## Metadata the server sees, and what hides it
+
+The SFU topology means the relay sees routing metadata: which accounts share a
+conversation, when a message is sent, and its size. Two of those are now
+addressed at the wire:
+
+- **Message size.** Every encrypted text message is padded to a multiple of 256
+  bytes before it is sealed (MLS `padding_size`, applied identically at group
+  create and join, proven by `crates/crypto/tests/e2e_text.rs`). The relay
+  learns only which 256-byte bucket a message fell into, not its length. This
+  does *not* pad media: audio and video frame sizes are set by their codecs, and
+  hiding those means constant-bitrate padding, a much more expensive tradeoff
+  left for later.
+
+- **Recipient set.** The relay routes a group's traffic to exactly that group's
+  members (`Relay` fan-out sets), so it learns the social graph of who talks to
+  whom. The obvious hardening -- broadcast every message to *every* account and
+  let clients discard what they cannot decrypt -- is **not viable** and is
+  deliberately not done:
+  - It is O(N) per message in server bandwidth and O(N) client work for N
+    accounts, so it does not scale past a tiny server, and a flood trivially
+    DoSes everyone.
+  - It hides the recipient set only if the anonymity set is *everyone* and cover
+    traffic is constant; with real servers where users come and go, timing and
+    online-set correlation re-identify pairs quickly.
+  - It trades a metadata leak for a much larger denial-of-service and
+    battery/bandwidth cost, i.e. it makes the accepted SFU tradeoff worse, not
+    better.
+
+  The honest way to shrink recipient-set metadata is a different transport
+  (a mixnet, or sealed-sender with per-message tokens the server cannot link to
+  an account), which is a separate design, not a routing tweak. Recorded here as
+  a known, accepted limitation of the SFU model.

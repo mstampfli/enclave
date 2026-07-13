@@ -32,6 +32,9 @@ impl Group {
             .ciphersuite(crate::CIPHERSUITE)
             // Carry the ratchet tree in Welcomes so joiners need no side channel.
             .use_ratchet_tree_extension(true)
+            // Pad every application message up to a multiple of PADDING, so the
+            // ciphertext length says nothing about what was typed.
+            .padding_size(crate::PADDING)
             .build(&owner.provider, &owner.signer, owner.credential.clone())
             .map_err(|e| CryptoError::GroupCreate(e.to_string()))?;
         Ok(Self { inner })
@@ -147,8 +150,11 @@ impl Group {
             _ => return Err(CryptoError::Join("message was not a Welcome".into())),
         };
 
+        // A joiner must pad exactly like the creator, or its messages would be
+        // the only ones in the group whose length leaks.
         let config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
+            .padding_size(crate::PADDING)
             .build();
 
         let staged = StagedWelcome::new_from_welcome(&joiner.provider, &config, welcome, None)
@@ -253,10 +259,19 @@ impl Group {
         let protocol_message = message
             .try_into_protocol_message()
             .map_err(|e| CryptoError::Text(format!("not a protocol message: {e}")))?;
-        let processed = self
-            .inner
-            .process_message(&receiver.provider, protocol_message)
-            .map_err(|e| CryptoError::Text(e.to_string()))?;
+        // openmls fires a `debug_assert!(false)` when AEAD open fails on a
+        // tampered ciphertext, so a hostile peer's garbage would panic a debug
+        // build instead of erroring (release compiles the assert out, but a
+        // crash class must not depend on the profile). Contain it: a message
+        // that does not decrypt is a rejection, never a panic. `&mut self` is
+        // unwind-safe here because a failed process_message does not advance
+        // the group's ratchet state.
+        let processed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.inner
+                .process_message(&receiver.provider, protocol_message)
+        }))
+        .map_err(|_| CryptoError::Text("message rejected (decryption failed)".into()))?
+        .map_err(|e| CryptoError::Text(e.to_string()))?;
 
         // Capture the authenticated sender before consuming the message.
         let sender = processed.credential().serialized_content().to_vec();

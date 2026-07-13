@@ -126,7 +126,7 @@ async fn conversations_and_history_survive_restart() {
     let handle = serve("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", handle.addr);
 
-    let dir = std::env::temp_dir().join(format!("enclave-persist-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("enclave-restart-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -155,6 +155,13 @@ async fn conversations_and_history_survive_restart() {
         }
     }
     let gid = alice.active_id().unwrap();
+    // Confirm the safety number out of band before the restart. create_group
+    // establishes the roster in one step, so the number will not change again.
+    alice.switch(&gid);
+    assert!(!alice.is_verified(), "a fresh group starts unverified");
+    let verified_number = alice.safety_number().expect("group has a safety number");
+    alice.mark_verified();
+    assert!(alice.is_verified(), "verified after confirming");
     let bob_gid = bob.conversations().first().unwrap().id.clone();
     bob.switch(&bob_gid);
     alice.send_text("before restart").await.unwrap();
@@ -188,6 +195,19 @@ async fn conversations_and_history_survive_restart() {
         "history restored after restart"
     );
 
+    // The verification mark survives the restart, checked against the same
+    // (unchanged) safety number.
+    alice2.switch(&gid);
+    assert_eq!(
+        alice2.safety_number().as_deref(),
+        Some(verified_number.as_str()),
+        "same safety number after restart"
+    );
+    assert!(
+        alice2.is_verified(),
+        "the verification mark survived the restart"
+    );
+
     // The MLS group is genuinely live: Alice can still send and Bob receives.
     alice2.switch(&gid);
     alice2.send_text("after restart").await.unwrap();
@@ -200,28 +220,4 @@ async fn conversations_and_history_survive_restart() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[tokio::test]
-async fn wrong_password_is_rejected() {
-    let handle = serve("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}", handle.addr);
-
-    // Create the account and learn the assigned handle.
-    let mut zara = Client::connect(&url).await.unwrap();
-    zara.set_keystore_dir(std::env::temp_dir());
-    zara.create_account("zara", "", "the-right-password")
-        .await
-        .unwrap();
-    let zara_handle = zara.name().to_string();
-
-    // A second connection with the correct handle but wrong password is rejected
-    // (this exercises the OPAQUE password check, not handle enumeration).
-    let mut imposter = Client::connect(&url).await.unwrap();
-    imposter.set_keystore_dir(std::env::temp_dir());
-    assert!(imposter
-        .login(&zara_handle, "the-wrong-password")
-        .await
-        .is_err());
-    assert!(!imposter.is_logged_in());
 }

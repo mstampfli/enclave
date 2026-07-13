@@ -1062,19 +1062,11 @@ function sealSVG(safety, verified, size) {
   </svg>`;
 }
 
-// Verified marks live in localStorage keyed by conversation + number, so a
-// rekey (new number) naturally resets to unverified. NOTE: the WebView's
-// storage directory is per-run today, so marks persist only within a run;
-// persisting them in the keystore is a backend follow-up.
-function verifyKey(conv, safety) { return "enclave.verified." + conv + "." + (safety || ""); }
-function isVerified() {
-  if (!activeConv || !activeSafety) return false;
-  try { return localStorage.getItem(verifyKey(activeConv, activeSafety)) === "1"; }
-  catch (e) { return false; }
-}
-function markVerified() {
-  try { localStorage.setItem(verifyKey(activeConv, activeSafety), "1"); } catch (e) {}
-}
+// Verification is owned by the core: it is persisted with the session and keyed
+// to the safety number itself, so a rekey correctly drops it. The UI just
+// mirrors what the core reports on ActiveConversation.
+let activeVerified = false;
+function isVerified() { return activeVerified; }
 
 // ---- toasts ----
 function toast(text, error) {
@@ -1844,9 +1836,8 @@ function openVerify() {
 $("header-seal").addEventListener("click", openVerify);
 $("copy-number").addEventListener("click", () => { copyText(activeSafety); toast("Safety number copied"); });
 $("mark-verified").addEventListener("click", () => {
-  markVerified();
+  send({ type: "MarkVerified" }); // the core stores it; ActiveConversation echoes it back
   closeModals();
-  renderHeader();
   const conv = convById(activeConv);
   toast((conv ? conv.title : "Conversation") + " is verified; the seal is now solid");
 });
@@ -2157,7 +2148,7 @@ function showLogin() {
   $("login-view").hidden = false;
   setTimeout(() => $("login-username").focus(), 0);
   myUsername = ""; myDisplay = ""; friends = []; incoming = []; outgoing = []; conversations = [];
-  activeConv = null; activeSafety = "";
+  activeConv = null; activeSafety = ""; activeVerified = false;
   inCall = false; myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false;
   watchingStream = true; currentSharer = ""; lastSent = "";
   activeShareId = null; activeCameraId = null; shareAudioOn = false;
@@ -2193,6 +2184,7 @@ window.onEnclaveEvent = (ev) => {
     case "ActiveConversation":
       activeConv = ev.conv;
       activeSafety = ev.safety || "";
+      activeVerified = !!ev.verified;
       if (ev.conv) { messages[ev.conv] = ev.history.slice(); delete unread[ev.conv]; }
       renderConvoList(); renderHeader(); renderChat();
       break;

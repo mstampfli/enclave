@@ -77,3 +77,40 @@ fn an_outsider_cannot_decrypt() {
         "a non-member must not decrypt the group's message, got {result:?}"
     );
 }
+
+#[test]
+fn message_length_is_hidden_by_padding() {
+    let (alice, mut alice_group, _bob, _bob_group) = two_member_group();
+
+    // Messages of very different plaintext lengths, all inside one 256-byte
+    // padding bucket, must seal to the same wire length: the ciphertext size
+    // reveals only the bucket, not what was typed.
+    let short = alice_group.encrypt_text(&alice, b"hi").expect("short");
+    let medium = alice_group
+        .encrypt_text(&alice, b"a slightly longer sentence to send")
+        .expect("medium");
+    let long = alice_group
+        .encrypt_text(&alice, &[b'x'; 120])
+        .expect("long");
+
+    assert_eq!(
+        short.len(),
+        medium.len(),
+        "a 2-byte and a 34-byte message must be indistinguishable on the wire"
+    );
+    assert_eq!(
+        short.len(),
+        long.len(),
+        "a 120-byte message stays in the same bucket"
+    );
+
+    // Crossing a bucket boundary is allowed to change the size (padding bounds
+    // the leak to one bucket, it does not make every message identical).
+    let over = alice_group
+        .encrypt_text(&alice, &[b'y'; 400])
+        .expect("over");
+    assert!(
+        over.len() > short.len(),
+        "a message past the bucket lands in a larger bucket, as expected"
+    );
+}

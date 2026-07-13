@@ -61,6 +61,8 @@ enum UiCommand {
     ImportSession {
         path: String,
     },
+    /// The user compared the safety number out of band and it matched.
+    MarkVerified,
     /// Join the active conversation's voice call.
     StartCall,
     /// Leave the current voice call.
@@ -191,6 +193,9 @@ enum UiEvent {
         conv: Option<String>,
         title: String,
         safety: Option<String>,
+        /// Whether this conversation's *current* safety number was confirmed
+        /// out of band. Comes from the core, and survives a restart.
+        verified: bool,
         history: Vec<Line>,
     },
     /// A single message arrived (or was sent) in conversation `conv`.
@@ -449,6 +454,7 @@ fn active_conversation_event(c: &Client) -> UiEvent {
         conv,
         title,
         safety: c.safety_number(),
+        verified: c.is_verified(),
         history,
     }
 }
@@ -738,6 +744,12 @@ async fn authenticate(
             let display = c.display_name().to_string();
             *client = Some(c);
             emit(proxy, UiEvent::LoggedIn { username, display });
+            // Login restores the saved conversations, but nothing told the UI:
+            // it started empty and stayed empty, so a restart looked like the
+            // chats were gone. Push the restored list.
+            if let Some(c) = client.as_ref() {
+                emit_conversations(proxy, c);
+            }
         }
         Err(e) => error_status(proxy, e.to_string()),
     }
@@ -815,6 +827,12 @@ async fn handle_command(
                     }
                     Err(e) => error_status(proxy, format!("Import failed: {e}")),
                 }
+            }
+        }
+        UiCommand::MarkVerified => {
+            if let Some(c) = client.as_mut() {
+                c.mark_verified();
+                emit(proxy, active_conversation_event(c));
             }
         }
         UiCommand::StartCall => {

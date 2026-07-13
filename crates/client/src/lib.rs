@@ -124,6 +124,9 @@ struct Conversation {
     title: String,
     members: Vec<String>,
     history: Vec<ChatLine>,
+    /// The safety number the user confirmed out of band. Compared against the
+    /// live number, so a rekey (which changes it) drops back to unverified.
+    verified: Option<String>,
 }
 
 #[derive(Clone)]
@@ -536,6 +539,7 @@ impl Client {
                     title: friend.to_string(),
                     members: vec![me, friend.to_string()],
                     history: Vec::new(),
+                    verified: None,
                 },
             );
             self.invite_peer(&dm_id, friend, "").await?;
@@ -554,6 +558,7 @@ impl Client {
                     title: friend.to_string(),
                     members: vec![me, friend.to_string()],
                     history: Vec::new(),
+                    verified: None,
                 },
             );
         }
@@ -585,6 +590,7 @@ impl Client {
                 title: name.to_string(),
                 members: vec![me],
                 history: Vec::new(),
+                verified: None,
             },
         );
         for member in members {
@@ -783,6 +789,44 @@ impl Client {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Whether the user has confirmed the active conversation's *current* safety
+    /// number out of band. A rekey changes the number, so this goes back to
+    /// false on any membership change: trust is never carried across one.
+    pub fn is_verified(&self) -> bool {
+        let Some(id) = self.active.as_ref() else {
+            return false;
+        };
+        let Some(conv) = self.conversations.get(id) else {
+            return false;
+        };
+        match (&conv.verified, conv.group.as_ref()) {
+            (Some(confirmed), Some(group)) => *confirmed == group.safety_number().to_string(),
+            _ => false,
+        }
+    }
+
+    /// Record that the user compared the active conversation's safety number
+    /// out of band and it matched. Persisted with the session, so it survives a
+    /// restart (the whole point: a mark that resets every run teaches people to
+    /// ignore it).
+    pub fn mark_verified(&mut self) {
+        let Some(id) = self.active.clone() else {
+            return;
+        };
+        let Some(number) = self
+            .conversations
+            .get(&id)
+            .and_then(|c| c.group.as_ref())
+            .map(|g| g.safety_number().to_string())
+        else {
+            return;
+        };
+        if let Some(conv) = self.conversations.get_mut(&id) {
+            conv.verified = Some(number);
+        }
+        self.save_session();
     }
 
     /// The active conversation's safety number, if it has an established group.
@@ -1091,6 +1135,7 @@ impl Client {
                 is_dm: c.kind == ConvKind::Dm,
                 title: c.title.clone(),
                 members: c.members.clone(),
+                verified: c.verified.clone(),
                 history: c
                     .history
                     .iter()
@@ -1149,6 +1194,7 @@ impl Client {
                     },
                     title: pc.title,
                     members: pc.members,
+                    verified: pc.verified,
                     history,
                 },
             ));
@@ -1310,6 +1356,7 @@ impl Client {
                                 title,
                                 members: vec![me, from.0],
                                 history: Vec::new(),
+                                verified: None,
                             },
                         );
                     }

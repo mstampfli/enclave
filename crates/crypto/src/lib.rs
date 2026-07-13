@@ -29,6 +29,17 @@ pub use media::{MediaOpener, MediaSealer, MediaSigner, MEDIA_SIG_CONTEXT};
 /// The single ciphersuite Enclave uses: X25519 KEM, AES-128-GCM, SHA-256, and
 /// Ed25519 signatures. One fixed ciphersuite (not a negotiated set) keeps the
 /// security surface small; Ed25519 identity matches `docs/PRIMITIVES.md`.
+/// Every encrypted text message is padded up to a multiple of this many bytes
+/// before it is sealed, so an observer of the wire (the relay included) learns
+/// only which bucket a message fell into, not its length. 256 bytes covers the
+/// overwhelming majority of chat lines in a single bucket; a longer message
+/// costs at most 255 wasted bytes.
+///
+/// This does not hide the length of *media*: audio and video frames are sized
+/// by their codecs, and padding them to a constant rate is a different and much
+/// more expensive tradeoff (see THREAT_MODEL.md).
+pub const PADDING: usize = 256;
+
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
 /// The MLS capabilities we advertise: our single ciphersuite, the LastResort
