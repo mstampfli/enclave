@@ -1070,3 +1070,28 @@ fn only_reliable_messages_spill() {
         participants: vec![],
     }));
 }
+
+#[test]
+fn a_timed_out_live_recipient_is_dropped_and_the_sender_is_told() {
+    // When the server gives up relaying a live chunk to a too-slow recipient, it
+    // drops them from the stream (later chunks skip them) and tells the sender
+    // precisely which offer did not reach them.
+    let mut r = Relay::new();
+    let (a, _ah, b, bh, group) = two_member_group(&mut r);
+    let offer_id = [20u8; 16];
+    r.handle(
+        a,
+        ClientMsg::FileOffer { offer_id, group, size: 0, manifest: Sealed(vec![1]), live: true },
+    );
+    r.handle(b, ClientMsg::FileAccept { offer_id });
+
+    let notify = r.drop_live_recipient(offer_id, b);
+    assert!(
+        notify.iter().any(|o| o.to == a
+            && matches!(&o.msg, ServerMsg::FileDeclined { by, .. } if by.0 == bh)),
+        "the sender is told the recipient did not receive it"
+    );
+    // A later chunk no longer routes to the dropped recipient.
+    let out = r.handle(a, ClientMsg::FileChunk { offer_id, data: Sealed(vec![9]) });
+    assert!(out.is_empty(), "the dropped recipient no longer receives chunks");
+}

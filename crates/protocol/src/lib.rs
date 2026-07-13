@@ -224,6 +224,18 @@ pub enum ClientMsg {
     FileDecline { offer_id: [u8; 16] },
     /// Withdraw an offer we made (before or during upload/streaming).
     FileCancel { offer_id: [u8; 16] },
+
+    /// A message wrapped for at-least-once delivery. The server processes `msg`
+    /// exactly as if it were sent bare, then replies [`ServerMsg::Ack`] with the
+    /// same `seq` once it has *durably accepted* it (delivered to online members
+    /// and persisted for offline ones). The sender keeps it in a retransmit
+    /// buffer until the ack arrives and resends it on reconnect (or on a retry
+    /// timer), so a connection drop, a server restart, or a transient queue-full
+    /// never silently loses a chat message. Duplicates from a resend are deduped
+    /// by the receiver (chunked messages by their transfer id; MLS by epoch).
+    /// `seq` is a per-session monotonic counter, meaningful only between this
+    /// sender and the server.
+    Reliable { seq: u64, msg: Box<ClientMsg> },
 }
 
 /// A person in the friend graph: the unique `username` (login/add id) plus the
@@ -352,6 +364,16 @@ pub enum ServerMsg {
     },
     /// Every chunk of `offer_id` from `from` has been delivered.
     FileComplete { offer_id: [u8; 16], from: DeviceId },
+    /// Confirms the server durably accepted the [`ClientMsg::Reliable`] with this
+    /// `seq`. The sender then drops it from its retransmit buffer.
+    Ack { seq: u64 },
+    /// A reliable message the sender sent to `group` could not be delivered and
+    /// could not be stored (the server's offline queue is at its global cap).
+    /// Sent to the sender so the failure is visible and actionable at the
+    /// conversation level -- the server names the group (which it routes in the
+    /// clear), never the message content or a per-message id (it cannot see
+    /// either), so the client flags the conversation rather than a single line.
+    DeliveryFailed { group: GroupId },
     Error {
         detail: String,
     },

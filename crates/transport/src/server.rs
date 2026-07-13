@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::error::TransportError;
 use crate::media_socket::media_codec;
 use crate::ratelimit::TokenBucket;
-use crate::relay::{BlobDelivery, ConnId, Relay};
+use crate::relay::{BlobDelivery, ConnId, Outgoing, Relay};
 
 /// How often the server sweeps lapsed file offers (stored TTL and the live
 /// accept window). Frequent enough that a live offer's ~90s window is honored.
@@ -424,6 +424,15 @@ where
         let Ok(client_msg) = serde_json::from_slice::<ClientMsg>(&bytes) else {
             continue;
         };
+        // Unwrap a reliability envelope: route the inner message exactly as if it
+        // were bare, then acknowledge it below once it has been durably accepted
+        // (delivered to online members and persisted for offline ones), so the
+        // sender can stop retransmitting it. `reliable_seq` is `Some` when an ack
+        // is owed.
+        let (reliable_seq, client_msg) = match client_msg {
+            ClientMsg::Reliable { seq, msg } => (Some(seq), *msg),
+            other => (None, other),
+        };
         // Control-plane messages additionally obey the tight signaling budget;
         // file chunks are exempt (see above).
         if !matches!(client_msg, ClientMsg::FileChunk { .. }) && !bucket.try_take(Instant::now()) {
@@ -457,28 +466,63 @@ where
         // (they are stuck), a reliable message is preserved in their offline
         // queue rather than dropped, and only if even that is at its global cap
         // is the sender told. A real-time / latest-wins message is fine to drop.
+        // Whether every reliable (spillable) recipient of this message was
+        // accepted -- delivered live or persisted to their offline queue. Only
+        // then is a `Reliable` sender acked; a global-queue-cap failure leaves it
+        // un-acked so the sender retransmits when space frees.
+        let mut all_accepted = true;
         for (to_conn, out, msg) in sends {
             if matches!(msg, ServerMsg::FileChunk { .. }) {
-                let _ = tokio::time::timeout(LIVE_BACKPRESSURE_TIMEOUT, out.send(&msg)).await;
+                if tokio::time::timeout(LIVE_BACKPRESSURE_TIMEOUT, out.send(&msg))
+                    .await
+                    .map(|r| r.is_ok())
+                    != Ok(true)
+                {
+                    // The recipient made no progress within the window (too slow
+                    // or gone): drop them from the live stream so later chunks
+                    // skip them, and tell the sender precisely which offer failed.
+                    if let ServerMsg::FileChunk { offer_id, .. } = msg {
+                        let notify = {
+                            let mut s = state.lock().unwrap();
+                            s.relay.drop_live_recipient(offer_id, to_conn)
+                        };
+                        dispatch_now(&state, notify);
+                    }
+                }
                 continue;
             }
             if out.try_send(&msg) {
                 continue; // delivered live
             }
             if crate::relay::spillable(&msg) {
+                // Preserve it in the recipient's offline queue rather than drop.
+                let group = crate::relay::group_of(&msg);
                 let queued = {
                     let mut s = state.lock().unwrap();
                     s.relay.spill_offline(to_conn, msg)
                 };
                 if !queued {
-                    // Offline queue also at its global cap: notify the sender.
-                    let s = state.lock().unwrap();
-                    if let Some(sender) = s.txs.get(&conn) {
-                        sender.try_send(&ServerMsg::Error {
-                            detail: "the server is out of queue space; a message was not delivered"
-                                .into(),
-                        });
+                    all_accepted = false;
+                    // The offline queue is at its global cap (true exhaustion):
+                    // tell the sender which conversation was affected, so nothing
+                    // is lost silently.
+                    if let Some(group) = group {
+                        let s = state.lock().unwrap();
+                        if let Some(sender) = s.txs.get(&conn) {
+                            sender.try_send(&ServerMsg::DeliveryFailed { group });
+                        }
                     }
+                }
+            }
+        }
+        // Acknowledge a durably-accepted reliable message so the sender can drop
+        // it from its retransmit buffer. Withheld if any recipient could not be
+        // accepted, so the sender keeps retrying until it can be.
+        if let Some(seq) = reliable_seq {
+            if all_accepted {
+                let s = state.lock().unwrap();
+                if let Some(sender) = s.txs.get(&conn) {
+                    sender.try_send(&ServerMsg::Ack { seq });
                 }
             }
         }
@@ -564,6 +608,20 @@ async fn stream_blob_chunks(f: &mut tokio::fs::File, d: &BlobDelivery, out: &Out
         // Backpressure: awaits until the recipient's outbound has room.
         if out.send(&msg).await.is_err() {
             return false; // recipient disconnected
+        }
+    }
+}
+
+/// Deliver a batch of `Outgoing` to their connections' outbound queues
+/// (non-blocking), for notifications produced outside the main dispatch loop.
+fn dispatch_now(state: &Arc<Mutex<ServerState>>, outgoing: Vec<Outgoing>) {
+    if outgoing.is_empty() {
+        return;
+    }
+    let s = state.lock().unwrap();
+    for o in outgoing {
+        if let Some(out) = s.txs.get(&o.to) {
+            out.try_send(&o.msg);
         }
     }
 }

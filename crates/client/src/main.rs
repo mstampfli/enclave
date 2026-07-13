@@ -646,9 +646,12 @@ async fn run_client(
 
         // Push any in-progress file uploads forward, paced by the connection's
         // bounded file queue (backpressure), so a large upload streams from disk
-        // instead of buffering in memory.
+        // instead of buffering in memory. Retransmit any reliable message the
+        // server has not yet acked, so nothing is lost to a drop or a transient
+        // server-full.
         if let Some(c) = client.as_mut() {
             c.pump_uploads();
+            c.pump_retransmits();
         }
 
         // A share can end without a command: the user cancels the system

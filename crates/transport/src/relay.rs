@@ -413,6 +413,12 @@ impl Relay {
             _ => return vec![],
         }
         match msg {
+            // A reliability wrapper: route the inner message exactly as if it
+            // were sent bare. The ack that confirms durable acceptance is added
+            // by the async shell (it knows whether delivery/persistence
+            // succeeded); the pure relay only routes.
+            ClientMsg::Reliable { msg, .. } => self.handle(from, *msg),
+
             ClientMsg::RegisterStart { name, request } => {
                 // Release any prior in-flight reservation on this connection.
                 if let Some(prev) = self.pending_register.remove(&from) {
@@ -1497,6 +1503,43 @@ impl Relay {
             Some(device) => self.queue.enqueue(&device.0, msg),
             None => false,
         }
+    }
+
+    /// A relayed live chunk could not be delivered to `recipient` within the
+    /// backpressure window (they are too slow or gone): drop them from the
+    /// offer's live stream so later chunks skip them (no per-chunk stall), and
+    /// tell the offer's sender they did not receive it (identified precisely by
+    /// the cleartext `offer_id`). Returns the sender notification to deliver.
+    pub fn drop_live_recipient(&mut self, offer_id: [u8; 16], recipient: ConnId) -> Vec<Outgoing> {
+        let Some(dev) = self.conn_device.get(&recipient).cloned() else {
+            return vec![];
+        };
+        let Some(offer) = self.live_offers.get_mut(&offer_id) else {
+            return vec![];
+        };
+        let dropped = offer.recipients.remove(&dev) | offer.accepted.remove(&dev);
+        let sender = offer.sender.clone();
+        if offer.recipients.is_empty() {
+            self.live_offers.remove(&offer_id);
+        }
+        if dropped {
+            self.notify_sender(&sender, ServerMsg::FileDeclined { offer_id, by: dev })
+        } else {
+            vec![]
+        }
+    }
+}
+
+/// The group a reliable message is bound for, if any (so a delivery failure can
+/// name the conversation to the sender). Real-time / latest-wins messages that
+/// are not spilled return `None`.
+pub fn group_of(msg: &ServerMsg) -> Option<GroupId> {
+    match msg {
+        ServerMsg::Text { group, .. }
+        | ServerMsg::Mls { group, .. }
+        | ServerMsg::Welcome { group, .. }
+        | ServerMsg::FileOffered { group, .. } => Some(group.clone()),
+        _ => None,
     }
 }
 

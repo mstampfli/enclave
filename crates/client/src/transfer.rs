@@ -18,7 +18,7 @@
 //! chunk. The reassembler bounds both the size of one transfer and the number
 //! in flight, so a hostile or buggy peer cannot exhaust memory.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -137,6 +137,9 @@ struct Partial {
 
 /// A finished transfer handed back by the reassembler.
 pub struct Complete {
+    /// The transfer id, so a caller can dedup a message that was fully resent
+    /// (e.g. after a retransmit whose earlier delivery's ack was lost).
+    pub id: [u8; 16],
     pub meta: TransferMeta,
     pub data: Vec<u8>,
 }
@@ -214,6 +217,7 @@ impl Reassembler {
                 data.extend_from_slice(&piece.expect("all parts present when complete"));
             }
             return Some(Complete {
+                id: part.id,
                 meta: partial.meta,
                 data,
             });
@@ -237,6 +241,48 @@ impl Reassembler {
                 break;
             }
         }
+    }
+}
+
+/// PRIMITIVE: a bounded set of recently-seen ids, for deduping a message that
+/// was fully resent (e.g. a retransmit whose earlier delivery's ack was lost).
+/// `insert` returns `true` the first time an id is seen and `false` on a
+/// duplicate; past `cap` the oldest id is evicted (a recent window, not a
+/// forever-growing set -- retransmits happen within seconds). FOR at-least-once
+/// receive-side dedup; NOT a durable, complete history of every message.
+pub struct SeenSet {
+    seen: HashSet<[u8; 16]>,
+    order: VecDeque<[u8; 16]>,
+    cap: usize,
+}
+
+impl SeenSet {
+    pub fn new(cap: usize) -> SeenSet {
+        SeenSet {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Record `id`. Returns `false` if it was already present (a duplicate to be
+    /// ignored), `true` the first time (recorded, evicting the oldest past `cap`).
+    pub fn insert(&mut self, id: [u8; 16]) -> bool {
+        if !self.seen.insert(id) {
+            return false;
+        }
+        self.order.push_back(id);
+        if self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.seen.clear();
+        self.order.clear();
     }
 }
 
@@ -558,5 +604,33 @@ mod tests {
         assert!(sink.write_part(&file_part(1, 0, 1, vec![0u8; 10])).is_err());
         sink.abort();
         let _ = std::fs::remove_file(path);
+    }
+
+    fn seen_id(n: u8) -> [u8; 16] {
+        let mut i = [0u8; 16];
+        i[0] = n;
+        i
+    }
+
+    #[test]
+    fn seen_set_reports_duplicates_and_admits_new_ids() {
+        let mut s = SeenSet::new(8);
+        assert!(s.insert(seen_id(1)), "first sighting is new");
+        assert!(!s.insert(seen_id(1)), "a repeat is a duplicate");
+        assert!(s.insert(seen_id(2)), "a different id is new");
+        assert!(!s.insert(seen_id(2)));
+    }
+
+    #[test]
+    fn seen_set_evicts_the_oldest_past_its_cap() {
+        let mut s = SeenSet::new(3);
+        for n in 0..3 {
+            assert!(s.insert(seen_id(n)));
+        }
+        // Inserting a 4th evicts id 0 (the oldest); id 0 then reads as "new".
+        assert!(s.insert(seen_id(3)));
+        assert!(s.insert(seen_id(0)), "evicted id is no longer remembered");
+        // A still-remembered recent id is still a duplicate.
+        assert!(!s.insert(seen_id(3)));
     }
 }

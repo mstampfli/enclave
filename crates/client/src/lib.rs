@@ -9,10 +9,10 @@
 //! Single-task and caller-driven: there is no background task, so the non-`Send`
 //! MLS group never crosses a thread boundary.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::transfer::{FileManifest, FileSink, Part, Reassembler, TransferMeta};
 use enclave_crypto::{Group, Identity};
@@ -31,6 +31,19 @@ mod transfer;
 /// (both parties online, nothing stored). Kept in sync with the server by hand;
 /// the server is the authority and rejects an over-size stored offer anyway.
 pub const STORE_FILE_MAX: u64 = 250 * 1024 * 1024;
+
+/// How long an un-acked reliable message waits before it is retransmitted. On a
+/// healthy connection the server acks in well under this, so a retransmit only
+/// fires when an ack (or the message) was actually lost -- or when a transient
+/// server-queue-full is clearing. Reconnect resends immediately, independent of
+/// this timer.
+const RETRANSMIT_AFTER: Duration = Duration::from_secs(5);
+
+/// Transfer ids remembered for receiver-side dedup, so a fully-resent message
+/// (whose earlier delivery's ack was lost) is not shown twice. A window rather
+/// than forever: retransmits happen within seconds, so a few thousand recent
+/// ids covers it without unbounded growth.
+const MAX_SEEN_IDS: usize = 4096;
 
 /// Why a screen share ended on its own (see [`Client::reap_ended_share`]):
 /// `Cancelled` is the user changing their mind at the system picker, `Failed`
@@ -295,6 +308,14 @@ pub struct Client {
     outgoing_files: HashMap<[u8; 16], OutgoingFile>,
     /// Uploads in progress, keyed by offer id, streamed by [`pump_uploads`].
     uploads: HashMap<[u8; 16], Upload>,
+    /// Reliable-delivery state. `next_seq` labels each reliable message;
+    /// `unacked` holds the ones the server has not yet acknowledged (with the
+    /// time they were last sent), retransmitted on reconnect and on a timer until
+    /// acked, so a dropped connection or a transient server-full never loses a
+    /// message. `seen` dedups a fully-resent message on the receive side.
+    next_seq: u64,
+    unacked: BTreeMap<u64, (ClientMsg, Instant)>,
+    seen: transfer::SeenSet,
     /// Files offered to us, awaiting/undergoing consented download (see
     /// [`IncomingFile`]). An entry exists from the offer until it resolves.
     incoming_files: HashMap<[u8; 16], IncomingFile>,
@@ -329,6 +350,9 @@ impl Client {
             outgoing_files: HashMap::new(),
             uploads: HashMap::new(),
             incoming_files: HashMap::new(),
+            next_seq: 0,
+            unacked: BTreeMap::new(),
+            seen: transfer::SeenSet::new(MAX_SEEN_IDS),
         })
     }
 
@@ -346,7 +370,12 @@ impl Client {
         // cleanly against a fresh session; abandon them (the user re-sends).
         self.uploads.clear();
         self.conn = Connection::connect(&self.server_url).await?;
-        self.login(&handle, &password).await
+        self.login(&handle, &password).await?;
+        // Replay everything the server had not acked before the drop, so no
+        // reliable message is lost across a reconnect (the receiver dedups any
+        // that actually got through).
+        self.resend_unacked();
+        Ok(())
     }
 
     /// Where identity key files and rosters are stored (default: current dir).
@@ -456,6 +485,8 @@ impl Client {
         self.outgoing_files.clear();
         self.uploads.clear();
         self.incoming_files.clear();
+        self.unacked.clear();
+        self.seen.clear();
     }
 
     fn finish_login(&mut self, identity: Identity, username: &str, display: String) {
@@ -764,13 +795,13 @@ impl Client {
         if !conv.members.iter().any(|m| m == friend) {
             conv.members.push(friend.to_string());
         }
-        self.conn.send(ClientMsg::Welcome {
+        self.send_reliable(ClientMsg::Welcome {
             to: DeviceId(friend.into()),
             group: group_id.clone(),
             name: name.to_string(),
             message: Sealed(add.welcome),
         });
-        self.conn.send(ClientMsg::Mls {
+        self.send_reliable(ClientMsg::Mls {
             group: group_id.clone(),
             message: Sealed(add.commit),
         });
@@ -822,7 +853,7 @@ impl Client {
             group: group_id.clone(),
             member: DeviceId(member.into()),
         });
-        self.conn.send(ClientMsg::Mls {
+        self.send_reliable(ClientMsg::Mls {
             group: group_id,
             message: Sealed(commit),
         });
@@ -882,6 +913,16 @@ impl Client {
         let meta_fs = std::fs::metadata(p)
             .map_err(|e| ClientError::Audio(format!("cannot read {name}: {e}")))?;
         let size = meta_fs.len();
+        // Enforce the hard ceiling up front: a recipient will not accept more
+        // than this (their streaming sink caps at it), so refuse to even offer a
+        // larger file, with a clear message, rather than failing mid-transfer.
+        if size > transfer::MAX_RECEIVE_BYTES {
+            let gb = transfer::MAX_RECEIVE_BYTES / (1024 * 1024 * 1024);
+            return Err(ClientError::Audio(format!(
+                "{name} is too large to send ({size_gb:.1} GB); the limit is {gb} GB",
+                size_gb = size as f64 / (1024.0 * 1024.0 * 1024.0),
+            )));
+        }
         let mime = mime_from_name(&name);
         let live = size > STORE_FILE_MAX;
 
@@ -1115,10 +1156,12 @@ impl Client {
     }
 
     /// Seal one serialized part with the group key and hand it to the relay as a
-    /// Text message (used for text and large-text transfers).
+    /// Text message (used for text and large-text transfers). Each part is sent
+    /// reliably: the server acks it and the sender retransmits until acked, so a
+    /// message never silently vanishes on a connection drop or server restart.
     fn seal_and_send(&mut self, group_id: &GroupId, part: &[u8]) -> Result<(), ClientError> {
         let sealed = self.seal(group_id, part)?;
-        self.conn.send(ClientMsg::Text {
+        self.send_reliable(ClientMsg::Text {
             group: group_id.clone(),
             message: Sealed(sealed),
         });
@@ -1136,6 +1179,70 @@ impl Client {
         let group = conv.group.as_mut().ok_or(ClientError::NoGroup)?;
         Ok(group.encrypt_text(identity, plaintext)?)
     }
+
+    /// Send `msg` with at-least-once delivery: label it with a sequence number,
+    /// keep it in the retransmit buffer until the server acks, and wrap it in a
+    /// [`ClientMsg::Reliable`]. Used for chat text, MLS handshakes, and Welcomes
+    /// -- messages whose loss would be a bug, not a dropped video frame.
+    fn send_reliable(&mut self, msg: ClientMsg) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.unacked.insert(seq, (msg.clone(), Instant::now()));
+        self.conn.send(ClientMsg::Reliable {
+            seq,
+            msg: Box::new(msg),
+        });
+    }
+
+    /// Resend every un-acked reliable message (in sequence order). Called on
+    /// reconnect: the new socket has none of the old in-flight state, so anything
+    /// the server had not yet acked must be replayed. The receiver dedups any
+    /// that actually did get through the first time.
+    fn resend_unacked(&mut self) {
+        let now = Instant::now();
+        let pending: Vec<(u64, ClientMsg)> = self
+            .unacked
+            .iter_mut()
+            .map(|(seq, (msg, sent))| {
+                *sent = now;
+                (*seq, msg.clone())
+            })
+            .collect();
+        for (seq, msg) in pending {
+            self.conn.send(ClientMsg::Reliable {
+                seq,
+                msg: Box::new(msg),
+            });
+        }
+    }
+
+    /// Retransmit reliable messages the server has not acked within
+    /// [`RETRANSMIT_AFTER`]. Driven by the event loop; on a healthy connection
+    /// nothing is due (acks arrive first), so this only fires for a genuinely
+    /// lost message/ack or a clearing server-queue-full.
+    pub fn pump_retransmits(&mut self) {
+        if self.unacked.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let due: Vec<u64> = self
+            .unacked
+            .iter()
+            .filter(|(_, (_, sent))| now.duration_since(*sent) >= RETRANSMIT_AFTER)
+            .map(|(seq, _)| *seq)
+            .collect();
+        for seq in due {
+            if let Some((msg, sent)) = self.unacked.get_mut(&seq) {
+                *sent = now;
+                let msg = msg.clone();
+                self.conn.send(ClientMsg::Reliable {
+                    seq,
+                    msg: Box::new(msg),
+                });
+            }
+        }
+    }
+
 
     /// A file was offered to us. Decrypt its manifest (no download needed),
     /// record the pending offer, and surface a consent prompt. Nothing touches
@@ -2092,6 +2199,11 @@ impl Client {
                 if !matches!(done.meta, TransferMeta::Text) {
                     return None;
                 }
+                // Dedup a message that was fully resent (a retransmit whose
+                // earlier delivery's ack was lost): show it exactly once.
+                if !self.seen.insert(done.id) {
+                    return None;
+                }
                 let text = String::from_utf8_lossy(&done.data).into_owned();
                 if let Some(conv) = self.conversations.get_mut(&group) {
                     conv.history.push(ChatLine {
@@ -2143,6 +2255,24 @@ impl Client {
                 self.handle_file_chunk(offer_id, data)
             }
             ServerMsg::FileComplete { offer_id, .. } => self.handle_file_complete(offer_id),
+            ServerMsg::Ack { seq } => {
+                // The server durably accepted this reliable message: stop tracking
+                // it for retransmission.
+                self.unacked.remove(&seq);
+                None
+            }
+            ServerMsg::DeliveryFailed { group } => {
+                // A message we sent could not be delivered or stored (server out
+                // of space). Name the conversation so the user can retry it.
+                let title = self
+                    .conversations
+                    .get(&group)
+                    .map(|c| c.title.clone())
+                    .unwrap_or_else(|| "a conversation".into());
+                Some(Event::Error(format!(
+                    "A message to {title} was not delivered: the server is out of space. Try again."
+                )))
+            }
             ServerMsg::Mls { group, message, .. } => {
                 let identity = self.identity.as_ref()?;
                 let conv = self.conversations.get_mut(&group)?;

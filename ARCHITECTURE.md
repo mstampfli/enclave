@@ -132,7 +132,14 @@ window by default and only add the WASM/browser target when we choose to.
    incoming file is only ever an offer (a sealed manifest); its bytes are
    requested only by an explicit accept, and a file smuggled over the text
    channel is dropped rather than written.
-5. Docs update in the same commit as the change they describe.
+5. A chat message is not silently lost. Text and MLS handshakes are sent
+   reliably (`ClientMsg::Reliable`): the server acks a message only once it has
+   delivered it to online members and persisted it for offline ones, and the
+   sender retransmits (on reconnect and on a timer) until acked. The receiver
+   dedups a resent message by its transfer id, so at-least-once + dedup is
+   effectively exactly-once. TCP handles bytes-to-socket; this handles
+   message-to-recipient, which TCP does not.
+6. Docs update in the same commit as the change they describe.
 
 ## Dependency plan (added per-phase, in the crate that first uses them)
 

@@ -363,3 +363,72 @@ async fn recv_message(c: &mut Client) -> String {
     }
 }
 
+
+#[tokio::test]
+async fn a_reliable_message_survives_a_reconnect_exactly_once() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let dir = std::env::temp_dir().join(format!("enclave-reliable-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut alice = Client::connect(&url).await.unwrap();
+    alice.set_keystore_dir(&dir);
+    alice
+        .create_account("relalice", "", "test-password-1234")
+        .await
+        .unwrap();
+    let mut bob = account(&url, "relbob").await;
+    let (an, bn) = (alice.name().to_string(), bob.name().to_string());
+
+    alice.send_friend_request(&bn);
+    loop {
+        if let Event::FriendRequest { from } = next_event(&mut bob).await {
+            assert_eq!(from, an);
+            break;
+        }
+    }
+    bob.accept_friend(&an);
+
+    let conv = alice.open_dm(&bn).await.unwrap();
+    alice.switch(&conv);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while alice.safety_number().is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "DM never established");
+        tokio::select! {
+            _ = tokio::time::timeout(Duration::from_millis(150), alice.next_event()) => {}
+            _ = tokio::time::timeout(Duration::from_millis(150), bob.next_event()) => {}
+        }
+        alice.switch(&conv);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while bob.conversations().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "Bob never joined the DM");
+        let _ = tokio::time::timeout(Duration::from_millis(150), bob.next_event()).await;
+    }
+    let bc = bob.conversations().first().unwrap().id.clone();
+    bob.switch(&bc);
+
+    // Alice sends a message, then immediately reconnects (as if the socket
+    // dropped before she knew it was acked). The unacked message is replayed on
+    // reconnect; Bob must see it exactly once -- dedup absorbs any duplicate.
+    alice.send_text("survive the reconnect").await.unwrap();
+    alice.reconnect().await.unwrap();
+
+    let mut count = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        tokio::select! {
+            _ = tokio::time::timeout(Duration::from_millis(60), alice.next_event()) => {}
+            e = tokio::time::timeout(Duration::from_millis(60), bob.next_event()) => {
+                if let Ok(Some(Event::Message { text, .. })) = e {
+                    if text == "survive the reconnect" {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(count, 1, "delivered exactly once despite the reconnect");
+    let _ = std::fs::remove_dir_all(&dir);
+}
