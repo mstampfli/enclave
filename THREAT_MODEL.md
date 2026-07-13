@@ -58,6 +58,31 @@ Each mitigation gets a test as its phase lands (see ARCHITECTURE.md roadmap):
   it is yours; no third-party dependency.
 - **Repudiation** is not provided (no audit log), by design.
 
+## Local capture surface (screen/window/audio share)
+
+Capture happens entirely on the user's machine, before the sealed-frame
+boundary; the wire story is unchanged (captured frames are H.264/Opus encoded,
+then sealed and signed like all media). What the capture layer itself trusts:
+
+- **User consent.** On Linux, screen/window selection is *mediated by the OS*:
+  the XDG portal's own dialog picks the source and the compositor enforces the
+  grant (spoofing the picker is out of our reach by design; the restore token
+  is kept in-process only, never on disk). On Windows the app enumerates
+  sources itself, as is native there. Shared system/app audio is opt-in per
+  share and stops with it.
+- **The media daemons are in the user's trust domain.** PipeWire (Linux) and
+  the audio engine (Windows) run as the same user; a compromised daemon could
+  already read the screen and mic, so we defend integrity, not against them:
+  every buffer they hand us is bounds-checked (`tighten_to_bgra` rejects
+  short/degenerate buffers instead of over-reading; chunk sizes are clamped to
+  the mapped length) and a dead/revoked stream ends the share visibly instead
+  of freezing it silently.
+- **Per-app audio matching** (Linux) uses the *kernel-verified*
+  `pipewire.sec.pid` on the owning client object (SO_PEERCRED), not the
+  client's self-reported process id, so one local app cannot trivially
+  impersonate another's audio stream to get itself captured; the self-reported
+  id is only a fallback for stacks that lack the sec pid.
+
 ## ASVS L2 review (Phase 7)
 
 Target level L2 (private communications). Chapters touched and status:

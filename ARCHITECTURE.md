@@ -49,8 +49,23 @@ crypto  media  transport
   `Sealed` (opaque) or routing metadata. Depends on nothing internal.
 - `enclave-crypto` -- identity keystore, MLS groups, media-key schedule, the
   nonce-safe frame sealer/opener, safety numbers.
-- `enclave-media` -- the audio pipeline: Opus codec (`audio`), tested
-  framing/format helpers (`frame`), and cpal mic/speaker device I/O (`device`).
+- `enclave-media` -- the audio/video pipeline: Opus codec (`audio`), tested
+  framing/format helpers (`frame`), cpal mic/speaker device I/O (`device`),
+  H.264 encode (`video`), webcam capture (`camera`), and the per-platform
+  capture backends (`screen`, `system_audio`) behind one platform-neutral API:
+
+  | Capability | Windows | Linux |
+  |---|---|---|
+  | Screen/window share | DXGI duplication / WGC; the app enumerates sources | XDG portal ScreenCast: the *system* dialog picks, frames arrive over a PipeWire video stream |
+  | System audio share | WASAPI endpoint loopback | PipeWire capture of the default sink monitor |
+  | Per-app audio share | WASAPI process loopback (pid from the shared window) | PipeWire capture of the app's output node (pid matched via the client's kernel-verified `pipewire.sec.pid`); the client app cannot use it for window shares because the portal hides the picked window's identity, so shared audio falls back to the system mix |
+  | Camera | Media Foundation (via nokhwa) | V4L2 (via nokhwa; metadata nodes filtered by `device_caps`) |
+
+  Starting a Linux share is asynchronous (a human sits behind the portal
+  dialog and may cancel), so every `ScreenCapture` carries a shared
+  `CaptureStatus` (`Starting -> Live -> Ended(reason)`); the client polls it
+  and reaps a share that ended on its own (cancel, compositor revoke, death),
+  tearing down the paired system-audio capture with it.
 - `enclave-transport` -- signaling + media transport. A pure `relay` routing
   core (metadata only; every payload opaque) drives both a reliable WebSocket
   signaling channel and a low-latency UDP media channel (`Server` runs both over
@@ -66,7 +81,9 @@ crypto  media  transport
 
 The client is **always a native, self-contained desktop window**, never a browser
 and never a localhost web service. It embeds a system WebView (`wry`/`tao` ->
-WebView2 on Windows, WebKit elsewhere) inside a single app window.
+WebView2 on Windows, WebKitGTK on Linux -- where the webview mounts into the
+tao window's GTK box and H.264 WebCodecs decode rides WebKit's GStreamer,
+checked at UI boot) inside a single app window.
 
 - The front end may be whatever web stack we like -- TypeScript, React, Svelte,
   or plain HTML/CSS. It is **bundled into the binary** (today a single
@@ -115,6 +132,7 @@ window by default and only add the WASM/browser target when we choose to.
 | 3 | media | `cpal`, `opus`; transport gains WebRTC/QUIC media |
 | 5 | media | `nokhwa` (camera), a video codec (VP9/AV1), screen capture |
 | 6 | client | `wry`/`tao` (self-contained WebView window) |
+| Linux port | media | `ashpd` (XDG portal), `pipewire` (video + loopback streams), `v4l` (capture-node filter) -- Linux-only target deps |
 
 ## Roadmap
 
@@ -156,7 +174,14 @@ window by default and only add the WASM/browser target when we choose to.
    `crates/crypto/tests/multiparty.rs` (three members agree; add/remove rekey;
    a removed member cannot open post-removal media) and the larger-group relay
    fan-out test.
-5. Video + screenshare.
+5. [DONE] Video + screenshare, on both desktop platforms. Sent as H.264
+   inside the same sealed-frame path as audio (`MediaKind::Screen` for the
+   share viewer, `MediaKind::Video` for camera tiles); decoded in the UI by
+   WebCodecs. Capture backends per platform (see the `enclave-media` table):
+   WGC/DXGI + WASAPI loopback on Windows, XDG portal + PipeWire on Linux
+   (validated end to end by `crates/media/examples/{screen,system_audio,
+   camera,mic}_probe` on real hardware; the interactive portal-dialog leg is
+   validated on a real desktop session).
 6. [MOSTLY DONE] Self-contained window + client controller. `enclave-client` is
    now a lib + bin: the lib is a high-level `Client` controller (connect, start
    group, invite, send text, safety number, event pump) proven by

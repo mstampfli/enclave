@@ -1,13 +1,29 @@
 # Running Enclave
 
-Everything below builds on Windows (WebView2) and Linux/macOS for the server.
-Nothing here is audited or safe to rely on yet.
+The client builds and runs on Windows (WebView2) and Linux (WebKitGTK +
+PipeWire); the server also runs on macOS. Nothing here is audited or safe to
+rely on yet.
+
+## 0. Linux build dependencies
+
+Debian/Ubuntu names; the Windows build needs no extra system packages.
+
+```
+sudo apt install build-essential clang nasm cmake pkg-config \
+    libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libpipewire-0.3-dev
+```
+
+At runtime the desktop needs PipeWire, an XDG desktop portal with a ScreenCast
+backend (KDE, GNOME, wlr, ... -- present on any mainstream desktop), and
+WebKitGTK's GStreamer H.264 decoder (`gstreamer1.0-libav` or
+`gstreamer1.0-plugins-bad`) to *watch* shares; the app tells you at startup if
+that decoder is missing.
 
 ## 1. Build
 
 ```
 cargo build
-cargo test        # 40+ headless tests
+cargo test        # 60+ headless tests
 ```
 
 ## 2. Run the relay server
@@ -42,18 +58,32 @@ A native window opens (no browser). Steps in the UI:
 Run two clients (two names) against one server to talk to yourself across
 windows.
 
-## 4. Check the audio device path on real hardware
+### Sharing on Linux vs Windows
 
-The audio capture/playback code compiles but cannot be exercised in CI. This
-example runs the mic -> Opus -> speaker loop locally so you can confirm it works
-on your machine (use headphones to avoid feedback):
+- **Windows** lists every monitor and window in the share picker; sharing a
+  window can carry just that app's audio (echo-free).
+- **Linux** shows one "Screen or window (choose in the system dialog)" entry:
+  the desktop portal's own picker chooses what to share (that is the only way
+  a Wayland app may see other windows). Shared audio is the whole system mix,
+  so the picker warns that others may hear the call echo back.
+
+## 4. Check the capture paths on real hardware
+
+Device capture cannot be exercised in CI; these probes verify each leg on your
+machine (all `[PASS]`/`[FAIL]`-scored, non-zero exit on failure):
 
 ```
-cargo run -p enclave-media --example mic_loopback
+cargo run -p enclave-media --example mic_probe            # mic frames flow
+cargo run -p enclave-media --example camera_probe         # webcam -> BGRA frames
+cargo run -p enclave-media --example system_audio_probe   # Linux: loopback hears a tone (audible!)
+cargo run -p enclave-media --example screen_probe -- --self-test  # Linux: PipeWire video leg, pixel-exact
+cargo run -p enclave-media --example screen_probe         # Linux: interactive portal dialog leg
+cargo run -p enclave-media --example mic_loopback         # hear yourself via Opus (headphones!)
 ```
 
 ## Still to come
 
-Live in-call audio wiring (feeding captured frames through the network and the
-jitter buffer to playback) and video/screenshare. The crypto, transport,
-presence, and relay are done and tested; see `ARCHITECTURE.md`.
+Presence broadcast polish and a persistent friends roster beyond
+invite-by-name; a macOS capture backend (the media API stubs cleanly there).
+The crypto, transport, calls, screen/window/camera share, and per-app or
+system audio share are done and tested; see `ARCHITECTURE.md`.
