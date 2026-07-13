@@ -133,7 +133,10 @@ Chat messages are delivered reliably: text and MLS handshakes are acked by the
 server, retransmitted (on reconnect and on a timer) until acked, and deduped on
 the receiver, with the retransmit buffer persisted across restarts, so a
 connection drop, a server restart, or the app closing mid-send does not lose a
-message.
+message. A brief blip is invisible (the retransmit delivers it); if delivery is
+persistently stuck, the client flushes the pending messages to disk and warns
+you rather than retrying silently -- the messages keep trying and are never
+dropped.
 
 The crypto, transport, calls, screen/window/camera share, per-app and system
 audio share, friends, presence, groups, large messages, consent-gated file
