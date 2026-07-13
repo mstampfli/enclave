@@ -521,7 +521,7 @@ impl Relay {
                     // Target offline: queue the Welcome for their next login, so a
                     // member added while away still joins the group.
                     None => {
-                        self.queue.enqueue(&to.0, welcome);
+                        let _ = self.queue.enqueue(&to.0, welcome);
                         vec![]
                     }
                 }
@@ -917,7 +917,9 @@ impl Relay {
                 // Online: deliver now.
                 Some(&conn) => out.push(Outgoing { to: conn, msg }),
                 // Offline: park it for delivery on their next login.
-                None => self.queue.enqueue(&dev.0, msg),
+                None => {
+                    self.queue.enqueue(&dev.0, msg);
+                }
             }
         }
         out
