@@ -140,8 +140,10 @@ window by default and only add the WASM/browser target when we choose to.
    the encrypted session, so a message sent moments before the app closed is
    still retransmitted on next launch, and a resent message is shown once even
    if both peers restarted. The receiver dedups a resent message by its transfer
-   id, so at-least-once + dedup is effectively exactly-once. TCP handles
-   bytes-to-socket; this handles message-to-recipient, which TCP does not.
+   id, so at-least-once + dedup is effectively exactly-once. A persistent failure
+   (retrying past a threshold) warns the user rather than retrying forever
+   silently. TCP handles bytes-to-socket; this handles message-to-recipient,
+   which TCP does not.
 6. Docs update in the same commit as the change they describe.
 
 ## Dependency plan (added per-phase, in the crate that first uses them)

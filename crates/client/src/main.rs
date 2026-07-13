@@ -651,7 +651,9 @@ async fn run_client(
         // server-full.
         if let Some(c) = client.as_mut() {
             c.pump_uploads();
-            c.pump_retransmits();
+            if let Some(Event::Error(message)) = c.pump_retransmits() {
+                error_status(&proxy, message);
+            }
         }
 
         // A share can end without a command: the user cancels the system

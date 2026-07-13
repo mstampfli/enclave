@@ -45,6 +45,17 @@ const RETRANSMIT_AFTER: Duration = Duration::from_secs(5);
 /// ids covers it without unbounded growth.
 const MAX_SEEN_IDS: usize = 4096;
 
+/// How long a message may go un-acked (retransmitting) before the client warns
+/// the user it is not getting through. Well past a normal reconnect, so a brief
+/// blip is silent, but a genuinely stuck connection surfaces rather than
+/// retransmitting invisibly forever.
+const UNDELIVERED_WARN_AFTER: Duration = Duration::from_secs(30);
+
+/// Un-acked reliable messages tolerated before the client warns that delivery is
+/// backing up (a stuck or absent server). They are still kept and retried, never
+/// dropped; this just bounds how far the backlog grows silently.
+const MAX_UNACKED_BEFORE_WARN: usize = 256;
+
 /// Why a screen share ended on its own (see [`Client::reap_ended_share`]):
 /// `Cancelled` is the user changing their mind at the system picker, `Failed`
 /// is a real error worth showing loudly.
@@ -223,6 +234,15 @@ struct OutgoingFile {
     started: bool,
 }
 
+/// A reliable message awaiting the server's ack. `first` is when it was first
+/// sent (the stall clock, for warning the user), `last` when it was last (re)sent
+/// (the retry clock). Both survive a restart as "now" on reload.
+struct Pending {
+    msg: ClientMsg,
+    first: Instant,
+    last: Instant,
+}
+
 /// An upload in progress: the open file and our position in it. The pump seals
 /// and sends one chunk at a time only while the connection's bounded file queue
 /// has room, so a large (or live, arbitrary-size) file is streamed from disk and
@@ -313,9 +333,12 @@ pub struct Client {
     /// time they were last sent), retransmitted on reconnect and on a timer until
     /// acked, so a dropped connection or a transient server-full never loses a
     /// message. `seen` dedups a fully-resent message on the receive side.
+    /// `delivery_warned` tracks whether we have already told the user delivery is
+    /// stuck, so the warning fires on the transition, not every tick.
     next_seq: u64,
-    unacked: BTreeMap<u64, (ClientMsg, Instant)>,
+    unacked: BTreeMap<u64, Pending>,
     seen: transfer::SeenSet,
+    delivery_warned: bool,
     /// Files offered to us, awaiting/undergoing consented download (see
     /// [`IncomingFile`]). An entry exists from the offer until it resolves.
     incoming_files: HashMap<[u8; 16], IncomingFile>,
@@ -353,6 +376,7 @@ impl Client {
             next_seq: 0,
             unacked: BTreeMap::new(),
             seen: transfer::SeenSet::new(MAX_SEEN_IDS),
+            delivery_warned: false,
         })
     }
 
@@ -1187,7 +1211,15 @@ impl Client {
     fn send_reliable(&mut self, msg: ClientMsg) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.unacked.insert(seq, (msg.clone(), Instant::now()));
+        let now = Instant::now();
+        self.unacked.insert(
+            seq,
+            Pending {
+                msg: msg.clone(),
+                first: now,
+                last: now,
+            },
+        );
         self.conn.send(ClientMsg::Reliable {
             seq,
             msg: Box::new(msg),
@@ -1203,9 +1235,9 @@ impl Client {
         let pending: Vec<(u64, ClientMsg)> = self
             .unacked
             .iter_mut()
-            .map(|(seq, (msg, sent))| {
-                *sent = now;
-                (*seq, msg.clone())
+            .map(|(seq, p)| {
+                p.last = now;
+                (*seq, p.msg.clone())
             })
             .collect();
         for (seq, msg) in pending {
@@ -1217,30 +1249,50 @@ impl Client {
     }
 
     /// Retransmit reliable messages the server has not acked within
-    /// [`RETRANSMIT_AFTER`]. Driven by the event loop; on a healthy connection
-    /// nothing is due (acks arrive first), so this only fires for a genuinely
-    /// lost message/ack or a clearing server-queue-full.
-    pub fn pump_retransmits(&mut self) {
-        if self.unacked.is_empty() {
-            return;
-        }
+    /// [`RETRANSMIT_AFTER`], and surface a warning if delivery is persistently
+    /// stuck (a message retrying past [`UNDELIVERED_WARN_AFTER`], or a backlog
+    /// past [`MAX_UNACKED_BEFORE_WARN`]). Driven by the event loop; on a healthy
+    /// connection nothing is due and nothing is stuck. Returns a one-shot warning
+    /// event on the transition into a stuck state (never every tick).
+    pub fn pump_retransmits(&mut self) -> Option<Event> {
         let now = Instant::now();
         let due: Vec<u64> = self
             .unacked
             .iter()
-            .filter(|(_, (_, sent))| now.duration_since(*sent) >= RETRANSMIT_AFTER)
+            .filter(|(_, p)| now.duration_since(p.last) >= RETRANSMIT_AFTER)
             .map(|(seq, _)| *seq)
             .collect();
         for seq in due {
-            if let Some((msg, sent)) = self.unacked.get_mut(&seq) {
-                *sent = now;
-                let msg = msg.clone();
+            if let Some(p) = self.unacked.get_mut(&seq) {
+                p.last = now;
+                let msg = p.msg.clone();
                 self.conn.send(ClientMsg::Reliable {
                     seq,
                     msg: Box::new(msg),
                 });
             }
         }
+
+        // Warn once when delivery becomes persistently stuck, and reset when it
+        // recovers, so the user learns their messages are not getting through
+        // instead of them retransmitting invisibly forever.
+        let stuck = self.unacked.len() > MAX_UNACKED_BEFORE_WARN
+            || self
+                .unacked
+                .values()
+                .any(|p| now.duration_since(p.first) >= UNDELIVERED_WARN_AFTER);
+        if stuck && !self.delivery_warned {
+            self.delivery_warned = true;
+            let n = self.unacked.len();
+            return Some(Event::Error(format!(
+                "{n} message{} not delivered yet -- still retrying; check your connection.",
+                if n == 1 { "" } else { "s" }
+            )));
+        }
+        if !stuck {
+            self.delivery_warned = false;
+        }
+        None
     }
 
 
@@ -1927,7 +1979,7 @@ impl Client {
             unacked: self
                 .unacked
                 .iter()
-                .map(|(seq, (msg, _))| (*seq, msg.clone()))
+                .map(|(seq, p)| (*seq, p.msg.clone()))
                 .collect(),
             seen_ids: self.seen.snapshot(),
         };
@@ -1945,11 +1997,16 @@ impl Client {
         // when the app last closed is retransmitted on this launch (not lost).
         // Backdate its last-sent so the retransmit pump replays it promptly.
         self.next_seq = self.next_seq.max(data.next_seq);
-        let due = Instant::now()
-            .checked_sub(RETRANSMIT_AFTER)
-            .unwrap_or_else(Instant::now);
+        let now = Instant::now();
+        let due = now.checked_sub(RETRANSMIT_AFTER).unwrap_or(now);
         for (seq, msg) in data.unacked {
-            self.unacked.entry(seq).or_insert((msg, due));
+            // A fresh stall clock (`first: now`) so a restart does not instantly
+            // warn; `last: due` so the retransmit pump replays it promptly.
+            self.unacked.entry(seq).or_insert(Pending {
+                msg,
+                first: now,
+                last: due,
+            });
         }
         self.seen.restore(data.seen_ids);
         if data.conversations.is_empty() {

@@ -476,7 +476,10 @@ for offline ones); the sender retransmits until acked, replaying on reconnect an
 from a persisted buffer on restart; the receiver dedups a resent message by its
 transfer id. This defends against **faults** -- a dropped connection, a server
 restart, the app closing mid-send, a transient queue-full -- so no chat message
-is silently lost to them.
+is silently lost to them. A *transient* failure is invisible (the retransmit
+delivers it), but a *persistent* one is not silent: if a message keeps retrying
+past a threshold (or the un-acked backlog grows), the client warns the user that
+delivery is stuck rather than retransmitting forever with no feedback.
 
 It is explicitly **not** a defense against a malicious relay. Delivery ultimately
 depends on the semi-trusted server, which by its nature can refuse to route
