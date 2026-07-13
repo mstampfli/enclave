@@ -422,14 +422,33 @@ surface, and every axis is bounded (`filestore.rs`, `relay.rs`).
   minimum needed for DoS control; the name and content stay sealed, and a live
   offer sends size 0 (the server stores nothing, so needs no size).
 
+### Denial of service -- per-connection outbound memory (bounded)
+
+Server->client delivery is bounded per connection so a slow or stalled reader
+cannot make the server buffer unbounded memory for it. Each online connection has
+an `Outbound` queue (`server.rs`) with two independent byte budgets:
+
+- a **file budget** (12 MiB) for the stored-blob stream, which *backpressures* --
+  the streamer awaits room, so a slow reader paces its own download instead of
+  growing memory;
+- a **control budget** (4 MiB) for everything else (control, text, relayed live
+  chunks), which never blocks a sender's connection and drops a message only once
+  even this budget is full (the reader is then not draining at all -- effectively
+  dead). A dropped live chunk fails that one transfer cleanly (the receiver's
+  in-order sink aborts), never corrupt.
+
+The budgets are separate, so a maxed-out file stream to a mid-download reader
+cannot starve that reader's control/text. Total buffered per connection is capped
+at their sum (16 MiB). This is the *online* path only: a message for an **offline**
+recipient goes to the persistent, separately-bounded `msgqueue` (per-device
+oldest-eviction, global cap) and is never subject to these caps -- so slow-reader
+backpressure never drops a store-and-forward message. Proven by
+`server::outbound_tests::{try_send_bounds_the_control_budget_and_drops_the_rest,
+a_saturated_file_stream_never_starves_control,
+the_file_budget_backpressures_instead_of_dropping}`.
+
 ### Residual / accepted risks
 
-- **Outbound channel backpressure is unbounded.** Server->client delivery uses an
-  unbounded channel (as all message types do), so a recipient who accepts a large
-  file and then reads slowly can make the server buffer that file in its own
-  outbound channel. This is a pre-existing property of the whole delivery path,
-  bounded per-file by the 250 MB stored cap and by consent; a bounded,
-  backpressured writer is a future improvement noted here, not silently skipped.
 - **Group + live: a late accepter misses the stream.** A live transfer is
   one-shot: the sender streams once to whoever has accepted. A group member who
   accepts after the stream finished does not receive it (they can be re-offered).

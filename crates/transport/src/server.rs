@@ -15,14 +15,14 @@ use bincode::Options;
 use enclave_protocol::{ClientMsg, Sealed, ServerMsg, UdpMsg};
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::error::TransportError;
-use crate::filestore::BlobReader;
 use crate::media_socket::media_codec;
 use crate::ratelimit::TokenBucket;
 use crate::relay::{BlobDelivery, ConnId, Relay};
@@ -30,6 +30,25 @@ use crate::relay::{BlobDelivery, ConnId, Relay};
 /// How often the server sweeps lapsed file offers (stored TTL and the live
 /// accept window). Frequent enough that a live offer's ~90s window is honored.
 const FILE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Per-connection outbound memory is capped in two independent budgets (ASVS
+/// V11), so a slow or stalled reader can never make the server buffer more than
+/// their sum, and a bulk file delivery can never starve the reader's control and
+/// text traffic:
+///  - `MAX_OUTBOUND_FILE_BYTES` bounds an in-flight stored-file stream, which
+///    *backpressures* at this bound (the streamer awaits room), so a slow reader
+///    paces its own download instead of growing memory.
+///  - `MAX_OUTBOUND_CTRL_BYTES` bounds everything else (control, text, relayed
+///    live chunks). These never block a sender's connection, so on overflow the
+///    message is dropped -- but only once even this budget is full, which means
+///    the reader is not draining tiny messages either, i.e. effectively dead.
+/// Because the two budgets are separate, a maxed-out file stream leaves the full
+/// control budget available, so ordinary messages to a mid-download reader are
+/// not dropped. Each is kept within `u32` so a message's size fits one permit.
+/// (Offline recipients are a different path entirely: their messages go to the
+/// persistent `msgqueue`, never here, and are not subject to these caps.)
+const MAX_OUTBOUND_FILE_BYTES: usize = 12 * 1024 * 1024;
+const MAX_OUTBOUND_CTRL_BYTES: usize = 4 * 1024 * 1024;
 
 /// Cap on a signaling message. Key packages and Welcomes are small; this bounds
 /// memory a malicious client can force the server to allocate (ASVS V5/V12).
@@ -59,7 +78,97 @@ const MEDIA_RATE_PER_SEC: f64 = 4000.0;
 /// Shared server state: the routing brain plus a per-connection outbound queue.
 struct ServerState {
     relay: Relay,
-    txs: HashMap<ConnId, mpsc::UnboundedSender<ServerMsg>>,
+    txs: HashMap<ConnId, Outbound>,
+}
+
+/// PRIMITIVE: a per-connection outbound queue bounded by bytes in flight, in two
+/// independent budgets. The single mechanism that caps server memory per
+/// connection and paces a slow reader. FOR every server->client message; NOT a
+/// general channel -- it carries pre-serialized frames each coupled to a byte
+/// permit (from one of the two budgets), so each cap is exact.
+///
+/// - `send` (async) draws on the *file* budget and AWAITS room -- true
+///   backpressure. Use it only for the high-volume producer, the stored-blob
+///   streamer, so a slow reader stalls its own download rather than growing
+///   server memory.
+/// - `try_send` draws on the *control* budget, never blocks, and DROPS the
+///   message if that budget is full. Use it for control/text and relayed live
+///   chunks dispatched from the reader loop, where blocking would stall an
+///   unrelated sender's whole connection. Because it is a separate budget, a
+///   maxed-out file stream cannot cause a control/text drop; a drop here means
+///   even the small control budget is full, i.e. the reader is not draining at
+///   all (effectively dead). A dropped live chunk makes that one transfer fail
+///   cleanly (the receiver's in-order sink aborts), not corrupt.
+///
+/// A frame's permit is released only after the writer hands it to the socket, so
+/// each budget accounts its frames' bytes for their whole lifetime in memory.
+#[derive(Clone)]
+struct Outbound {
+    tx: mpsc::UnboundedSender<Framed>,
+    file_quota: Arc<Semaphore>,
+    ctrl_quota: Arc<Semaphore>,
+}
+
+/// A serialized frame plus the byte permit it holds until it is written out.
+struct Framed {
+    bytes: Vec<u8>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Outbound {
+    fn new() -> (Outbound, mpsc::UnboundedReceiver<Framed>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Outbound {
+                tx,
+                file_quota: Arc::new(Semaphore::new(MAX_OUTBOUND_FILE_BYTES)),
+                ctrl_quota: Arc::new(Semaphore::new(MAX_OUTBOUND_CTRL_BYTES)),
+            },
+            rx,
+        )
+    }
+
+    /// Serialize `msg` and the permit count it needs (its on-wire byte size,
+    /// clamped to `cap` so a lone oversize frame can never wait for more permits
+    /// than the budget holds).
+    fn frame(msg: &ServerMsg, cap: usize) -> Option<(Vec<u8>, u32)> {
+        let bytes = serde_json::to_vec(msg).ok()?;
+        let n = bytes.len().min(cap) as u32;
+        Some((bytes, n))
+    }
+
+    /// Await room in the file budget, then queue. Backpressure; errs only if the
+    /// connection is gone. For the stored-blob streamer.
+    async fn send(&self, msg: &ServerMsg) -> Result<(), ()> {
+        let (bytes, n) = Self::frame(msg, MAX_OUTBOUND_FILE_BYTES).ok_or(())?;
+        let permit = self
+            .file_quota
+            .clone()
+            .acquire_many_owned(n)
+            .await
+            .map_err(|_| ())?;
+        self.tx
+            .send(Framed {
+                bytes,
+                _permit: permit,
+            })
+            .map_err(|_| ())
+    }
+
+    /// Queue without waiting on the control budget; drop the message if that
+    /// budget is already full. For control/text and relayed live chunks.
+    fn try_send(&self, msg: &ServerMsg) {
+        let Some((bytes, n)) = Self::frame(msg, MAX_OUTBOUND_CTRL_BYTES) else {
+            return;
+        };
+        let Ok(permit) = self.ctrl_quota.clone().try_acquire_many_owned(n) else {
+            return;
+        };
+        let _ = self.tx.send(Framed {
+            bytes,
+            _permit: permit,
+        });
+    }
 }
 
 /// A server instance. Start the signaling and/or media channels on it; they
@@ -260,24 +369,24 @@ where
     };
     let (mut write, mut read) = ws.split();
 
-    // Register the connection and its outbound queue.
-    let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
+    // Register the connection and its byte-bounded outbound queue.
+    let (out, mut rx) = Outbound::new();
     let conn = {
         let mut s = state.lock().unwrap();
         let conn = s.relay.connect();
-        s.txs.insert(conn, tx);
+        s.txs.insert(conn, out);
         conn
     };
 
-    // Writer task: serialize queued ServerMsgs to the socket.
+    // Writer task: write already-serialized frames to the socket. Each frame's
+    // byte permit is released here, after the write, so the outbound byte cap
+    // accounts a frame from the moment it is queued until it leaves for the wire.
     let writer = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            let Ok(bytes) = serde_json::to_vec(&msg) else {
-                continue;
-            };
-            if write.send(Message::binary(bytes)).await.is_err() {
+        while let Some(framed) = rx.recv().await {
+            if write.send(Message::binary(framed.bytes)).await.is_err() {
                 break;
             }
+            // framed._permit drops here, releasing its bytes back to the quota.
         }
     });
 
@@ -310,89 +419,111 @@ where
             continue;
         }
 
-        // Route under the lock; resolve target senders; release before sending.
+        // Route under the lock; resolve target queues; release before sending.
         // Also collect any stored-blob deliveries scheduled by this message, to
         // stream off-lock (a large blob read must never hold the global lock).
         let (sends, deliveries) = {
             let mut s = state.lock().unwrap();
             let outgoing = s.relay.handle(conn, client_msg);
-            let sends: Vec<(mpsc::UnboundedSender<ServerMsg>, ServerMsg)> = outgoing
+            let sends: Vec<(Outbound, ServerMsg)> = outgoing
                 .into_iter()
-                .filter_map(|o| s.txs.get(&o.to).cloned().map(|tx| (tx, o.msg)))
+                .filter_map(|o| s.txs.get(&o.to).cloned().map(|out| (out, o.msg)))
                 .collect();
-            let deliveries: Vec<(BlobDelivery, mpsc::UnboundedSender<ServerMsg>)> = s
+            let deliveries: Vec<(BlobDelivery, Outbound)> = s
                 .relay
                 .take_blob_deliveries()
                 .into_iter()
-                .filter_map(|d| s.txs.get(&d.to).cloned().map(|tx| (d, tx)))
+                .filter_map(|d| s.txs.get(&d.to).cloned().map(|out| (d, out)))
                 .collect();
             (sends, deliveries)
         };
-        for (tx, msg) in sends {
-            let _ = tx.send(msg);
+        // Control/text/relayed-live: non-blocking, bounded by the outbound cap.
+        for (out, msg) in sends {
+            out.try_send(&msg);
         }
-        for (delivery, tx) in deliveries {
+        for (delivery, out) in deliveries {
             let state = state.clone();
-            // The blob read is blocking I/O and can be large, so it runs on a
-            // blocking thread, off the async workers and off the relay lock.
-            tokio::task::spawn_blocking(move || stream_blob(state, delivery, tx));
+            // A stored blob is streamed off the relay lock with backpressure, so
+            // a slow recipient stalls its own download instead of buffering the
+            // whole file in server memory.
+            tokio::spawn(stream_blob(state, delivery, out));
         }
     }
 
     // Cleanup: disconnect may produce presence-offline broadcasts to deliver.
-    let sends: Vec<(mpsc::UnboundedSender<ServerMsg>, ServerMsg)> = {
+    let sends: Vec<(Outbound, ServerMsg)> = {
         let mut s = state.lock().unwrap();
         let outgoing = s.relay.disconnect(conn);
         s.txs.remove(&conn);
         outgoing
             .into_iter()
-            .filter_map(|o| s.txs.get(&o.to).cloned().map(|tx| (tx, o.msg)))
+            .filter_map(|o| s.txs.get(&o.to).cloned().map(|out| (out, o.msg)))
             .collect()
     };
-    for (tx, msg) in sends {
-        let _ = tx.send(msg);
+    for (out, msg) in sends {
+        out.try_send(&msg);
     }
     writer.abort();
 }
 
 /// Stream one stored blob to an accepting recipient off the relay lock, one
-/// sealed chunk at a time (never the whole file in memory), then mark the
-/// delivery done so the store can reclaim the blob once every recipient has
-/// resolved. If the recipient's connection drops mid-stream, the delivery is
-/// aborted (the offer stays pending, so it can be retried).
-fn stream_blob(
-    state: Arc<Mutex<ServerState>>,
-    d: BlobDelivery,
-    tx: mpsc::UnboundedSender<ServerMsg>,
-) {
-    let ok = match BlobReader::open(&d.blob) {
-        Ok(mut reader) => loop {
-            match reader.next_chunk() {
-                Ok(Some(chunk)) => {
-                    let msg = ServerMsg::FileChunk {
-                        offer_id: d.offer_id,
-                        from: d.from.clone(),
-                        data: Sealed(chunk),
-                    };
-                    if tx.send(msg).is_err() {
-                        break false; // recipient disconnected
-                    }
-                }
-                Ok(None) => break true, // end of blob
-                Err(_) => break false,  // read error
-            }
-        },
+/// sealed chunk at a time (never the whole file in memory) and with backpressure
+/// (the recipient's outbound cap paces the read), then mark the delivery done so
+/// the store can reclaim the blob once every recipient has resolved. If the
+/// recipient's connection drops mid-stream, the delivery is aborted (the offer
+/// stays pending, so it can be retried).
+async fn stream_blob(state: Arc<Mutex<ServerState>>, d: BlobDelivery, out: Outbound) {
+    let ok = match tokio::fs::File::open(&d.blob).await {
+        Ok(mut f) => stream_blob_chunks(&mut f, &d, &out).await,
         Err(_) => false,
     };
-    let mut s = state.lock().unwrap();
     if ok {
-        let _ = tx.send(ServerMsg::FileComplete {
+        // Ordered after the chunks (same queue); tiny, so it is not dropped.
+        out.try_send(&ServerMsg::FileComplete {
             offer_id: d.offer_id,
             from: d.from.clone(),
         });
+    }
+    let mut s = state.lock().unwrap();
+    if ok {
         s.relay.finish_stored_delivery(&d.offer_id, &d.recipient);
     } else {
         s.relay.abort_stored_delivery(&d.offer_id, &d.recipient);
+    }
+}
+
+/// Read the length-prefixed sealed chunks of a blob and stream each one to the
+/// recipient, awaiting outbound room between chunks. Returns whether the whole
+/// blob was delivered (`false` on read error, corrupt length, or a dropped
+/// recipient). The blob format matches `filestore`'s writer: a `u32` LE length
+/// then that many bytes, per chunk.
+async fn stream_blob_chunks(f: &mut tokio::fs::File, d: &BlobDelivery, out: &Outbound) -> bool {
+    loop {
+        let mut len_buf = [0u8; 4];
+        match f.read_exact(&mut len_buf).await {
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return true,
+            Err(_) => return false,
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+        // A single sealed chunk is under the frame limit; a larger length means
+        // a corrupt blob, so refuse it rather than allocate a huge buffer.
+        if len > SIGNALING_MSG_LIMIT {
+            return false;
+        }
+        let mut buf = vec![0u8; len];
+        if f.read_exact(&mut buf).await.is_err() {
+            return false;
+        }
+        let msg = ServerMsg::FileChunk {
+            offer_id: d.offer_id,
+            from: d.from.clone(),
+            data: Sealed(buf),
+        };
+        // Backpressure: awaits until the recipient's outbound has room.
+        if out.send(&msg).await.is_err() {
+            return false; // recipient disconnected
+        }
     }
 }
 
@@ -402,17 +533,107 @@ fn spawn_file_sweeper(state: Arc<Mutex<ServerState>>) {
         let mut ticker = tokio::time::interval(FILE_SWEEP_INTERVAL);
         loop {
             ticker.tick().await;
-            let sends: Vec<(mpsc::UnboundedSender<ServerMsg>, ServerMsg)> = {
+            let sends: Vec<(Outbound, ServerMsg)> = {
                 let mut s = state.lock().unwrap();
                 let outgoing = s.relay.sweep_files();
                 outgoing
                     .into_iter()
-                    .filter_map(|o| s.txs.get(&o.to).cloned().map(|tx| (tx, o.msg)))
+                    .filter_map(|o| s.txs.get(&o.to).cloned().map(|out| (out, o.msg)))
                     .collect()
             };
-            for (tx, msg) in sends {
-                let _ = tx.send(msg);
+            for (out, msg) in sends {
+                out.try_send(&msg);
             }
         }
     });
+}
+
+#[cfg(test)]
+mod outbound_tests {
+    use super::*;
+    use enclave_protocol::ServerMsg;
+
+    // A control message whose serialized size is about `bytes`.
+    fn msg(bytes: usize) -> ServerMsg {
+        ServerMsg::Error {
+            detail: "x".repeat(bytes),
+        }
+    }
+
+    // Count (and drop) everything currently queued, releasing its permits.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<Framed>) -> usize {
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn try_send_bounds_the_control_budget_and_drops_the_rest() {
+        let (out, mut rx) = Outbound::new();
+        // ~1 MiB each; the 4 MiB control budget holds a few, the rest are dropped
+        // (never blocks, never grows without bound).
+        for _ in 0..16 {
+            out.try_send(&msg(1024 * 1024));
+        }
+        let queued = drain(&mut rx);
+        assert!(
+            (1..=4).contains(&queued),
+            "control budget bounded the queue, got {queued}"
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_frames_frees_the_budget_again() {
+        let (out, mut rx) = Outbound::new();
+        for _ in 0..16 {
+            out.try_send(&msg(1024 * 1024));
+        }
+        assert!(drain(&mut rx) > 0);
+        // Permits are released as the frames drop, so there is room once more.
+        out.try_send(&msg(1024 * 1024));
+        assert_eq!(drain(&mut rx), 1, "budget freed after draining");
+    }
+
+    #[tokio::test]
+    async fn a_saturated_file_stream_never_starves_control() {
+        let (out, mut rx) = Outbound::new();
+        // Hold the entire file budget, as the blob streamer would while a reader
+        // is stalled mid-download.
+        let _held = out
+            .file_quota
+            .clone()
+            .acquire_many_owned(MAX_OUTBOUND_FILE_BYTES as u32)
+            .await
+            .unwrap();
+        // Control still flows: the two budgets are independent.
+        out.try_send(&msg(1024));
+        assert_eq!(drain(&mut rx), 1, "control not starved by a full file budget");
+    }
+
+    #[tokio::test]
+    async fn the_file_budget_backpressures_instead_of_dropping() {
+        let (out, mut rx) = Outbound::new();
+        // Fill the file budget so no permits remain.
+        let _held = out
+            .file_quota
+            .clone()
+            .acquire_many_owned(MAX_OUTBOUND_FILE_BYTES as u32)
+            .await
+            .unwrap();
+        // A file send now blocks (backpressure) rather than dropping; it must not
+        // complete until room frees up.
+        let m = msg(1024);
+        let send = out.send(&m);
+        tokio::pin!(send);
+        tokio::select! {
+            _ = &mut send => panic!("file send should block while the budget is full"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+        // Free the budget; the send now completes.
+        drop(_held);
+        send.await.expect("send completes once room frees");
+        assert_eq!(drain(&mut rx), 1);
+    }
 }

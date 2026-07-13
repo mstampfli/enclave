@@ -12,7 +12,7 @@ bincode = "1.3"
 futures-util = "0.3.32"
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time", "fs"] }
 tokio-tungstenite = "0.30.0"
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
