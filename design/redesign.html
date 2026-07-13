@@ -95,8 +95,7 @@ input, select, textarea { font: inherit; }
 .icon.sm { width: 15px; height: 15px; }
 
 .field { display: flex; flex-direction: column; gap: 5px; }
-.field label { font-family: var(--mono); font-size: 11px; text-transform: uppercase;
-  letter-spacing: 0.08em; color: var(--muted); }
+.field label { font-size: 12.5px; font-weight: 550; color: var(--muted); }
 .field input, .field select {
   padding: 8px 10px; border-radius: var(--radius);
   background: var(--bg); border: 1px solid var(--border);
@@ -136,7 +135,7 @@ input, select, textarea { font: inherit; }
 .login-brand svg { width: 30px; height: 30px; }
 .login-brand .name {
   font-family: var(--mono); font-size: 19px; font-weight: 600;
-  letter-spacing: 0.22em; color: var(--ink-strong);
+  letter-spacing: 0.16em; color: var(--ink-strong);
 }
 .login-tagline { font-size: 13.5px; color: var(--muted); margin-top: -10px; }
 .login-tabs { display: flex; border: 1px solid var(--border); border-radius: var(--radius); }
@@ -161,7 +160,8 @@ input, select, textarea { font: inherit; }
   display: flex; flex-direction: column; min-height: 0;
 }
 
-.self-card { display: flex; align-items: center; gap: 10px; padding: 13px 14px 11px; }
+.self-card { display: flex; align-items: center; gap: 10px; padding: 13px 14px 11px;
+  position: relative; }
 .self-card .who { flex: 1; min-width: 0; }
 .self-card .who .display { font-weight: 600; font-size: 14px; color: var(--ink-strong);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -169,10 +169,30 @@ input, select, textarea { font: inherit; }
   color: var(--muted); padding: 1px 5px; margin-left: -5px; border-radius: var(--radius); }
 .presence-btn:hover { background: var(--raised); color: var(--ink); }
 
+.presence-menu {
+  position: absolute; left: 12px; top: 56px; z-index: 30; width: 248px;
+  background: var(--panel); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg); padding: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.presence-menu button.pm-item { display: flex; align-items: center; gap: 9px; width: 100%;
+  padding: 7px 9px; border-radius: var(--radius); text-align: left; font-size: 13.5px;
+  color: var(--ink); }
+.presence-menu button.pm-item:hover { background: var(--raised); }
+.presence-menu button.pm-item .pm-sub { margin-left: auto; font-size: 11.5px; color: var(--faint); white-space: nowrap; }
+.presence-menu button.pm-item .check { width: 14px; height: 14px; margin-left: auto;
+  color: var(--accent-ink); }
+.presence-menu .pm-divider { height: 1px; background: var(--border); margin: 4px 2px; }
+.pm-keep { display: flex; align-items: center; gap: 8px; padding: 4px 9px 6px; }
+.pm-keep label { font-size: 12.5px; color: var(--muted); flex: none; }
+.pm-keep select { flex: 1; padding: 4px 6px; border-radius: var(--radius);
+  background: var(--bg); border: 1px solid var(--border); color: var(--ink); font-size: 12.5px; }
+.pm-note { font-size: 11.5px; color: var(--faint); padding: 0 9px 6px; }
+
 .side-tabs { display: flex; padding: 0 14px; gap: 16px; border-bottom: 1px solid var(--border); }
 .side-tabs button {
-  padding: 7px 2px 8px; font-family: var(--mono); font-size: 12px;
-  text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted);
+  padding: 7px 2px 8px; font-size: 13px; font-weight: 550; color: var(--muted);
   border-bottom: 1px solid transparent; margin-bottom: -1px;
   transition: color 130ms ease-out;
 }
@@ -186,8 +206,7 @@ input, select, textarea { font: inherit; }
 .side-section { margin-bottom: 14px; }
 .side-section > .head {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 2px 8px 6px; font-family: var(--mono); font-size: 10.5px; font-weight: 500;
-  letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint);
+  padding: 2px 8px 6px; font-size: 12px; font-weight: 550; color: var(--faint);
 }
 .side-section > .head button { color: var(--muted); display: grid; place-items: center;
   width: 20px; height: 20px; border-radius: var(--radius); }
@@ -213,7 +232,7 @@ input, select, textarea { font: inherit; }
 }
 .convo-row .live {
   display: inline-flex; align-items: center; gap: 5px;
-  font-family: var(--mono); font-size: 11px; color: var(--accent-ink);
+  font-size: 12px; font-weight: 500; color: var(--accent-ink);
 }
 .live .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
 
@@ -333,7 +352,7 @@ input, select, textarea { font: inherit; }
 .tile .avatar { width: 48px; height: 48px; font-size: 16px; }
 .tile .nameplate {
   position: absolute; left: 6px; bottom: 6px;
-  font-family: var(--mono); font-size: 11px; color: var(--ink);
+  font-size: 12px; font-weight: 500; color: var(--ink);
   background: rgba(16, 16, 16, 0.88);
   padding: 2px 7px; border-radius: var(--radius);
   display: flex; align-items: center; gap: 5px;
@@ -348,7 +367,7 @@ input, select, textarea { font: inherit; }
 .ctl {
   display: inline-flex; flex-direction: column; align-items: center; gap: 3px;
   min-width: 76px; padding: 8px 12px 6px; border-radius: var(--radius);
-  color: var(--ink); font-family: var(--mono); font-size: 11px;
+  color: var(--ink); font-size: 12px; font-weight: 500;
   background: var(--raised); border: 1px solid var(--border);
   transition: background 130ms ease-out, border-color 130ms ease-out, color 130ms ease-out;
 }
@@ -370,8 +389,7 @@ input, select, textarea { font: inherit; }
 .msg-col { max-width: 720px; margin: 0 auto; padding: 22px 24px 10px; }
 
 .day-divider { display: flex; align-items: center; gap: 12px; margin: 18px 0 14px;
-  color: var(--faint); font-family: var(--mono); font-size: 11px;
-  text-transform: uppercase; letter-spacing: 0.08em; }
+  color: var(--faint); font-size: 12px; font-weight: 500; }
 .day-divider::before, .day-divider::after { content: ""; flex: 1; height: 1px;
   background: var(--border); }
 
@@ -432,8 +450,7 @@ input, select, textarea { font: inherit; }
   display: grid; place-items: center; border-radius: var(--radius); }
 .modal .m-head button:hover { background: var(--raised); color: var(--ink); }
 .modal .m-section { display: flex; flex-direction: column; gap: 10px; }
-.modal .m-section > .s-head { font-family: var(--mono); font-size: 10.5px; font-weight: 500;
-  letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint); }
+.modal .m-section > .s-head { font-size: 12px; font-weight: 550; color: var(--faint); }
 .modal .m-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .modal .divider { height: 1px; background: var(--border); }
 
@@ -489,8 +506,7 @@ input, select, textarea { font: inherit; }
   padding: 8px 11px; border-radius: var(--radius); text-align: left; font-size: 14px;
   border: 1px solid transparent; }
 .palette .p-row .icon { color: var(--muted); }
-.palette .p-row .kind { margin-left: auto; font-family: var(--mono); font-size: 10.5px;
-  color: var(--faint); text-transform: uppercase; letter-spacing: 0.08em; }
+.palette .p-row .kind { margin-left: auto; font-size: 11.5px; color: var(--faint); }
 .palette .p-row.sel { background: var(--hover); }
 .palette .p-hint { padding: 8px 16px; font-size: 12px; color: var(--faint);
   border-top: 1px solid var(--border); display: flex; gap: 14px; }
@@ -582,10 +598,33 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--raised);
       </div>
       <div class="who">
         <div class="display">Marc</div>
-        <button class="presence-btn" id="presence-btn">
+        <button class="presence-btn" id="presence-btn" aria-haspopup="menu">
           <span id="presence-label">Online</span>
           <svg class="icon sm" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
         </button>
+        <div class="presence-menu" id="presence-menu" hidden>
+          <button class="pm-item" data-mode="auto" title="Shows what your connection shows">
+            <span class="presence-dot online"></span> Automatic</button>
+          <button class="pm-item" data-mode="online">
+            <span class="presence-dot online"></span> Online</button>
+          <button class="pm-item" data-mode="away">
+            <span class="presence-dot away"></span> Away</button>
+          <button class="pm-item" data-mode="offline">
+            <span class="presence-dot offline"></span> Offline
+            <span class="pm-sub">appear offline</span></button>
+          <div class="pm-divider"></div>
+          <div class="pm-keep">
+            <label for="presence-duration">Keep for</label>
+            <select id="presence-duration">
+              <option value="0">until I change it</option>
+              <option value="30">30 minutes</option>
+              <option value="60">1 hour</option>
+              <option value="120">2 hours</option>
+              <option value="480">8 hours</option>
+            </select>
+          </div>
+          <div class="pm-note">Disconnecting always shows you offline.</div>
+        </div>
       </div>
       <button class="btn ghost" id="open-settings" title="Settings" aria-label="Settings" style="padding:6px">
         <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -921,6 +960,8 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--raised);
     <div class="d-head">Connection</div>
     <button data-proto="reconnect">Reconnecting</button>
     <button data-proto="online">Back online</button>
+    <div class="d-head">Presence</div>
+    <button data-proto="expire-status">Expire status override now</button>
     <div class="d-head">Trust</div>
     <button data-proto="unverify">Reset verification</button>
     <div class="d-head">Toasts</div>
@@ -1485,6 +1526,7 @@ function setConnection(s) {
     s === "online" ? "Connected · wss"
     : s === "reconnecting" ? "Reconnecting…" : "Offline";
   $("banner-reconnect").hidden = s !== "reconnecting";
+  if (typeof applyPresence === "function") applyPresence();
 }
 
 /* ---------------- login ---------------- */
@@ -1559,13 +1601,56 @@ $("mark-verified").onclick = () => {
 $("s-export").onclick = () => toast("Exported enclave-marc-backup.enc");
 $("s-import").onclick = () => toast("Choose a .enc backup file (prototype)");
 $("s-logout").onclick = () => { closeModals(); showLogin(true); };
-$("presence-btn").onclick = () => {
-  const order = ["online", "away", "offline"];
-  const cur = $("presence-label").textContent.toLowerCase();
-  const next = order[(order.indexOf(cur) + 1) % order.length];
-  $("presence-label").textContent = next[0].toUpperCase() + next.slice(1);
-  $("self-presence-dot").className = "presence-dot " + next;
+/* Presence: a manual status optionally expires back to automatic; a real
+   disconnect always shows offline regardless of what was picked. */
+const selfPresence = { mode: "auto", until: null };
+const cap = w => w[0].toUpperCase() + w.slice(1);
+
+function applyPresence() {
+  const real = state.connection === "online" ? "online" : "offline";
+  let shown = selfPresence.mode === "auto" ? real : selfPresence.mode;
+  if (state.connection !== "online") shown = "offline"; // reality wins
+  $("self-presence-dot").className = "presence-dot " + shown;
+  let label = selfPresence.mode === "auto" ? cap(shown) : cap(selfPresence.mode);
+  if (selfPresence.mode !== "auto" && selfPresence.until) {
+    const mins = Math.max(1, Math.ceil((selfPresence.until - Date.now()) / 60000));
+    label += mins >= 60 ? ` · ${Math.round(mins / 60)} h left` : ` · ${mins} min left`;
+  }
+  $("presence-label").textContent = label;
+}
+
+setInterval(() => {
+  if (selfPresence.until && Date.now() > selfPresence.until) {
+    selfPresence.mode = "auto"; selfPresence.until = null;
+    toast("Status expired; presence is automatic again");
+  }
+  applyPresence();
+}, 1000);
+
+$("presence-btn").onclick = e => {
+  e.stopPropagation();
+  const menu = $("presence-menu");
+  menu.hidden = !menu.hidden;
+  if (!menu.hidden) {
+    menu.querySelectorAll(".pm-item .check").forEach(c => c.remove());
+    const cur = menu.querySelector(`[data-mode="${selfPresence.mode}"]`);
+    if (cur) cur.insertAdjacentHTML("beforeend",
+      `<svg class="icon check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>`);
+  }
 };
+document.querySelectorAll("#presence-menu .pm-item").forEach(b => b.onclick = () => {
+  const mode = b.dataset.mode;
+  const mins = +$("presence-duration").value;
+  selfPresence.mode = mode;
+  selfPresence.until = mode !== "auto" && mins ? Date.now() + mins * 60000 : null;
+  $("presence-menu").hidden = true;
+  applyPresence();
+});
+document.addEventListener("mousedown", e => {
+  if (!$("presence-menu").hidden && !e.target.closest(".self-card")) {
+    $("presence-menu").hidden = true;
+  }
+});
 $("palette-hint").onclick = openPalette;
 
 document.addEventListener("keydown", e => {
@@ -1593,6 +1678,7 @@ document.querySelectorAll("#proto [data-proto]").forEach(b => b.onclick = () => 
   if (a === "end-call") leaveCall();
   if (a === "reconnect") setConnection("reconnecting");
   if (a === "online") setConnection("online");
+  if (a === "expire-status") { if (selfPresence.until) selfPresence.until = Date.now() - 1; }
   if (a === "unverify") { CONVOS.aria.verified = false; CONVOS.aria.verifiedOn = null; renderHeader(); renderConvoList(); }
   if (a === "toast-ok") toast("Exported enclave-marc-backup.enc");
   if (a === "toast-err") toast("Screen share ended: the share was ended by the system", true);
