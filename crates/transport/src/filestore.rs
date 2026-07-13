@@ -46,6 +46,17 @@ pub const DISK_FREE_FLOOR: u64 = 4 * 1024 * 1024 * 1024;
 /// How long an unanswered offer is kept before it is swept.
 pub const OFFER_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The quota (`PER_FILE_MAX`, `STORE_TOTAL_MAX`) is accounted in *plaintext*
+/// bytes -- the file's real size, which is what the user's 250MB / 2GB limits
+/// mean. The bytes actually written are the sealed chunks, slightly larger
+/// (MLS framing + a 256-byte pad per chunk). This bounds how far the sealed
+/// total may exceed the declared plaintext size before the store treats it as a
+/// sender lying about the size to slip past admission: a generous ~1.6% + 64KiB,
+/// far above real sealing overhead (<0.3%) yet nowhere near a quota bypass.
+fn seal_ceiling(plaintext: u64) -> u64 {
+    plaintext.saturating_add(plaintext / 64).saturating_add(64 * 1024)
+}
+
 /// Why an upload was refused. Returned to the sender so the UI can explain it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rejected {
@@ -87,13 +98,21 @@ struct Offer {
     sender: String,
     /// Everyone who may still accept. Shrinks as recipients resolve.
     pending: HashSet<String>,
-    /// Declared total size, used for the quota and to detect overrun.
+    /// A recipient currently being streamed the blob (off-lock). Kept in
+    /// `pending` too, so the blob is not deleted from under an active download.
+    delivering: HashSet<String>,
+    /// Declared plaintext size, charged against the quota.
     declared: u64,
-    /// Bytes written so far.
+    /// Hard ceiling on sealed bytes written, above which the sender is treated
+    /// as under-declaring to bypass the quota. Derived from `declared`.
+    write_cap: u64,
+    /// Sealed bytes written so far.
     written: u64,
     /// Set once the sender finishes uploading and the offer is deliverable.
     complete: bool,
-    manifest: Option<Sealed>,
+    /// The sealed name+mime+size the recipient decrypts to decide, without
+    /// downloading. Known at offer time.
+    manifest: Sealed,
     expires_at: SystemTime,
     blob: PathBuf,
 }
@@ -145,7 +164,8 @@ impl FileStore {
         Ok(())
     }
 
-    /// Begin an upload: admit `declared` bytes and open the blob for writing.
+    /// Begin an upload: admit `declared` plaintext bytes, record the sealed
+    /// manifest, and open the blob for writing.
     pub fn begin(
         &mut self,
         id: [u8; 16],
@@ -153,6 +173,7 @@ impl FileStore {
         sender: String,
         recipients: Vec<String>,
         declared: u64,
+        manifest: Sealed,
         now: SystemTime,
     ) -> Result<(), Rejected> {
         if self.offers.contains_key(&id) {
@@ -168,10 +189,12 @@ impl FileStore {
                 group,
                 sender,
                 pending: recipients.into_iter().collect(),
+                delivering: HashSet::new(),
                 declared,
+                write_cap: seal_ceiling(declared),
                 written: 0,
                 complete: false,
-                manifest: None,
+                manifest,
                 expires_at: now + OFFER_TTL,
                 blob,
             },
@@ -181,8 +204,8 @@ impl FileStore {
     }
 
     /// Append one sealed chunk to an in-progress upload. Rejects (and drops the
-    /// whole offer) if the running total exceeds what was declared, so a sender
-    /// cannot under-declare to slip past admission.
+    /// whole offer) if the sealed total exceeds the declared size plus sealing
+    /// slack, so a sender cannot under-declare to slip past admission.
     pub fn append(&mut self, id: &[u8; 16], chunk: &[u8]) -> Result<(), Rejected> {
         let Some(offer) = self.offers.get_mut(id) else {
             return Err(Rejected::Unavailable);
@@ -191,7 +214,7 @@ impl FileStore {
             return Err(Rejected::Unavailable);
         }
         let new_written = offer.written.saturating_add(chunk.len() as u64);
-        if new_written > offer.declared {
+        if new_written > offer.write_cap {
             // Overrun: the sender lied about the size. Drop the whole offer.
             self.remove(id);
             return Err(Rejected::TooLarge);
@@ -207,23 +230,35 @@ impl FileStore {
         Ok(())
     }
 
-    /// Finish an upload: attach the sealed manifest and make it deliverable.
-    /// Reclaims any over-reserved bytes (declared minus actually written).
-    pub fn finish(&mut self, id: &[u8; 16], manifest: Sealed) -> Result<(), Rejected> {
+    /// Finish an upload: make the offer deliverable. The declared size is the
+    /// exact plaintext size, so there is nothing to reclaim.
+    pub fn finish(&mut self, id: &[u8; 16]) -> Result<(), Rejected> {
         let Some(offer) = self.offers.get_mut(id) else {
             return Err(Rejected::Unavailable);
         };
-        // Return the difference between what we reserved and what arrived.
-        let slack = offer.declared.saturating_sub(offer.written);
-        self.used_bytes = self.used_bytes.saturating_sub(slack);
-        offer.declared = offer.written;
-        offer.manifest = Some(manifest);
         offer.complete = true;
         Ok(())
     }
 
-    /// The group, sender, size, manifest, and recipients of a completed offer,
-    /// for building the `FileOffered` notifications.
+    /// The sender device of an offer (used to authorize its chunks/finish).
+    pub fn sender_of(&self, id: &[u8; 16]) -> Option<&str> {
+        self.offers.get(id).map(|o| o.sender.as_str())
+    }
+
+    /// How many offers `sender` currently has open, to cap offer spam.
+    pub fn offer_count_for(&self, sender: &str) -> usize {
+        self.offers.values().filter(|o| o.sender == sender).count()
+    }
+
+    /// The group and still-pending recipients of an offer (complete or not), so
+    /// a cancel can tell them the offer is gone.
+    pub fn pending_recipients(&self, id: &[u8; 16]) -> Option<(GroupId, Vec<String>)> {
+        let o = self.offers.get(id)?;
+        Some((o.group.clone(), o.pending.iter().cloned().collect()))
+    }
+
+    /// The group, sender, declared size, manifest, and still-pending recipients
+    /// of a completed offer, for building the `FileOffered` notifications.
     pub fn offer_meta(&self, id: &[u8; 16]) -> Option<(GroupId, String, u64, Sealed, Vec<String>)> {
         let o = self.offers.get(id)?;
         if !o.complete {
@@ -232,33 +267,58 @@ impl FileStore {
         Some((
             o.group.clone(),
             o.sender.clone(),
-            o.written,
-            o.manifest.clone()?,
+            o.declared,
+            o.manifest.clone(),
             o.pending.iter().cloned().collect(),
         ))
     }
 
-    /// Read the stored sealed chunks back, in upload order, streamed from disk
-    /// (one chunk in memory at a time). `None` if the offer is unknown or
-    /// incomplete. `recipient` must be a pending recipient of the offer.
+    /// Begin delivering the blob to `recipient`: if the offer is complete and
+    /// `recipient` is pending and not already being served, mark it in-flight
+    /// and return the blob path plus the sender device (for the chunk envelope).
+    /// The caller streams the blob off-lock via [`BlobReader`], then calls
+    /// [`finish_delivery`](Self::finish_delivery) or
+    /// [`abort_delivery`](Self::abort_delivery). Keeping `recipient` in `pending`
+    /// during the stream stops a concurrent resolve from deleting the blob.
+    pub fn begin_delivery(&mut self, id: &[u8; 16], recipient: &str) -> Option<(PathBuf, String)> {
+        let offer = self.offers.get_mut(id)?;
+        if !offer.complete || !offer.pending.contains(recipient) || offer.delivering.contains(recipient) {
+            return None;
+        }
+        offer.delivering.insert(recipient.to_string());
+        Some((offer.blob.clone(), offer.sender.clone()))
+    }
+
+    /// A delivery to `recipient` finished: resolve it (accept), deleting the
+    /// blob once every recipient has resolved.
+    pub fn finish_delivery(&mut self, id: &[u8; 16], recipient: &str) -> Resolution {
+        if let Some(offer) = self.offers.get_mut(id) {
+            offer.delivering.remove(recipient);
+        }
+        self.resolve(id, recipient)
+    }
+
+    /// A delivery to `recipient` failed midway (e.g. it went offline): free the
+    /// in-flight slot but leave it pending, so it can retry from its side.
+    pub fn abort_delivery(&mut self, id: &[u8; 16], recipient: &str) {
+        if let Some(offer) = self.offers.get_mut(id) {
+            offer.delivering.remove(recipient);
+        }
+    }
+
+    /// Read the stored sealed chunks back into memory, in upload order. Test
+    /// helper only; production delivery streams via [`BlobReader`] instead of
+    /// materializing the whole blob. `recipient` must be pending.
+    #[cfg(test)]
     pub fn read_chunks(&self, id: &[u8; 16], recipient: &str) -> Option<Vec<Vec<u8>>> {
         let offer = self.offers.get(id)?;
         if !offer.complete || !offer.pending.contains(recipient) {
             return None;
         }
-        let mut f = std::fs::File::open(&offer.blob).ok()?;
+        let mut reader = BlobReader::open(&offer.blob).ok()?;
         let mut chunks = Vec::new();
-        loop {
-            let mut len_buf = [0u8; 4];
-            match f.read_exact(&mut len_buf) {
-                Ok(()) => {}
-                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(_) => return None,
-            }
-            let len = u32::from_le_bytes(len_buf) as usize;
-            let mut buf = vec![0u8; len];
-            f.read_exact(&mut buf).ok()?;
-            chunks.push(buf);
+        while let Some(c) = reader.next_chunk().ok()? {
+            chunks.push(c);
         }
         Some(chunks)
     }
@@ -270,6 +330,7 @@ impl FileStore {
             return Resolution::Unknown;
         };
         offer.pending.remove(recipient);
+        offer.delivering.remove(recipient);
         if offer.pending.is_empty() {
             self.remove(id);
             Resolution::Deleted
@@ -283,15 +344,18 @@ impl FileStore {
         self.offers.get(id).map(|o| (o.group.clone(), o.sender.clone()))
     }
 
-    /// Delete every offer past its TTL, returning their ids (to notify).
-    pub fn sweep(&mut self, now: SystemTime) -> Vec<[u8; 16]> {
-        let expired: Vec<[u8; 16]> = self
+    /// Delete every offer past its TTL, returning each expired offer's id and
+    /// sender device (to notify the sender it lapsed). An offer with a delivery
+    /// in flight is left for the next sweep, so the blob is never unlinked out
+    /// from under an active download.
+    pub fn sweep(&mut self, now: SystemTime) -> Vec<([u8; 16], String)> {
+        let expired: Vec<([u8; 16], String)> = self
             .offers
             .iter()
-            .filter(|(_, o)| o.expires_at <= now)
-            .map(|(id, _)| *id)
+            .filter(|(_, o)| o.expires_at <= now && o.delivering.is_empty())
+            .map(|(id, o)| (*id, o.sender.clone()))
             .collect();
-        for id in &expired {
+        for (id, _) in &expired {
             self.remove(id);
         }
         expired
@@ -312,6 +376,37 @@ impl FileStore {
 
 fn hex(id: &[u8; 16]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Streams a stored blob's length-prefixed sealed chunks back one at a time, so
+/// delivery holds only a single chunk in memory (never the whole file) and runs
+/// off the relay lock. Each chunk is exactly one sealed [`Part`] as uploaded.
+///
+/// [`Part`]: enclave-client's transfer module (opaque to the server).
+pub struct BlobReader {
+    file: std::fs::File,
+}
+
+impl BlobReader {
+    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self {
+            file: std::fs::File::open(path)?,
+        })
+    }
+
+    /// The next sealed chunk, or `None` at end of blob.
+    pub fn next_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        let mut len_buf = [0u8; 4];
+        match self.file.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        self.file.read_exact(&mut buf)?;
+        Ok(Some(buf))
+    }
 }
 
 #[cfg(test)]
@@ -341,11 +436,11 @@ mod tests {
     fn upload_then_read_replays_the_exact_chunks() {
         let (mut s, dir) = store(u64::MAX);
         let i = id(1);
-        s.begin(i, GroupId([0; 32]), "alice".into(), vec!["bob".into()], 30, SystemTime::UNIX_EPOCH)
+        s.begin(i, GroupId([0; 32]), "alice".into(), vec!["bob".into()], 30, Sealed(vec![9, 9]), SystemTime::UNIX_EPOCH)
             .unwrap();
         s.append(&i, b"hello ").unwrap();
         s.append(&i, b"world").unwrap();
-        s.finish(&i, Sealed(vec![9, 9])).unwrap();
+        s.finish(&i).unwrap();
         let chunks = s.read_chunks(&i, "bob").expect("readable");
         assert_eq!(chunks, vec![b"hello ".to_vec(), b"world".to_vec()]);
         let _ = std::fs::remove_dir_all(dir);
@@ -378,7 +473,7 @@ mod tests {
                 break;
             }
             n += 1;
-            s.begin(id(n), GroupId([0; 32]), "a".into(), vec!["b".into()], PER_FILE_MAX, SystemTime::UNIX_EPOCH)
+            s.begin(id(n), GroupId([0; 32]), "a".into(), vec!["b".into()], PER_FILE_MAX, Sealed(vec![1]), SystemTime::UNIX_EPOCH)
                 .unwrap();
         }
         assert!(n >= 1, "at least one offer fit");
@@ -391,12 +486,19 @@ mod tests {
     fn under_declaring_the_size_is_caught_on_overrun() {
         let (mut s, dir) = store(u64::MAX);
         let i = id(1);
-        s.begin(i, GroupId([0; 32]), "a".into(), vec!["b".into()], 4, SystemTime::UNIX_EPOCH)
+        // Declare 1000 bytes: the sealed write ceiling is ~66KiB (declared +
+        // slack). Writing far past that is treated as lying about the size.
+        s.begin(i, GroupId([0; 32]), "a".into(), vec!["b".into()], 1000, Sealed(vec![1]), SystemTime::UNIX_EPOCH)
             .unwrap();
         s.append(&i, b"ok").unwrap();
-        // Declared 4, this pushes to 6: rejected, offer dropped.
-        assert_eq!(s.append(&i, b"toolong"), Err(Rejected::TooLarge));
+        let over = vec![0u8; 100 * 1024]; // 100KiB, past the ~66KiB ceiling
+        assert_eq!(s.append(&i, &over), Err(Rejected::TooLarge));
         assert!(s.read_chunks(&i, "b").is_none(), "offer was dropped");
+        // A legitimate sealing overhead (a few % over the declared size) is fine.
+        let j = id(2);
+        s.begin(j, GroupId([0; 32]), "a".into(), vec!["b".into()], 1000, Sealed(vec![1]), SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert!(s.append(&j, &vec![0u8; 1000 + 40]).is_ok(), "sealing slack allowed");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -404,10 +506,10 @@ mod tests {
     fn deletes_only_after_every_recipient_resolves() {
         let (mut s, dir) = store(u64::MAX);
         let i = id(1);
-        s.begin(i, GroupId([0; 32]), "a".into(), vec!["b".into(), "c".into()], 5, SystemTime::UNIX_EPOCH)
+        s.begin(i, GroupId([0; 32]), "a".into(), vec!["b".into(), "c".into()], 5, Sealed(vec![1]), SystemTime::UNIX_EPOCH)
             .unwrap();
         s.append(&i, b"data!").unwrap();
-        s.finish(&i, Sealed(vec![1])).unwrap();
+        s.finish(&i).unwrap();
         assert_eq!(s.resolve(&i, "b"), Resolution::Recorded, "c still pending");
         assert!(s.read_chunks(&i, "c").is_some(), "c can still download");
         assert_eq!(s.resolve(&i, "c"), Resolution::Deleted, "last recipient");
@@ -421,11 +523,11 @@ mod tests {
         let (mut s, dir) = store(u64::MAX);
         let i = id(1);
         let t0 = SystemTime::UNIX_EPOCH;
-        s.begin(i, GroupId([0; 32]), "a".into(), vec!["b".into()], 5, t0).unwrap();
-        s.finish(&i, Sealed(vec![1])).unwrap();
+        s.begin(i, GroupId([0; 32]), "a".into(), vec!["b".into()], 5, Sealed(vec![1]), t0).unwrap();
+        s.finish(&i).unwrap();
         assert!(s.sweep(t0 + Duration::from_secs(60)).is_empty(), "not yet expired");
         let expired = s.sweep(t0 + OFFER_TTL + Duration::from_secs(1));
-        assert_eq!(expired, vec![i], "swept after TTL");
+        assert_eq!(expired, vec![(i, "a".to_string())], "swept after TTL");
         assert!(s.read_chunks(&i, "b").is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -434,10 +536,10 @@ mod tests {
     fn a_non_recipient_cannot_read() {
         let (mut s, dir) = store(u64::MAX);
         let i = id(1);
-        s.begin(i, GroupId([0; 32]), "a".into(), vec!["b".into()], 3, SystemTime::UNIX_EPOCH)
+        s.begin(i, GroupId([0; 32]), "a".into(), vec!["b".into()], 3, Sealed(vec![1]), SystemTime::UNIX_EPOCH)
             .unwrap();
         s.append(&i, b"xyz").unwrap();
-        s.finish(&i, Sealed(vec![1])).unwrap();
+        s.finish(&i).unwrap();
         assert!(s.read_chunks(&i, "eve").is_none(), "non-recipient refused");
         assert!(s.read_chunks(&i, "b").is_some());
         let _ = std::fs::remove_dir_all(dir);

@@ -196,6 +196,34 @@ pub enum ClientMsg {
     /// Decline the incoming call in `group` (we were rung but will not join). The
     /// caller is told; our client falls back to showing a "call active" banner.
     DeclineCall { group: GroupId },
+
+    /// Offer a file to `group`. A file is never pushed to a recipient: it is
+    /// offered, and each recipient explicitly accepts or declines. `manifest` is
+    /// the sealed name+mime+size the recipients decrypt to decide, without
+    /// downloading. `size` is the plaintext size, which the server needs to
+    /// enforce its store quota; it is 0 for a `live` offer (the server stores
+    /// nothing, so needs no size). When `live` is false the server buffers the
+    /// upload on disk for offline delivery if it fits the quota; when true the
+    /// bytes are streamed in real time to whoever accepts and never stored.
+    FileOffer {
+        offer_id: [u8; 16],
+        group: GroupId,
+        size: u64,
+        manifest: Sealed,
+        live: bool,
+    },
+    /// One sealed chunk (a `transfer::Part`) of an offered file: appended to the
+    /// server's store while uploading, or relayed live to accepting recipients.
+    FileChunk { offer_id: [u8; 16], data: Sealed },
+    /// The sender has sent every chunk of `offer_id`.
+    FileComplete { offer_id: [u8; 16] },
+    /// Consent to receive an offered file. The server then delivers its chunks
+    /// (from the store, or by relaying the sender's live stream).
+    FileAccept { offer_id: [u8; 16] },
+    /// Refuse an offered file. The server drops it once every recipient resolves.
+    FileDecline { offer_id: [u8; 16] },
+    /// Withdraw an offer we made (before or during upload/streaming).
+    FileCancel { offer_id: [u8; 16] },
 }
 
 /// A person in the friend graph: the unique `username` (login/add id) plus the
@@ -293,6 +321,37 @@ pub enum ServerMsg {
         group: GroupId,
         from: String,
     },
+    /// The server admitted a stored offer; the sender may begin uploading its
+    /// chunks. (Sent only for non-live offers.)
+    FileUploadReady { offer_id: [u8; 16] },
+    /// The server refused to store the offer (too large, store full, or low on
+    /// disk). `reason` is a short human-readable explanation. The sender may
+    /// retry the transfer live if the recipients are online.
+    FileOfferRejected { offer_id: [u8; 16], reason: String },
+    /// A file has been offered to you. Do NOT download it automatically: show
+    /// the user (from the decrypted `manifest`) who sent what, and accept or
+    /// decline. `live` means the sender is streaming now, so accept promptly.
+    FileOffered {
+        offer_id: [u8; 16],
+        group: GroupId,
+        from: DeviceId,
+        size: u64,
+        manifest: Sealed,
+        live: bool,
+    },
+    /// A recipient accepted `offer_id`. For a live offer this is the sender's cue
+    /// to start streaming chunks; for a stored offer it is informational.
+    FileAccepted { offer_id: [u8; 16], by: DeviceId },
+    /// A recipient declined `offer_id` (or it expired for them).
+    FileDeclined { offer_id: [u8; 16], by: DeviceId },
+    /// One sealed chunk of a file you accepted, from device `from`.
+    FileChunk {
+        offer_id: [u8; 16],
+        from: DeviceId,
+        data: Sealed,
+    },
+    /// Every chunk of `offer_id` from `from` has been delivered.
+    FileComplete { offer_id: [u8; 16], from: DeviceId },
     Error {
         detail: String,
     },

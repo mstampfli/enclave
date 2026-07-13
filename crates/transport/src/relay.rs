@@ -12,10 +12,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
-use enclave_protocol::{ClientMsg, DeviceId, Friend, GroupId, Presence, ServerMsg, UserId};
+use enclave_protocol::{ClientMsg, DeviceId, Friend, GroupId, Presence, Sealed, ServerMsg, UserId};
 
 use crate::accounts::{AccountStore, AuthOutcome};
+use crate::filestore::FileStore;
 use crate::friends::{FriendStore, RequestOutcome};
 use crate::groups::GroupStore;
 use crate::msgqueue::MessageQueue;
@@ -27,6 +30,19 @@ pub type ConnId = u64;
 /// Failed logins allowed per connection before it is locked out (ASVS V2).
 const MAX_LOGIN_ATTEMPTS: u32 = 5;
 
+/// How long a live (streamed) file offer waits for the recipient to accept
+/// before it lapses. Live transfer is "like a call": the sender is online and
+/// streaming, so the window is short.
+const LIVE_OFFER_TTL: Duration = Duration::from_secs(90);
+
+/// Concurrent file offers one sender may have open at once (stored + live),
+/// so a member cannot spam offers to exhaust store metadata/inodes (ASVS V11).
+const MAX_OFFERS_PER_SENDER: usize = 32;
+
+/// The empty device id the server uses as the `by` of a `FileDeclined` that is
+/// really a lapse (TTL) or a sender cancel, not a specific recipient's refusal.
+const NO_DEVICE: &str = "";
+
 /// A message the relay wants delivered to a specific connection.
 #[derive(Debug, Clone)]
 pub struct Outgoing {
@@ -34,9 +50,35 @@ pub struct Outgoing {
     pub msg: ServerMsg,
 }
 
+/// A stored blob the async server should stream to a recipient off the relay
+/// lock (so a large read never blocks all other connections). Produced by a
+/// `FileAccept` on a stored offer; the server streams the blob via
+/// [`crate::filestore::BlobReader`], then calls
+/// [`Relay::finish_stored_delivery`] or [`Relay::abort_stored_delivery`].
+#[derive(Debug, Clone)]
+pub struct BlobDelivery {
+    /// The accepting recipient's connection.
+    pub to: ConnId,
+    /// The accepting recipient's device (to resolve the offer afterwards).
+    pub recipient: DeviceId,
+    pub offer_id: [u8; 16],
+    /// The original sender device, for the chunk envelope.
+    pub from: DeviceId,
+    pub blob: PathBuf,
+}
+
+/// A live (streamed, never stored) file offer in flight.
+struct LiveOffer {
+    sender: DeviceId,
+    /// Recipients the offer was sent to and who are still candidates.
+    recipients: HashSet<DeviceId>,
+    /// Recipients who accepted; the sender's chunks are relayed to them.
+    accepted: HashSet<DeviceId>,
+    expires_at: SystemTime,
+}
+
 /// Routing state for the signaling + delivery service. Holds no keys and no
 /// message content.
-#[derive(Default)]
 pub struct Relay {
     next_conn: ConnId,
     /// Online devices and their current connection (both directions).
@@ -79,6 +121,23 @@ pub struct Relay {
     pending_register: HashMap<ConnId, String>,
     /// Failed login attempts per connection, for lockout.
     login_attempts: HashMap<ConnId, u32>,
+    /// On-disk store for offered files awaiting the recipient's consent (stored
+    /// path). Holds opaque sealed blobs; enforces the size/disk quota + TTL.
+    files: FileStore,
+    /// Live (streamed, never stored) file offers, keyed by offer id.
+    live_offers: HashMap<[u8; 16], LiveOffer>,
+    /// Stored-blob deliveries the async shell should stream off-lock. Drained
+    /// after each `handle` via [`take_blob_deliveries`](Self::take_blob_deliveries).
+    blob_deliveries: Vec<BlobDelivery>,
+    /// Injected wall clock, so file TTLs are testable. Defaults to the system
+    /// clock; the async shell may leave it as is.
+    now: Box<dyn Fn() -> SystemTime + Send>,
+}
+
+impl Default for Relay {
+    fn default() -> Self {
+        Relay::new()
+    }
 }
 
 /// Server-side state for an OPAQUE login in progress on one connection.
@@ -89,7 +148,31 @@ struct PendingLogin {
 
 impl Relay {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            next_conn: 0,
+            device_conn: HashMap::new(),
+            conn_device: HashMap::new(),
+            key_packages: HashMap::new(),
+            identities: HashMap::new(),
+            groups: GroupStore::default(),
+            active_calls: HashMap::new(),
+            queue: MessageQueue::new(),
+            udp_addrs: HashMap::new(),
+            conn_user: HashMap::new(),
+            presence: HashMap::new(),
+            presence_watchers: HashMap::new(),
+            accounts: AccountStore::default(),
+            friends: FriendStore::default(),
+            opaque: OpaqueServer::default(),
+            pending_login: HashMap::new(),
+            reserved: HashSet::new(),
+            pending_register: HashMap::new(),
+            login_attempts: HashMap::new(),
+            files: fresh_file_store(),
+            live_offers: HashMap::new(),
+            blob_deliveries: Vec::new(),
+            now: Box::new(SystemTime::now),
+        }
     }
 
     /// Create a relay backed by a specific (e.g. persistent) account store, with
@@ -98,19 +181,22 @@ impl Relay {
     pub fn with_accounts(accounts: AccountStore) -> Self {
         Self {
             accounts,
-            ..Self::default()
+            ..Self::new()
         }
     }
 
-    /// Create a relay backed by a persistent account store, OPAQUE setup, and
-    /// friend graph. The account envelopes are only usable under the OPAQUE
-    /// setup they were registered against, so those two must persist together.
+    /// Create a relay backed by a persistent account store, OPAQUE setup,
+    /// friend graph, group routing, offline queue, and an on-disk file store
+    /// rooted at `files_dir`. The account envelopes are only usable under the
+    /// OPAQUE setup they were registered against, so those two must persist
+    /// together.
     pub fn with_auth(
         accounts: AccountStore,
         opaque: OpaqueServer,
         friends: FriendStore,
         groups: GroupStore,
         queue: MessageQueue,
+        files_dir: PathBuf,
     ) -> Self {
         Self {
             accounts,
@@ -118,8 +204,21 @@ impl Relay {
             friends,
             groups,
             queue,
-            ..Self::default()
+            files: FileStore::new(files_dir),
+            ..Self::new()
         }
+    }
+
+    /// Replace the wall clock (tests inject a fixed/advanceable time so file
+    /// TTLs are deterministic).
+    pub fn set_clock(&mut self, clock: impl Fn() -> SystemTime + Send + 'static) {
+        self.now = Box::new(clock);
+    }
+
+    /// Point the file store at a specific directory with an injected free-disk
+    /// probe (tests, to exercise the disk-floor without a real full disk).
+    pub fn set_file_store(&mut self, store: FileStore) {
+        self.files = store;
     }
 
     /// Register a new connection and get its id.
@@ -143,6 +242,10 @@ impl Relay {
             // skipped by fan-out (they are not in device_conn).
             // But do drop them from any live call and tell the other participants.
             out.extend(self.drop_from_calls(&device));
+            // Tear down live file offers the device was streaming, and drop it
+            // from live offers it was receiving (a stored offer survives: its
+            // blob is on disk and can be delivered/accepted after reconnect).
+            out.extend(self.drop_from_live_offers(&device));
         }
         self.login_attempts.remove(&conn);
         self.pending_login.remove(&conn);
@@ -764,7 +867,455 @@ impl Relay {
                     })
                     .collect()
             }
+
+            ClientMsg::FileOffer {
+                offer_id,
+                group,
+                size,
+                manifest,
+                live,
+            } => self.handle_file_offer(from, offer_id, group, size, manifest, live),
+
+            ClientMsg::FileChunk { offer_id, data } => {
+                self.handle_file_chunk(from, offer_id, data)
+            }
+
+            ClientMsg::FileComplete { offer_id } => self.handle_file_complete(from, offer_id),
+
+            ClientMsg::FileAccept { offer_id } => self.handle_file_accept(from, offer_id),
+
+            ClientMsg::FileDecline { offer_id } => self.handle_file_decline(from, offer_id),
+
+            ClientMsg::FileCancel { offer_id } => self.handle_file_cancel(from, offer_id),
         }
+    }
+
+    /// A member offers a file to a group. A stored (`!live`) offer is admitted to
+    /// the on-disk store (subject to the size/disk quota) for offline delivery;
+    /// a `live` offer is relayed to online recipients to stream in real time.
+    /// Deny-by-default: only a routing member of the group may offer (ASVS V4).
+    fn handle_file_offer(
+        &mut self,
+        from: ConnId,
+        offer_id: [u8; 16],
+        group: GroupId,
+        size: u64,
+        manifest: Sealed,
+        live: bool,
+    ) -> Vec<Outgoing> {
+        let sender = self.device_for(from);
+        if !self.is_member(&group, &sender) {
+            return vec![];
+        }
+        // A fresh offer id only; never reuse one already in flight.
+        if self.files.sender_of(&offer_id).is_some() || self.live_offers.contains_key(&offer_id) {
+            return vec![];
+        }
+        // Cap concurrent offers per sender (anti-spam, ASVS V11).
+        let open = self.files.offer_count_for(&sender.0)
+            + self
+                .live_offers
+                .values()
+                .filter(|o| o.sender == sender)
+                .count();
+        if open >= MAX_OFFERS_PER_SENDER {
+            return vec![reject(from, offer_id, "you have too many file offers open")];
+        }
+        // Recipients are the group's routing members except the sender.
+        let recipients: Vec<DeviceId> = match self.groups.members(&group) {
+            Some(m) => m.iter().filter(|d| **d != sender).cloned().collect(),
+            None => return vec![],
+        };
+        if recipients.is_empty() {
+            return vec![reject(from, offer_id, "no one is in this conversation to receive it")];
+        }
+
+        if live {
+            // Live needs the recipient online now; offline recipients are skipped.
+            let online: HashSet<DeviceId> = recipients
+                .iter()
+                .filter(|d| self.device_conn.contains_key(*d))
+                .cloned()
+                .collect();
+            if online.is_empty() {
+                return vec![reject(
+                    from,
+                    offer_id,
+                    "the recipient is offline; a file this large needs them online",
+                )];
+            }
+            let expires_at = (self.now)() + LIVE_OFFER_TTL;
+            let mut out = Vec::new();
+            for dev in &online {
+                if let Some(&conn) = self.device_conn.get(dev) {
+                    out.push(Outgoing {
+                        to: conn,
+                        msg: ServerMsg::FileOffered {
+                            offer_id,
+                            group: group.clone(),
+                            from: sender.clone(),
+                            size,
+                            manifest: manifest.clone(),
+                            live: true,
+                        },
+                    });
+                }
+            }
+            self.live_offers.insert(
+                offer_id,
+                LiveOffer {
+                    sender,
+                    recipients: online.clone(),
+                    accepted: HashSet::new(),
+                    expires_at,
+                },
+            );
+            out
+        } else {
+            // Stored: admit to the on-disk store, then let the sender upload.
+            let recip_names: Vec<String> = recipients.iter().map(|d| d.0.clone()).collect();
+            let now = (self.now)();
+            match self
+                .files
+                .begin(offer_id, group, sender.0.clone(), recip_names, size, manifest, now)
+            {
+                Ok(()) => vec![Outgoing {
+                    to: from,
+                    msg: ServerMsg::FileUploadReady { offer_id },
+                }],
+                Err(reason) => vec![reject(from, offer_id, reason.as_str())],
+            }
+        }
+    }
+
+    /// One sealed chunk from the sender: appended to a stored upload, or relayed
+    /// to the accepting recipients of a live offer. Only the offer's own sender
+    /// may push chunks (ASVS V4).
+    fn handle_file_chunk(&mut self, from: ConnId, offer_id: [u8; 16], data: Sealed) -> Vec<Outgoing> {
+        let sender = self.device_for(from);
+        if self.files.sender_of(&offer_id) == Some(sender.0.as_str()) {
+            // Stored upload: buffer the chunk to disk.
+            match self.files.append(&offer_id, &data.0) {
+                Ok(()) => vec![],
+                // Overrun (declared less than uploaded): the offer was dropped.
+                Err(_) => vec![reject(
+                    from,
+                    offer_id,
+                    "the upload exceeded the size you declared",
+                )],
+            }
+        } else if self
+            .live_offers
+            .get(&offer_id)
+            .is_some_and(|o| o.sender == sender)
+        {
+            // Live stream: relay to everyone who accepted (and is still online).
+            let targets: Vec<DeviceId> = self.live_offers[&offer_id].accepted.iter().cloned().collect();
+            targets
+                .into_iter()
+                .filter_map(|dev| self.device_conn.get(&dev).copied())
+                .map(|conn| Outgoing {
+                    to: conn,
+                    msg: ServerMsg::FileChunk {
+                        offer_id,
+                        from: sender.clone(),
+                        data: data.clone(),
+                    },
+                })
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// The sender finished uploading/streaming. For a stored offer this makes it
+    /// deliverable and offers it to the recipients (queuing for those offline);
+    /// for a live offer it tells the accepting recipients the stream is done.
+    fn handle_file_complete(&mut self, from: ConnId, offer_id: [u8; 16]) -> Vec<Outgoing> {
+        let sender = self.device_for(from);
+        if self.files.sender_of(&offer_id) == Some(sender.0.as_str()) {
+            if self.files.finish(&offer_id).is_err() {
+                return vec![];
+            }
+            let Some((group, _sender, size, manifest, recipients)) = self.files.offer_meta(&offer_id)
+            else {
+                return vec![];
+            };
+            let mut out = Vec::new();
+            for name in recipients {
+                let dev = DeviceId(name);
+                let msg = ServerMsg::FileOffered {
+                    offer_id,
+                    group: group.clone(),
+                    from: sender.clone(),
+                    size,
+                    manifest: manifest.clone(),
+                    live: false,
+                };
+                match self.device_conn.get(&dev) {
+                    Some(&conn) => out.push(Outgoing { to: conn, msg }),
+                    // Offline: park the offer for their next login.
+                    None => {
+                        self.queue.enqueue(&dev.0, msg);
+                    }
+                }
+            }
+            out
+        } else if self
+            .live_offers
+            .get(&offer_id)
+            .is_some_and(|o| o.sender == sender)
+        {
+            let offer = self.live_offers.remove(&offer_id).expect("just checked");
+            offer
+                .accepted
+                .into_iter()
+                .filter_map(|dev| self.device_conn.get(&dev).copied())
+                .map(|conn| Outgoing {
+                    to: conn,
+                    msg: ServerMsg::FileComplete {
+                        offer_id,
+                        from: sender.clone(),
+                    },
+                })
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// A recipient consents. For a stored offer this queues an off-lock blob
+    /// delivery and tells the sender; for a live offer it enrolls the recipient
+    /// in the stream and cues the sender to start.
+    fn handle_file_accept(&mut self, from: ConnId, offer_id: [u8; 16]) -> Vec<Outgoing> {
+        let recipient = self.device_for(from);
+        // Stored: schedule the off-lock delivery if this recipient may have it.
+        if let Some((blob, sender_name)) = self.files.begin_delivery(&offer_id, &recipient.0) {
+            self.blob_deliveries.push(BlobDelivery {
+                to: from,
+                recipient: recipient.clone(),
+                offer_id,
+                from: DeviceId(sender_name.clone()),
+                blob,
+            });
+            // Tell the sender it was accepted (if online).
+            return self.notify_sender(
+                &DeviceId(sender_name),
+                ServerMsg::FileAccepted {
+                    offer_id,
+                    by: recipient,
+                },
+            );
+        }
+        // Live: enroll in the stream and cue the sender.
+        if let Some(offer) = self.live_offers.get_mut(&offer_id) {
+            if !offer.recipients.contains(&recipient) {
+                return vec![];
+            }
+            offer.accepted.insert(recipient.clone());
+            let sender = offer.sender.clone();
+            return self.notify_sender(
+                &sender,
+                ServerMsg::FileAccepted {
+                    offer_id,
+                    by: recipient,
+                },
+            );
+        }
+        vec![]
+    }
+
+    /// A recipient refuses. The offer is resolved for them (and deleted once
+    /// every recipient has resolved); the sender is told.
+    fn handle_file_decline(&mut self, from: ConnId, offer_id: [u8; 16]) -> Vec<Outgoing> {
+        let recipient = self.device_for(from);
+        if let Some((_group, sender)) = self.files.offer_group(&offer_id) {
+            self.files.resolve(&offer_id, &recipient.0);
+            return self.notify_sender(
+                &DeviceId(sender),
+                ServerMsg::FileDeclined {
+                    offer_id,
+                    by: recipient,
+                },
+            );
+        }
+        if let Some(offer) = self.live_offers.get_mut(&offer_id) {
+            offer.recipients.remove(&recipient);
+            offer.accepted.remove(&recipient);
+            let sender = offer.sender.clone();
+            let empty = offer.recipients.is_empty();
+            if empty {
+                self.live_offers.remove(&offer_id);
+            }
+            return self.notify_sender(
+                &sender,
+                ServerMsg::FileDeclined {
+                    offer_id,
+                    by: recipient,
+                },
+            );
+        }
+        vec![]
+    }
+
+    /// The sender withdraws an offer: delete it and tell any pending recipients
+    /// it is gone (so their consent prompt disappears).
+    fn handle_file_cancel(&mut self, from: ConnId, offer_id: [u8; 16]) -> Vec<Outgoing> {
+        let sender = self.device_for(from);
+        if self.files.sender_of(&offer_id) == Some(sender.0.as_str()) {
+            let pending = self
+                .files
+                .pending_recipients(&offer_id)
+                .map(|(_, r)| r)
+                .unwrap_or_default();
+            self.files.remove(&offer_id);
+            return pending
+                .into_iter()
+                .filter_map(|name| self.device_conn.get(&DeviceId(name)).copied())
+                .map(|conn| Outgoing {
+                    to: conn,
+                    msg: ServerMsg::FileDeclined {
+                        offer_id,
+                        by: DeviceId(NO_DEVICE.into()),
+                    },
+                })
+                .collect();
+        }
+        if let Some(offer) = self.live_offers.remove(&offer_id) {
+            if offer.sender != sender {
+                // Not the owner: put it back untouched.
+                self.live_offers.insert(offer_id, offer);
+                return vec![];
+            }
+            return offer
+                .recipients
+                .into_iter()
+                .filter_map(|dev| self.device_conn.get(&dev).copied())
+                .map(|conn| Outgoing {
+                    to: conn,
+                    msg: ServerMsg::FileDeclined {
+                        offer_id,
+                        by: DeviceId(NO_DEVICE.into()),
+                    },
+                })
+                .collect();
+        }
+        vec![]
+    }
+
+    /// Handle a device going offline for live file offers: cancel the ones it
+    /// was sending (tell the recipients the stream is gone) and drop it from the
+    /// ones it was receiving (tell those senders it declined-by-departure).
+    fn drop_from_live_offers(&mut self, device: &DeviceId) -> Vec<Outgoing> {
+        let mut out = Vec::new();
+        // Offers this device was sending: remove and notify their recipients.
+        let sent: Vec<[u8; 16]> = self
+            .live_offers
+            .iter()
+            .filter(|(_, o)| &o.sender == device)
+            .map(|(id, _)| *id)
+            .collect();
+        for offer_id in sent {
+            if let Some(offer) = self.live_offers.remove(&offer_id) {
+                for dev in offer.recipients {
+                    out.extend(self.notify_sender(
+                        &dev,
+                        ServerMsg::FileDeclined {
+                            offer_id,
+                            by: DeviceId(NO_DEVICE.into()),
+                        },
+                    ));
+                }
+            }
+        }
+        // Offers this device was receiving: drop it and tell those senders.
+        let receiving: Vec<([u8; 16], DeviceId)> = self
+            .live_offers
+            .iter()
+            .filter(|(_, o)| o.recipients.contains(device))
+            .map(|(id, o)| (*id, o.sender.clone()))
+            .collect();
+        for (offer_id, sender) in receiving {
+            let empty = if let Some(offer) = self.live_offers.get_mut(&offer_id) {
+                offer.recipients.remove(device);
+                offer.accepted.remove(device);
+                offer.recipients.is_empty()
+            } else {
+                false
+            };
+            if empty {
+                self.live_offers.remove(&offer_id);
+            }
+            out.extend(self.notify_sender(
+                &sender,
+                ServerMsg::FileDeclined {
+                    offer_id,
+                    by: device.clone(),
+                },
+            ));
+        }
+        out
+    }
+
+    /// Deliver `msg` to a device if it is online, else nothing (used to notify a
+    /// sender of an accept/decline; senders can be offline for stored offers).
+    fn notify_sender(&self, device: &DeviceId, msg: ServerMsg) -> Vec<Outgoing> {
+        match self.device_conn.get(device) {
+            Some(&conn) => vec![Outgoing { to: conn, msg }],
+            None => vec![],
+        }
+    }
+
+    /// Drain the stored-blob deliveries queued by the most recent `handle`, for
+    /// the async shell to stream off-lock.
+    pub fn take_blob_deliveries(&mut self) -> Vec<BlobDelivery> {
+        std::mem::take(&mut self.blob_deliveries)
+    }
+
+    /// A stored delivery streamed successfully: resolve the recipient (deleting
+    /// the blob once every recipient has resolved).
+    pub fn finish_stored_delivery(&mut self, offer_id: &[u8; 16], recipient: &DeviceId) {
+        self.files.finish_delivery(offer_id, &recipient.0);
+    }
+
+    /// A stored delivery failed midway (recipient dropped): free the in-flight
+    /// slot but leave the offer pending so it can be retried.
+    pub fn abort_stored_delivery(&mut self, offer_id: &[u8; 16], recipient: &DeviceId) {
+        self.files.abort_delivery(offer_id, &recipient.0);
+    }
+
+    /// Sweep expired file offers (stored TTL and live accept-window), telling
+    /// each lapsed offer's sender. Called periodically by the async shell.
+    pub fn sweep_files(&mut self) -> Vec<Outgoing> {
+        let now = (self.now)();
+        let mut out = Vec::new();
+        for (offer_id, sender) in self.files.sweep(now) {
+            out.extend(self.notify_sender(
+                &DeviceId(sender),
+                ServerMsg::FileDeclined {
+                    offer_id,
+                    by: DeviceId(NO_DEVICE.into()),
+                },
+            ));
+        }
+        let expired_live: Vec<[u8; 16]> = self
+            .live_offers
+            .iter()
+            .filter(|(_, o)| o.expires_at <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for offer_id in expired_live {
+            if let Some(offer) = self.live_offers.remove(&offer_id) {
+                out.extend(self.notify_sender(
+                    &offer.sender,
+                    ServerMsg::FileDeclined {
+                        offer_id,
+                        by: DeviceId(NO_DEVICE.into()),
+                    },
+                ));
+            }
+        }
+        out
     }
 
     /// Deliver a `CallOffer` to every online routing member of `group` except
@@ -924,6 +1475,30 @@ impl Relay {
         }
         out
     }
+}
+
+/// Build a `FileOfferRejected` reply to the sender.
+fn reject(to: ConnId, offer_id: [u8; 16], reason: &str) -> Outgoing {
+    Outgoing {
+        to,
+        msg: ServerMsg::FileOfferRejected {
+            offer_id,
+            reason: reason.to_string(),
+        },
+    }
+}
+
+/// A file store in a unique temp directory, for a relay created without an
+/// explicit store (tests, `Relay::new`). Real deployments call `with_auth`.
+fn fresh_file_store() -> FileStore {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "enclave-relay-files-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    FileStore::new(dir)
 }
 
 /// Build an auth-failure reply. Login failures use a single coarse message so

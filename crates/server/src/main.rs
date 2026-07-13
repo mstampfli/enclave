@@ -52,7 +52,9 @@ async fn main() {
     let groups = GroupStore::load("enclave-groups.json");
     // Store-and-forward queue for offline members (opaque ciphertext only).
     let queue = MessageQueue::load("enclave-queue.json");
-    let server = Server::with_auth(accounts, opaque, friends, groups, queue);
+    // On-disk store for offered files awaiting the recipient's consent.
+    let files_dir = std::path::PathBuf::from("enclave-files");
+    let server = Server::with_auth(accounts, opaque, friends, groups, queue, files_dir);
 
     // Signaling: TLS when a cert + key are provided, plaintext otherwise.
     let tls = std::env::var("ENCLAVE_TLS_CERT")

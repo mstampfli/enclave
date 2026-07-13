@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bincode::Options;
-use enclave_protocol::{ClientMsg, ServerMsg, UdpMsg};
+use enclave_protocol::{ClientMsg, Sealed, ServerMsg, UdpMsg};
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::{TcpListener, UdpSocket};
@@ -22,9 +22,14 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::error::TransportError;
+use crate::filestore::BlobReader;
 use crate::media_socket::media_codec;
 use crate::ratelimit::TokenBucket;
-use crate::relay::{ConnId, Relay};
+use crate::relay::{BlobDelivery, ConnId, Relay};
+
+/// How often the server sweeps lapsed file offers (stored TTL and the live
+/// accept window). Frequent enough that a live offer's ~90s window is honored.
+const FILE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Cap on a signaling message. Key packages and Welcomes are small; this bounds
 /// memory a malicious client can force the server to allocate (ASVS V5/V12).
@@ -90,10 +95,11 @@ impl Server {
         friends: crate::friends::FriendStore,
         groups: crate::groups::GroupStore,
         queue: crate::msgqueue::MessageQueue,
+        files_dir: std::path::PathBuf,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(ServerState {
-                relay: Relay::with_auth(accounts, opaque, friends, groups, queue),
+                relay: Relay::with_auth(accounts, opaque, friends, groups, queue, files_dir),
                 txs: HashMap::new(),
             })),
         }
@@ -105,6 +111,7 @@ impl Server {
         let listener = TcpListener::bind(addr).await?;
         let local = listener.local_addr()?;
         let state = self.state.clone();
+        spawn_file_sweeper(state.clone());
         tokio::spawn(async move {
             while let Ok((stream, _peer)) = listener.accept().await {
                 tokio::spawn(handle_conn(stream, state.clone()));
@@ -192,6 +199,7 @@ impl Server {
         let listener = TcpListener::bind(addr).await?;
         let local = listener.local_addr()?;
         let state = self.state.clone();
+        spawn_file_sweeper(state.clone());
         tokio::spawn(async move {
             while let Ok((stream, _peer)) = listener.accept().await {
                 let acceptor = acceptor.clone();
@@ -282,16 +290,31 @@ where
         };
 
         // Route under the lock; resolve target senders; release before sending.
-        let sends: Vec<(mpsc::UnboundedSender<ServerMsg>, ServerMsg)> = {
+        // Also collect any stored-blob deliveries scheduled by this message, to
+        // stream off-lock (a large blob read must never hold the global lock).
+        let (sends, deliveries) = {
             let mut s = state.lock().unwrap();
             let outgoing = s.relay.handle(conn, client_msg);
-            outgoing
+            let sends: Vec<(mpsc::UnboundedSender<ServerMsg>, ServerMsg)> = outgoing
                 .into_iter()
                 .filter_map(|o| s.txs.get(&o.to).cloned().map(|tx| (tx, o.msg)))
-                .collect()
+                .collect();
+            let deliveries: Vec<(BlobDelivery, mpsc::UnboundedSender<ServerMsg>)> = s
+                .relay
+                .take_blob_deliveries()
+                .into_iter()
+                .filter_map(|d| s.txs.get(&d.to).cloned().map(|tx| (d, tx)))
+                .collect();
+            (sends, deliveries)
         };
         for (tx, msg) in sends {
             let _ = tx.send(msg);
+        }
+        for (delivery, tx) in deliveries {
+            let state = state.clone();
+            // The blob read is blocking I/O and can be large, so it runs on a
+            // blocking thread, off the async workers and off the relay lock.
+            tokio::task::spawn_blocking(move || stream_blob(state, delivery, tx));
         }
     }
 
@@ -309,4 +332,66 @@ where
         let _ = tx.send(msg);
     }
     writer.abort();
+}
+
+/// Stream one stored blob to an accepting recipient off the relay lock, one
+/// sealed chunk at a time (never the whole file in memory), then mark the
+/// delivery done so the store can reclaim the blob once every recipient has
+/// resolved. If the recipient's connection drops mid-stream, the delivery is
+/// aborted (the offer stays pending, so it can be retried).
+fn stream_blob(
+    state: Arc<Mutex<ServerState>>,
+    d: BlobDelivery,
+    tx: mpsc::UnboundedSender<ServerMsg>,
+) {
+    let ok = match BlobReader::open(&d.blob) {
+        Ok(mut reader) => loop {
+            match reader.next_chunk() {
+                Ok(Some(chunk)) => {
+                    let msg = ServerMsg::FileChunk {
+                        offer_id: d.offer_id,
+                        from: d.from.clone(),
+                        data: Sealed(chunk),
+                    };
+                    if tx.send(msg).is_err() {
+                        break false; // recipient disconnected
+                    }
+                }
+                Ok(None) => break true, // end of blob
+                Err(_) => break false,  // read error
+            }
+        },
+        Err(_) => false,
+    };
+    let mut s = state.lock().unwrap();
+    if ok {
+        let _ = tx.send(ServerMsg::FileComplete {
+            offer_id: d.offer_id,
+            from: d.from.clone(),
+        });
+        s.relay.finish_stored_delivery(&d.offer_id, &d.recipient);
+    } else {
+        s.relay.abort_stored_delivery(&d.offer_id, &d.recipient);
+    }
+}
+
+/// Periodically sweep lapsed file offers and deliver the resulting notifications.
+fn spawn_file_sweeper(state: Arc<Mutex<ServerState>>) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(FILE_SWEEP_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let sends: Vec<(mpsc::UnboundedSender<ServerMsg>, ServerMsg)> = {
+                let mut s = state.lock().unwrap();
+                let outgoing = s.relay.sweep_files();
+                outgoing
+                    .into_iter()
+                    .filter_map(|o| s.txs.get(&o.to).cloned().map(|tx| (tx, o.msg)))
+                    .collect()
+            };
+            for (tx, msg) in sends {
+                let _ = tx.send(msg);
+            }
+        }
+    });
 }
