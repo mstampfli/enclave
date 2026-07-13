@@ -18,6 +18,7 @@
 pub mod accounts;
 pub mod client;
 pub mod error;
+pub mod filestore;
 pub mod friends;
 pub mod groups;
 pub mod media_socket;
