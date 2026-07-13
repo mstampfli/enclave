@@ -16,13 +16,39 @@ pub fn i16_to_f32(sample: i16) -> f32 {
 
 /// Downmix interleaved `channels`-channel audio to mono by averaging channels.
 pub fn downmix_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
+    let mut out = Vec::new();
+    downmix_to_mono_into(interleaved, channels, &mut out);
+    out
+}
+
+/// Downmix into a caller-owned buffer, allocation-free when the buffer already
+/// has capacity. Used by the real-time capture callback, which must not allocate
+/// (a heap allocation in an audio callback risks a buffer under/overrun).
+pub fn downmix_to_mono_into(interleaved: &[f32], channels: usize, out: &mut Vec<f32>) {
+    out.clear();
     if channels <= 1 {
-        return interleaved.to_vec();
+        out.extend_from_slice(interleaved);
+        return;
     }
-    interleaved
-        .chunks(channels)
-        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
-        .collect()
+    out.extend(
+        interleaved
+            .chunks(channels)
+            .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32),
+    );
+}
+
+/// Downmix interleaved i16 audio to mono directly (averaging in i32 to avoid
+/// overflow), into a caller-owned buffer. Avoids the f32 round-trip for i16
+/// devices and, like [`downmix_to_mono_into`], does not allocate.
+pub fn downmix_i16_to_mono_into(interleaved: &[i16], channels: usize, out: &mut Vec<i16>) {
+    out.clear();
+    if channels <= 1 {
+        out.extend_from_slice(interleaved);
+        return;
+    }
+    out.extend(interleaved.chunks(channels).map(|frame| {
+        (frame.iter().map(|&s| s as i32).sum::<i32>() / frame.len() as i32) as i16
+    }));
 }
 
 /// Streaming linear resampler between two sample rates, mono. It is fed

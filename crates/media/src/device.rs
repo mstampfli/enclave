@@ -19,7 +19,10 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
 
 use crate::audio::SAMPLE_RATE_HZ;
-use crate::frame::{downmix_to_mono, f32_to_i16, i16_to_f32, FrameAccumulator, Resampler};
+use crate::frame::{
+    downmix_i16_to_mono_into, downmix_to_mono_into, f32_to_i16, i16_to_f32, FrameAccumulator,
+    Resampler,
+};
 use crate::MediaError;
 
 fn codec_err(e: impl std::fmt::Display) -> MediaError {
@@ -126,15 +129,30 @@ impl AudioCapture {
         let mut resampler = Resampler::new(config.sample_rate, SAMPLE_RATE_HZ as u32);
 
         let mut acc = FrameAccumulator::new();
+        // Reused scratch buffers so the real-time callback never allocates on the
+        // hot path (heap allocation in an audio callback is a classic cause of
+        // buffer under/overruns). Only the per-frame `to_vec` into the channel
+        // remains, which happens at the 20 ms frame rate, not every callback.
+        let mut mono: Vec<f32> = Vec::new();
+        let mut native: Vec<i16> = Vec::new();
         let mut resampled: Vec<i16> = Vec::new();
-        let on_error = |e| eprintln!("input stream error: {e}");
+        // xruns recover on their own; log the first, then stay quiet so a burst
+        // does not flood the console (which reads as a hard failure).
+        let mut warned = false;
+        let on_error = move |e| {
+            if !warned {
+                warned = true;
+                eprintln!("input stream error: {e} (recovering; further xruns silenced)");
+            }
+        };
 
         let stream = match sample_format {
             SampleFormat::F32 => device.build_input_stream(
                 config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let mono = downmix_to_mono(data, channels);
-                    let native: Vec<i16> = mono.iter().map(|&s| f32_to_i16(s)).collect();
+                    downmix_to_mono_into(data, channels, &mut mono);
+                    native.clear();
+                    native.extend(mono.iter().map(|&s| f32_to_i16(s)));
                     resampled.clear();
                     resampler.process(&native, &mut resampled);
                     acc.push(&resampled, |frame| {
@@ -147,9 +165,8 @@ impl AudioCapture {
             SampleFormat::I16 => device.build_input_stream(
                 config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let floats: Vec<f32> = data.iter().map(|&s| i16_to_f32(s)).collect();
-                    let mono = downmix_to_mono(&floats, channels);
-                    let native: Vec<i16> = mono.iter().map(|&s| f32_to_i16(s)).collect();
+                    // i16 downmixes to mono directly (no f32 round-trip).
+                    downmix_i16_to_mono_into(data, channels, &mut native);
                     resampled.clear();
                     resampler.process(&native, &mut resampled);
                     acc.push(&resampled, |frame| {
