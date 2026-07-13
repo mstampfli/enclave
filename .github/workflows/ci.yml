@@ -10,13 +10,23 @@ on:
 # THREAT_MODEL.md.
 jobs:
   build-test:
-    name: Build, lint, test
-    runs-on: windows-latest
+    name: Build, lint, test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - name: Linux system libraries (WebKitGTK, ALSA, PipeWire)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang nasm cmake pkg-config \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libpipewire-0.3-dev
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy (warnings are errors)
