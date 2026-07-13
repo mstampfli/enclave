@@ -50,6 +50,15 @@ const FILE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 const MAX_OUTBOUND_FILE_BYTES: usize = 12 * 1024 * 1024;
 const MAX_OUTBOUND_CTRL_BYTES: usize = 4 * 1024 * 1024;
 
+/// How long a relayed live file chunk waits for room in a slow recipient's file
+/// budget before the sender's connection gives up on that recipient. A merely
+/// slow-but-progressing reader never reaches it (each chunk drains within the
+/// window); only a reader making no progress at all is dropped from the live
+/// stream, so a dead recipient cannot wedge the sender. Stored delivery needs no
+/// such timeout: it runs in its own task and self-heals when the reader's socket
+/// closes.
+const LIVE_BACKPRESSURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Cap on a signaling message. Key packages and Welcomes are small; this bounds
 /// memory a malicious client can force the server to allocate (ASVS V5/V12).
 const SIGNALING_MSG_LIMIT: usize = 1 << 20; // 1 MiB
@@ -88,17 +97,16 @@ struct ServerState {
 /// permit (from one of the two budgets), so each cap is exact.
 ///
 /// - `send` (async) draws on the *file* budget and AWAITS room -- true
-///   backpressure. Use it only for the high-volume producer, the stored-blob
-///   streamer, so a slow reader stalls its own download rather than growing
-///   server memory.
-/// - `try_send` draws on the *control* budget, never blocks, and DROPS the
-///   message if that budget is full. Use it for control/text and relayed live
-///   chunks dispatched from the reader loop, where blocking would stall an
-///   unrelated sender's whole connection. Because it is a separate budget, a
-///   maxed-out file stream cannot cause a control/text drop; a drop here means
-///   even the small control budget is full, i.e. the reader is not draining at
-///   all (effectively dead). A dropped live chunk makes that one transfer fail
-///   cleanly (the receiver's in-order sink aborts), not corrupt.
+///   backpressure. Use it for the file producers: the stored-blob streamer (its
+///   own task) and relayed live chunks (the reader loop, bounded by
+///   `LIVE_BACKPRESSURE_TIMEOUT` so a dead recipient cannot wedge the sender).
+///   A slow reader paces the producer rather than growing server memory.
+/// - `try_send` draws on the *control* budget and never blocks; it DROPS the
+///   message if that budget is full. Use it for control/text, where blocking
+///   would stall an unrelated sender's whole connection. Because it is a
+///   separate budget, a maxed-out file stream cannot cause a control/text drop;
+///   a drop here means even the small control budget is full, i.e. the reader is
+///   not draining at all (effectively dead).
 ///
 /// A frame's permit is released only after the writer hands it to the socket, so
 /// each budget accounts its frames' bytes for their whole lifetime in memory.
@@ -155,19 +163,22 @@ impl Outbound {
             .map_err(|_| ())
     }
 
-    /// Queue without waiting on the control budget; drop the message if that
-    /// budget is already full. For control/text and relayed live chunks.
-    fn try_send(&self, msg: &ServerMsg) {
+    /// Queue without waiting on the control budget. Returns `false` (without
+    /// queuing) if the budget is full or the connection is gone, so the caller
+    /// can preserve a reliable message elsewhere instead of dropping it.
+    fn try_send(&self, msg: &ServerMsg) -> bool {
         let Some((bytes, n)) = Self::frame(msg, MAX_OUTBOUND_CTRL_BYTES) else {
-            return;
+            return false;
         };
         let Ok(permit) = self.ctrl_quota.clone().try_acquire_many_owned(n) else {
-            return;
+            return false;
         };
-        let _ = self.tx.send(Framed {
-            bytes,
-            _permit: permit,
-        });
+        self.tx
+            .send(Framed {
+                bytes,
+                _permit: permit,
+            })
+            .is_ok()
     }
 }
 
@@ -425,9 +436,9 @@ where
         let (sends, deliveries) = {
             let mut s = state.lock().unwrap();
             let outgoing = s.relay.handle(conn, client_msg);
-            let sends: Vec<(Outbound, ServerMsg)> = outgoing
+            let sends: Vec<(ConnId, Outbound, ServerMsg)> = outgoing
                 .into_iter()
-                .filter_map(|o| s.txs.get(&o.to).cloned().map(|out| (out, o.msg)))
+                .filter_map(|o| s.txs.get(&o.to).cloned().map(|out| (o.to, out, o.msg)))
                 .collect();
             let deliveries: Vec<(BlobDelivery, Outbound)> = s
                 .relay
@@ -437,9 +448,39 @@ where
                 .collect();
             (sends, deliveries)
         };
-        // Control/text/relayed-live: non-blocking, bounded by the outbound cap.
-        for (out, msg) in sends {
-            out.try_send(&msg);
+        // Dispatch. A relayed live file chunk backpressures on the recipient's
+        // file budget so a slow reader paces the sender instead of the chunk
+        // being dropped; the wait is bounded by a timeout so a dead reader
+        // cannot wedge the sender's connection (it is dropped from the live
+        // stream, and its in-order sink then aborts cleanly). Everything else is
+        // low-volume control/text; if the recipient's control budget is full
+        // (they are stuck), a reliable message is preserved in their offline
+        // queue rather than dropped, and only if even that is at its global cap
+        // is the sender told. A real-time / latest-wins message is fine to drop.
+        for (to_conn, out, msg) in sends {
+            if matches!(msg, ServerMsg::FileChunk { .. }) {
+                let _ = tokio::time::timeout(LIVE_BACKPRESSURE_TIMEOUT, out.send(&msg)).await;
+                continue;
+            }
+            if out.try_send(&msg) {
+                continue; // delivered live
+            }
+            if crate::relay::spillable(&msg) {
+                let queued = {
+                    let mut s = state.lock().unwrap();
+                    s.relay.spill_offline(to_conn, msg)
+                };
+                if !queued {
+                    // Offline queue also at its global cap: notify the sender.
+                    let s = state.lock().unwrap();
+                    if let Some(sender) = s.txs.get(&conn) {
+                        sender.try_send(&ServerMsg::Error {
+                            detail: "the server is out of queue space; a message was not delivered"
+                                .into(),
+                        });
+                    }
+                }
+            }
         }
         for (delivery, out) in deliveries {
             let state = state.clone();

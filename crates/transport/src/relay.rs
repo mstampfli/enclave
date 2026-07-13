@@ -623,10 +623,7 @@ impl Relay {
                     }],
                     // Target offline: queue the Welcome for their next login, so a
                     // member added while away still joins the group.
-                    None => {
-                        let _ = self.queue.enqueue(&to.0, welcome);
-                        vec![]
-                    }
+                    None => self.queue_for_offline(from, &to.0, welcome).into_iter().collect(),
                 }
             }
 
@@ -1054,10 +1051,9 @@ impl Relay {
                 };
                 match self.device_conn.get(&dev) {
                     Some(&conn) => out.push(Outgoing { to: conn, msg }),
-                    // Offline: park the offer for their next login.
-                    None => {
-                        self.queue.enqueue(&dev.0, msg);
-                    }
+                    // Offline: park the offer for their next login (notify the
+                    // sender if the queue is at its global cap).
+                    None => out.extend(self.queue_for_offline(from, &dev.0, msg)),
                 }
             }
             out
@@ -1467,14 +1463,66 @@ impl Relay {
             match self.device_conn.get(&dev) {
                 // Online: deliver now.
                 Some(&conn) => out.push(Outgoing { to: conn, msg }),
-                // Offline: park it for delivery on their next login.
-                None => {
-                    self.queue.enqueue(&dev.0, msg);
-                }
+                // Offline: park it for delivery on their next login; tell the
+                // sender if the queue is at its global cap (never a silent drop).
+                None => out.extend(self.queue_for_offline(from, &dev.0, msg)),
             }
         }
         out
     }
+
+    /// Park `msg` in the persistent offline queue for `device`. Returns a
+    /// sender-facing `Error` to append only when the queue is at its global cap
+    /// -- i.e. real resource exhaustion. Below that the queue evicts the device's
+    /// own oldest to make room, so an incoming message is never silently lost;
+    /// at true exhaustion the sender is told rather than the message vanishing.
+    fn queue_for_offline(&mut self, sender: ConnId, device: &str, msg: ServerMsg) -> Option<Outgoing> {
+        if self.queue.enqueue(device, msg) {
+            None
+        } else {
+            Some(Outgoing {
+                to: sender,
+                msg: server_full_error(),
+            })
+        }
+    }
+
+    /// Spill a message meant for an *online* recipient whose live outbound is
+    /// full into their persistent offline queue instead of dropping it (it is
+    /// delivered on their next reconnect). Returns whether it was queued
+    /// (`false` = the offline queue is at its global cap, or the target has no
+    /// device). Used by the async shell as the no-drop path for a stuck reader.
+    pub fn spill_offline(&mut self, to: ConnId, msg: ServerMsg) -> bool {
+        match self.conn_device.get(&to).cloned() {
+            Some(device) => self.queue.enqueue(&device.0, msg),
+            None => false,
+        }
+    }
+}
+
+/// The message the server sends a sender when a reliable message could not be
+/// delivered *and* could not be stored -- the offline queue is at its global
+/// byte cap (real resource exhaustion). Surfaced so nothing is ever lost
+/// silently: at true exhaustion the sender is told, not left guessing.
+fn server_full_error() -> ServerMsg {
+    ServerMsg::Error {
+        detail: "the server is out of queue space; a message could not be delivered".into(),
+    }
+}
+
+/// Whether a server->client message should be preserved in the offline queue
+/// rather than dropped when a live outbound is full. Reliable-delivery messages
+/// (text, MLS handshake, group Welcome, a file offer) spill; real-time or
+/// latest-wins ones (media, presence, call/friend state) do not -- dropping a
+/// stale one is correct, and the next update supersedes it.
+pub fn spillable(msg: &ServerMsg) -> bool {
+    matches!(
+        msg,
+        ServerMsg::Text { .. }
+            | ServerMsg::Mls { .. }
+            | ServerMsg::Welcome { .. }
+            | ServerMsg::FileOffered { .. }
+    )
 }
 
 /// Build a `FileOfferRejected` reply to the sender.

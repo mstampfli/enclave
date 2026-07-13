@@ -1017,3 +1017,56 @@ fn a_chunk_from_someone_who_is_not_the_sender_is_ignored() {
     let out = r.handle(b, ClientMsg::FileChunk { offer_id, data: Sealed(vec![9, 9]) });
     assert!(out.is_empty());
 }
+
+#[test]
+fn a_spilled_message_reaches_the_recipient_on_reconnect() {
+    // When an online recipient's live outbound is full, the server spills the
+    // reliable message into their offline queue instead of dropping it; they
+    // receive it on their next reconnect. Nothing is lost.
+    let mut r = Relay::new();
+    let (_a, ah, b, bh, group) = two_member_group(&mut r);
+    let queued = r.spill_offline(
+        b,
+        ServerMsg::Text {
+            group: group.clone(),
+            from: DeviceId(ah.clone()),
+            message: Sealed(vec![1, 2, 3]),
+        },
+    );
+    assert!(queued, "spilled into the offline queue");
+    // Bob's stuck connection drops; on reconnect he drains the spilled message.
+    r.disconnect(b);
+    let (_b2, finish) = login(&mut r, &bh, vec![2]);
+    assert!(
+        finish.iter().any(|o| matches!(
+            &o.msg,
+            ServerMsg::Text { message, .. } if message.0 == vec![1, 2, 3]
+        )),
+        "the spilled message is delivered on reconnect, not lost"
+    );
+}
+
+#[test]
+fn only_reliable_messages_spill() {
+    use enclave_transport::relay::spillable;
+    let group = GroupId([0u8; 32]);
+    assert!(spillable(&ServerMsg::Text {
+        group: group.clone(),
+        from: DeviceId("a".into()),
+        message: Sealed(vec![]),
+    }));
+    assert!(spillable(&ServerMsg::Mls {
+        group: group.clone(),
+        from: DeviceId("a".into()),
+        message: Sealed(vec![]),
+    }));
+    // Latest-wins / real-time state is not spilled (dropping a stale one is fine).
+    assert!(!spillable(&ServerMsg::Presence {
+        user: UserId("a".into()),
+        status: Presence::Online,
+    }));
+    assert!(!spillable(&ServerMsg::CallParticipants {
+        group,
+        participants: vec![],
+    }));
+}
