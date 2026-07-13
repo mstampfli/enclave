@@ -8,9 +8,9 @@
 /* ============================================================
    Enclave design prototype, take 2: graphite instrument panel.
    One warm-neutral gray ramp. Hairline borders carry structure.
-   Radius 2px. No colored controls: the primary action is
-   inverted ink. Color is semantic only: sage = trust/presence,
-   brick = danger. Mono = labels, timestamps, cryptographic truth.
+   Radius 2px. Color is semantic only: sage = trust, presence,
+   and the primary action; brick = danger; amber = degraded.
+   One sans family; only the safety number gets tabular digits.
    ============================================================ */
 
 :root {
@@ -57,6 +57,7 @@ body {
 
 button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
 input, select, textarea { font: inherit; }
+input[type="checkbox"], select { cursor: pointer; }
 
 * { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
 ::-webkit-scrollbar { width: 10px; }
@@ -107,7 +108,7 @@ input, select, textarea { font: inherit; }
 .field .hint { font-size: 12.5px; color: var(--muted); }
 
 .avatar {
-  width: 32px; height: 32px; border-radius: 3px; flex: none;
+  width: 32px; height: 32px; border-radius: var(--radius); flex: none;
   display: grid; place-items: center;
   font-size: 12px; font-weight: 600;
   background: var(--raised);
@@ -124,7 +125,7 @@ input, select, textarea { font: inherit; }
 
 #login-view { height: 100%; display: grid; place-items: center; background: var(--bg); }
 .login-card {
-  width: 380px; padding: 34px 32px 26px;
+  width: min(380px, calc(100vw - 48px)); padding: 34px 32px 26px;
   background: var(--panel); border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   display: flex; flex-direction: column; gap: 18px;
@@ -138,7 +139,8 @@ input, select, textarea { font: inherit; }
 .login-tagline { font-size: 13.5px; color: var(--muted); margin-top: -10px; }
 .login-tabs { display: flex; border: 1px solid var(--border); border-radius: var(--radius); }
 .login-tabs button { flex: 1; padding: 7px 0; font-size: 13px; color: var(--muted);
-  font-weight: 500; }
+  font-weight: 500; transition: color 130ms ease-out; }
+.login-tabs button:hover { color: var(--ink); }
 .login-tabs button + button { border-left: 1px solid var(--border); }
 .login-tabs button.active { background: var(--raised); color: var(--ink); }
 .login-error { color: var(--danger); font-size: 13px; min-height: 1em; }
@@ -197,7 +199,9 @@ input, select, textarea { font: inherit; }
 .side-tabs button:hover { color: var(--ink); }
 .side-tabs button.active { color: var(--ink-strong); border-bottom-color: var(--ink-strong); }
 .side-tabs .count { font-size: 11px; margin-left: 4px; color: var(--muted); }
-.side-tabs .count.attention { color: var(--accent-ink); }
+/* Waiting requests get the same treatment as unread counts: weight, not a
+   hue. Sage means trust/presence/live, and a pending request is none of those. */
+.side-tabs .count.attention { color: var(--ink-strong); font-weight: 600; }
 
 .side-scroll { flex: 1; overflow-y: auto; min-height: 0; padding: 8px; }
 
@@ -207,7 +211,7 @@ input, select, textarea { font: inherit; }
   padding: 2px 8px 6px; font-size: 12px; font-weight: 550; color: var(--faint);
 }
 .side-section > .head button { color: var(--muted); display: grid; place-items: center;
-  width: 20px; height: 20px; border-radius: var(--radius); }
+  width: 24px; height: 24px; margin: -4px 0; border-radius: var(--radius); }
 .side-section > .head button:hover { background: var(--raised); color: var(--ink); }
 
 .convo-row {
@@ -219,17 +223,21 @@ input, select, textarea { font: inherit; }
 .convo-row:hover { background: var(--raised); }
 .convo-row.active { background: var(--hover); }
 .convo-row .meta { flex: 1; min-width: 0; }
+/* A flex container cannot ellipsize a bare text node, so the title gets its
+   own span; the unread count / live tag sits on the first text line instead
+   of floating between the two lines of the row. */
 .convo-row .name { font-size: 14px; font-weight: 500; color: var(--ink);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   display: flex; align-items: center; gap: 7px; }
+.convo-row .name .name-text { flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .convo-row.active .name { color: var(--ink-strong); }
 .convo-row .last { font-size: 12.5px; color: var(--muted);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .convo-row .unread {
-  font-size: 12px; font-weight: 600; color: var(--ink-strong);
+  flex: none; font-size: 12px; font-weight: 600; color: var(--ink-strong);
 }
 .convo-row .live {
-  display: inline-flex; align-items: center; gap: 5px;
+  flex: none; display: inline-flex; align-items: center; gap: 5px;
   font-size: 12px; font-weight: 500; color: var(--accent-ink);
 }
 .live .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
@@ -239,15 +247,24 @@ input, select, textarea { font: inherit; }
   box-shadow: 0 0 0 3px var(--panel); }
 
 /* people tab */
-.person-row { display: flex; align-items: center; gap: 10px; width: 100%;
-  padding: 6px 8px; border-radius: var(--radius); }
-.person-row:hover { background: var(--raised); }
-.person-row .meta { flex: 1; min-width: 0; text-align: left; }
-.person-row .display { font-size: 14px; color: var(--ink); }
-.person-row .handle { font-size: 11.5px; color: var(--faint); }
-.person-row .row-actions { display: flex; gap: 4px; opacity: 0; }
-.person-row:hover .row-actions, .person-row:focus-within .row-actions { opacity: 1; }
-.row-actions button { width: 26px; height: 26px; display: grid; place-items: center;
+/* A friend row exists to open the conversation, so the whole row is that
+   control; remove is a sibling, never nested inside it. Request rows have no
+   single primary act: they stay plain and keep their actions visible. */
+.person-row { display: flex; align-items: center; width: 100%;
+  border-radius: var(--radius); }
+.person-row .row-main { display: flex; align-items: center; gap: 10px;
+  flex: 1; min-width: 0; padding: 6px 8px; text-align: left;
+  border-radius: var(--radius); }
+.person-row.clickable:hover { background: var(--raised); }
+.person-row .meta { flex: 1; min-width: 0; }
+.person-row .display { font-size: 14px; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.person-row .handle { font-size: 11.5px; color: var(--faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.person-row .row-actions { display: flex; gap: 4px; margin-right: 6px; opacity: 0; }
+.person-row:hover .row-actions, .person-row:focus-within .row-actions,
+.person-row.plain .row-actions { opacity: 1; }
+.row-actions button { width: 28px; height: 28px; display: grid; place-items: center;
   border-radius: var(--radius); color: var(--muted); }
 .row-actions button:hover { background: var(--hover); color: var(--ink); }
 .row-actions button.ok:hover { color: var(--accent-ink); }
@@ -332,7 +349,7 @@ input, select, textarea { font: inherit; }
 .header-actions > button:hover { background: var(--raised); border-color: var(--border);
   color: var(--ink); }
 .header-actions > button.accent { color: var(--accent-ink); }
-.header-actions > button.accent:hover { background: var(--accent-bg); border-color: transparent; }
+.header-actions > button.accent:hover { background: var(--accent-bg); border-color: var(--accent-border); }
 /* While the call is live the header shows state, not an action. */
 .header-actions > button.state { color: var(--accent-ink); cursor: default; }
 .header-actions > button.state:hover { background: transparent; border-color: transparent; }
@@ -383,8 +400,9 @@ input, select, textarea { font: inherit; }
   background: var(--raised); border: 1px solid var(--border);
   transition: background 130ms ease-out, border-color 130ms ease-out, color 130ms ease-out;
 }
-.ctl:hover { border-color: var(--border-strong); }
+.ctl:hover { background: var(--hover); border-color: var(--border-strong); }
 .ctl.engaged { background: var(--accent-bg); border-color: var(--accent-border); color: var(--accent-ink); }
+.ctl.engaged:hover { background: var(--accent-bg-hover); }
 .ctl.off { background: var(--danger-bg); border-color: var(--danger-border); color: var(--danger); }
 .ctl.leave { color: var(--danger); }
 .ctl.leave:hover { background: var(--danger-bg); border-color: var(--danger-border); }
@@ -409,9 +427,41 @@ input, select, textarea { font: inherit; }
 .msg-group .avatar { margin-top: 2px; }
 .msg-group .body { flex: 1; min-width: 0; }
 .msg-group .byline { display: flex; align-items: baseline; gap: 8px; }
-.msg-group .author { font-weight: 600; font-size: 14px; color: var(--ink-strong); }
+.msg-group .author { font-weight: 600; font-size: 14px; color: var(--ink-strong);
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .msg-group .author.me { color: var(--muted); }
-.msg-group .time { font-size: 11.5px; color: var(--faint); }
+.msg-group .time { flex: none; font-size: 11.5px; color: var(--faint); }
+.attach-btn { width: 32px; height: 32px; display: grid; place-items: center;
+  border-radius: var(--radius); color: var(--muted); flex: none; }
+.attach-btn:hover { background: var(--raised); color: var(--ink); }
+.file-att { display: flex; align-items: center; gap: 10px; margin-top: 4px;
+  max-width: 360px; padding: 9px 11px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg); }
+.file-att .ico, .file-offer .ico { flex: none; color: var(--muted); }
+.file-att .meta, .file-offer .meta { min-width: 0; flex: 1; }
+.file-att .fname, .file-offer .fname { font-size: 14px; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-att .fsize, .file-offer .fsize { font-size: 12px; color: var(--muted); }
+.file-att .open { flex: none; color: var(--accent-ink); font-size: 13px;
+  padding: 3px 8px; border-radius: var(--radius); }
+.file-att .open:hover { background: var(--accent-bg); }
+.file-offer { max-width: 380px; margin-top: 4px; padding: 11px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
+.file-offer .head { display: flex; align-items: center; gap: 10px; }
+.file-offer .note { font-size: 12px; color: var(--muted); margin-top: 7px; }
+.file-offer .actions { display: flex; gap: 8px; margin-top: 10px; }
+.file-offer .actions button { font-size: 13px; padding: 6px 12px; border-radius: var(--radius); }
+.file-offer .accept { background: var(--accent); color: #10150f; font-weight: 600; }
+.file-offer .accept:hover { background: #74bb7c; }
+.file-offer .decline { color: var(--muted); }
+.file-offer .decline:hover { background: var(--raised); color: var(--ink); }
+#xfers { max-width: 720px; margin: 0 auto; padding: 0 24px; display: flex; flex-direction: column; gap: 6px; }
+#xfers:empty { display: none; }
+.xfer { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 12.5px; color: var(--muted); }
+.xfer .label { flex: none; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.xfer .track { flex: 1; height: 4px; border-radius: 2px; background: var(--raised); overflow: hidden; }
+.xfer .fill { height: 100%; background: var(--accent); }
+.xfer .pct { flex: none; font-variant-numeric: tabular-nums; }
 .msg-group p { color: var(--ink); font-size: 14.5px; margin-top: 1px;
   overflow-wrap: anywhere; }
 .msg-group p + p { margin-top: 3px; }
@@ -441,46 +491,6 @@ input, select, textarea { font: inherit; }
 .send-btn { width: 32px; height: 32px; display: grid; place-items: center;
   border-radius: var(--radius); color: var(--muted); }
 .send-btn:hover { background: var(--raised); color: var(--ink); }
-.attach-btn { width: 32px; height: 32px; display: grid; place-items: center;
-  border-radius: var(--radius); color: var(--muted); flex: none; }
-.attach-btn:hover { background: var(--raised); color: var(--ink); }
-.file-att { display: flex; align-items: center; gap: 10px; margin-top: 4px;
-  max-width: 360px; padding: 9px 11px; border: 1px solid var(--border);
-  border-radius: var(--radius); background: var(--bg); }
-.file-att .ico { flex: none; color: var(--muted); }
-.file-att .meta { min-width: 0; flex: 1; }
-.file-att .fname { font-size: 14px; color: var(--ink); overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; }
-.file-att .fsize { font-size: 12px; color: var(--muted); }
-.file-att .open { flex: none; color: var(--accent-ink); font-size: 13px;
-  padding: 3px 8px; border-radius: var(--radius); }
-.file-att .open:hover { background: var(--accent-bg); }
-.file-offer { max-width: 380px; margin-top: 4px; padding: 11px 12px;
-  border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
-.file-offer .head { display: flex; align-items: center; gap: 10px; }
-.file-offer .ico { flex: none; color: var(--muted); }
-.file-offer .meta { min-width: 0; flex: 1; }
-.file-offer .fname { font-size: 14px; color: var(--ink); overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; }
-.file-offer .fsize { font-size: 12px; color: var(--muted); }
-.file-offer .note { font-size: 12px; color: var(--muted); margin-top: 7px; }
-.file-offer .actions { display: flex; gap: 8px; margin-top: 10px; }
-.file-offer .actions button { font-size: 13px; padding: 6px 12px;
-  border-radius: var(--radius); }
-.file-offer .accept { background: var(--accent); color: #10150f; font-weight: 600; }
-.file-offer .accept:hover { background: #74bb7c; }
-.file-offer .decline { color: var(--muted); }
-.file-offer .decline:hover { background: var(--raised); color: var(--ink); }
-#xfers { max-width: 720px; margin: 0 auto; padding: 0 24px;
-  display: flex; flex-direction: column; gap: 6px; }
-#xfers:empty { display: none; }
-.xfer { display: flex; align-items: center; gap: 10px; padding: 6px 0;
-  font-size: 12.5px; color: var(--muted); }
-.xfer .label { flex: none; max-width: 200px; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
-.xfer .track { flex: 1; height: 4px; border-radius: 2px; background: var(--raised); overflow: hidden; }
-.xfer .fill { height: 100%; background: var(--accent); }
-.xfer .pct { flex: none; font-variant-numeric: tabular-nums; }
 
 /* ============ MODALS ============ */
 
@@ -513,7 +523,7 @@ input, select, textarea { font: inherit; }
   border: 1px solid transparent;
   transition: background 120ms ease-out, border-color 120ms ease-out; }
 .pick-row:hover { background: var(--raised); }
-.pick-row.current { background: var(--accent-bg); }
+.pick-row.current { background: var(--accent-bg); border-color: var(--accent-border); }
 .pick-row .now { margin-left: auto; font-size: 12px; color: var(--accent-ink); flex: none; }
 .pick-row .icon { color: var(--muted); }
 .pick-row .lbl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
@@ -521,6 +531,7 @@ input, select, textarea { font: inherit; }
 .pick-empty { font-size: 13px; color: var(--muted); padding: 6px 2px; }
 .share-audio-row { display: flex; align-items: flex-start; gap: 9px; }
 .share-audio-row input { margin-top: 3px; accent-color: var(--accent); }
+.share-audio-row label { cursor: pointer; }
 .share-audio-row .lbl { font-size: 14px; }
 .share-audio-row .hint { font-size: 12.5px; color: var(--muted); }
 
@@ -550,13 +561,15 @@ input, select, textarea { font: inherit; }
 
 /* members */
 .member-row { display: flex; align-items: center; gap: 10px; padding: 6px 4px; }
-.member-row .meta { flex: 1; }
-.member-row .display { font-size: 14px; }
-.member-row .handle { font-size: 11.5px; color: var(--faint); }
-.member-row input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
+.member-row .meta { flex: 1; min-width: 0; }
+.member-row .display { font-size: 14px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.member-row .handle { font-size: 11.5px; color: var(--faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.member-row input[type="checkbox"] { accent-color: var(--accent); }
 label.member-row { cursor: pointer; border-radius: var(--radius); }
 label.member-row:hover { background: var(--raised); }
-.member-row .kick { opacity: 0; color: var(--muted); width: 26px; height: 26px;
+.member-row .kick { opacity: 0; color: var(--muted); width: 28px; height: 28px;
   display: grid; place-items: center; border-radius: var(--radius); }
 .member-row:hover .kick { opacity: 1; }
 .member-row .kick:hover { background: var(--danger-bg); color: var(--danger); }
@@ -581,12 +594,17 @@ label.member-row:hover { background: var(--raised); }
 /* toasts */
 #toasts { position: fixed; right: 18px; bottom: 18px; display: flex;
   flex-direction: column; gap: 8px; z-index: 60; }
-.toast { display: flex; align-items: center; gap: 10px; min-width: 260px; max-width: 380px;
+/* Top-aligned so the dismiss button sits on the first line of a multi-line
+   toast instead of floating between lines. */
+.toast { display: flex; align-items: flex-start; gap: 10px; min-width: 260px; max-width: 380px;
   background: var(--panel); border: 1px solid var(--border-strong);
   border-left: 2px solid var(--accent);
   border-radius: var(--radius); padding: 10px 14px; font-size: 13.5px; }
 .toast.error { border-left-color: var(--danger); }
-.toast .close { margin-left: auto; color: var(--muted); }
+.toast > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.toast .close { flex: none; width: 28px; height: 28px; display: grid; place-items: center;
+  margin: -4px -8px -4px auto; border-radius: var(--radius); color: var(--muted); }
+.toast .close:hover { background: var(--raised); color: var(--ink); }
 
 /* prototype drawer (not part of the product) */
 #proto { position: fixed; left: 306px; bottom: 18px; z-index: 70; font-size: 12px; }
@@ -718,7 +736,7 @@ label.member-row:hover { background: var(--raised); }
       <div class="add-friend">
         <input id="add-friend-input" placeholder="add by username, e.g. wren" spellcheck="false">
         <button class="btn" id="add-friend-btn" style="padding:7px 10px" title="Send friend request" aria-label="Send friend request">
-          <svg class="icon sm" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+          <svg class="icon sm" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6M23 11h-6"/></svg>
         </button>
       </div>
       <div class="side-section" id="sec-incoming">
@@ -822,6 +840,7 @@ label.member-row:hover { background: var(--raised); }
     <div id="messages"><div class="msg-col" id="msg-col"></div></div>
 
     <footer id="composer">
+      <div id="xfers"></div>
       <div class="composer-inner">
         <div class="composer-box">
           <button class="attach-btn" type="button" id="attach-btn" title="Send a file" aria-label="Send a file">
@@ -977,7 +996,11 @@ label.member-row:hover { background: var(--raised); }
     </div>
     <div class="m-section">
       <div class="s-head">Members</div>
+      <div class="modal-search">
+        <input id="members-search" placeholder="Search members" autocomplete="off" spellcheck="false">
+      </div>
       <div id="members-list"></div>
+      <div class="pick-empty" id="members-none" hidden>No member matches that.</div>
     </div>
     <div class="m-section">
       <div class="s-head">Add someone</div>
@@ -1084,35 +1107,6 @@ const state = {
   paletteSel: 0,
 };
 
-function humanSize(n) {
-  if (n < 1024) return n + " B";
-  const u = ["KB", "MB", "GB"]; let v = n / 1024, i = 0;
-  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
-  return v.toFixed(v < 10 ? 1 : 0) + " " + u[i];
-}
-function fileRowHTML(file, mine) {
-  return `<div class="file-att">
-    <svg class="icon ico" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7"/></svg>
-    <div class="meta"><div class="fname" title="${file.name}">${file.name}</div>
-      <div class="fsize">${humanSize(file.size)}${mine ? " · sent" : ""}</div></div>
-    <button class="open" type="button">Open</button></div>`;
-}
-// A file offered to us: a consent prompt, not a download. Nothing lands on disk
-// until Download is clicked; the two actions are siblings, each its own target.
-function offerRowHTML(offer) {
-  return `<div class="file-offer">
-    <div class="head">
-      <svg class="icon ico" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7"/></svg>
-      <div class="meta"><div class="fname" title="${offer.name}">${offer.name}</div>
-        <div class="fsize">${humanSize(offer.size)}</div></div></div>
-    <div class="note">${offer.live
-      ? "Sent live — accept promptly, the sender is streaming it now."
-      : "This file has not been downloaded. Choose whether to receive it."}</div>
-    <div class="actions">
-      <button class="accept" type="button">Download</button>
-      <button class="decline" type="button">Decline</button></div></div>`;
-}
-
 const CONVOS = {
   aria: {
     kind: "dm", title: "Aria Chen", with: "aria",
@@ -1205,11 +1199,14 @@ function sealSVG(safety, verified, size) {
 const $ = id => document.getElementById(id);
 const GEAR_PATHS = `<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>`;
 const initials = name => name.split(/\s+/).map(w => w[0]).slice(0, 2).join("").toUpperCase();
+// Typed text renders as typed: "a<b" is a message, not markup.
+const esc = s => String(s).replace(/[&<>"']/g,
+  ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
 
 function toast(text, error) {
   const t = document.createElement("div");
   t.className = "toast" + (error ? " error" : "");
-  t.innerHTML = `<span>${text}</span><button class="close" aria-label="Dismiss">
+  t.innerHTML = `<span>${esc(text)}</span><button class="close" aria-label="Dismiss">
     <svg class="icon sm" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>`;
   t.querySelector(".close").onclick = () => t.remove();
   $("toasts").appendChild(t);
@@ -1249,25 +1246,32 @@ function renderConvoList() {
       : c.unread ? `<span class="unread">${c.unread}</span>` : "";
     row.innerHTML = `${av}
       <div class="meta">
-        <div class="name">${c.title}</div>
-        <div class="last">${c.last}</div>
-      </div>${right}`;
+        <div class="name"><span class="name-text">${esc(c.title)}</span>${right}</div>
+        <div class="last">${esc(c.last)}</div>
+      </div>`;
     row.onclick = () => { switchConvo(id); };
     el.appendChild(row);
   }
 }
 
-function personRow(p, actions) {
+// With an onOpen the whole row is that action and hides its extras until
+// hover; without one the row is plain and its actions stay visible.
+function personRow(p, actions, onOpen) {
   const row = document.createElement("div");
-  row.className = "person-row";
-  row.innerHTML = `
-    <div class="avatar-wrap"><div class="avatar">${initials(p.display || p.handle)}</div>
+  row.className = "person-row " + (onOpen ? "clickable" : "plain");
+  const name = esc(p.display || p.handle);
+  const inner = `
+    <div class="avatar-wrap"><div class="avatar">${esc(initials(p.display || p.handle))}</div>
       ${p.presence ? `<span class="presence-dot ${p.presence}"></span>` : ""}</div>
     <div class="meta">
-      <div class="display">${p.display || p.handle}</div>
-      <div class="handle">${p.handle}</div>
-    </div>
-    <div class="row-actions">${actions}</div>`;
+      <div class="display">${name}</div>
+      <div class="handle">${esc(p.handle)}</div>
+    </div>`;
+  row.innerHTML = (onOpen
+    ? `<button class="row-main" title="Message ${name}">${inner}</button>`
+    : `<div class="row-main">${inner}</div>`)
+    + `<div class="row-actions">${actions}</div>`;
+  if (onOpen) row.querySelector(".row-main").onclick = onOpen;
   return row;
 }
 
@@ -1301,12 +1305,11 @@ function renderPeople() {
   }
   shownFriends.forEach(p => {
     const row = personRow(p, `
-      <button title="Message"><svg class="icon sm" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></button>
-      <button class="no" title="Remove friend"><svg class="icon sm" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg></button>`);
-    row.querySelector("button[title=Message]").onclick = () => {
-      const convoId = Object.keys(CONVOS).find(k => CONVOS[k].with === p.handle);
-      setTab("chats"); if (convoId) switchConvo(convoId);
-    };
+      <button class="no" title="Remove friend"><svg class="icon sm" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg></button>`,
+      () => {
+        const convoId = Object.keys(CONVOS).find(k => CONVOS[k].with === p.handle);
+        setTab("chats"); if (convoId) switchConvo(convoId);
+      });
     row.querySelector(".no").onclick = () => toast(`Removed ${p.display} (prototype: no-op)`);
     fr.appendChild(row);
   });
@@ -1346,6 +1349,34 @@ function renderHeader() {
   $("composer-input").placeholder = `Message ${c.title}`;
 }
 
+function humanSize(n) {
+  if (n < 1024) return n + " B";
+  const u = ["KB", "MB", "GB"]; let v = n / 1024, i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v < 10 ? 1 : 0) + " " + u[i];
+}
+function fileRowHTML(file, mine) {
+  return `<div class="file-att">
+    <svg class="icon ico" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7"/></svg>
+    <div class="meta"><div class="fname" title="${esc(file.name)}">${esc(file.name)}</div>
+      <div class="fsize">${humanSize(file.size)}${mine ? " \u00b7 sent" : ""}</div></div>
+    <button class="open" type="button">Open</button></div>`;
+}
+// A file offered to us: a consent prompt, not a download. Nothing lands on disk
+// until Download is clicked; the two actions are siblings, each its own target.
+function offerRowHTML(offer) {
+  return `<div class="file-offer">
+    <div class="head">
+      <svg class="icon ico" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7"/></svg>
+      <div class="meta"><div class="fname" title="${esc(offer.name)}">${esc(offer.name)}</div>
+        <div class="fsize">${humanSize(offer.size)}</div></div></div>
+    <div class="note">${offer.live
+      ? "Sent live \u2014 accept promptly, the sender is streaming it now."
+      : "This file has not been downloaded. Choose whether to receive it."}</div>
+    <div class="actions">
+      <button class="accept" type="button">Download</button>
+      <button class="decline" type="button">Decline</button></div></div>`;
+}
 function renderMessages() {
   const col = $("msg-col");
   col.innerHTML = "";
@@ -1377,12 +1408,12 @@ function renderMessages() {
       <div class="avatar">${initials(m.from)}</div>
       <div class="body">
         <div class="byline">
-          <span class="author${m.me ? " me" : ""}">${m.me ? "Marc" : m.from}</span>
+          <span class="author${m.me ? " me" : ""}">${m.me ? "Marc" : esc(m.from)}</span>
           <span class="time">${m.time}</span>
         </div>
         ${m.offer ? offerRowHTML(m.offer)
           : m.file ? fileRowHTML(m.file, m.me)
-          : m.lines.map(l => `<p>${l}</p>`).join("")}
+          : m.lines.map(l => `<p>${esc(l)}</p>`).join("")}
       </div>`;
     if (m.file) g.querySelector(".open").onclick = () => toast("Opening " + m.file.name);
     if (m.offer) {
@@ -1570,8 +1601,7 @@ function fillPicks(id, items, kind) {
 
 function openVerify() {
   const c = convo();
-  $("modal-verify").querySelector("h2").textContent =
-    c.kind === "dm" ? `Verify ${c.title}` : `Verify ${c.title}`;
+  $("modal-verify").querySelector("h2").textContent = `Verify ${c.title}`;
   $("verify-seal").innerHTML = sealSVG(c.safety, c.verified, 72);
   $("safety-number").textContent = c.safety;
   const st = $("verify-state");
@@ -1599,6 +1629,7 @@ function openMembers() {
   for (const h of c.members) {
     const row = document.createElement("div");
     row.className = "member-row";
+    row.dataset.search = (names[h] + " " + h).toLowerCase();
     row.innerHTML = `
       <div class="avatar">${initials(names[h])}</div>
       <div class="meta"><div class="display">${names[h]}${h === "marc" ? " (you)" : ""}</div>
@@ -1609,6 +1640,8 @@ function openMembers() {
     if (kick) kick.onclick = () => toast(`Removed ${names[h]}; group rekeyed`, false);
     list.appendChild(row);
   }
+  $("members-search").value = "";
+  filterMembers();
   openModal("modal-members");
 }
 
@@ -1619,9 +1652,9 @@ function openNewGroup() {
     row.className = "member-row";
     row.dataset.search = (p.display + " " + p.handle).toLowerCase();
     row.innerHTML = `<input type="checkbox">
-      <div class="avatar">${initials(p.display)}</div>
-      <div class="meta"><div class="display">${p.display}</div>
-        <div class="handle">${p.handle}</div></div>`;
+      <div class="avatar">${esc(initials(p.display))}</div>
+      <div class="meta"><div class="display">${esc(p.display)}</div>
+        <div class="handle">${esc(p.handle)}</div></div>`;
     wrap.appendChild(row);
   });
   $("group-search").value = "";
@@ -1631,17 +1664,20 @@ function openNewGroup() {
 }
 // Rows hide rather than rebuild, so a friend ticked before you typed stays
 // ticked after you filter.
-function filterGroupPicks() {
-  const q = $("group-search").value.trim().toLowerCase();
+function filterMemberRows(inputEl, listEl, emptyEl) {
+  const q = inputEl.value.trim().toLowerCase();
   let any = false;
-  for (const row of $("newgroup-friends").querySelectorAll(".member-row")) {
+  for (const row of listEl.querySelectorAll(".member-row")) {
     const hit = !q || row.dataset.search.includes(q);
     row.style.display = hit ? "" : "none";
     any = any || hit;
   }
-  $("group-none").hidden = any;
+  emptyEl.hidden = any;
 }
+function filterGroupPicks() { filterMemberRows($("group-search"), $("newgroup-friends"), $("group-none")); }
 $("group-search").addEventListener("input", filterGroupPicks);
+function filterMembers() { filterMemberRows($("members-search"), $("members-list"), $("members-none")); }
+$("members-search").addEventListener("input", filterMembers);
 
 /* ---------------- modals ---------------- */
 
@@ -1734,6 +1770,7 @@ function setConnection(s) {
 function showLogin(show) {
   $("login-view").hidden = !show;
   $("app").hidden = show;
+  if (show) setTimeout(() => $("f-user").focus(), 0);
 }
 
 $("tab-login").onclick = () => {
@@ -1787,8 +1824,8 @@ $("camera-stop").onclick = () => {
 $("btn-watch").onclick = () => { state.watching = !state.watching; renderStage(); };
 $("ring-join").onclick = joinCall;
 $("ring-decline").onclick = () => { state.ringing = false; $("banner-ring").hidden = true; };
-$("attach-btn").onclick = () => toast("Native file picker opens here (prototype)");
 $("send-btn").onclick = sendMessage;
+$("attach-btn").onclick = () => toast("Native file picker opens here (prototype)");
 $("composer-input").addEventListener("keydown", e => { if (e.key === "Enter") sendMessage(); });
 $("add-friend-btn").onclick = () => {
   const v = $("add-friend-input").value.trim();
@@ -1869,7 +1906,7 @@ $("palette-hint").onclick = openPalette;
 
 document.addEventListener("keydown", e => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
-  if (e.key === "Escape") closeModals();
+  if (e.key === "Escape") { closeModals(); $("presence-menu").hidden = true; }
   if (!$("palette-overlay").hidden) {
     const items = paletteItems($("palette-input").value);
     if (e.key === "ArrowDown") { state.paletteSel = Math.min(state.paletteSel + 1, items.length - 1); renderPalette(); e.preventDefault(); }

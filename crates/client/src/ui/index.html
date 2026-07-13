@@ -57,6 +57,7 @@ body {
 
 button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
 input, select, textarea { font: inherit; }
+input[type="checkbox"], select { cursor: pointer; }
 
 * { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
 ::-webkit-scrollbar { width: 10px; }
@@ -107,7 +108,7 @@ input, select, textarea { font: inherit; }
 .field .hint { font-size: 12.5px; color: var(--muted); }
 
 .avatar {
-  width: 32px; height: 32px; border-radius: 3px; flex: none;
+  width: 32px; height: 32px; border-radius: var(--radius); flex: none;
   display: grid; place-items: center;
   font-size: 12px; font-weight: 600;
   background: var(--raised);
@@ -124,7 +125,7 @@ input, select, textarea { font: inherit; }
 
 #login-view { height: 100%; display: grid; place-items: center; background: var(--bg); }
 .login-card {
-  width: 380px; padding: 34px 32px 26px;
+  width: min(380px, calc(100vw - 48px)); padding: 34px 32px 26px;
   background: var(--panel); border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   display: flex; flex-direction: column; gap: 18px;
@@ -138,7 +139,8 @@ input, select, textarea { font: inherit; }
 .login-tagline { font-size: 13.5px; color: var(--muted); margin-top: -10px; }
 .login-tabs { display: flex; border: 1px solid var(--border); border-radius: var(--radius); }
 .login-tabs button { flex: 1; padding: 7px 0; font-size: 13px; color: var(--muted);
-  font-weight: 500; }
+  font-weight: 500; transition: color 130ms ease-out; }
+.login-tabs button:hover { color: var(--ink); }
 .login-tabs button + button { border-left: 1px solid var(--border); }
 .login-tabs button.active { background: var(--raised); color: var(--ink); }
 .login-error { color: var(--danger); font-size: 13px; min-height: 1em; }
@@ -197,7 +199,7 @@ input, select, textarea { font: inherit; }
 .side-tabs button:hover { color: var(--ink); }
 .side-tabs button.active { color: var(--ink-strong); border-bottom-color: var(--ink-strong); }
 .side-tabs .count { font-size: 11px; margin-left: 4px; color: var(--muted); }
-.side-tabs .count.attention { color: var(--accent-ink); }
+.side-tabs .count.attention { color: var(--ink-strong); font-weight: 600; }
 
 .side-scroll { flex: 1; overflow-y: auto; min-height: 0; padding: 8px; }
 
@@ -207,7 +209,7 @@ input, select, textarea { font: inherit; }
   padding: 2px 8px 6px; font-size: 12px; font-weight: 550; color: var(--faint);
 }
 .side-section > .head button { color: var(--muted); display: grid; place-items: center;
-  width: 20px; height: 20px; border-radius: var(--radius); }
+  width: 24px; height: 24px; margin: -4px 0; border-radius: var(--radius); }
 .side-section > .head button:hover { background: var(--raised); color: var(--ink); }
 
 .convo-row {
@@ -220,16 +222,17 @@ input, select, textarea { font: inherit; }
 .convo-row.active { background: var(--hover); }
 .convo-row .meta { flex: 1; min-width: 0; }
 .convo-row .name { font-size: 14px; font-weight: 500; color: var(--ink);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   display: flex; align-items: center; gap: 7px; }
+.convo-row .name .name-text { flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .convo-row.active .name { color: var(--ink-strong); }
 .convo-row .last { font-size: 12.5px; color: var(--muted);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .convo-row .unread {
-  font-size: 12px; font-weight: 600; color: var(--ink-strong);
+  flex: none; font-size: 12px; font-weight: 600; color: var(--ink-strong);
 }
 .convo-row .live {
-  display: inline-flex; align-items: center; gap: 5px;
+  flex: none; display: inline-flex; align-items: center; gap: 5px;
   font-size: 12px; font-weight: 500; color: var(--accent-ink);
 }
 .live .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
@@ -239,15 +242,24 @@ input, select, textarea { font: inherit; }
   box-shadow: 0 0 0 3px var(--panel); }
 
 /* people tab */
-.person-row { display: flex; align-items: center; gap: 10px; width: 100%;
-  padding: 6px 8px; border-radius: var(--radius); }
-.person-row:hover { background: var(--raised); }
-.person-row .meta { flex: 1; min-width: 0; text-align: left; }
-.person-row .display { font-size: 14px; color: var(--ink); }
-.person-row .handle { font-size: 11.5px; color: var(--faint); }
-.person-row .row-actions { display: flex; gap: 4px; opacity: 0; }
-.person-row:hover .row-actions, .person-row:focus-within .row-actions { opacity: 1; }
-.row-actions button { width: 26px; height: 26px; display: grid; place-items: center;
+/* A friend row exists to open the conversation, so the whole row is that
+   control; remove is a sibling, never nested inside it. Request rows have no
+   single primary act: they stay plain and keep their actions visible. */
+.person-row { display: flex; align-items: center; width: 100%;
+  border-radius: var(--radius); }
+.person-row .row-main { display: flex; align-items: center; gap: 10px;
+  flex: 1; min-width: 0; padding: 6px 8px; text-align: left;
+  border-radius: var(--radius); }
+.person-row.clickable:hover { background: var(--raised); }
+.person-row .meta { flex: 1; min-width: 0; }
+.person-row .display { font-size: 14px; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.person-row .handle { font-size: 11.5px; color: var(--faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.person-row .row-actions { display: flex; gap: 4px; margin-right: 6px; opacity: 0; }
+.person-row:hover .row-actions, .person-row:focus-within .row-actions,
+.person-row.plain .row-actions { opacity: 1; }
+.row-actions button { width: 28px; height: 28px; display: grid; place-items: center;
   border-radius: var(--radius); color: var(--muted); }
 .row-actions button:hover { background: var(--hover); color: var(--ink); }
 .row-actions button.ok:hover { color: var(--accent-ink); }
@@ -332,7 +344,7 @@ input, select, textarea { font: inherit; }
 .header-actions > button:hover { background: var(--raised); border-color: var(--border);
   color: var(--ink); }
 .header-actions > button.accent { color: var(--accent-ink); }
-.header-actions > button.accent:hover { background: var(--accent-bg); border-color: transparent; }
+.header-actions > button.accent:hover { background: var(--accent-bg); border-color: var(--accent-border); }
 /* While the call is live the header shows state, not an action: no hover,
    no pointer, nothing that invites a click. */
 .header-actions > button.state { color: var(--accent-ink); cursor: default; }
@@ -384,7 +396,8 @@ input, select, textarea { font: inherit; }
   background: var(--raised); border: 1px solid var(--border);
   transition: background 130ms ease-out, border-color 130ms ease-out, color 130ms ease-out;
 }
-.ctl:hover { border-color: var(--border-strong); }
+.ctl:hover { background: var(--hover); border-color: var(--border-strong); }
+.ctl.engaged:hover { background: var(--accent-bg-hover); }
 .ctl.engaged { background: var(--accent-bg); border-color: var(--accent-border); color: var(--accent-ink); }
 .ctl.off { background: var(--danger-bg); border-color: var(--danger-border); color: var(--danger); }
 .ctl.leave { color: var(--danger); }
@@ -410,9 +423,10 @@ input, select, textarea { font: inherit; }
 .msg-group .avatar { margin-top: 2px; }
 .msg-group .body { flex: 1; min-width: 0; }
 .msg-group .byline { display: flex; align-items: baseline; gap: 8px; }
-.msg-group .author { font-weight: 600; font-size: 14px; color: var(--ink-strong); }
+.msg-group .author { font-weight: 600; font-size: 14px; color: var(--ink-strong);
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .msg-group .author.me { color: var(--muted); }
-.msg-group .time { font-size: 11.5px; color: var(--faint); }
+.msg-group .time { flex: none; font-size: 11.5px; color: var(--faint); }
 .msg-group p { color: var(--ink); font-size: 14.5px; margin-top: 1px;
   overflow-wrap: anywhere; }
 .msg-group p + p { margin-top: 3px; }
@@ -525,7 +539,7 @@ input, select, textarea { font: inherit; }
   border: 1px solid transparent;
   transition: background 120ms ease-out, border-color 120ms ease-out; }
 .pick-row:hover { background: var(--raised); }
-.pick-row.current { background: var(--accent-bg); }
+.pick-row.current { background: var(--accent-bg); border-color: var(--accent-border); }
 .pick-row .now { margin-left: auto; font-size: 12px; color: var(--accent-ink); flex: none; }
 .pick-row .icon { color: var(--muted); }
 .pick-row .lbl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
@@ -534,6 +548,7 @@ input, select, textarea { font: inherit; }
 .share-audio-row { display: flex; align-items: flex-start; gap: 9px; }
 .share-audio-row input { margin-top: 3px; accent-color: var(--accent); }
 .share-audio-row .lbl { font-size: 14px; }
+.share-audio-row label { cursor: pointer; }
 .share-audio-row .hint { font-size: 12.5px; color: var(--muted); }
 
 /* verification */
@@ -551,10 +566,12 @@ input, select, textarea { font: inherit; }
 
 /* members */
 .member-row { display: flex; align-items: center; gap: 10px; padding: 6px 4px; }
-.member-row .meta { flex: 1; }
-.member-row .display { font-size: 14px; }
-.member-row .handle { font-size: 11.5px; color: var(--faint); }
-.member-row .kick { opacity: 0; color: var(--muted); width: 26px; height: 26px;
+.member-row .meta { flex: 1; min-width: 0; }
+.member-row .display { font-size: 14px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.member-row .handle { font-size: 11.5px; color: var(--faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.member-row .kick { opacity: 0; color: var(--muted); width: 28px; height: 28px;
   display: grid; place-items: center; border-radius: var(--radius); }
 .member-row:hover .kick { opacity: 1; }
 .member-row .kick:hover { background: var(--danger-bg); color: var(--danger); }
@@ -579,12 +596,17 @@ input, select, textarea { font: inherit; }
 /* toasts */
 #toasts { position: fixed; right: 18px; bottom: 18px; display: flex;
   flex-direction: column; gap: 8px; z-index: 60; }
-.toast { display: flex; align-items: center; gap: 10px; min-width: 260px; max-width: 380px;
+/* Top-aligned so the dismiss button sits on the first line of a multi-line
+   toast instead of floating between lines. */
+.toast { display: flex; align-items: flex-start; gap: 10px; min-width: 260px; max-width: 380px;
   background: var(--panel); border: 1px solid var(--border-strong);
   border-left: 2px solid var(--accent);
   border-radius: var(--radius); padding: 10px 14px; font-size: 13.5px; }
 .toast.error { border-left-color: var(--danger); }
-.toast .close { margin-left: auto; color: var(--muted); }
+.toast > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.toast .close { flex: none; width: 28px; height: 28px; display: grid; place-items: center;
+  margin: -4px -8px -4px auto; border-radius: var(--radius); color: var(--muted); }
+.toast .close:hover { background: var(--raised); color: var(--ink); }
 
 [hidden] { display: none !important; }
 
@@ -603,7 +625,7 @@ input, select, textarea { font: inherit; }
 .pending-note { text-align: center; font-size: 12.5px; color: var(--faint); padding: 6px 0; }
 
 /* group-picker rows reuse member-row; make the checkbox visible */
-.member-row input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
+.member-row input[type="checkbox"] { accent-color: var(--accent); }
 label.member-row { cursor: pointer; border-radius: var(--radius); padding: 6px; }
 label.member-row:hover { background: var(--raised); }
 
@@ -995,7 +1017,11 @@ label.member-row:hover { background: var(--raised); }
     </div>
     <div class="m-section">
       <div class="s-head">Members</div>
+      <div class="modal-search">
+        <input id="members-search" placeholder="Search members" autocomplete="off" spellcheck="false">
+      </div>
       <div id="members-list"></div>
+      <div class="pick-empty" id="members-none" hidden>No member matches that.</div>
     </div>
     <div class="m-section">
       <div class="s-head">Add someone</div>
@@ -1645,44 +1671,59 @@ function renderConvoList() {
     const meta = document.createElement("div");
     meta.className = "meta";
     const name = document.createElement("div");
-    name.className = "name"; name.textContent = c.title;
+    name.className = "name";
+    const nameText = document.createElement("span");
+    nameText.className = "name-text"; nameText.textContent = c.title;
+    name.appendChild(nameText);
+    // The unread count / live tag sits on the first text line (flex:none),
+    // beside the title, not floating between the two lines of the row.
+    const inThat = inCall && myCallConv === c.id;
+    if (inThat || (callPart[c.id] || []).length) {
+      const live = document.createElement("span");
+      live.className = "live";
+      live.innerHTML = '<span class="live-dot"></span>' + (inThat ? "in call" : "live");
+      name.appendChild(live);
+    } else if (unread[c.id]) {
+      const b = document.createElement("span");
+      b.className = "unread"; b.textContent = unread[c.id] > 99 ? "99+" : unread[c.id];
+      name.appendChild(b);
+    }
     const last = document.createElement("div");
     last.className = "last";
     last.textContent = c.pending ? "starting conversation..." :
       lastLine(c.id) || (c.is_dm ? "" : (c.members || []).length + " members");
     meta.appendChild(name); meta.appendChild(last);
     row.appendChild(meta);
-    const inThat = inCall && myCallConv === c.id;
-    if (inThat || (callPart[c.id] || []).length) {
-      const live = document.createElement("span");
-      live.className = "live";
-      live.innerHTML = '<span class="live-dot"></span>' + (inThat ? "in call" : "live");
-      row.appendChild(live);
-    } else if (unread[c.id]) {
-      const b = document.createElement("span");
-      b.className = "unread"; b.textContent = unread[c.id] > 99 ? "99+" : unread[c.id];
-      row.appendChild(b);
-    }
     row.addEventListener("click", () => send({ type: "SwitchConversation", conv: c.id }));
     el.appendChild(row);
   }
 }
 
-function personRow(p, dotStatus) {
+// With an `onOpen` the whole row is that action (a row-main button) and hides
+// its extras until hover; without one the row is plain and its actions stay
+// visible. Remove/accept/decline are siblings of row-main, never nested in it.
+function personRow(p, dotStatus, onOpen) {
   const row = document.createElement("div");
-  row.className = "person-row";
+  row.className = "person-row " + (onOpen ? "clickable" : "plain");
+  const main = document.createElement(onOpen ? "button" : "div");
+  main.className = "row-main";
   const av = document.createElement("div");
   av.className = "avatar-wrap";
   av.innerHTML = '<div class="avatar"></div>' + (dotStatus ? '<span class="presence-dot"></span>' : "");
   av.querySelector(".avatar").textContent = initials(p.display || p.username);
   if (dotStatus) av.querySelector(".presence-dot").classList.add(dotStatus);
-  row.appendChild(av);
+  main.appendChild(av);
   const meta = document.createElement("div");
   meta.className = "meta";
   meta.innerHTML = '<div class="display"></div><div class="handle"></div>';
   meta.querySelector(".display").textContent = p.display || p.username;
   meta.querySelector(".handle").textContent = p.username;
-  row.appendChild(meta);
+  main.appendChild(meta);
+  if (onOpen) {
+    main.title = "Message " + (p.display || p.username);
+    main.addEventListener("click", onOpen);
+  }
+  row.appendChild(main);
   const actions = document.createElement("div");
   actions.className = "row-actions";
   row.appendChild(actions);
@@ -1735,16 +1776,15 @@ function renderPeople() {
     fr.appendChild(d);
   }
   for (const f of shownFriends) {
-    const row = personRow(f, statusOf(f.username));
+    // The whole friend row opens the DM; remove is the only sibling action.
+    const row = personRow(f, statusOf(f.username),
+      () => { setTab("chats"); send({ type: "OpenDm", handle: f.username }); });
     const acts = row.querySelector(".row-actions");
-    const msg = actionBtn("", "Message", SVG_MSG);
-    msg.addEventListener("click", () => { setTab("chats"); send({ type: "OpenDm", handle: f.username }); });
     const rm = actionBtn("no", "Remove friend", SVG_TRASH);
     rm.addEventListener("click", () => {
       if (confirm("Remove " + f.display + " from your friends?")) send({ type: "RemoveFriend", handle: f.username });
     });
-    acts.appendChild(msg); acts.appendChild(rm);
-    row.addEventListener("dblclick", () => { setTab("chats"); send({ type: "OpenDm", handle: f.username }); });
+    acts.appendChild(rm);
     fr.appendChild(row);
   }
 
@@ -2006,6 +2046,7 @@ function openMembers() {
   for (const u of conv.members || []) {
     const row = document.createElement("div");
     row.className = "member-row";
+    row.dataset.search = (displayOf(u) + " " + u).toLowerCase();
     const av = document.createElement("div");
     av.className = "avatar"; av.textContent = initials(displayOf(u));
     row.appendChild(av);
@@ -2027,6 +2068,8 @@ function openMembers() {
     }
     list.appendChild(row);
   }
+  $("members-search").value = "";
+  filterMembers();
   openModal("modal-members");
 }
 $("btn-members").addEventListener("click", openMembers);
@@ -2084,6 +2127,18 @@ function filterGroupPicks() {
   if (none) none.hidden = any || !friends.length;
 }
 $("group-search").addEventListener("input", filterGroupPicks);
+// The members modal is searchable too (a big group is a long list).
+function filterMembers() {
+  const q = $("members-search").value.trim().toLowerCase();
+  let any = false;
+  for (const row of $("members-list").querySelectorAll(".member-row")) {
+    const hit = !q || (row.dataset.search || "").includes(q);
+    row.style.display = hit ? "" : "none";
+    any = any || hit;
+  }
+  $("members-none").hidden = any;
+}
+$("members-search").addEventListener("input", filterMembers);
 $("new-group").addEventListener("click", openGroupModal);
 $("group-create").addEventListener("click", () => {
   const name = $("group-name").value.trim() || "New group";
@@ -2272,7 +2327,7 @@ $("palette-hint").addEventListener("click", openPalette);
 $("palette-input").addEventListener("input", () => { paletteSel = 0; renderPalette(); });
 document.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
-  if (e.key === "Escape") closeModals();
+  if (e.key === "Escape") { closeModals(); $("presence-menu").hidden = true; }
   if (!$("palette-overlay").hidden) {
     const items = paletteItems($("palette-input").value);
     if (e.key === "ArrowDown") { paletteSel = Math.min(paletteSel + 1, items.length - 1); renderPalette(); e.preventDefault(); }
@@ -2414,8 +2469,15 @@ window.onEnclaveEvent = (ev) => {
       if (!(inCall && myCallConv === ev.conv)) {
         ringConv = ev.conv;
         const c = convById(ev.conv);
-        $("ring-text").innerHTML = "<strong></strong> is calling" + (c && !c.is_dm ? " in " + c.title : "");
-        $("ring-text").querySelector("strong").textContent = ev.from;
+        // Build with text nodes so a caller/group name is never interpreted as
+        // markup (the conversation title is user-controlled).
+        const rt = $("ring-text");
+        rt.textContent = "";
+        const who = document.createElement("strong");
+        who.textContent = ev.from;
+        rt.appendChild(who);
+        rt.appendChild(document.createTextNode(
+          " is calling" + (c && !c.is_dm ? " in " + c.title : "")));
         $("banner-ring").hidden = false;
         startRing();
         if (ringTimeout) clearTimeout(ringTimeout);
