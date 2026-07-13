@@ -284,6 +284,19 @@ impl SeenSet {
         self.seen.clear();
         self.order.clear();
     }
+
+    /// The remembered ids in insertion order, for persistence.
+    pub fn snapshot(&self) -> Vec<[u8; 16]> {
+        self.order.iter().copied().collect()
+    }
+
+    /// Re-seed from a persisted snapshot (in order), so dedup survives a restart
+    /// and a message resent after both peers restarted is still shown once.
+    pub fn restore(&mut self, ids: Vec<[u8; 16]>) {
+        for id in ids {
+            self.insert(id);
+        }
+    }
 }
 
 /// Largest file we will accept and stream to disk. Received files (unlike sent

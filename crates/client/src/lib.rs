@@ -1921,6 +1921,15 @@ impl Client {
         let data = session::SessionData {
             mls: identity.storage_snapshot(),
             conversations,
+            next_seq: self.next_seq,
+            // Persist un-acked reliable messages so one sent just before the app
+            // closes is retransmitted on next launch, not lost.
+            unacked: self
+                .unacked
+                .iter()
+                .map(|(seq, (msg, _))| (*seq, msg.clone()))
+                .collect(),
+            seen_ids: self.seen.snapshot(),
         };
         session::save(&self.session_path(), &self.export_key, &data);
     }
@@ -1932,6 +1941,17 @@ impl Client {
             return;
         }
         let data = session::load(&self.session_path(), &self.export_key);
+        // Restore reliable-delivery state first, so a message that was un-acked
+        // when the app last closed is retransmitted on this launch (not lost).
+        // Backdate its last-sent so the retransmit pump replays it promptly.
+        self.next_seq = self.next_seq.max(data.next_seq);
+        let due = Instant::now()
+            .checked_sub(RETRANSMIT_AFTER)
+            .unwrap_or_else(Instant::now);
+        for (seq, msg) in data.unacked {
+            self.unacked.entry(seq).or_insert((msg, due));
+        }
+        self.seen.restore(data.seen_ids);
         if data.conversations.is_empty() {
             return;
         }

@@ -135,10 +135,13 @@ window by default and only add the WASM/browser target when we choose to.
 5. A chat message is not silently lost. Text and MLS handshakes are sent
    reliably (`ClientMsg::Reliable`): the server acks a message only once it has
    delivered it to online members and persisted it for offline ones, and the
-   sender retransmits (on reconnect and on a timer) until acked. The receiver
-   dedups a resent message by its transfer id, so at-least-once + dedup is
-   effectively exactly-once. TCP handles bytes-to-socket; this handles
-   message-to-recipient, which TCP does not.
+   sender retransmits (on reconnect and on a timer) until acked. The unacked
+   buffer, its sequence counter, and the receive-side dedup set are persisted in
+   the encrypted session, so a message sent moments before the app closed is
+   still retransmitted on next launch, and a resent message is shown once even
+   if both peers restarted. The receiver dedups a resent message by its transfer
+   id, so at-least-once + dedup is effectively exactly-once. TCP handles
+   bytes-to-socket; this handles message-to-recipient, which TCP does not.
 6. Docs update in the same commit as the change they describe.
 
 ## Dependency plan (added per-phase, in the crate that first uses them)

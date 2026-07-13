@@ -13,6 +13,7 @@ use std::path::Path;
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use enclave_protocol::ClientMsg;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -60,6 +61,21 @@ pub struct SessionData {
     /// MLS provider storage snapshot (group states + private keys).
     pub mls: HashMap<Vec<u8>, Vec<u8>>,
     pub conversations: Vec<PersistConv>,
+    /// Next reliable-delivery sequence number, persisted so a restart does not
+    /// reuse ids for still-unacked messages.
+    #[serde(default)]
+    pub next_seq: u64,
+    /// Reliable messages the server had not yet acked at save time, so that a
+    /// message sent moments before the app closed is retransmitted on next
+    /// launch rather than lost. Each is an already-sealed `ClientMsg`; the
+    /// receiver dedups any that actually got through. Old sessions default this
+    /// to empty.
+    #[serde(default)]
+    pub unacked: Vec<(u64, ClientMsg)>,
+    /// Recently-delivered transfer ids, so receive-side dedup survives a restart
+    /// -- a message resent after both peers restarted is still shown once.
+    #[serde(default)]
+    pub seen_ids: Vec<[u8; 16]>,
 }
 
 /// Derive the 32-byte at-rest key from the OPAQUE export key (domain-separated).
@@ -105,5 +121,49 @@ pub fn load(path: &Path, export_key: &[u8]) -> SessionData {
     match cipher.decrypt(&Nonce::from(nonce), &bytes[12..]) {
         Ok(plaintext) => bincode::deserialize(&plaintext).unwrap_or_default(),
         Err(_) => SessionData::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use enclave_protocol::{GroupId, Sealed};
+
+    #[test]
+    fn unacked_and_dedup_state_survive_a_session_round_trip() {
+        let path = std::env::temp_dir().join(format!("enclave-sess-{}.enc", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let key = b"an-export-key-for-the-session-test";
+
+        let data = SessionData {
+            mls: HashMap::new(),
+            conversations: Vec::new(),
+            next_seq: 42,
+            unacked: vec![(
+                7,
+                ClientMsg::Text {
+                    group: GroupId([3u8; 32]),
+                    message: Sealed(vec![1, 2, 3]),
+                },
+            )],
+            seen_ids: vec![[9u8; 16], [10u8; 16]],
+        };
+        save(&path, key, &data);
+
+        let loaded = load(&path, key);
+        assert_eq!(loaded.next_seq, 42, "sequence counter persisted");
+        assert_eq!(loaded.unacked.len(), 1, "un-acked message persisted");
+        assert_eq!(loaded.unacked[0].0, 7);
+        assert!(matches!(
+            &loaded.unacked[0].1,
+            ClientMsg::Text { message, .. } if message.0 == vec![1, 2, 3]
+        ));
+        assert_eq!(loaded.seen_ids, vec![[9u8; 16], [10u8; 16]], "dedup ids persisted");
+
+        // A wrong key yields a default (no leakage), including empty reliability state.
+        let wrong = load(&path, b"the-wrong-export-key-entirely-here");
+        assert!(wrong.unacked.is_empty());
+        assert_eq!(wrong.next_seq, 0);
+        let _ = std::fs::remove_file(&path);
     }
 }
