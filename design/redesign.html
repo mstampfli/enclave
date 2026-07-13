@@ -256,7 +256,7 @@ input, select, textarea { font: inherit; }
 .row-actions button.no:hover { color: var(--danger); }
 
 .add-friend { display: flex; gap: 6px; padding: 4px 8px 10px; }
-.add-friend input { flex: 1; padding: 7px 10px; font-family: var(--mono); font-size: 12.5px;
+.add-friend input { flex: 1; padding: 8px 11px; font-size: 13.5px;
   background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
   color: var(--ink); }
 .add-friend input:focus { outline: none; border-color: var(--border-strong); }
@@ -562,12 +562,12 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--raised);
 
     <div class="field">
       <label for="f-server">Server</label>
-      <input id="f-server" class="mono" value="wss://enclave.example.org" spellcheck="false">
+      <input id="f-server" value="wss://enclave.example.org" spellcheck="false">
       <span class="hint">The relay you or a friend runs. It never sees your messages.</span>
     </div>
     <div class="field">
       <label for="f-user">Username</label>
-      <input id="f-user" class="mono" placeholder="marc" spellcheck="false" autocomplete="username">
+      <input id="f-user" placeholder="marc" spellcheck="false" autocomplete="username">
     </div>
     <div class="field" id="f-display-wrap" hidden>
       <label for="f-display">Display name</label>
@@ -603,8 +603,6 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--raised);
           <svg class="icon sm" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
         </button>
         <div class="presence-menu" id="presence-menu" hidden>
-          <button class="pm-item" data-mode="auto" title="Shows what your connection shows">
-            <span class="presence-dot online"></span> Automatic</button>
           <button class="pm-item" data-mode="online">
             <span class="presence-dot online"></span> Online</button>
           <button class="pm-item" data-mode="away">
@@ -623,7 +621,7 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--raised);
               <option value="480">8 hours</option>
             </select>
           </div>
-          <div class="pm-note">Disconnecting always shows you offline.</div>
+          <div class="pm-note">Idle for 15 minutes shows you away; disconnecting shows you offline.</div>
         </div>
       </div>
       <button class="btn ghost" id="open-settings" title="Settings" aria-label="Settings" style="padding:6px">
@@ -650,7 +648,7 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--raised);
 
     <div class="side-scroll" id="pane-people" hidden>
       <div class="add-friend">
-        <input id="add-friend-input" placeholder="add by handle, e.g. wren" spellcheck="false">
+        <input id="add-friend-input" placeholder="add by username, e.g. wren" spellcheck="false">
         <button class="btn" id="add-friend-btn" style="padding:7px 10px" title="Send friend request" aria-label="Send friend request">
           <svg class="icon sm" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
         </button>
@@ -840,9 +838,9 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--raised);
         <input id="s-display" value="Marc">
       </div>
       <div class="field">
-        <label>Handle</label>
-        <input class="mono" value="marc" disabled>
-        <span class="hint">Your handle is bound to your keys and cannot change.</span>
+        <label>Username</label>
+        <input value="marc" disabled>
+        <span class="hint">Your username is bound to your keys and cannot change.</span>
       </div>
     </div>
     <div class="divider"></div>
@@ -900,7 +898,7 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--raised);
     <div class="m-section">
       <div class="s-head">Add someone</div>
       <div class="add-friend" style="padding:0">
-        <input placeholder="friend's handle" spellcheck="false" id="member-add-input">
+        <input placeholder="friend's username" spellcheck="false" id="member-add-input">
         <button class="btn" style="padding:7px 12px" id="member-add-btn">Add</button>
       </div>
       <span class="hint" style="font-size:12.5px;color:var(--muted)">
@@ -962,6 +960,7 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--raised);
     <button data-proto="online">Back online</button>
     <div class="d-head">Presence</div>
     <button data-proto="expire-status">Expire status override now</button>
+    <button data-proto="idle">Simulate 15 min idle</button>
     <div class="d-head">Trust</div>
     <button data-proto="unverify">Reset verification</button>
     <div class="d-head">Toasts</div>
@@ -1601,18 +1600,29 @@ $("mark-verified").onclick = () => {
 $("s-export").onclick = () => toast("Exported enclave-marc-backup.enc");
 $("s-import").onclick = () => toast("Choose a .enc backup file (prototype)");
 $("s-logout").onclick = () => { closeModals(); showLogin(true); };
-/* Presence: a manual status optionally expires back to automatic; a real
-   disconnect always shows offline regardless of what was picked. */
-const selfPresence = { mode: "auto", until: null };
+/* Presence rules (the real client enforces these in the core, not the UI):
+   - the set status can carry a duration; when it lapses you are online again
+   - 15 minutes of inactivity shows online users as away
+   - a real disconnect always shows offline, whatever was set */
+const IDLE_MS = 15 * 60 * 1000;
+const selfPresence = { mode: "online", until: null };
+let lastActivity = Date.now();
 const cap = w => w[0].toUpperCase() + w.slice(1);
 
+["mousemove", "keydown", "pointerdown"].forEach(ev =>
+  document.addEventListener(ev, () => { lastActivity = Date.now(); }, { passive: true }));
+
 function applyPresence() {
-  const real = state.connection === "online" ? "online" : "offline";
-  let shown = selfPresence.mode === "auto" ? real : selfPresence.mode;
-  if (state.connection !== "online") shown = "offline"; // reality wins
+  const idle = Date.now() - lastActivity > IDLE_MS;
+  let shown = selfPresence.mode;
+  if (state.connection !== "online") shown = "offline";
+  else if (shown === "online" && idle) shown = "away";
   $("self-presence-dot").className = "presence-dot " + shown;
-  let label = selfPresence.mode === "auto" ? cap(shown) : cap(selfPresence.mode);
-  if (selfPresence.mode !== "auto" && selfPresence.until) {
+  let label = cap(shown);
+  if (state.connection === "online" && shown === "away" && selfPresence.mode === "online") {
+    label += " · idle";
+  }
+  if (selfPresence.until) {
     const mins = Math.max(1, Math.ceil((selfPresence.until - Date.now()) / 60000));
     label += mins >= 60 ? ` · ${Math.round(mins / 60)} h left` : ` · ${mins} min left`;
   }
@@ -1621,8 +1631,8 @@ function applyPresence() {
 
 setInterval(() => {
   if (selfPresence.until && Date.now() > selfPresence.until) {
-    selfPresence.mode = "auto"; selfPresence.until = null;
-    toast("Status expired; presence is automatic again");
+    selfPresence.mode = "online"; selfPresence.until = null;
+    toast("Status expired; you are online again");
   }
   applyPresence();
 }, 1000);
@@ -1642,7 +1652,7 @@ document.querySelectorAll("#presence-menu .pm-item").forEach(b => b.onclick = ()
   const mode = b.dataset.mode;
   const mins = +$("presence-duration").value;
   selfPresence.mode = mode;
-  selfPresence.until = mode !== "auto" && mins ? Date.now() + mins * 60000 : null;
+  selfPresence.until = mins ? Date.now() + mins * 60000 : null;
   $("presence-menu").hidden = true;
   applyPresence();
 });
@@ -1679,6 +1689,7 @@ document.querySelectorAll("#proto [data-proto]").forEach(b => b.onclick = () => 
   if (a === "reconnect") setConnection("reconnecting");
   if (a === "online") setConnection("online");
   if (a === "expire-status") { if (selfPresence.until) selfPresence.until = Date.now() - 1; }
+  if (a === "idle") { setTimeout(() => { lastActivity = Date.now() - IDLE_MS - 1000; applyPresence(); }, 50); }
   if (a === "unverify") { CONVOS.aria.verified = false; CONVOS.aria.verifiedOn = null; renderHeader(); renderConvoList(); }
   if (a === "toast-ok") toast("Exported enclave-marc-backup.enc");
   if (a === "toast-err") toast("Screen share ended: the share was ended by the system", true);
