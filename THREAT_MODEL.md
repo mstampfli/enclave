@@ -428,24 +428,43 @@ Server->client delivery is bounded per connection so a slow or stalled reader
 cannot make the server buffer unbounded memory for it. Each online connection has
 an `Outbound` queue (`server.rs`) with two independent byte budgets:
 
-- a **file budget** (12 MiB) for the stored-blob stream, which *backpressures* --
-  the streamer awaits room, so a slow reader paces its own download instead of
-  growing memory;
-- a **control budget** (4 MiB) for everything else (control, text, relayed live
-  chunks), which never blocks a sender's connection and drops a message only once
-  even this budget is full (the reader is then not draining at all -- effectively
-  dead). A dropped live chunk fails that one transfer cleanly (the receiver's
-  in-order sink aborts), never corrupt.
+- a **file budget** (12 MiB) for both the stored-blob stream *and* relayed live
+  chunks, which *backpressures* -- the producer awaits room, so a slow reader
+  paces the sender instead of growing memory. A relayed live chunk waits on this
+  budget in the sender's dispatch, bounded by `LIVE_BACKPRESSURE_TIMEOUT` (10 s)
+  so a reader making no progress at all cannot wedge the sender's connection: it
+  is dropped from the live stream and its in-order sink aborts cleanly (never
+  corrupt). A slow-but-progressing reader never hits the timeout.
+- a **control budget** (4 MiB) for everything else (control, text), which never
+  blocks a sender's connection and drops a message only once even this budget is
+  full (the reader is then not draining at all -- effectively dead).
 
 The budgets are separate, so a maxed-out file stream to a mid-download reader
 cannot starve that reader's control/text. Total buffered per connection is capped
-at their sum (16 MiB). This is the *online* path only: a message for an **offline**
-recipient goes to the persistent, separately-bounded `msgqueue` (per-device
-oldest-eviction, global cap) and is never subject to these caps -- so slow-reader
-backpressure never drops a store-and-forward message. Proven by
-`server::outbound_tests::{try_send_bounds_the_control_budget_and_drops_the_rest,
+at their sum (16 MiB). Proven by `server::outbound_tests::{try_send_bounds_the_control_budget_and_drops_the_rest,
 a_saturated_file_stream_never_starves_control,
 the_file_budget_backpressures_instead_of_dropping}`.
+
+**Nothing reliable is dropped short of true exhaustion.** A reliable message
+(text, MLS, Welcome, file offer) that will not fit a stuck online reader's
+control budget is not dropped: it is spilled into that recipient's persistent
+offline queue and delivered on their next reconnect. A message is dropped only at
+a genuine global resource cap -- the offline queue's 128 MiB total -- and there
+the sender is told with an `Error` rather than losing it silently
+(`relay::{spill_offline, queue_for_offline}`, proven by
+`relay_core::a_spilled_message_reaches_the_recipient_on_reconnect`). The offline
+queue itself is the separately-bounded `msgqueue` (4 MiB/device, 2000 msgs/device,
+128 MiB total): below the global cap it evicts a device's *own* oldest to make
+room, so an incoming message is never silently lost. Real-time / latest-wins
+messages (media, presence, call/friend state) are still dropped when a stuck
+reader's budget is full, since a stale one is superseded by the next update.
+
+**The sender is paced, not buffered.** The client's outbound has a bounded
+file-chunk queue: a large (or arbitrary-size live) upload is a pump that seals
+and sends one chunk at a time only while the queue has room, so TCP backpressure
+from a slow server or slow relayed recipient stalls the pump instead of buffering
+the whole file in the sender's memory. Control/text keep a separate latency-first
+channel.
 
 ### Residual / accepted risks
 

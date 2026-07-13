@@ -342,6 +342,9 @@ impl Client {
             return Err(ClientError::NotLoggedIn);
         }
         let password = self.password.clone();
+        // The old socket is gone, so any in-progress uploads cannot be resumed
+        // cleanly against a fresh session; abandon them (the user re-sends).
+        self.uploads.clear();
         self.conn = Connection::connect(&self.server_url).await?;
         self.login(&handle, &password).await
     }
@@ -1066,11 +1069,15 @@ impl Client {
                             }
                         };
                         // Capacity was checked at the loop head and we are the
-                        // only file producer, so this send is accepted.
-                        self.conn.try_send_file(ClientMsg::FileChunk {
+                        // only file producer, so a send fails only if the
+                        // connection dropped -- abandon the doomed upload then.
+                        if !self.conn.try_send_file(ClientMsg::FileChunk {
                             offer_id: id,
                             data: Sealed(sealed),
-                        });
+                        }) {
+                            self.uploads.remove(&id);
+                            break;
+                        }
                         let (label, size, sent) = match self.uploads.get_mut(&id) {
                             Some(up) => {
                                 up.index += 1;
