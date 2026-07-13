@@ -14,7 +14,9 @@ nokhwa = { version = "0.10", default-features = false, features = ["input-native
 openh264 = "0.9"
 thiserror.workspace = true
 
-# Screen/window capture and WASAPI system-audio loopback are Windows-only.
+# Platform capture backends. Windows: WGC/DXGI screen capture and WASAPI
+# system-audio loopback. Linux: XDG portal ScreenCast (ashpd; tokio runs its
+# D-Bus calls on the capture thread) and PipeWire video/audio streams.
 [target.'cfg(windows)'.dependencies]
 windows-capture = "2.0.0"
 windows-core = "0.61"
@@ -28,3 +30,15 @@ windows = { version = "0.61", features = [
     "Win32_System_Variant",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `decoding` adds nokhwa's software MJPEG decoder: V4L2 hands the app raw
+# MJPEG at the high frame rates, while Windows' Media Foundation decodes in
+# the OS -- so only Linux needs (and pays for) mozjpeg.
+nokhwa = { version = "0.10", default-features = false, features = ["input-native", "decoding"] }
+ashpd = { version = "0.13.12", default-features = false, features = ["tokio", "screencast"] }
+# v0_3_44 gates pw::keys::TARGET_OBJECT (per-app capture); systems this old
+# would lack portal screen cast anyway.
+pipewire = { version = "0.10.0", features = ["v0_3_44"] }
+tokio = { version = "1.52.3", default-features = false, features = ["rt"] }
+v4l = "0.14"

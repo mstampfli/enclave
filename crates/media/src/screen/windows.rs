@@ -1,9 +1,5 @@
 //! Screen and window capture (Windows).
 //!
-//! Two backends feed one shared "latest frame" slot that the encoder loop pulls
-//! at its own cadence, dropping anything it cannot keep up with -- the right
-//! behavior for real-time sharing:
-//!
 //! - Monitors use DXGI Desktop Duplication (`DxgiDuplicationApi`): a background
 //!   thread owns the (`!Send`) device and pushes each frame into the slot. Low
 //!   latency, no capture border.
@@ -11,7 +7,9 @@
 //!   a callback delivers frames on its own thread; WGC is the only API that can
 //!   target a single window (DXGI is monitor-only).
 //!
-//! Both de-pad to a tight BGRA buffer ready for [`crate::H264Encoder`].
+//! The shared frame slot, source types, and status cell live in [`super`]. A
+//! Windows capture either starts `Live` or fails synchronously, so its
+//! [`SharedStatus`] never leaves `Live`.
 //!
 //! HARDWARE PATH: capture cannot be exercised headlessly (no display / DXGI in
 //! CI); it is compile-verified and validated on a real machine.
@@ -20,6 +18,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+use super::{store, CaptureStatus, CapturedFrame, ScreenSource, SharedStatus, Slot, WindowSource};
 
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::dxgi_duplication_api::DxgiDuplicationApi;
@@ -33,35 +33,6 @@ use windows_capture::settings::{
 use windows_capture::window::Window;
 
 use crate::MediaError;
-
-/// One captured frame: tightly packed BGRA (`width*height*4`, no row padding).
-#[derive(Clone)]
-pub struct CapturedFrame {
-    pub bgra: Vec<u8>,
-    pub width: usize,
-    pub height: usize,
-}
-
-type Slot = Arc<Mutex<Option<CapturedFrame>>>;
-
-/// Store a de-padded BGRA frame into the shared slot, dropping malformed ones.
-fn store(slot: &Slot, w: usize, h: usize, tight: &[u8]) {
-    if tight.len() == w * h * 4 {
-        *slot.lock().unwrap() = Some(CapturedFrame {
-            bgra: tight.to_vec(),
-            width: w,
-            height: h,
-        });
-    }
-}
-
-/// A monitor the user can pick to share: its zero-based `index` (pass to
-/// [`ScreenCapture::start_index`]) and a human-readable `name`.
-#[derive(Debug, Clone)]
-pub struct ScreenSource {
-    pub index: usize,
-    pub name: String,
-}
 
 /// Enumerate the monitors attached to this machine. Best-effort: returns an
 /// empty list if enumeration fails.
@@ -81,14 +52,6 @@ pub fn monitor_sources() -> Vec<ScreenSource> {
             Some(ScreenSource { index, name })
         })
         .collect()
-}
-
-/// A window the user can pick to share: its `hwnd` (an opaque handle, pass to
-/// [`ScreenCapture::start_window`]) and its title.
-#[derive(Debug, Clone)]
-pub struct WindowSource {
-    pub hwnd: isize,
-    pub name: String,
 }
 
 /// Enumerate the shareable top-level windows (visible, titled, not our own).
@@ -172,6 +135,7 @@ enum Backend {
 /// frame. Dropping it stops the capture.
 pub struct ScreenCapture {
     latest: Slot,
+    status: SharedStatus,
     backend: Backend,
 }
 
@@ -229,6 +193,7 @@ impl ScreenCapture {
         match init_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 latest,
+                status: SharedStatus::live(),
                 backend: Backend::Dxgi {
                     stop,
                     thread: Some(thread),
@@ -243,7 +208,9 @@ impl ScreenCapture {
     pub fn start_window(hwnd: isize) -> Result<Self, MediaError> {
         let window = Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void);
         if !window.is_valid() {
-            return Err(MediaError::Codec("that window is no longer available".into()));
+            return Err(MediaError::Codec(
+                "that window is no longer available".into(),
+            ));
         }
         let latest: Slot = Arc::new(Mutex::new(None));
         let settings = Settings::new(
@@ -260,6 +227,7 @@ impl ScreenCapture {
             .map_err(|e| MediaError::Codec(format!("window capture: {e}")))?;
         Ok(Self {
             latest,
+            status: SharedStatus::live(),
             backend: Backend::Window(Some(control)),
         })
     }
@@ -267,6 +235,17 @@ impl ScreenCapture {
     /// The most recently captured frame, if any has arrived yet.
     pub fn latest(&self) -> Option<CapturedFrame> {
         self.latest.lock().unwrap().clone()
+    }
+
+    /// This capture's life-cycle status (always `Live` on Windows).
+    pub fn status(&self) -> CaptureStatus {
+        self.status.get()
+    }
+
+    /// The shared status cell, for supervising the share after the capture has
+    /// been moved into its encode thread.
+    pub fn status_handle(&self) -> SharedStatus {
+        self.status.clone()
     }
 }
 

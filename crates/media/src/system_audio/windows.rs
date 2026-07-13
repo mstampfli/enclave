@@ -1,19 +1,12 @@
-//! WASAPI loopback capture of system audio, for "share system audio" in a call.
+//! WASAPI loopback capture of system audio (Windows).
 //!
-//! Two modes, both echo-aware:
-//! - [`LoopbackMode::Process`]: capture only a target application's audio (and
-//!   its child processes) via the process-loopback virtual device. This is the
-//!   default, tied to sharing that app's window: it does NOT re-capture the call
-//!   audio you are hearing, so participants never get an echo.
-//! - [`LoopbackMode::System`]: capture the whole render endpoint mix. Simple and
-//!   works with a monitor share, but during a call it also captures the voices
-//!   you are hearing (echo) unless the call plays to a different device -- the UI
-//!   warns about this.
+//! [`LoopbackMode::Process`] uses the process-loopback virtual device (the
+//! target app and its children only); [`LoopbackMode::System`] captures the
+//! default render endpoint mix. Modes, the shared mix ring, and the mono
+//! down-mix live in [`super`].
 //!
-//! Captured audio is force-converted to 48 kHz / stereo / 16-bit, down-mixed to
-//! mono, and pushed into a shared ring the mic encoder drains and sums into each
-//! outgoing frame (so it rides the sender's existing single Opus stream -- the
-//! receiver needs no change and there is no second decoder to keep in sync).
+//! Captured audio is force-converted to 48 kHz / stereo / 16-bit by the audio
+//! engine (`AUTOCONVERTPCM`) and pushed through [`super::mix_in_stereo_i16`].
 //!
 //! The device is `!Send` COM, so a capture is created and pumped on one
 //! dedicated thread and never crosses threads.
@@ -21,22 +14,21 @@
 //! HARDWARE PATH: WASAPI loopback cannot be exercised headlessly; this is
 //! compile-verified and validated on a real machine.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use windows::core::{implement, Interface, Ref, IUnknown, PCWSTR};
+use windows::core::{implement, IUnknown, Interface, Ref, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE, HWND};
 use windows::Win32::Media::Audio::{
     eConsole, eRender, ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
-    IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDIOCLIENT_ACTIVATION_PARAMS,
-    AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
-    AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, MMDeviceEnumerator,
+    IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+    AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
+    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
     PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
     WAVEFORMATEX,
 };
@@ -47,25 +39,11 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 
+use super::{mix_in_stereo_i16, AudioMix, LoopbackMode};
 use crate::MediaError;
 
-/// Shared 48 kHz mono i16 ring the mic encoder drains and mixes in.
-pub type AudioMix = Arc<Mutex<VecDeque<i16>>>;
-
-/// Cap the ring so shared audio cannot build unbounded latency (100 ms @ 48 k).
-const MIX_CAP: usize = 4800;
-
-/// What to capture.
-#[derive(Debug, Clone, Copy)]
-pub enum LoopbackMode {
-    /// Only this process (and its children) -- echo-free during a call.
-    Process(u32),
-    /// The whole render endpoint mix.
-    System,
-}
-
 /// Resolve the process id that owns a window (for [`LoopbackMode::Process`]).
-pub fn window_pid(hwnd: isize) -> Option<u32> {
+pub(super) fn window_pid(hwnd: isize) -> Option<u32> {
     let mut pid = 0u32;
     let handle = HWND(hwnd as *mut std::ffi::c_void);
     // SAFETY: GetWindowThreadProcessId only reads; a stale HWND yields pid 0.
@@ -200,7 +178,9 @@ unsafe fn acquire_client(mode: LoopbackMode) -> windows::core::Result<IAudioClie
             let mut unknown: Option<IUnknown> = None;
             op.GetActivateResult(&mut hr, &mut unknown)?;
             hr.ok()?;
-            unknown.ok_or_else(|| windows::core::Error::from(E_FAIL))?.cast()
+            unknown
+                .ok_or_else(|| windows::core::Error::from(E_FAIL))?
+                .cast()
         }
     }
 }
@@ -249,17 +229,9 @@ unsafe fn run_loopback(
             let mut fl: u32 = 0;
             capture.GetBuffer(&mut data, &mut frames, &mut fl, None, None)?;
             if frames > 0 && fl & silent_flag == 0 && !data.is_null() {
-                // Interleaved stereo i16 -> mono, appended to the ring.
+                // Interleaved stereo i16 -> mono, appended to the bounded ring.
                 let stereo = std::slice::from_raw_parts(data.cast::<i16>(), frames as usize * 2);
-                let mut ring = mix.lock().unwrap();
-                for pair in stereo.chunks_exact(2) {
-                    let mono = ((pair[0] as i32 + pair[1] as i32) / 2) as i16;
-                    ring.push_back(mono);
-                }
-                // Bound latency: drop the oldest audio if we fall behind.
-                while ring.len() > MIX_CAP {
-                    ring.pop_front();
-                }
+                mix_in_stereo_i16(mix, stereo);
             }
             capture.ReleaseBuffer(frames)?;
         }
