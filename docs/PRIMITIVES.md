@@ -1,7 +1,15 @@
-# Enclave -- cryptographic primitives (single source of truth)
+# Enclave -- primitives (single source of truth)
 
-We assemble vetted primitives and hand-roll none. Every crypto choice lives
-here; if it is not in this table, we do not use it.
+We assemble vetted primitives and hand-roll none, for cryptography **and** for
+the recurring safety concerns (bounds, dedup, backpressure, path safety). Each
+one is the single tested home of its concern; the hand-rolled form of anything
+below is a smell to convert. Crypto choices are in the first table; the
+runtime-safety primitives are cataloged after it (each tagged `// PRIMITIVE` in
+code, so `grep -rn PRIMITIVE crates/` finds them).
+
+## Cryptographic primitives
+
+Every crypto choice lives here; if it is not in this table, we do not use it.
 
 | Concern | Primitive | Library | Why |
 |---|---|---|---|
@@ -38,3 +46,27 @@ here; if it is not in this table, we do not use it.
 - **Frame layout:** encrypt the *encoded* frame (Opus/video), never raw samples
   -- there is no lossy stage after encryption to corrupt ciphertext.
 - **No new primitive** without adding it here first, with a justification.
+
+## Runtime-safety primitives
+
+Not cryptography, but the same rule: one tested, safe-by-construction home per
+recurring concern, reused everywhere, never re-derived inline. Each guarantees a
+bug class cannot occur for any caller.
+
+| Concern | Primitive | Where | Makes impossible / replaces |
+|---|---|---|---|
+| Nonce reuse (media AEAD) | `MediaSealer` monotonic counter | `crypto/src/media.rs` | A reused AEAD nonce under one key -- the counter owns the nonce, so reuse is unrepresentable, not merely avoided |
+| Replay of real-time frames | `ReplayWindow` (RFC 6479, 64-entry) | `crypto/src/media.rs` | Accepting a duplicate/too-old media frame; hand-rolled seen-checks |
+| Per-connection / per-source flood | `TokenBucket` | `transport/src/ratelimit.rs` | Ad-hoc rate math; an unbounded message/datagram rate exhausting CPU |
+| Chunk reassembly | `Reassembler` | `client/src/transfer.rs` | A hand-rolled buffer with unbounded size, too-many-in-flight, bad indices, or duplicate chunks (all capped/deduped by construction) |
+| Deliver-once dedup | `SeenSet` | `client/src/transfer.rs` | Showing a retransmitted message twice; an unbounded seen-set |
+| Streaming a received file to disk | `FileSink` | `client/src/transfer.rs` | Buffering a whole (arbitrary-size) file in RAM; out-of-order or over-cap writes |
+| Per-connection outbound memory | `Outbound` (two byte budgets, backpressure) | `transport/src/server.rs` | An unbounded outbound channel a slow/hostile reader can grow without limit |
+| Offline store-and-forward | `MessageQueue` (per-device + global byte/count caps, persisted) | `transport/src/msgqueue.rs` | An unbounded queue a peer can fill by spamming an offline victim |
+| Offered-file store | `FileStore` (per-file + total + free-disk-floor quota, TTL) | `transport/src/filestore.rs` | A peer filling server disk/RAM with buffered files |
+| Received-file naming | `safe_file_name` + `reserve_download` | `client/src/lib.rs` | Using an attacker-controlled filename as a path (traversal) or overwriting an existing file |
+
+- **No new runtime-safety primitive** without adding it here, with the bug class
+  it removes; and once one exists, the hand-rolled form (a bare bound, a raw
+  filename-as-path, an unbounded channel/queue, an inline dedup) is a smell to
+  convert, one site at a time, each with a test.

@@ -1530,19 +1530,6 @@ impl Relay {
     }
 }
 
-/// The group a reliable message is bound for, if any (so a delivery failure can
-/// name the conversation to the sender). Real-time / latest-wins messages that
-/// are not spilled return `None`.
-pub fn group_of(msg: &ServerMsg) -> Option<GroupId> {
-    match msg {
-        ServerMsg::Text { group, .. }
-        | ServerMsg::Mls { group, .. }
-        | ServerMsg::Welcome { group, .. }
-        | ServerMsg::FileOffered { group, .. } => Some(group.clone()),
-        _ => None,
-    }
-}
-
 /// The message the server sends a sender when a reliable message could not be
 /// delivered *and* could not be stored -- the offline queue is at its global
 /// byte cap (real resource exhaustion). Surfaced so nothing is ever lost

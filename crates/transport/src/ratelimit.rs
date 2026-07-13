@@ -6,6 +6,8 @@ use std::time::Instant;
 
 /// A refilling token bucket: bursts up to `capacity`, sustained at
 /// `refill_per_sec`.
+/// PRIMITIVE: token-bucket rate limiter; the one home for per-connection/
+/// per-source flood limiting.
 pub struct TokenBucket {
     capacity: f64,
     tokens: f64,

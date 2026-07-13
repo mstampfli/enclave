@@ -2281,18 +2281,6 @@ impl Client {
                 self.unacked.remove(&seq);
                 None
             }
-            ServerMsg::DeliveryFailed { group } => {
-                // A message we sent could not be delivered or stored (server out
-                // of space). Name the conversation so the user can retry it.
-                let title = self
-                    .conversations
-                    .get(&group)
-                    .map(|c| c.title.clone())
-                    .unwrap_or_else(|| "a conversation".into());
-                Some(Event::Error(format!(
-                    "A message to {title} was not delivered: the server is out of space. Try again."
-                )))
-            }
             ServerMsg::Mls { group, message, .. } => {
                 let identity = self.identity.as_ref()?;
                 let conv = self.conversations.get_mut(&group)?;
@@ -2409,6 +2397,8 @@ fn read_full(reader: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result
 /// component only, with separators and control characters stripped, never
 /// empty, never `.`/`..`. This is the primary defense against path traversal
 /// (a peer naming a file `../../.ssh/authorized_keys`) -- see THREAT_MODEL.md.
+/// PRIMITIVE (with `reserve_download`): safe naming of an attacker-controlled
+/// received filename -- no path traversal, no overwrite.
 fn safe_file_name(raw: &str) -> String {
     // Take only the last component under either separator, so any directory
     // prefix (`../`, `/etc/`, `C:\`) is discarded before we look at the name.

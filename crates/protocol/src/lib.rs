@@ -365,15 +365,11 @@ pub enum ServerMsg {
     /// Every chunk of `offer_id` from `from` has been delivered.
     FileComplete { offer_id: [u8; 16], from: DeviceId },
     /// Confirms the server durably accepted the [`ClientMsg::Reliable`] with this
-    /// `seq`. The sender then drops it from its retransmit buffer.
+    /// `seq`. The sender then drops it from its retransmit buffer. Until it
+    /// arrives the sender keeps retransmitting, so a message that momentarily
+    /// could not be accepted (e.g. the offline queue was at its global cap) is
+    /// simply retried rather than reported failed.
     Ack { seq: u64 },
-    /// A reliable message the sender sent to `group` could not be delivered and
-    /// could not be stored (the server's offline queue is at its global cap).
-    /// Sent to the sender so the failure is visible and actionable at the
-    /// conversation level -- the server names the group (which it routes in the
-    /// clear), never the message content or a per-message id (it cannot see
-    /// either), so the client flags the conversation rather than a single line.
-    DeliveryFailed { group: GroupId },
     Error {
         detail: String,
     },

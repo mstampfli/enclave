@@ -758,7 +758,7 @@ fn two_member_group(r: &mut Relay) -> (u64, String, u64, String, GroupId) {
     (a, ah, b, bh, group)
 }
 
-fn offered<'a>(out: &'a [Outgoing]) -> Option<&'a ServerMsg> {
+fn offered(out: &[Outgoing]) -> Option<&ServerMsg> {
     out.iter()
         .map(|o| &o.msg)
         .find(|m| matches!(m, ServerMsg::FileOffered { .. }))

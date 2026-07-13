@@ -50,6 +50,9 @@ struct QueuedFor {
 }
 
 /// A persistent, bounded per-device outbound queue for offline delivery.
+///
+/// PRIMITIVE: bounded, persisted offline store-and-forward queue (per-device
+/// and global caps).
 #[derive(Default)]
 pub struct MessageQueue {
     by_device: HashMap<String, DeviceQueue>,

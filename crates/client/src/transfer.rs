@@ -146,6 +146,9 @@ pub struct Complete {
 
 /// Reassembles parts into whole transfers, keyed by transfer id. Bounds memory
 /// by capping both one transfer's size and the number in flight.
+///
+/// PRIMITIVE: bounded chunk reassembly (size/in-flight/index/duplicate all
+/// capped by construction).
 #[derive(Default)]
 pub struct Reassembler {
     inflight: HashMap<[u8; 16], Partial>,
@@ -315,6 +318,8 @@ pub const MAX_RECEIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// The sink is constructed over a file the caller has already reserved under a
 /// safe, unique, contained name (see the client's `reserve_download`), so this
 /// module holds none of the path-safety logic -- it only writes bytes.
+/// PRIMITIVE: streams a received file to disk with a hard size cap; never
+/// buffers the whole file in memory.
 pub struct FileSink {
     file: std::fs::File,
     path: PathBuf,
@@ -588,9 +593,9 @@ mod tests {
         let a = vec![1u8; CHUNK_BYTES];
         let b = vec![2u8; CHUNK_BYTES];
         let c = vec![3u8; 100];
-        assert_eq!(sink.write_part(&file_part(1, 0, 3, a.clone())).unwrap(), false);
-        assert_eq!(sink.write_part(&file_part(1, 1, 3, b.clone())).unwrap(), false);
-        assert_eq!(sink.write_part(&file_part(1, 2, 3, c.clone())).unwrap(), true);
+        assert!(!sink.write_part(&file_part(1, 0, 3, a.clone())).unwrap(), "not done");
+        assert!(!sink.write_part(&file_part(1, 1, 3, b.clone())).unwrap(), "not done");
+        assert!(sink.write_part(&file_part(1, 2, 3, c.clone())).unwrap(), "last part completes");
         sink.finish().unwrap();
         let got = std::fs::read(&path).unwrap();
         let mut want = a;

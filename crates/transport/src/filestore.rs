@@ -118,6 +118,7 @@ struct Offer {
 }
 
 /// The file store. Blobs live under `dir`; metadata is in memory.
+/// PRIMITIVE: quota-, disk-floor-, and TTL-bounded store for offered files.
 pub struct FileStore {
     dir: PathBuf,
     offers: HashMap<[u8; 16], Offer>,
@@ -165,7 +166,10 @@ impl FileStore {
     }
 
     /// Begin an upload: admit `declared` plaintext bytes, record the sealed
-    /// manifest, and open the blob for writing.
+    /// manifest, and open the blob for writing. The parameters are the intrinsic
+    /// identity of an offer (id, group, sender, recipients, size, manifest,
+    /// time); grouping them into a struct would only add ceremony.
+    #[allow(clippy::too_many_arguments)]
     pub fn begin(
         &mut self,
         id: [u8; 16],

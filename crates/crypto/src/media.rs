@@ -177,6 +177,8 @@ fn nonce_bytes(salt: &[u8; 4], counter: u64) -> [u8; 12] {
 
 /// Seals outgoing media frames for one sender. Owns the monotonic counter and
 /// the sender's [`MediaSigner`], so every frame is both encrypted and signed.
+/// PRIMITIVE: owns the monotonic per-sender nonce counter, so AEAD nonce
+/// reuse under one key is unrepresentable.
 pub struct MediaSealer {
     cipher: ChaCha20Poly1305,
     salt: [u8; 4],
@@ -335,6 +337,8 @@ impl MediaOpener {
 
 /// A 64-entry sliding replay window over frame counters (RFC 6479 style). Bit
 /// `i` of `bitmap` records that counter `highest - i` has been accepted.
+/// PRIMITIVE: RFC 6479 sliding replay window; the one home for real-time
+/// frame anti-replay.
 struct ReplayWindow {
     highest: u64,
     bitmap: u64,

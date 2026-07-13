@@ -42,6 +42,7 @@ const FILE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 ///    live chunks). These never block a sender's connection, so on overflow the
 ///    message is dropped -- but only once even this budget is full, which means
 ///    the reader is not draining tiny messages either, i.e. effectively dead.
+///
 /// Because the two budgets are separate, a maxed-out file stream leaves the full
 /// control budget available, so ordinary messages to a mid-download reader are
 /// not dropped. Each is kept within `u32` so a message's size fits one permit.
@@ -433,6 +434,12 @@ where
             ClientMsg::Reliable { seq, msg } => (Some(seq), *msg),
             other => (None, other),
         };
+        // A legit client never double-wraps; reject a nested envelope so the
+        // relay never recurses on attacker-controlled nesting (serde_json's
+        // 128-deep parse limit already bounds it, this makes the intent explicit).
+        if matches!(client_msg, ClientMsg::Reliable { .. }) {
+            continue;
+        }
         // Control-plane messages additionally obey the tight signaling budget;
         // file chunks are exempt (see above).
         if !matches!(client_msg, ClientMsg::FileChunk { .. }) && !bucket.try_take(Instant::now()) {
@@ -496,22 +503,16 @@ where
             }
             if crate::relay::spillable(&msg) {
                 // Preserve it in the recipient's offline queue rather than drop.
-                let group = crate::relay::group_of(&msg);
                 let queued = {
                     let mut s = state.lock().unwrap();
                     s.relay.spill_offline(to_conn, msg)
                 };
                 if !queued {
-                    all_accepted = false;
                     // The offline queue is at its global cap (true exhaustion):
-                    // tell the sender which conversation was affected, so nothing
-                    // is lost silently.
-                    if let Some(group) = group {
-                        let s = state.lock().unwrap();
-                        if let Some(sender) = s.txs.get(&conn) {
-                            sender.try_send(&ServerMsg::DeliveryFailed { group });
-                        }
-                    }
+                    // withhold the ack so the sender's reliable-delivery layer
+                    // keeps retransmitting until space frees. No separate failure
+                    // notice is needed -- retransmit-until-acked supersedes it.
+                    all_accepted = false;
                 }
             }
         }
