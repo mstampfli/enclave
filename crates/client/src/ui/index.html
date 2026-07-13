@@ -226,7 +226,6 @@ input, select, textarea { font: inherit; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .convo-row .unread {
   font-size: 12px; font-weight: 600; color: var(--ink-strong);
-  font-variant-numeric: tabular-nums;
 }
 .convo-row .live {
   display: inline-flex; align-items: center; gap: 5px;
@@ -284,9 +283,9 @@ input, select, textarea { font: inherit; }
 .server-card.reconnecting .state-dot { background: var(--warn); }
 .server-card.offline .state-dot { background: var(--danger); }
 .server-card .meta { flex: 1; min-width: 0; }
-.server-card .host { font-size: 12px; color: var(--ink);
+.server-card .host { font-size: 13px; color: var(--ink);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.server-card .sub { font-size: 11px; color: var(--faint); }
+.server-card .sub { font-size: 12px; color: var(--faint); }
 .server-card button { color: var(--muted); width: 28px; height: 28px;
   display: grid; place-items: center; border-radius: var(--radius); }
 .server-card button:hover { background: var(--raised); color: var(--ink); }
@@ -397,7 +396,7 @@ input, select, textarea { font: inherit; }
 .msg-group .byline { display: flex; align-items: baseline; gap: 8px; }
 .msg-group .author { font-weight: 600; font-size: 14px; color: var(--ink-strong); }
 .msg-group .author.me { color: var(--muted); }
-.msg-group .time { font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.msg-group .time { font-size: 11.5px; color: var(--faint); }
 .msg-group p { color: var(--ink); font-size: 14.5px; margin-top: 1px;
   overflow-wrap: anywhere; }
 .msg-group p + p { margin-top: 3px; }
@@ -504,12 +503,9 @@ input, select, textarea { font: inherit; }
   padding: 8px 11px; border-radius: var(--radius); text-align: left; font-size: 14px;
   border: 1px solid transparent; }
 .palette .p-row .icon { color: var(--muted); }
-.palette .p-row .kind { margin-left: auto; font-size: 11.5px; color: var(--faint); }
 .palette .p-row.sel { background: var(--hover); }
-.palette .p-hint { padding: 8px 16px; font-size: 12px; color: var(--faint);
-  border-top: 1px solid var(--border); display: flex; gap: 14px; }
-kbd { font-size: 11px; background: var(--raised);
-  border: 1px solid var(--border); border-radius: var(--radius); padding: 0 5px; }
+.palette .p-hint { padding: 9px 16px; font-size: 12px; color: var(--faint);
+  border-top: 1px solid var(--border); }
 
 /* toasts */
 #toasts { position: fixed; right: 18px; bottom: 18px; display: flex;
@@ -689,7 +685,7 @@ label.member-row:hover { background: var(--raised); }
         <div class="sub" id="server-state">Connected</div>
       </div>
       <button id="palette-hint" title="Command palette (Ctrl+K)" aria-label="Command palette">
-        <svg class="icon sm" viewBox="0 0 24 24"><path d="M4 17V7l6 5 6-5v10"/><path d="M20 7v10"/></svg>
+        <svg class="icon sm" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20.5 20.5 16.5 16.5"/></svg>
       </button>
     </div>
   </aside>
@@ -933,9 +929,7 @@ label.member-row:hover { background: var(--raised); }
   <div class="palette">
     <input id="palette-input" placeholder="Jump to a conversation or run a command..." autocomplete="off">
     <div class="results" id="palette-results"></div>
-    <div class="p-hint">
-      <span><kbd>&#8593;&#8595;</kbd> navigate</span><span><kbd>Enter</kbd> run</span><span><kbd>Esc</kbd> close</span>
-    </div>
+    <div class="p-hint">Up and down to move, Enter to run, Esc to close.</div>
   </div>
 </div>
 
@@ -1541,6 +1535,7 @@ function actionBtn(cls, title, svg) {
 const SVG_CHECK = '<svg class="icon sm" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>';
 const SVG_X = '<svg class="icon sm" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>';
 const SVG_MSG = '<svg class="icon sm" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>';
+const GEAR_ICON = '<svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
 const SVG_TRASH = '<svg class="icon sm" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>';
 
 function renderPeople() {
@@ -1933,7 +1928,7 @@ function paletteItems(q) {
     { label: "Export encrypted backup", kind: "action",
       icon: '<svg class="icon" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>',
       run: () => send({ type: "ExportSession" }) },
-    { label: "Settings", kind: "action", icon: '<svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></svg>', run: openSettings },
+    { label: "Settings", kind: "action", icon: GEAR_ICON, run: openSettings },
   );
   const needle = q.trim().toLowerCase();
   return needle ? items.filter((i) => i.label.toLowerCase().includes(needle)) : items;
@@ -1947,7 +1942,7 @@ function renderPalette() {
   items.forEach((it, i) => {
     const b = document.createElement("button");
     b.className = "p-row" + (i === paletteSel ? " sel" : "");
-    b.innerHTML = it.icon + '<span class="p-label"></span><span class="kind">' + it.kind + '</span>';
+    b.innerHTML = it.icon + '<span class="p-label"></span>';
     b.querySelector(".p-label").textContent = it.label;
     b.addEventListener("click", () => { closeModals(); it.run(); });
     box.appendChild(b);
