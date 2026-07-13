@@ -14,6 +14,10 @@
    ============================================================ */
 
 :root {
+  /* The app is always dark; tell the engine so native form controls, scrollbars,
+     and autofill render dark. Without this, WebKitGTK on a light GTK theme paints
+     inputs with a white platform background, leaving light CSS text unreadable. */
+  color-scheme: dark;
   --bg: #141414;            /* page */
   --panel: #191919;         /* sidebar, headers, modals */
   --room: #1d1d1d;          /* conversation canvas */
@@ -56,7 +60,16 @@ body {
 }
 
 button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
-input, select, textarea { font: inherit; }
+/* Strip native rendering on text inputs so our CSS background/color always wins
+   (a native-rendered input on a light platform theme ignores CSS `background`
+   and shows white). Selects keep their native arrow but get dark colors; the
+   `color-scheme: dark` on :root makes their popup and arrow render dark too. */
+input:not([type="checkbox"]), textarea {
+  font: inherit; color: var(--ink); background-color: var(--bg);
+  appearance: none; -webkit-appearance: none;
+}
+select { font: inherit; color: var(--ink); background-color: var(--bg); }
+input[type="checkbox"] { font: inherit; }
 input[type="checkbox"], select { cursor: pointer; }
 
 * { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
@@ -1197,7 +1210,7 @@ function ensureDecoder() {
     },
     error: (e) => { console.error("screen decoder", e); closeDecoder(); },
   });
-  try { svDecoder.configure({ codec: "avc1.42E01E", optimizeForLatency: true }); }
+  try { svDecoder.configure({ codec: "avc1.42E033", optimizeForLatency: true }); }
   catch (e) { console.error("configure", e); closeDecoder(); }
 }
 function handleScreenFrame(ev) {
@@ -1246,7 +1259,7 @@ function handleCameraFrame(ev) {
       },
       error: (e) => { console.error("camera decoder", e); camGone(name); },
     });
-    try { decoder.configure({ codec: "avc1.42E01E", optimizeForLatency: true }); }
+    try { decoder.configure({ codec: "avc1.42E033", optimizeForLatency: true }); }
     catch (e) { console.error("camera configure", e); delete camCanvas[name]; return; }
     camState[name] = { decoder, gotKey: false, ts: 0, timer: null };
   }
@@ -2226,7 +2239,10 @@ $("ctl-share").addEventListener("click", openShareModal);
 $("ctl-camera").addEventListener("click", openCameraModal);
 $("share-stop").addEventListener("click", () => {
   send({ type: "StopScreenShare" });
-  activeShareId = null; shareAudioOn = false;
+  // Reflect the stop immediately rather than waiting for the round-trip, so the
+  // control never looks stuck "sharing" if the share had already ended.
+  sharing = false; activeShareId = null; shareAudioOn = false;
+  renderCall();
   closeModals();
 });
 $("camera-stop").addEventListener("click", () => {
@@ -2586,7 +2602,7 @@ $("brand-seal").innerHTML = sealSVG(BRAND_SAFETY, true, 32);
   let ok = false;
   try {
     if (typeof window.VideoDecoder === "function") {
-      const res = await VideoDecoder.isConfigSupported({ codec: "avc1.42E01E" });
+      const res = await VideoDecoder.isConfigSupported({ codec: "avc1.42E033" });
       ok = !!(res && res.supported);
     }
   } catch (e) { /* unsupported -> ok stays false */ }
