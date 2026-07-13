@@ -1283,6 +1283,11 @@ impl Client {
                 .any(|p| now.duration_since(p.first) >= UNDELIVERED_WARN_AFTER);
         if stuck && !self.delivery_warned {
             self.delivery_warned = true;
+            // We now know delivery is failing: flush the pending buffer to disk
+            // so these messages survive even a hard kill and are retransmitted on
+            // next launch. (Each send already persists; this makes it a hard
+            // guarantee at the moment we detect we cannot send.)
+            self.save_session();
             let n = self.unacked.len();
             return Some(Event::Error(format!(
                 "{n} message{} not delivered yet -- still retrying; check your connection.",
