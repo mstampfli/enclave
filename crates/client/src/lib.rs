@@ -210,6 +210,23 @@ struct OutgoingFile {
     started: bool,
 }
 
+/// An upload in progress: the open file and our position in it. The pump seals
+/// and sends one chunk at a time only while the connection's bounded file queue
+/// has room, so a large (or live, arbitrary-size) file is streamed from disk and
+/// paced by the socket -- never sealed or buffered whole in memory.
+struct Upload {
+    group: GroupId,
+    file: std::fs::File,
+    /// Display name, for progress.
+    name: String,
+    meta: TransferMeta,
+    /// Total chunks and the next one to send.
+    total: u32,
+    index: u32,
+    size: u64,
+    sent: u64,
+}
+
 /// A file offered to us, awaiting our consent. Nothing is written to disk until
 /// we accept; on accept a [`FileSink`] streams the chunks straight to disk.
 struct IncomingFile {
@@ -276,6 +293,8 @@ pub struct Client {
     password: Zeroizing<String>,
     /// Files we are offering, keyed by offer id (see [`OutgoingFile`]).
     outgoing_files: HashMap<[u8; 16], OutgoingFile>,
+    /// Uploads in progress, keyed by offer id, streamed by [`pump_uploads`].
+    uploads: HashMap<[u8; 16], Upload>,
     /// Files offered to us, awaiting/undergoing consented download (see
     /// [`IncomingFile`]). An entry exists from the offer until it resolves.
     incoming_files: HashMap<[u8; 16], IncomingFile>,
@@ -308,6 +327,7 @@ impl Client {
             server_url: server_url.to_string(),
             password: Zeroizing::new(String::new()),
             outgoing_files: HashMap::new(),
+            uploads: HashMap::new(),
             incoming_files: HashMap::new(),
         })
     }
@@ -430,6 +450,9 @@ impl Client {
         self.incoming.clear();
         self.outgoing.clear();
         self.display_names.clear();
+        self.outgoing_files.clear();
+        self.uploads.clear();
+        self.incoming_files.clear();
     }
 
     fn finish_login(&mut self, identity: Identity, username: &str, display: String) {
@@ -936,56 +959,138 @@ impl Client {
     pub fn cancel_file(&mut self, offer_id: &str) -> Result<(), ClientError> {
         let id = decode_offer_id(offer_id).ok_or(ClientError::NoGroup)?;
         if self.outgoing_files.remove(&id).is_some() {
+            self.uploads.remove(&id); // stop streaming it if in progress
             self.conn.send(ClientMsg::FileCancel { offer_id: id });
         }
         Ok(())
     }
 
-    /// Read the offered file from disk and stream it as sealed chunks: one
-    /// `FileChunk` per part, then `FileComplete`. Emits send progress. Marks the
-    /// offer started so a repeated trigger does not re-stream it.
-    fn upload_file(&mut self, offer_id: [u8; 16]) -> Result<(), ClientError> {
-        let (group_id, path, name, mime, size) = match self.outgoing_files.get_mut(&offer_id) {
+    /// Begin uploading an offered file: open it and register an [`Upload`]; the
+    /// bytes are streamed later by [`pump_uploads`], paced by the connection.
+    /// Marks the offer started so a repeated trigger does not re-stream it.
+    fn start_upload(&mut self, offer_id: [u8; 16]) {
+        let (group, path, name, mime, size) = match self.outgoing_files.get_mut(&offer_id) {
             Some(o) if !o.started => {
                 o.started = true;
                 (o.group.clone(), o.path.clone(), o.name.clone(), o.mime.clone(), o.size)
             }
-            _ => return Ok(()), // unknown or already streaming
+            _ => return, // unknown or already streaming
         };
-        let meta = TransferMeta::File { name: name.clone(), mime };
-        let mut file = std::fs::File::open(&path)
-            .map_err(|e| ClientError::Audio(format!("cannot open {name}: {e}")))?;
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                self.pending
+                    .push_back(Event::Error(format!("cannot open {name}: {e}")));
+                return;
+            }
+        };
         let total = (size as usize).div_ceil(transfer::CHUNK_BYTES).max(1) as u32;
-        let id_hex = hex::encode(offer_id);
-        let mut buf = vec![0u8; transfer::CHUNK_BYTES];
-        let mut sent: u64 = 0;
-        for index in 0..total {
-            let n = read_full(&mut file, &mut buf)
-                .map_err(|e| ClientError::Audio(format!("reading {name}: {e}")))?;
-            let part = Part {
-                id: offer_id,
-                index,
+        self.uploads.insert(
+            offer_id,
+            Upload {
+                group,
+                file,
+                meta: TransferMeta::File {
+                    name: name.clone(),
+                    mime,
+                },
+                name,
                 total,
-                meta: meta.clone(),
-                data: buf[..n].to_vec(),
-            };
-            let sealed = self.seal(&group_id, &part.encode())?;
-            self.conn.send(ClientMsg::FileChunk {
-                offer_id,
-                data: Sealed(sealed),
-            });
-            sent += n as u64;
-            self.pending.push_back(Event::TransferProgress {
-                conv: hex_id(&group_id),
-                id: id_hex.clone(),
-                label: name.clone(),
-                sent,
-                total: size,
-                incoming: false,
-            });
+                index: 0,
+                size,
+                sent: 0,
+            },
+        );
+    }
+
+    /// Push in-progress uploads forward: for each, seal and send chunks while the
+    /// connection's bounded file queue has room, then `FileComplete` when done.
+    /// Non-blocking -- when the queue is full it stops and resumes on the next
+    /// call, so the socket (and any slow relayed recipient) paces the upload and
+    /// the whole file is never buffered in memory. Driven by the event loop.
+    pub fn pump_uploads(&mut self) {
+        let ids: Vec<[u8; 16]> = self.uploads.keys().copied().collect();
+        for id in ids {
+            // Send while there is room in the bounded file queue (backpressure).
+            while self.conn.file_capacity() > 0 {
+                // Read the next chunk (or detect completion) under a short borrow.
+                let chunk = {
+                    let Some(up) = self.uploads.get_mut(&id) else {
+                        break;
+                    };
+                    if up.index >= up.total {
+                        None // done
+                    } else {
+                        let mut buf = vec![0u8; transfer::CHUNK_BYTES];
+                        match read_full(&mut up.file, &mut buf) {
+                            Ok(n) => Some((
+                                up.index,
+                                up.total,
+                                up.group.clone(),
+                                up.meta.clone(),
+                                buf[..n].to_vec(),
+                                n,
+                            )),
+                            Err(e) => {
+                                let name = up.name.clone();
+                                self.pending
+                                    .push_back(Event::Error(format!("reading {name}: {e}")));
+                                self.uploads.remove(&id);
+                                break;
+                            }
+                        }
+                    }
+                };
+                match chunk {
+                    None => {
+                        // Every chunk sent: signal completion and finish.
+                        self.conn.try_send_file(ClientMsg::FileComplete { offer_id: id });
+                        self.uploads.remove(&id);
+                        break;
+                    }
+                    Some((index, total, group, meta, data, n)) => {
+                        let part = Part {
+                            id,
+                            index,
+                            total,
+                            meta,
+                            data,
+                        };
+                        let sealed = match self.seal(&group, &part.encode()) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                self.pending
+                                    .push_back(Event::Error(format!("sealing a file chunk: {e}")));
+                                self.uploads.remove(&id);
+                                break;
+                            }
+                        };
+                        // Capacity was checked at the loop head and we are the
+                        // only file producer, so this send is accepted.
+                        self.conn.try_send_file(ClientMsg::FileChunk {
+                            offer_id: id,
+                            data: Sealed(sealed),
+                        });
+                        let (label, size, sent) = match self.uploads.get_mut(&id) {
+                            Some(up) => {
+                                up.index += 1;
+                                up.sent += n as u64;
+                                (up.name.clone(), up.size, up.sent)
+                            }
+                            None => break,
+                        };
+                        self.pending.push_back(Event::TransferProgress {
+                            conv: hex_id(&group),
+                            id: hex::encode(id),
+                            label,
+                            sent,
+                            total: size,
+                            incoming: false,
+                        });
+                    }
+                }
+            }
         }
-        self.conn.send(ClientMsg::FileComplete { offer_id });
-        Ok(())
     }
 
     /// Split `data` into parts and send each one sealed to `group_id`.
@@ -2006,10 +2111,9 @@ impl Client {
                 ..
             } => self.handle_file_offered(offer_id, group, from, manifest, live),
             ServerMsg::FileUploadReady { offer_id } => {
-                // The server admitted our stored offer: upload the bytes now.
-                if let Err(e) = self.upload_file(offer_id) {
-                    return Some(Event::Error(format!("upload failed: {e}")));
-                }
+                // The server admitted our stored offer: begin uploading (the
+                // pump streams the bytes, paced by the connection).
+                self.start_upload(offer_id);
                 None
             }
             ServerMsg::FileAccepted { offer_id, .. } => {
@@ -2020,9 +2124,7 @@ impl Client {
                     .get(&offer_id)
                     .is_some_and(|o| o.live && !o.started)
                 {
-                    if let Err(e) = self.upload_file(offer_id) {
-                        return Some(Event::Error(format!("streaming failed: {e}")));
-                    }
+                    self.start_upload(offer_id);
                 }
                 None
             }

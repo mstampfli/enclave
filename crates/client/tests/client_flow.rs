@@ -315,14 +315,16 @@ async fn large_message_and_file_transfer_between_two_clients() {
 }
 
 /// Drive both clients until Bob receives a file offer; return its id. Driving
-/// Alice lets her process `FileUploadReady` and upload the chunks.
+/// Alice lets her process `FileUploadReady`; pumping her lets the paced upload
+/// stream (the event loop does this in the real app).
 async fn pump_until_offer(alice: &mut Client, bob: &mut Client) -> String {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         assert!(tokio::time::Instant::now() < deadline, "no file offer arrived");
+        alice.pump_uploads();
         tokio::select! {
-            _ = tokio::time::timeout(Duration::from_millis(150), alice.next_event()) => {}
-            e = tokio::time::timeout(Duration::from_millis(150), bob.next_event()) => {
+            _ = tokio::time::timeout(Duration::from_millis(50), alice.next_event()) => {}
+            e = tokio::time::timeout(Duration::from_millis(50), bob.next_event()) => {
                 if let Ok(Some(Event::FileOffered { offer_id, .. })) = e {
                     return offer_id;
                 }
@@ -336,9 +338,10 @@ async fn pump_until_file(alice: &mut Client, bob: &mut Client) -> String {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         assert!(tokio::time::Instant::now() < deadline, "no file arrived");
+        alice.pump_uploads();
         tokio::select! {
-            _ = tokio::time::timeout(Duration::from_millis(150), alice.next_event()) => {}
-            e = tokio::time::timeout(Duration::from_millis(150), bob.next_event()) => {
+            _ = tokio::time::timeout(Duration::from_millis(50), alice.next_event()) => {}
+            e = tokio::time::timeout(Duration::from_millis(50), bob.next_event()) => {
                 if let Ok(Some(Event::File { file, .. })) = e {
                     return file.path;
                 }

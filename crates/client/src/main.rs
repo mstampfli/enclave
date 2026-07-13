@@ -644,6 +644,13 @@ async fn run_client(
             handle_command(&mut client, &proxy, cmd).await;
         }
 
+        // Push any in-progress file uploads forward, paced by the connection's
+        // bounded file queue (backpressure), so a large upload streams from disk
+        // instead of buffering in memory.
+        if let Some(c) = client.as_mut() {
+            c.pump_uploads();
+        }
+
         // A share can end without a command: the user cancels the system
         // picker (Linux portal), the compositor revokes the share, or the
         // capture dies. Reap it so the UI reflects reality.
