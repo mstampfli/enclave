@@ -371,7 +371,7 @@
       <div class="share-head">Cameras</div>
       <div id="share-cameras" class="share-list"><div class="share-empty">Looking for cameras...</div></div>
       <label class="share-audio"><input id="share-audio" type="checkbox" /> Also share audio</label>
-      <p class="hint">A window shares only that app's audio. A whole screen shares all system audio, so others may hear the call echo back.</p>
+      <p class="hint" id="share-audio-hint">A window shares only that app's audio. A whole screen shares all system audio, so others may hear the call echo back.</p>
       <div class="modal-actions">
         <button id="share-close" class="primary">Cancel</button>
       </div>
@@ -1053,6 +1053,11 @@
         fillShareList("share-screens", ev.screens, "screen");
         fillShareList("share-windows", ev.windows, "window");
         fillShareList("share-cameras", ev.cameras, "camera");
+        // Without per-app audio (Linux), shared audio is always the whole
+        // system mix; say so instead of promising per-window audio.
+        $("share-audio-hint").textContent = ev.per_app_audio
+          ? "A window shares only that app's audio. A whole screen shares all system audio, so others may hear the call echo back."
+          : "Shared audio is the whole system mix, so others may hear the call echo back unless it plays on another device.";
         break;
       case "Connection": {
         const b = $("conn-banner");
@@ -1085,6 +1090,21 @@
         break;
     }
   };
+
+  // Boot diagnostic: the share viewer decodes H.264 with WebCodecs, which the
+  // WebView must provide (WebKitGTK needs its GStreamer H.264 decoder). Ask
+  // for the exact config the viewer uses, so a missing decoder is visible
+  // instead of a silently black share.
+  (async () => {
+    let ok = false;
+    try {
+      if (typeof window.VideoDecoder === "function") {
+        const res = await VideoDecoder.isConfigSupported({ codec: "avc1.42E01E" });
+        ok = !!(res && res.supported);
+      }
+    } catch (e) { /* unsupported -> ok stays false */ }
+    send({ type: "UiReady", webcodecs: ok });
+  })();
 </script>
 </body>
 </html>

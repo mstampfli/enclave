@@ -68,6 +68,10 @@ pub struct CallParams {
 struct VideoSender {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The capture's life-cycle status, for supervising shares that can end on
+    /// their own (the Linux portal dialog may be cancelled, the compositor may
+    /// revoke the share). `None` for captures that cannot (camera).
+    status: Option<enclave_media::SharedStatus>,
 }
 
 impl Drop for VideoSender {
@@ -99,7 +103,6 @@ pub struct Call {
     /// Shared system audio mixed into the mic stream; the ring is drained by the
     /// audio encode thread. `system_audio` holds the live loopback capture.
     mix: MixRing,
-    #[cfg(windows)]
     system_audio: Option<enclave_media::SystemAudioCapture>,
     /// Our own username, tagged on locally looped-back camera preview frames.
     me: String,
@@ -276,7 +279,6 @@ impl Call {
             screen: None,
             camera: None,
             mix,
-            #[cfg(windows)]
             system_audio: None,
             me,
             local_frame_tx,
@@ -330,8 +332,8 @@ impl Call {
     }
 
     /// Start sharing a monitor (`monitor_index` is a zero-based index from
-    /// [`enclave_media::monitor_sources`]).
-    #[cfg(windows)]
+    /// [`enclave_media::monitor_sources`]; on Linux the index is nominal and
+    /// the system picker chooses the actual monitor or window).
     pub fn start_screen(&mut self, monitor_index: usize) -> Result<(), ClientError> {
         if self.screen.is_some() {
             return Ok(());
@@ -342,7 +344,6 @@ impl Call {
     }
 
     /// Start sharing a single window (`hwnd` from [`enclave_media::window_sources`]).
-    #[cfg(windows)]
     pub fn start_window(&mut self, hwnd: isize) -> Result<(), ClientError> {
         if self.screen.is_some() {
             return Ok(());
@@ -358,41 +359,41 @@ impl Call {
     /// a user may share screen and camera at once without the two streams
     /// colliding on the receiver's decoder. A keyframe is emitted periodically so
     /// a viewer who joins mid-share recovers within a couple of seconds.
-    #[cfg(windows)]
     fn spawn_screen(&mut self, capture: enclave_media::ScreenCapture) {
         let sealer = self.sealer.clone();
         let frame_tx = self.frame_tx.clone();
+        let status = capture.status_handle();
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
         let thread = std::thread::spawn(move || {
-            video_encode_loop(
-                &s,
-                MediaKind::Screen,
-                &sealer,
-                &frame_tx,
-                None,
-                || capture.latest().map(|cf| (cf.bgra, cf.width, cf.height)),
-            );
+            video_encode_loop(&s, MediaKind::Screen, &sealer, &frame_tx, None, || {
+                capture.latest().map(|cf| (cf.bgra, cf.width, cf.height))
+            });
         });
         self.screen = Some(VideoSender {
             stop,
             thread: Some(thread),
+            status: Some(status),
         });
-    }
-
-    #[cfg(not(windows))]
-    pub fn start_screen(&mut self, _monitor_index: usize) -> Result<(), ClientError> {
-        Err(ClientError::Audio("screen share is Windows-only".into()))
-    }
-
-    #[cfg(not(windows))]
-    pub fn start_window(&mut self, _hwnd: isize) -> Result<(), ClientError> {
-        Err(ClientError::Audio("window share is Windows-only".into()))
     }
 
     /// Stop sharing the screen or window (keeps the call running).
     pub fn stop_screen(&mut self) {
         self.screen = None; // Drop stops the thread and the capture.
+    }
+
+    /// If the screen share ended on its own -- the user cancelled the system
+    /// picker, the compositor revoked the share, the capture died -- tear it
+    /// down (including any shared system audio: they are one logical share)
+    /// and report why. `None` while nothing noteworthy has happened.
+    pub fn reap_ended_screen(&mut self) -> Option<enclave_media::EndedReason> {
+        let status = self.screen.as_ref()?.status.as_ref()?.get();
+        let enclave_media::CaptureStatus::Ended(reason) = status else {
+            return None;
+        };
+        self.screen = None;
+        self.stop_system_audio();
+        Some(reason)
     }
 
     /// Whether our camera is currently being shared.
@@ -445,6 +446,7 @@ impl Call {
                 self.camera = Some(VideoSender {
                     stop,
                     thread: Some(thread),
+                    status: None,
                 });
                 Ok(())
             }
@@ -460,19 +462,11 @@ impl Call {
 
     /// Whether we are currently sharing system audio.
     pub fn is_sharing_audio(&self) -> bool {
-        #[cfg(windows)]
-        {
-            self.system_audio.is_some()
-        }
-        #[cfg(not(windows))]
-        {
-            false
-        }
+        self.system_audio.is_some()
     }
 
     /// Start mixing shared system audio into our outgoing stream. `pid` shares a
-    /// single application's audio (echo-free); `None` shares the whole endpoint.
-    #[cfg(windows)]
+    /// single application's audio (echo-free); `None` shares the whole mix.
     pub fn start_system_audio(&mut self, pid: Option<u32>) -> Result<(), ClientError> {
         use enclave_media::{LoopbackMode, SystemAudioCapture};
         if self.system_audio.is_some() {
@@ -487,17 +481,10 @@ impl Call {
         Ok(())
     }
 
-    #[cfg(not(windows))]
-    pub fn start_system_audio(&mut self, _pid: Option<u32>) -> Result<(), ClientError> {
-        Err(ClientError::Audio("system audio share is Windows-only".into()))
-    }
-
     /// Stop sharing system audio; the ring drains and the mic goes back to normal.
     pub fn stop_system_audio(&mut self) {
-        #[cfg(windows)]
-        {
-            self.system_audio = None; // Drop stops the loopback thread.
-        }
+        // Drop stops the loopback thread.
+        self.system_audio = None;
         // Clear any residual shared audio so it does not linger in the mic mix.
         self.mix.lock().unwrap().clear();
     }

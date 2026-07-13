@@ -1,6 +1,7 @@
-//! Enclave client: a self-contained native window (wry/WebView2). The UI is
-//! bundled into the binary and driven over an IPC bridge; all crypto, keys, and
-//! transport live in Rust ([`enclave_client::Client`]).
+//! Enclave client: a self-contained native window (wry: WebView2 on Windows,
+//! WebKitGTK on Linux). The UI is bundled into the binary and driven over an
+//! IPC bridge; all crypto, keys, and transport live in Rust
+//! ([`enclave_client::Client`]).
 //!
 //! The controller runs on its own thread with a Tokio runtime; the tao event
 //! loop owns the WebView on the main thread and shuttles events between them.
@@ -16,10 +17,16 @@ use std::borrow::Cow;
 
 use tao::event::{Event as TaoEvent, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+#[cfg(target_os = "linux")]
+use tao::platform::unix::WindowExtUnix;
 use tao::window::WindowBuilder;
 use tokio::sync::mpsc;
 use wry::http::Request;
-use wry::{WebViewBuilder, WebViewBuilderExtWindows};
+use wry::WebViewBuilder;
+#[cfg(target_os = "linux")]
+use wry::WebViewBuilderExtUnix;
+#[cfg(windows)]
+use wry::WebViewBuilderExtWindows;
 
 const UI_HTML: &str = include_str!("ui/index.html");
 
@@ -27,6 +34,11 @@ const UI_HTML: &str = include_str!("ui/index.html");
 #[derive(serde::Deserialize)]
 #[serde(tag = "type")]
 enum UiCommand {
+    /// The UI booted; `webcodecs` reports whether the WebView can decode
+    /// H.264 (WebCodecs), i.e. whether watching shares/cameras will work.
+    UiReady {
+        webcodecs: bool,
+    },
     CreateAccount {
         server: String,
         username: String,
@@ -235,10 +247,13 @@ enum UiEvent {
         on: bool,
     },
     /// The monitors, windows, and cameras this machine can share, for the picker.
+    /// `per_app_audio` tells the UI whether a window share can carry only that
+    /// app's audio (Windows) or shared audio is always the whole mix (Linux).
     ShareSources {
         screens: Vec<ShareSource>,
         windows: Vec<ShareSource>,
         cameras: Vec<ShareSource>,
+        per_app_audio: bool,
     },
     /// Someone sent us a friend request.
     FriendRequest {
@@ -276,17 +291,21 @@ fn main() -> wry::Result<()> {
     // user is not already looking at Enclave.
     let focused = Arc::new(AtomicBool::new(true));
 
-    // Each process gets its own WebView2 user-data folder. Two instances sharing
+    // Each process gets its own WebView user-data folder. Two instances sharing
     // the default folder collide with a WebView2 "invalid parameter" error, so
     // running multiple windows (e.g. two accounts on one machine) would fail.
     let wv_data = std::env::temp_dir().join(format!("enclave-webview-{}", std::process::id()));
     let mut web_context = wry::WebContext::new(Some(wv_data));
-    // Serve the UI from a custom-protocol origin (https://enclave.localhost/)
-    // instead of NavigateToString. That origin is a *secure context*, which the
-    // opaque about:blank origin of with_html is not -- and WebCodecs (the H.264
-    // screen-share decoder) is only available in a secure context.
-    let webview = WebViewBuilder::new_with_web_context(&mut web_context)
-        .with_https_scheme(true)
+    // Serve the UI from a custom-protocol origin (https://enclave.localhost/ on
+    // Windows, enclave://localhost/ on WebKitGTK) instead of NavigateToString.
+    // That origin is a *secure context*, which the opaque about:blank origin of
+    // with_html is not -- and WebCodecs (the H.264 screen-share decoder) is
+    // only available in a secure context.
+    let builder = WebViewBuilder::new_with_web_context(&mut web_context);
+    // WebView2 can only register custom protocols under an http(s) mapping.
+    #[cfg(windows)]
+    let builder = builder.with_https_scheme(true);
+    let builder = builder
         .with_custom_protocol("enclave".to_string(), |_id, _req| {
             wry::http::Response::builder()
                 .header("Content-Type", "text/html")
@@ -298,8 +317,19 @@ fn main() -> wry::Result<()> {
             if let Ok(cmd) = serde_json::from_str::<UiCommand>(req.body()) {
                 let _ = cmd_tx.send(cmd);
             }
-        })
-        .build(&window)?;
+        });
+    // On Linux, tao windows are GTK windows and wry attaches to the GTK
+    // widget tree (a raw Wayland/X11 handle is unsupported). The webview must
+    // land in tao's default vbox: the window itself is a GtkBin that already
+    // holds that box and can take no second child.
+    #[cfg(target_os = "linux")]
+    let webview = builder.build_gtk(
+        window
+            .default_vbox()
+            .expect("tao always adds a default GtkBox"),
+    )?;
+    #[cfg(not(target_os = "linux"))]
+    let webview = builder.build(&window)?;
 
     let core_focused = focused.clone();
     std::thread::spawn(move || {
@@ -523,6 +553,27 @@ async fn run_client(
             handle_command(&mut client, &proxy, cmd).await;
         }
 
+        // A share can end without a command: the user cancels the system
+        // picker (Linux portal), the compositor revokes the share, or the
+        // capture dies. Reap it so the UI reflects reality.
+        if let Some(c) = client.as_mut() {
+            if let Some(reason) = c.reap_ended_share() {
+                emit(&proxy, UiEvent::ScreenShareState { sharing: false });
+                match reason {
+                    enclave_client::ShareEnded::Cancelled => emit(
+                        &proxy,
+                        UiEvent::Status {
+                            message: "Share cancelled.".into(),
+                            error: false,
+                        },
+                    ),
+                    enclave_client::ShareEnded::Failed(e) => {
+                        error_status(&proxy, format!("Screen share ended: {e}"))
+                    }
+                }
+            }
+        }
+
         let next = async {
             match client.as_mut() {
                 Some(c) => c.next_event().await,
@@ -692,6 +743,18 @@ async fn handle_command(
     cmd: UiCommand,
 ) {
     match cmd {
+        UiCommand::UiReady { webcodecs } => {
+            eprintln!("enclave: UI ready; WebCodecs H.264 decode: {webcodecs}");
+            if !webcodecs {
+                error_status(
+                    proxy,
+                    "This system's WebView cannot decode H.264 (WebCodecs missing); \
+                     watching screen shares and cameras will not work. On Linux, \
+                     install the GStreamer H.264 decoder (gstreamer1.0-libav)."
+                        .into(),
+                );
+            }
+        }
         UiCommand::CreateAccount {
             server,
             username,
@@ -799,6 +862,7 @@ async fn handle_command(
                         screens,
                         windows,
                         cameras,
+                        per_app_audio: cfg!(windows),
                     },
                 );
             }

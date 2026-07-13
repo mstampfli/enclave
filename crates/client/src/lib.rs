@@ -24,6 +24,11 @@ use zeroize::Zeroizing;
 mod call;
 mod session;
 
+/// Why a screen share ended on its own (see [`Client::reap_ended_share`]):
+/// `Cancelled` is the user changing their mind at the system picker, `Failed`
+/// is a real error worth showing loudly.
+pub use enclave_media::EndedReason as ShareEnded;
+
 /// Errors surfaced to the UI.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -843,7 +848,8 @@ impl Client {
     }
 
     /// The monitors available to share (index + name), for a source picker.
-    #[cfg(windows)]
+    /// On Linux this is a single "choose in the system dialog" entry: the XDG
+    /// portal picks the actual monitor or window.
     pub fn screen_sources(&self) -> Vec<(usize, String)> {
         enclave_media::monitor_sources()
             .into_iter()
@@ -851,23 +857,13 @@ impl Client {
             .collect()
     }
 
-    #[cfg(not(windows))]
-    pub fn screen_sources(&self) -> Vec<(usize, String)> {
-        Vec::new()
-    }
-
     /// The windows available to share (hwnd + title), for a source picker.
-    #[cfg(windows)]
+    /// Empty on Linux, where only the system dialog may list other windows.
     pub fn window_sources(&self) -> Vec<(isize, String)> {
         enclave_media::window_sources()
             .into_iter()
             .map(|s| (s.hwnd, s.name))
             .collect()
-    }
-
-    #[cfg(not(windows))]
-    pub fn window_sources(&self) -> Vec<(isize, String)> {
-        Vec::new()
     }
 
     /// The cameras available to share (index + name), for a source picker.
@@ -906,15 +902,18 @@ impl Client {
         }
     }
 
-    /// The process id owning a window, for per-app audio (`None` off Windows).
-    #[cfg(windows)]
-    pub fn window_pid(&self, hwnd: isize) -> Option<u32> {
-        enclave_media::window_pid(hwnd)
+    /// If the screen share ended on its own (the user cancelled the system
+    /// picker, the compositor revoked the share, the capture died), tear it
+    /// down -- shared system audio included -- and say why. Poll this from the
+    /// event loop; `None` means the share is fine (or there is none).
+    pub fn reap_ended_share(&mut self) -> Option<ShareEnded> {
+        self.call.as_mut()?.reap_ended_screen()
     }
 
-    #[cfg(not(windows))]
-    pub fn window_pid(&self, _hwnd: isize) -> Option<u32> {
-        None
+    /// The process id owning a window, for per-app audio (`None` where the
+    /// platform cannot know, e.g. Linux portal shares).
+    pub fn window_pid(&self, hwnd: isize) -> Option<u32> {
+        enclave_media::window_pid(hwnd)
     }
 
     /// Start sharing system audio into the call. `pid` = one app (echo-free);
