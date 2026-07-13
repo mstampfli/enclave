@@ -252,7 +252,9 @@ input, select, textarea { font: inherit; }
 .row-actions button.ok:hover { color: var(--accent-ink); }
 .row-actions button.no:hover { color: var(--danger); }
 
-.add-friend { display: flex; gap: 6px; padding: 4px 8px 10px; }
+/* The scroll pane already insets its contents by 8px; adding more here
+   would push this row inward of the search bar above it. */
+.add-friend { display: flex; gap: 6px; padding: 4px 0 10px; }
 .add-friend input { flex: 1; padding: 8px 11px; font-size: 13.5px;
   background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
   color: var(--ink); }
