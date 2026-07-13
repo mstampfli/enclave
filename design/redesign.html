@@ -1,0 +1,1622 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Enclave - UI prototype</title>
+<style>
+/* ============================================================
+   Enclave design prototype: "cold shell, warm room"
+   Shell chrome: cool slate. Conversation canvas: warm dark.
+   One accent (jade) for trust + primary actions. Coral for
+   calls/destructive only. Mono = cryptographic truth.
+   ============================================================ */
+
+:root {
+  /* shell (cool) */
+  --shell-0: #0d1117;        /* page */
+  --shell-1: #12161e;        /* sidebar, headers */
+  --shell-2: #1a2029;        /* raised rows, inputs on shell */
+  --shell-3: #232b37;        /* hover */
+  --shell-text: #c9d1dc;
+  --shell-muted: #7d8794;
+  --shell-border: rgba(190, 205, 224, 0.09);
+
+  /* room (warm) */
+  --room-0: #171613;         /* conversation canvas */
+  --room-1: #1e1d19;         /* composer, hover rows */
+  --room-2: #262420;
+  --room-text: #e8e5de;
+  --room-muted: #8f8a7f;
+  --room-border: rgba(232, 224, 205, 0.08);
+
+  /* the one accent: jade (trust, primary) */
+  --jade: #46b58a;
+  --jade-strong: #5ecf9f;
+  --jade-dim: rgba(70, 181, 138, 0.14);
+
+  /* calls + destructive only */
+  --coral: #e0644f;
+  --coral-dim: rgba(224, 100, 79, 0.14);
+
+  /* status */
+  --amber: #d9a03f;
+
+  --radius: 6px;
+  --radius-lg: 10px;
+
+  --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", "Fira Code", "DejaVu Sans Mono", monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body { height: 100%; }
+body {
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.55;
+  background: var(--shell-0);
+  color: var(--shell-text);
+  overflow: hidden;
+}
+
+button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+input, select, textarea { font: inherit; }
+
+* { scrollbar-width: thin; scrollbar-color: var(--shell-3) transparent; }
+::-webkit-scrollbar { width: 10px; }
+::-webkit-scrollbar-thumb { background: var(--shell-3); border-radius: 5px;
+  border: 2px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-track { background: transparent; }
+::selection { background: var(--jade); color: #0d1117; }
+
+:focus-visible { outline: 2px solid var(--jade); outline-offset: 2px; border-radius: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}
+
+/* ---------- shared bits ---------- */
+
+.btn {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 7px 14px; border-radius: var(--radius);
+  background: var(--shell-2); border: 1px solid var(--shell-border);
+  color: var(--shell-text); font-weight: 500; font-size: 14px;
+  transition: background 140ms ease-out, border-color 140ms ease-out;
+}
+.btn:hover { background: var(--shell-3); border-color: rgba(190,205,224,0.18); }
+.btn.primary { background: var(--jade); border-color: var(--jade); color: #0b1210; font-weight: 600; }
+.btn.primary:hover { background: var(--jade-strong); border-color: var(--jade-strong); }
+.btn.danger { color: var(--coral); }
+.btn.danger:hover { background: var(--coral-dim); border-color: rgba(224,100,79,0.3); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--shell-muted); }
+.btn.ghost:hover { background: var(--shell-2); color: var(--shell-text); }
+.btn:disabled { opacity: .45; cursor: default; }
+
+.icon { width: 18px; height: 18px; flex: none; stroke: currentColor; stroke-width: 1.75;
+        fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.icon.sm { width: 15px; height: 15px; }
+
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field label { font-size: 12.5px; font-weight: 550; color: var(--shell-muted); }
+.field input, .field select {
+  padding: 8px 11px; border-radius: var(--radius);
+  background: var(--shell-2); border: 1px solid var(--shell-border);
+  color: var(--shell-text);
+  transition: border-color 140ms ease-out;
+}
+.field input:focus, .field select:focus { outline: none; border-color: var(--jade); }
+.field input::placeholder { color: var(--shell-muted); }
+.field .hint { font-size: 12.5px; color: var(--shell-muted); }
+
+.mono { font-family: var(--mono); }
+
+.avatar {
+  width: 34px; height: 34px; border-radius: 50%; flex: none;
+  display: grid; place-items: center;
+  font-size: 13px; font-weight: 600; letter-spacing: .02em;
+  background: var(--shell-3); color: var(--shell-text);
+}
+.avatar.lg { width: 44px; height: 44px; font-size: 16px; }
+
+.presence-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.presence-dot.online  { background: var(--jade); }
+.presence-dot.away    { background: var(--amber); }
+.presence-dot.offline { background: none; border: 1.5px solid var(--shell-muted); }
+
+/* ============ LOGIN ============ */
+
+#login-view {
+  height: 100%; display: grid; place-items: center;
+  background: var(--shell-0);
+}
+.login-card {
+  width: 380px; padding: 36px 34px 30px;
+  background: var(--shell-1); border: 1px solid var(--shell-border);
+  border-radius: var(--radius-lg);
+  display: flex; flex-direction: column; gap: 18px;
+}
+.login-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+.login-brand svg { width: 34px; height: 34px; }
+.login-brand .name {
+  font-size: 21px; font-weight: 650; letter-spacing: 0.14em; color: var(--room-text);
+}
+.login-tagline { font-size: 13.5px; color: var(--shell-muted); margin-top: -12px; }
+.login-tabs { display: flex; gap: 2px; background: var(--shell-2); padding: 3px;
+  border-radius: var(--radius); }
+.login-tabs button { flex: 1; padding: 6px 0; border-radius: 4px; font-size: 13.5px;
+  color: var(--shell-muted); font-weight: 550; }
+.login-tabs button.active { background: var(--shell-3); color: var(--shell-text); }
+.login-error { color: var(--coral); font-size: 13px; min-height: 1em; }
+.login-footer { display: flex; justify-content: space-between; align-items: center;
+  border-top: 1px solid var(--shell-border); padding-top: 14px; }
+.login-footer button { font-size: 13px; color: var(--shell-muted); }
+.login-footer button:hover { color: var(--shell-text); }
+
+/* ============ APP SHELL ============ */
+
+#app { height: 100%; display: grid; grid-template-columns: 288px 1fr; }
+
+/* ---------- sidebar ---------- */
+
+#sidebar {
+  background: var(--shell-1); border-right: 1px solid var(--shell-border);
+  display: flex; flex-direction: column; min-height: 0;
+}
+
+.self-card {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 14px 12px;
+}
+.self-card .who { flex: 1; min-width: 0; }
+.self-card .who .display { font-weight: 600; font-size: 14.5px; color: var(--room-text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.self-card .who .handle { font-family: var(--mono); font-size: 12px; color: var(--shell-muted); }
+.presence-btn { display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+  color: var(--shell-muted); padding: 2px 6px; margin-left: -6px; border-radius: 4px; }
+.presence-btn:hover { background: var(--shell-2); color: var(--shell-text); }
+
+.side-tabs { display: flex; padding: 0 14px; gap: 18px; border-bottom: 1px solid var(--shell-border); }
+.side-tabs button {
+  padding: 8px 2px 9px; font-size: 13.5px; font-weight: 550; color: var(--shell-muted);
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  transition: color 140ms ease-out;
+}
+.side-tabs button:hover { color: var(--shell-text); }
+.side-tabs button.active { color: var(--room-text); border-bottom-color: var(--jade); }
+.side-tabs .count { font-size: 11.5px; background: var(--shell-2); border-radius: 8px;
+  padding: 0 6px; margin-left: 5px; color: var(--shell-muted); }
+.side-tabs .count.attention { background: var(--jade-dim); color: var(--jade-strong); }
+
+.side-scroll { flex: 1; overflow-y: auto; min-height: 0; padding: 10px 8px; }
+
+.side-section { margin-bottom: 14px; }
+.side-section > .head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 2px 8px 6px; font-size: 11.5px; font-weight: 600; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--shell-muted);
+}
+.side-section > .head button { color: var(--shell-muted); display: grid; place-items: center;
+  width: 20px; height: 20px; border-radius: 4px; }
+.side-section > .head button:hover { background: var(--shell-2); color: var(--shell-text); }
+
+.convo-row {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 8px 8px; border-radius: var(--radius); text-align: left;
+  transition: background 120ms ease-out;
+}
+.convo-row:hover { background: var(--shell-2); }
+.convo-row.active { background: var(--shell-3); }
+.convo-row .meta { flex: 1; min-width: 0; }
+.convo-row .name { font-size: 14px; font-weight: 500; color: var(--shell-text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; align-items: center; gap: 7px; }
+.convo-row.active .name { color: var(--room-text); }
+.convo-row .last { font-size: 12.5px; color: var(--shell-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.convo-row .unread {
+  font-size: 11.5px; font-weight: 600; background: var(--shell-3);
+  color: var(--shell-text); border-radius: 9px; padding: 1px 7px;
+}
+.convo-row .live {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11.5px; font-weight: 600; color: var(--jade-strong);
+}
+.live .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--jade); }
+
+.avatar-wrap { position: relative; }
+.avatar-wrap .presence-dot { position: absolute; right: -1px; bottom: -1px;
+  box-shadow: 0 0 0 3px var(--shell-1); }
+
+/* people tab */
+.person-row { display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 7px 8px; border-radius: var(--radius); }
+.person-row:hover { background: var(--shell-2); }
+.person-row .meta { flex: 1; min-width: 0; text-align: left; }
+.person-row .display { font-size: 14px; color: var(--shell-text); }
+.person-row .handle { font-family: var(--mono); font-size: 11.5px; color: var(--shell-muted); }
+.person-row .row-actions { display: flex; gap: 4px; opacity: 0; }
+.person-row:hover .row-actions, .person-row:focus-within .row-actions { opacity: 1; }
+.row-actions button { width: 26px; height: 26px; display: grid; place-items: center;
+  border-radius: 5px; color: var(--shell-muted); }
+.row-actions button:hover { background: var(--shell-3); color: var(--shell-text); }
+.row-actions button.ok:hover { color: var(--jade-strong); }
+.row-actions button.no:hover { color: var(--coral); }
+
+.add-friend { display: flex; gap: 6px; padding: 4px 8px 10px; }
+.add-friend input { flex: 1; padding: 7px 10px; font-family: var(--mono); font-size: 13px;
+  background: var(--shell-2); border: 1px solid var(--shell-border); border-radius: var(--radius);
+  color: var(--shell-text); }
+.add-friend input:focus { outline: none; border-color: var(--jade); }
+
+/* call mini-bar (call active, different convo open) */
+.callbar {
+  margin: 0 8px 8px; padding: 9px 10px; border-radius: var(--radius);
+  background: var(--jade-dim); border: 1px solid rgba(70,181,138,0.25);
+  display: flex; align-items: center; gap: 9px;
+}
+.callbar .txt { flex: 1; min-width: 0; font-size: 13px; color: var(--jade-strong); font-weight: 550;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.callbar button { color: var(--shell-text); width: 26px; height: 26px; display: grid;
+  place-items: center; border-radius: 5px; }
+.callbar button:hover { background: rgba(70,181,138,0.18); }
+.callbar button.leave { color: var(--coral); }
+.callbar button.leave:hover { background: var(--coral-dim); }
+
+/* server card */
+.server-card {
+  border-top: 1px solid var(--shell-border);
+  padding: 11px 14px; display: flex; align-items: center; gap: 10px;
+}
+.server-card .state-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--jade); flex: none; }
+.server-card.reconnecting .state-dot { background: var(--amber); }
+.server-card.offline .state-dot { background: var(--coral); }
+.server-card .meta { flex: 1; min-width: 0; }
+.server-card .host { font-family: var(--mono); font-size: 12.5px; color: var(--shell-text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.server-card .sub { font-size: 11.5px; color: var(--shell-muted); }
+.server-card button { color: var(--shell-muted); width: 28px; height: 28px;
+  display: grid; place-items: center; border-radius: 5px; }
+.server-card button:hover { background: var(--shell-2); color: var(--shell-text); }
+
+/* ============ CONVERSATION ============ */
+
+#room { display: flex; flex-direction: column; min-width: 0; min-height: 0;
+  background: var(--room-0); }
+
+.room-header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 18px; background: var(--shell-1);
+  border-bottom: 1px solid var(--shell-border);
+}
+.room-header .seal-btn { display: flex; align-items: center; }
+.room-header .title-wrap { flex: 1; min-width: 0; }
+.room-header .title { font-size: 15.5px; font-weight: 600; color: var(--room-text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-header .subtitle { font-size: 12px; color: var(--shell-muted);
+  display: flex; align-items: center; gap: 6px; }
+.room-header .subtitle .verify-link { color: var(--jade-strong); font-size: 12px; }
+.room-header .subtitle .verify-link:hover { text-decoration: underline; }
+.room-header .subtitle .verified-tag { color: var(--jade-strong); }
+.header-actions { display: flex; gap: 4px; }
+.header-actions > button {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 6px 11px; border-radius: var(--radius); font-size: 13.5px; font-weight: 500;
+  color: var(--shell-muted);
+  transition: background 140ms ease-out, color 140ms ease-out;
+}
+.header-actions > button:hover { background: var(--shell-2); color: var(--shell-text); }
+.header-actions > button.accent { color: var(--jade-strong); }
+.header-actions > button.accent:hover { background: var(--jade-dim); }
+
+/* thin state banners under header */
+.banner { display: flex; align-items: center; gap: 10px; padding: 7px 18px; font-size: 13px; }
+.banner.reconnect { background: rgba(217,160,63,0.12); color: var(--amber); }
+.banner.offline-b { background: var(--coral-dim); color: var(--coral); }
+.banner.ring { background: var(--jade-dim); color: var(--jade-strong); }
+.banner .spacer { flex: 1; }
+.banner .btn { padding: 4px 11px; font-size: 12.5px; }
+
+/* ---------- call stage ---------- */
+
+#stage {
+  background: var(--shell-0);
+  border-bottom: 1px solid var(--shell-border);
+  padding: 14px 18px 12px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.tiles { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+.tile {
+  position: relative; width: 200px; aspect-ratio: 16/10;
+  background: var(--shell-1); border: 1px solid var(--shell-border);
+  border-radius: var(--radius-lg);
+  display: grid; place-items: center; overflow: hidden;
+}
+.tile.speaking { border-color: var(--jade); }
+.tile .avatar { width: 52px; height: 52px; font-size: 18px; }
+.tile .nameplate {
+  position: absolute; left: 8px; bottom: 7px;
+  font-size: 12px; font-weight: 550; color: var(--shell-text);
+  background: rgba(13,17,23,0.82); padding: 2px 8px; border-radius: 4px;
+  display: flex; align-items: center; gap: 5px;
+}
+.tile .nameplate .icon { width: 12px; height: 12px; color: var(--coral); }
+.tile.sharing-tile { width: 420px; }
+.tile .fake-screen {
+  position: absolute; inset: 0;
+  background:
+    repeating-linear-gradient(45deg, #1d2430 0 14px, #171d27 14px 28px); /* stand-in for video content */
+}
+.tile .fake-cam { position: absolute; inset: 0; background: #202833; }
+
+.stage-controls { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; }
+.ctl {
+  display: inline-flex; flex-direction: column; align-items: center; gap: 3px;
+  min-width: 76px; padding: 8px 12px 6px; border-radius: var(--radius);
+  color: var(--shell-text); font-size: 11.5px; font-weight: 550;
+  background: var(--shell-1); border: 1px solid var(--shell-border);
+  transition: background 140ms ease-out, border-color 140ms ease-out, color 140ms ease-out;
+}
+.ctl:hover { background: var(--shell-2); }
+.ctl.engaged { background: var(--jade-dim); border-color: rgba(70,181,138,0.35); color: var(--jade-strong); }
+.ctl.off { background: var(--coral-dim); border-color: rgba(224,100,79,0.3); color: var(--coral); }
+.ctl.leave { color: var(--coral); }
+.ctl.leave:hover { background: var(--coral-dim); border-color: rgba(224,100,79,0.3); }
+
+.share-offer {
+  display: flex; align-items: center; gap: 10px; justify-content: center;
+  font-size: 13px; color: var(--shell-muted);
+}
+.share-offer .btn { padding: 4px 12px; font-size: 12.5px; }
+
+/* ---------- messages ---------- */
+
+#messages { flex: 1; overflow-y: auto; min-height: 0; }
+.msg-col { max-width: 720px; margin: 0 auto; padding: 22px 24px 10px; }
+
+.day-divider { display: flex; align-items: center; gap: 12px; margin: 18px 0 14px;
+  color: var(--room-muted); font-size: 12px; font-weight: 550; }
+.day-divider::before, .day-divider::after { content: ""; flex: 1; height: 1px; background: var(--room-border); }
+
+.msg-group { display: flex; gap: 12px; padding: 5px 0; }
+.msg-group + .msg-group.same { margin-top: -2px; }
+.msg-group .avatar { margin-top: 2px; }
+.msg-group .body { flex: 1; min-width: 0; }
+.msg-group .byline { display: flex; align-items: baseline; gap: 8px; }
+.msg-group .author { font-weight: 600; font-size: 14px; color: var(--room-text); }
+.msg-group .author.me { color: var(--jade-strong); }
+.msg-group .time { font-size: 11.5px; color: var(--room-muted); }
+.msg-group p { color: var(--room-text); font-size: 14.5px; margin-top: 1px;
+  overflow-wrap: anywhere; }
+.msg-group p + p { margin-top: 3px; }
+
+.sys-line { text-align: center; font-size: 12.5px; color: var(--room-muted); padding: 8px 0; }
+.sys-line .mono { font-size: 12px; }
+
+.empty-room { height: 100%; display: grid; place-items: center; }
+.empty-room .inner { text-align: center; max-width: 360px; display: flex;
+  flex-direction: column; align-items: center; gap: 10px; color: var(--room-muted); }
+.empty-room .inner .big { font-size: 16px; font-weight: 600; color: var(--room-text); }
+
+/* ---------- composer ---------- */
+
+#composer { padding: 10px 24px 18px; }
+.composer-inner { max-width: 720px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+.composer-box {
+  flex: 1; display: flex; align-items: center; gap: 8px;
+  background: var(--room-1); border: 1px solid var(--room-border);
+  border-radius: var(--radius-lg); padding: 4px 6px 4px 14px;
+  transition: border-color 140ms ease-out;
+}
+.composer-box:focus-within { border-color: rgba(70,181,138,0.5); }
+.composer-box input { flex: 1; background: none; border: none; color: var(--room-text);
+  font-size: 14.5px; padding: 8px 0; }
+.composer-box input:focus { outline: none; }
+.composer-box input::placeholder { color: var(--room-muted); }
+.send-btn { width: 34px; height: 34px; display: grid; place-items: center;
+  border-radius: var(--radius); color: var(--room-muted); }
+.send-btn:hover { background: var(--room-2); color: var(--jade-strong); }
+
+/* ============ MODALS ============ */
+
+.overlay {
+  position: fixed; inset: 0; background: rgba(5, 8, 12, 0.72);
+  display: grid; place-items: center; z-index: 40;
+}
+.modal {
+  width: min(460px, calc(100vw - 48px)); max-height: min(640px, calc(100vh - 48px));
+  overflow-y: auto;
+  background: var(--shell-1); border: 1px solid var(--shell-border);
+  border-radius: var(--radius-lg); padding: 22px;
+  display: flex; flex-direction: column; gap: 16px;
+}
+.modal.wide { width: min(560px, calc(100vw - 48px)); }
+.modal h2 { font-size: 16px; font-weight: 650; color: var(--room-text); }
+.modal .m-head { display: flex; align-items: center; justify-content: space-between; }
+.modal .m-head button { color: var(--shell-muted); width: 28px; height: 28px;
+  display: grid; place-items: center; border-radius: 5px; }
+.modal .m-head button:hover { background: var(--shell-2); color: var(--shell-text); }
+.modal .m-section { display: flex; flex-direction: column; gap: 10px; }
+.modal .m-section > .s-head { font-size: 11.5px; font-weight: 600; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--shell-muted); }
+.modal .m-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.modal .divider { height: 1px; background: var(--shell-border); }
+
+/* share picker */
+.pick-list { display: flex; flex-direction: column; gap: 4px; max-height: 200px; overflow-y: auto; }
+.pick-row { display: flex; align-items: center; gap: 11px; padding: 9px 11px;
+  border-radius: var(--radius); text-align: left; width: 100%;
+  border: 1px solid transparent;
+  transition: background 120ms ease-out; }
+.pick-row:hover { background: var(--shell-2); }
+.pick-row .icon { color: var(--shell-muted); }
+.pick-row .lbl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-size: 14px; }
+.pick-empty { font-size: 13px; color: var(--shell-muted); padding: 6px 2px; }
+.share-audio-row { display: flex; align-items: flex-start; gap: 9px; }
+.share-audio-row input { margin-top: 3px; accent-color: var(--jade); }
+.share-audio-row .lbl { font-size: 14px; }
+.share-audio-row .hint { font-size: 12.5px; color: var(--shell-muted); }
+
+/* verification */
+.verify-hero { display: flex; flex-direction: column; align-items: center; gap: 14px;
+  padding: 8px 0 2px; }
+.safety-number {
+  font-family: var(--mono); font-size: 16px; letter-spacing: 0.06em;
+  color: var(--room-text); text-align: center; line-height: 1.9;
+  user-select: all;
+}
+.verify-copy { font-size: 13.5px; color: var(--shell-muted); text-align: center; max-width: 340px; }
+.verify-state { display: flex; align-items: center; gap: 8px; font-size: 13.5px; }
+.verify-state.ok { color: var(--jade-strong); }
+.verify-state.pending { color: var(--shell-muted); }
+
+/* members popover (as modal for prototype) */
+.member-row { display: flex; align-items: center; gap: 10px; padding: 7px 4px; }
+.member-row .meta { flex: 1; }
+.member-row .display { font-size: 14px; }
+.member-row .handle { font-family: var(--mono); font-size: 11.5px; color: var(--shell-muted); }
+.member-row .kick { opacity: 0; color: var(--shell-muted); width: 26px; height: 26px;
+  display: grid; place-items: center; border-radius: 5px; }
+.member-row:hover .kick { opacity: 1; }
+.member-row .kick:hover { background: var(--coral-dim); color: var(--coral); }
+
+/* command palette */
+#palette-overlay { align-items: start; padding-top: 14vh; display: grid; justify-items: center; }
+.palette { width: min(560px, calc(100vw - 48px)); background: var(--shell-1);
+  border: 1px solid var(--shell-border); border-radius: var(--radius-lg); overflow: hidden; }
+.palette input { width: 100%; padding: 14px 16px; background: none; border: none;
+  border-bottom: 1px solid var(--shell-border); color: var(--room-text); font-size: 15px; }
+.palette input:focus { outline: none; }
+.palette .results { max-height: 320px; overflow-y: auto; padding: 6px; }
+.palette .p-row { display: flex; align-items: center; gap: 11px; width: 100%;
+  padding: 9px 11px; border-radius: var(--radius); text-align: left; font-size: 14px; }
+.palette .p-row .icon { color: var(--shell-muted); }
+.palette .p-row .kind { margin-left: auto; font-size: 11.5px; color: var(--shell-muted);
+  text-transform: uppercase; letter-spacing: 0.06em; }
+.palette .p-row.sel { background: var(--shell-3); }
+.palette .p-hint { padding: 8px 16px; font-size: 12px; color: var(--shell-muted);
+  border-top: 1px solid var(--shell-border); display: flex; gap: 14px; }
+kbd { font-family: var(--mono); font-size: 11px; background: var(--shell-2);
+  border: 1px solid var(--shell-border); border-radius: 4px; padding: 1px 5px; }
+
+/* toasts */
+#toasts { position: fixed; right: 18px; bottom: 18px; display: flex;
+  flex-direction: column; gap: 8px; z-index: 60; }
+.toast { display: flex; align-items: center; gap: 10px; min-width: 260px; max-width: 380px;
+  background: var(--shell-1); border: 1px solid var(--shell-border);
+  border-left: 3px solid var(--jade);
+  border-radius: var(--radius); padding: 11px 14px; font-size: 13.5px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.35); }
+.toast.error { border-left-color: var(--coral); }
+.toast .close { margin-left: auto; color: var(--shell-muted); }
+
+/* prototype drawer (not part of the product) */
+#proto {
+  position: fixed; left: 306px; bottom: 18px; z-index: 70;
+  font-size: 12px;
+}
+#proto .drawer {
+  background: var(--shell-1); border: 1px dashed rgba(190,205,224,0.3);
+  border-radius: var(--radius); padding: 10px 12px; display: none;
+  flex-direction: column; gap: 6px; margin-bottom: 8px; width: 230px;
+}
+#proto.open .drawer { display: flex; }
+#proto .drawer button { text-align: left; padding: 4px 7px; border-radius: 4px;
+  color: var(--shell-muted); font-size: 12px; }
+#proto .drawer button:hover { background: var(--shell-2); color: var(--shell-text); }
+#proto .drawer .d-head { font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+  font-size: 10.5px; color: var(--shell-muted); margin-top: 4px; }
+#proto > .tab { background: var(--shell-1); border: 1px dashed rgba(190,205,224,0.3);
+  color: var(--shell-muted); border-radius: var(--radius); padding: 5px 10px; }
+#proto > .tab:hover { color: var(--shell-text); }
+
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<!-- ================= LOGIN ================= -->
+<div id="login-view">
+  <div class="login-card">
+    <div class="login-brand">
+      <svg viewBox="0 0 34 34" aria-hidden="true">
+        <circle cx="17" cy="17" r="15" fill="none" stroke="#46b58a" stroke-width="2"/>
+        <circle cx="17" cy="17" r="8.5" fill="none" stroke="#c9d1dc" stroke-width="1.5"
+                stroke-dasharray="4 3"/>
+        <circle cx="17" cy="17" r="3" fill="#46b58a"/>
+      </svg>
+      <span class="name">ENCLAVE</span>
+    </div>
+    <div class="login-tagline">Your server. Your keys. Your people.</div>
+
+    <div class="login-tabs" role="tablist">
+      <button class="active" id="tab-login">Sign in</button>
+      <button id="tab-create">Create account</button>
+    </div>
+
+    <div class="field">
+      <label for="f-server">Server</label>
+      <input id="f-server" class="mono" value="wss://enclave.example.org" spellcheck="false">
+      <span class="hint">The relay you or a friend runs. It never sees your messages.</span>
+    </div>
+    <div class="field">
+      <label for="f-user">Username</label>
+      <input id="f-user" class="mono" placeholder="marc" spellcheck="false" autocomplete="username">
+    </div>
+    <div class="field" id="f-display-wrap" hidden>
+      <label for="f-display">Display name</label>
+      <input id="f-display" placeholder="Marc">
+    </div>
+    <div class="field">
+      <label for="f-pass">Password</label>
+      <input id="f-pass" type="password" autocomplete="current-password">
+      <span class="hint">Never sent to the server: it proves you without revealing itself.</span>
+    </div>
+    <div class="login-error" id="login-error"></div>
+    <button class="btn primary" id="login-go" style="justify-content:center">Sign in</button>
+    <div class="login-footer">
+      <button id="import-session">Restore from backup…</button>
+      <span class="hint mono" style="font-size:11.5px">v0.1 · AGPL</span>
+    </div>
+  </div>
+</div>
+
+<!-- ================= APP ================= -->
+<div id="app" hidden>
+
+  <aside id="sidebar">
+    <div class="self-card">
+      <div class="avatar-wrap">
+        <div class="avatar">M</div>
+        <span class="presence-dot online" id="self-presence-dot"></span>
+      </div>
+      <div class="who">
+        <div class="display">Marc</div>
+        <button class="presence-btn" id="presence-btn">
+          <span id="presence-label">Online</span>
+          <svg class="icon sm" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+      </div>
+      <button class="btn ghost" id="open-settings" title="Settings" aria-label="Settings" style="padding:6px">
+        <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+    </div>
+
+    <div class="side-tabs">
+      <button class="active" id="tab-chats">Chats</button>
+      <button id="tab-people">People <span class="count attention" id="req-count">1</span></button>
+    </div>
+
+    <div class="side-scroll" id="pane-chats">
+      <div class="side-section">
+        <div class="head">
+          <span>Conversations</span>
+          <button id="new-group" title="New group" aria-label="New group">
+            <svg class="icon sm" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+        </div>
+        <div id="convo-list"></div>
+      </div>
+    </div>
+
+    <div class="side-scroll" id="pane-people" hidden>
+      <div class="add-friend">
+        <input id="add-friend-input" placeholder="add by handle, e.g. wren" spellcheck="false">
+        <button class="btn" id="add-friend-btn" style="padding:7px 10px" title="Send friend request" aria-label="Send friend request">
+          <svg class="icon sm" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+      </div>
+      <div class="side-section" id="sec-incoming">
+        <div class="head"><span>Requests for you</span></div>
+        <div id="incoming-list"></div>
+      </div>
+      <div class="side-section" id="sec-outgoing">
+        <div class="head"><span>Sent requests</span></div>
+        <div id="outgoing-list"></div>
+      </div>
+      <div class="side-section">
+        <div class="head"><span>Friends</span></div>
+        <div id="friend-list"></div>
+      </div>
+    </div>
+
+    <div class="callbar" id="callbar" hidden>
+      <svg class="icon sm" viewBox="0 0 24 24" style="color:var(--jade-strong)"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+      <span class="txt">In call · <span id="callbar-with">Aria Chen</span></span>
+      <button id="callbar-return" title="Return to call" aria-label="Return to call">
+        <svg class="icon sm" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </button>
+      <button class="leave" id="callbar-leave" title="Leave call" aria-label="Leave call">
+        <svg class="icon sm" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+
+    <div class="server-card" id="server-card">
+      <span class="state-dot"></span>
+      <div class="meta" title="Your relay sees ciphertext and routing only, never a message.">
+        <div class="host">enclave.example.org</div>
+        <div class="sub" id="server-state">Connected · wss</div>
+      </div>
+      <button id="palette-hint" title="Command palette (Ctrl+K)" aria-label="Command palette">
+        <svg class="icon sm" viewBox="0 0 24 24"><path d="M4 17V7l6 5 6-5v10"/><path d="M20 7v10"/></svg>
+      </button>
+    </div>
+  </aside>
+
+  <main id="room">
+    <header class="room-header">
+      <button class="seal-btn" id="header-seal" title="Verify identity"></button>
+      <div class="title-wrap">
+        <div class="title" id="room-title">Aria Chen</div>
+        <div class="subtitle" id="room-subtitle"></div>
+      </div>
+      <div class="header-actions">
+        <button id="btn-members" hidden>
+          <svg class="icon" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          <span id="member-count">3 members</span>
+        </button>
+        <button class="accent" id="btn-call">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+          <span>Call</span>
+        </button>
+      </div>
+    </header>
+
+    <div class="banner reconnect" id="banner-reconnect" hidden>
+      <svg class="icon sm" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+      Reconnecting to your server…
+    </div>
+
+    <div class="banner ring" id="banner-ring" hidden>
+      <svg class="icon sm" viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+      <span><strong id="ring-from">Tobias Fenn</strong> is calling</span>
+      <span class="spacer"></span>
+      <button class="btn primary" id="ring-join">Join</button>
+      <button class="btn" id="ring-decline">Decline</button>
+    </div>
+
+    <section id="stage" hidden>
+      <div class="share-offer" id="share-offer" hidden>
+        <span><strong id="share-from">Aria Chen</strong> is sharing a screen</span>
+        <button class="btn" id="btn-watch">Watch</button>
+      </div>
+      <div class="tiles" id="tiles"></div>
+      <div class="stage-controls">
+        <button class="ctl" id="ctl-mic">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v4"/></svg>
+          <span>Mute</span>
+        </button>
+        <button class="ctl" id="ctl-deafen">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg>
+          <span>Deafen</span>
+        </button>
+        <button class="ctl" id="ctl-camera">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M23 7 16 12l7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+          <span>Camera</span>
+        </button>
+        <button class="ctl" id="ctl-share">
+          <svg class="icon" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          <span>Share</span>
+        </button>
+        <button class="ctl leave" id="ctl-leave">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          <span>Leave</span>
+        </button>
+      </div>
+    </section>
+
+    <div id="messages"><div class="msg-col" id="msg-col"></div></div>
+
+    <footer id="composer">
+      <div class="composer-inner">
+        <div class="composer-box">
+          <input id="composer-input" placeholder="Message Aria Chen" autocomplete="off">
+          <button class="send-btn" id="send-btn" title="Send" aria-label="Send">
+            <svg class="icon" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/></svg>
+          </button>
+        </div>
+      </div>
+    </footer>
+  </main>
+</div>
+
+<!-- ================= MODALS ================= -->
+
+<div class="overlay" id="modal-verify" hidden>
+  <div class="modal">
+    <div class="m-head">
+      <h2>Verify Aria Chen</h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="verify-hero">
+      <span id="verify-seal"></span>
+      <div class="safety-number" id="safety-number"></div>
+      <div class="verify-copy">
+        Read this number aloud on a call, or compare it in person.
+        If it matches on both machines, no one, not even your server,
+        sits between you.
+      </div>
+      <div class="verify-state pending" id="verify-state">
+        <svg class="icon sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke-dasharray="4 3"/></svg>
+        <span>Not verified yet</span>
+      </div>
+    </div>
+    <div class="m-actions">
+      <button class="btn" id="copy-number">Copy number</button>
+      <button class="btn primary" id="mark-verified">We compared, it matches</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="modal-share" hidden>
+  <div class="modal wide">
+    <div class="m-head">
+      <h2>Share to the call</h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="m-section">
+      <div class="s-head">Screens</div>
+      <div class="pick-list" id="pick-screens"></div>
+    </div>
+    <div class="m-section">
+      <div class="s-head">Windows</div>
+      <div class="pick-list" id="pick-windows"></div>
+    </div>
+    <div class="m-section">
+      <div class="s-head">Cameras</div>
+      <div class="pick-list" id="pick-cameras"></div>
+    </div>
+    <div class="divider"></div>
+    <div class="share-audio-row">
+      <input type="checkbox" id="share-audio-check">
+      <div>
+        <div class="lbl"><label for="share-audio-check">Also share audio</label></div>
+        <div class="hint" id="share-audio-hint">A window shares only that app's audio. A whole screen
+          shares everything, so others may hear the call echo back.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="modal-settings" hidden>
+  <div class="modal">
+    <div class="m-head">
+      <h2>Settings</h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="m-section">
+      <div class="s-head">Profile</div>
+      <div class="field">
+        <label for="s-display">Display name</label>
+        <input id="s-display" value="Marc">
+      </div>
+      <div class="field">
+        <label>Handle</label>
+        <input class="mono" value="marc" disabled>
+        <span class="hint">Your handle is bound to your keys and cannot change.</span>
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div class="m-section">
+      <div class="s-head">Audio</div>
+      <div class="field">
+        <label for="s-mic">Microphone</label>
+        <select id="s-mic">
+          <option>System default</option>
+          <option>Built-in microphone (sof-hda-dsp)</option>
+          <option>USB headset</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="s-speaker">Speaker</label>
+        <select id="s-speaker">
+          <option>System default</option>
+          <option>Speakers (sof-hda-dsp)</option>
+          <option>USB headset</option>
+        </select>
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div class="m-section">
+      <div class="s-head">Session</div>
+      <div style="display:flex; gap:8px">
+        <button class="btn" id="s-export">
+          <svg class="icon sm" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
+          Export encrypted backup</button>
+        <button class="btn" id="s-import">
+          <svg class="icon sm" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>
+          Import backup</button>
+      </div>
+      <span class="hint" style="font-size:12.5px; color:var(--shell-muted)">
+        The backup holds your keys and history, sealed with your password.</span>
+    </div>
+    <div class="divider"></div>
+    <div class="m-actions" style="justify-content:space-between">
+      <button class="btn danger" id="s-logout">Log out</button>
+      <button class="btn primary" data-close>Done</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="modal-members" hidden>
+  <div class="modal">
+    <div class="m-head">
+      <h2 id="members-title">ops-room</h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="m-section">
+      <div class="s-head">Members</div>
+      <div id="members-list"></div>
+    </div>
+    <div class="m-section">
+      <div class="s-head">Add someone</div>
+      <div class="add-friend" style="padding:0">
+        <input placeholder="friend's handle" spellcheck="false" id="member-add-input">
+        <button class="btn" style="padding:7px 12px" id="member-add-btn">Add</button>
+      </div>
+      <span class="hint" style="font-size:12.5px;color:var(--shell-muted)">
+        Adding rekeys the group; the newcomer cannot read anything sent before.</span>
+    </div>
+    <div class="divider"></div>
+    <div class="m-actions" style="justify-content:flex-start">
+      <button class="btn danger" id="leave-convo">Leave conversation</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="modal-newgroup" hidden>
+  <div class="modal">
+    <div class="m-head">
+      <h2>New group</h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="field">
+      <label for="g-name">Name</label>
+      <input id="g-name" placeholder="ops-room">
+    </div>
+    <div class="m-section">
+      <div class="s-head">Invite friends</div>
+      <div id="newgroup-friends"></div>
+    </div>
+    <div class="m-actions">
+      <button class="btn" data-close>Cancel</button>
+      <button class="btn primary" id="g-create">Create group</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="palette-overlay" hidden>
+  <div class="palette">
+    <input id="palette-input" placeholder="Jump to a conversation or run a command…" autocomplete="off">
+    <div class="results" id="palette-results"></div>
+    <div class="p-hint">
+      <span><kbd>↑↓</kbd> navigate</span><span><kbd>Enter</kbd> run</span><span><kbd>Esc</kbd> close</span>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<!-- prototype-only state simulator -->
+<div id="proto">
+  <div class="drawer">
+    <div class="d-head">Views</div>
+    <button data-proto="login">Login screen</button>
+    <button data-proto="empty">Empty conversation</button>
+    <div class="d-head">Call</div>
+    <button data-proto="ring">Incoming call rings</button>
+    <button data-proto="call">Join call</button>
+    <button data-proto="remote-share">Peer shares screen</button>
+    <button data-proto="end-call">End call</button>
+    <div class="d-head">Connection</div>
+    <button data-proto="reconnect">Reconnecting</button>
+    <button data-proto="online">Back online</button>
+    <div class="d-head">Trust</div>
+    <button data-proto="unverify">Reset verification</button>
+    <div class="d-head">Toasts</div>
+    <button data-proto="toast-ok">Backup exported</button>
+    <button data-proto="toast-err">Share ended (error)</button>
+    <button data-proto="toast-codec">Missing H.264 decoder</button>
+  </div>
+  <button class="tab" id="proto-toggle">prototype states</button>
+</div>
+
+<script>
+"use strict";
+
+/* ---------------- fake data ---------------- */
+
+const PEOPLE = {
+  aria:   { handle: "aria",   display: "Aria Chen",   presence: "online"  },
+  tobias: { handle: "tobias", display: "Tobias Fenn", presence: "away"    },
+  nadia:  { handle: "nadia",  display: "Nadia Osei",  presence: "offline" },
+};
+
+const state = {
+  view: "app",              // login | app
+  tab: "chats",
+  activeConvo: "aria",
+  inCall: false,
+  callConvo: null,
+  muted: false, deafened: false, camera: false, sharing: false,
+  remoteSharing: false, watching: false,
+  ringing: false,
+  connection: "online",
+  incoming: ["kestrel"],
+  outgoing: ["wren"],
+  paletteSel: 0,
+};
+
+const CONVOS = {
+  aria: {
+    kind: "dm", title: "Aria Chen", with: "aria",
+    verified: true, verifiedOn: "12 Jun",
+    safety: "29418 55210 03974 66182 41007 83355 12940 77821",
+    unread: 0, last: "the relay never saw a byte of it",
+    messages: [
+      { day: "Yesterday" },
+      { from: "Aria Chen", me: false, time: "21:14", lines: [
+        "okay I moved the relay to the new box",
+        "same host, cert rotated" ] },
+      { from: "Marc", me: true, time: "21:16", lines: [
+        "seal still matches on my end, good rotation" ] },
+      { day: "Today" },
+      { from: "Aria Chen", me: false, time: "09:02", lines: [
+        "sending you the floor plans tonight",
+        "the relay never saw a byte of it" ] },
+    ],
+  },
+  tobias: {
+    kind: "dm", title: "Tobias Fenn", with: "tobias",
+    verified: false, verifiedOn: null,
+    safety: "77120 04562 91833 20574 66019 35827 40196 58230",
+    unread: 2, last: "can you hop on a call?",
+    messages: [
+      { day: "Today" },
+      { from: "Tobias Fenn", me: false, time: "10:41", lines: [
+        "hey, new laptop, same me" ] },
+      { from: "Tobias Fenn", me: false, time: "10:42", lines: [
+        "can you hop on a call?" ] },
+      { sys: "Tobias is on a new device. Verify the number before you trust it." },
+    ],
+  },
+  ops: {
+    kind: "group", title: "ops-room", members: ["marc", "aria", "nadia"],
+    verified: true, verifiedOn: "3 Jul",
+    safety: "18402 93710 55284 06471 88213 30952 17604 42985",
+    unread: 0, last: "Nadia: patched and rebooted", liveCall: true,
+    messages: [
+      { day: "Today" },
+      { from: "Aria Chen", me: false, time: "08:10", lines: [ "server updates at noon" ] },
+      { from: "Nadia Osei", me: false, time: "12:03", lines: [ "patched and rebooted" ] },
+      { sys: "Aria started a call, 2 in it now" },
+    ],
+  },
+};
+
+/* ---------------- seal (signature element) ----------------
+   Deterministic glyph from the safety number: two rings of arc
+   segments. Solid jade ring = verified; dashed neutral = not. */
+
+function sealSVG(safety, verified, size) {
+  const digits = safety.replace(/\D/g, "");
+  const seg = (r, a0, a1) => {
+    const p = a => [16 + r * Math.cos(a), 16 + r * Math.sin(a)];
+    const [x0, y0] = p(a0), [x1, y1] = p(a1);
+    const large = (a1 - a0) > Math.PI ? 1 : 0;
+    return `M ${x0.toFixed(2)} ${y0.toFixed(2)} A ${r} ${r} 0 ${large} 1 ${x1.toFixed(2)} ${y1.toFixed(2)}`;
+  };
+  let inner = "", mid = "";
+  for (let i = 0; i < 8; i++) {
+    const d = +digits[i % digits.length];
+    if (d % 2) {
+      const a = (i / 8) * 2 * Math.PI - Math.PI / 2;
+      mid += `<path d="${seg(9.5, a, a + Math.PI / 5)}"/>`;
+    }
+    const d2 = +digits[(i + 11) % digits.length];
+    if (d2 % 3 === 0) {
+      const a = (i / 8) * 2 * Math.PI - Math.PI / 3;
+      inner += `<path d="${seg(5.5, a, a + Math.PI / 3.2)}"/>`;
+    }
+  }
+  const ring = verified
+    ? `<circle cx="16" cy="16" r="13.5" stroke="var(--jade)" stroke-width="2"/>`
+    : `<circle cx="16" cy="16" r="13.5" stroke="var(--shell-muted)" stroke-width="1.5" stroke-dasharray="3.4 2.6"/>`;
+  const tone = verified ? "var(--jade-strong)" : "var(--shell-muted)";
+  return `<svg width="${size}" height="${size}" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+    ${ring}
+    <g stroke="${tone}" stroke-width="1.6" stroke-linecap="round">${mid}${inner}</g>
+    <circle cx="16" cy="16" r="1.6" fill="${tone}"/>
+  </svg>`;
+}
+
+/* ---------------- helpers ---------------- */
+
+const $ = id => document.getElementById(id);
+const initials = name => name.split(/\s+/).map(w => w[0]).slice(0, 2).join("").toUpperCase();
+
+function toast(text, error) {
+  const t = document.createElement("div");
+  t.className = "toast" + (error ? " error" : "");
+  t.innerHTML = `<span>${text}</span><button class="close" aria-label="Dismiss">
+    <svg class="icon sm" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>`;
+  t.querySelector(".close").onclick = () => t.remove();
+  $("toasts").appendChild(t);
+  setTimeout(() => t.remove(), 6000);
+}
+
+/* ---------------- sidebar ---------------- */
+
+function renderConvoList() {
+  const el = $("convo-list");
+  el.innerHTML = "";
+  for (const [id, c] of Object.entries(CONVOS)) {
+    const row = document.createElement("button");
+    row.className = "convo-row" + (id === state.activeConvo ? " active" : "");
+    const av = c.kind === "dm"
+      ? `<div class="avatar-wrap"><div class="avatar">${initials(c.title)}</div>
+           <span class="presence-dot ${PEOPLE[c.with].presence}"></span></div>`
+      : `<div class="avatar" style="border-radius:${'8px'}">${initials(c.title)}</div>`;
+    const right = state.inCall && state.callConvo === id
+      ? `<span class="live"><span class="live-dot"></span>in call</span>`
+      : c.liveCall && !(state.inCall && state.callConvo === id)
+      ? `<span class="live"><span class="live-dot"></span>live</span>`
+      : c.unread ? `<span class="unread">${c.unread}</span>` : "";
+    row.innerHTML = `${av}
+      <div class="meta">
+        <div class="name">${c.title}</div>
+        <div class="last">${c.last}</div>
+      </div>${right}`;
+    row.onclick = () => { switchConvo(id); };
+    el.appendChild(row);
+  }
+}
+
+function personRow(p, actions) {
+  const row = document.createElement("div");
+  row.className = "person-row";
+  row.innerHTML = `
+    <div class="avatar-wrap"><div class="avatar">${initials(p.display || p.handle)}</div>
+      ${p.presence ? `<span class="presence-dot ${p.presence}"></span>` : ""}</div>
+    <div class="meta">
+      <div class="display">${p.display || p.handle}</div>
+      <div class="handle">${p.handle}</div>
+    </div>
+    <div class="row-actions">${actions}</div>`;
+  return row;
+}
+
+function renderPeople() {
+  const inc = $("incoming-list"); inc.innerHTML = "";
+  state.incoming.forEach(h => {
+    const row = personRow({ handle: h }, `
+      <button class="ok" title="Accept"><svg class="icon sm" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></button>
+      <button class="no" title="Decline"><svg class="icon sm" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>`);
+    row.querySelector(".ok").onclick = () => { state.incoming = state.incoming.filter(x => x !== h);
+      PEOPLE[h] = { handle: h, display: h, presence: "online" }; renderPeople(); toast(`${h} is now a friend`); };
+    row.querySelector(".no").onclick = () => { state.incoming = state.incoming.filter(x => x !== h);
+      renderPeople(); };
+    inc.appendChild(row);
+  });
+  $("sec-incoming").hidden = !state.incoming.length;
+
+  const out = $("outgoing-list"); out.innerHTML = "";
+  state.outgoing.forEach(h => {
+    const row = personRow({ handle: h }, `
+      <button class="no" title="Cancel request"><svg class="icon sm" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>`);
+    row.querySelector(".no").onclick = () => { state.outgoing = state.outgoing.filter(x => x !== h); renderPeople(); };
+    out.appendChild(row);
+  });
+  $("sec-outgoing").hidden = !state.outgoing.length;
+
+  const fr = $("friend-list"); fr.innerHTML = "";
+  Object.values(PEOPLE).forEach(p => {
+    const row = personRow(p, `
+      <button title="Message"><svg class="icon sm" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></button>
+      <button class="no" title="Remove friend"><svg class="icon sm" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg></button>`);
+    row.querySelector("button[title=Message]").onclick = () => {
+      const convoId = Object.keys(CONVOS).find(k => CONVOS[k].with === p.handle);
+      setTab("chats"); if (convoId) switchConvo(convoId);
+    };
+    row.querySelector(".no").onclick = () => toast(`Removed ${p.display} (prototype: no-op)`);
+    fr.appendChild(row);
+  });
+
+  const n = state.incoming.length;
+  $("req-count").textContent = n; $("req-count").hidden = !n;
+}
+
+function setTab(tab) {
+  state.tab = tab;
+  $("tab-chats").classList.toggle("active", tab === "chats");
+  $("tab-people").classList.toggle("active", tab === "people");
+  $("pane-chats").hidden = tab !== "chats";
+  $("pane-people").hidden = tab !== "people";
+}
+
+/* ---------------- conversation ---------------- */
+
+function convo() { return CONVOS[state.activeConvo]; }
+
+function renderHeader() {
+  const c = convo();
+  $("room-title").textContent = c.title;
+  $("header-seal").innerHTML = sealSVG(c.safety, c.verified, 30);
+  const sub = $("room-subtitle");
+  if (c.verified) {
+    sub.innerHTML = `End-to-end encrypted · <span class="verified-tag">verified ${c.verifiedOn}</span>`;
+  } else {
+    sub.innerHTML = `End-to-end encrypted · identity not verified:
+      <button class="verify-link" id="verify-link">verify now</button>`;
+    sub.querySelector("#verify-link").onclick = openVerify;
+  }
+  const isGroup = c.kind === "group";
+  $("btn-members").hidden = !isGroup;
+  if (isGroup) $("member-count").textContent = `${c.members.length} members`;
+  $("composer-input").placeholder = `Message ${c.title}`;
+}
+
+function renderMessages() {
+  const col = $("msg-col");
+  col.innerHTML = "";
+  const c = convo();
+  if (!c.messages.length) {
+    col.innerHTML = `<div class="empty-room" style="padding:80px 0"><div class="inner">
+      <span id="empty-seal"></span>
+      <div class="big">This room is sealed</div>
+      <div>Only you and ${c.title} hold the keys. Say something:
+        the server relays ciphertext and nothing else.</div>
+    </div></div>`;
+    col.querySelector("#empty-seal").innerHTML = sealSVG(c.safety, c.verified, 44);
+    return;
+  }
+  for (const m of c.messages) {
+    if (m.day) {
+      const d = document.createElement("div");
+      d.className = "day-divider"; d.textContent = m.day;
+      col.appendChild(d); continue;
+    }
+    if (m.sys) {
+      const s = document.createElement("div");
+      s.className = "sys-line"; s.textContent = m.sys;
+      col.appendChild(s); continue;
+    }
+    const g = document.createElement("div");
+    g.className = "msg-group";
+    g.innerHTML = `
+      <div class="avatar">${initials(m.from)}</div>
+      <div class="body">
+        <div class="byline">
+          <span class="author${m.me ? " me" : ""}">${m.me ? "Marc" : m.from}</span>
+          <span class="time">${m.time}</span>
+        </div>
+        ${m.lines.map(l => `<p>${l}</p>`).join("")}
+      </div>`;
+    col.appendChild(g);
+  }
+  $("messages").scrollTop = $("messages").scrollHeight;
+}
+
+function switchConvo(id) {
+  state.activeConvo = id;
+  CONVOS[id].unread = 0;
+  renderConvoList(); renderHeader(); renderMessages(); renderStage();
+}
+
+function sendMessage() {
+  const input = $("composer-input");
+  const text = input.value.trim();
+  if (!text) return;
+  const c = convo();
+  const now = new Date();
+  const t = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+  c.messages.push({ from: "Marc", me: true, time: t, lines: [text] });
+  c.last = text;
+  input.value = "";
+  renderMessages(); renderConvoList();
+}
+
+/* ---------------- call ---------------- */
+
+function renderStage() {
+  const inThisCall = state.inCall && state.callConvo === state.activeConvo;
+  $("stage").hidden = !inThisCall;
+  $("callbar").hidden = !(state.inCall && !inThisCall);
+  if (state.inCall) $("callbar-with").textContent = CONVOS[state.callConvo].title;
+
+  const callBtn = $("btn-call");
+  callBtn.querySelector("span").textContent =
+    inThisCall ? "In call" : (convo().liveCall || (state.inCall && state.callConvo === state.activeConvo)) ? "Join call" : "Call";
+
+  if (!inThisCall) return;
+
+  // tiles
+  const c = CONVOS[state.callConvo];
+  const tiles = $("tiles"); tiles.innerHTML = "";
+  const parts = c.kind === "dm" ? ["Marc", c.title] : ["Marc", "Aria Chen", "Nadia Osei"];
+  for (const name of parts) {
+    const me = name === "Marc";
+    const tile = document.createElement("div");
+    tile.className = "tile";
+    const cam = me && state.camera;
+    tile.innerHTML = `
+      ${cam ? `<div class="fake-cam"></div>` : ""}
+      <div class="avatar lg" ${cam ? 'style="visibility:hidden"' : ""}>${initials(name)}</div>
+      <span class="nameplate">${me ? "You" : name}${me && state.muted
+        ? `<svg class="icon" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v4"/><path d="M4 4l16 16"/></svg>` : ""}</span>`;
+    tiles.appendChild(tile);
+  }
+  if (state.sharing) {
+    const tile = document.createElement("div");
+    tile.className = "tile sharing-tile";
+    tile.innerHTML = `<div class="fake-screen"></div>
+      <span class="nameplate">Your screen</span>`;
+    tiles.appendChild(tile);
+  }
+  if (state.remoteSharing && state.watching) {
+    const tile = document.createElement("div");
+    tile.className = "tile sharing-tile";
+    tile.innerHTML = `<div class="fake-screen"></div>
+      <span class="nameplate">Aria's screen</span>`;
+    tiles.appendChild(tile);
+  }
+
+  // share offer strip
+  $("share-offer").hidden = !(state.remoteSharing && !state.watching);
+
+  // controls
+  setCtl("ctl-mic", state.muted, state.muted ? "Unmute" : "Mute", "off");
+  setCtl("ctl-deafen", state.deafened, state.deafened ? "Undeafen" : "Deafen", "off");
+  setCtl("ctl-camera", state.camera, state.camera ? "Camera off" : "Camera", "engaged");
+  setCtl("ctl-share", state.sharing, state.sharing ? "Stop sharing" : "Share", "engaged");
+  const watchBtn = $("btn-watch");
+  watchBtn.textContent = state.watching ? "Stop watching" : "Watch";
+}
+
+function setCtl(id, on, label, cls) {
+  const b = $(id);
+  b.classList.toggle(cls, on);
+  b.querySelector("span").textContent = label;
+}
+
+function joinCall() {
+  state.inCall = true;
+  state.callConvo = state.activeConvo;
+  state.ringing = false;
+  $("banner-ring").hidden = true;
+  renderStage(); renderConvoList();
+}
+
+function leaveCall() {
+  state.inCall = false; state.callConvo = null;
+  state.muted = state.deafened = state.camera = state.sharing = false;
+  state.remoteSharing = state.watching = false;
+  renderStage(); renderConvoList();
+}
+
+/* ---------------- share picker ---------------- */
+
+const WAYLAND = false;   // flip to preview the Wayland variant of the picker
+
+function openSharePicker() {
+  const screens = WAYLAND
+    ? [{ label: "Screen or window (choose in the system dialog)" }]
+    : [{ label: "HDMI-A-1 (2560x1440)" }, { label: "eDP-1 (1920x1080)" }];
+  const windows = WAYLAND ? [] :
+    [{ label: "Firefox - enclave docs" }, { label: "Terminal - ~/enclave" }, { label: "Steam" }];
+  const cams = [{ label: "HD Webcam" }];
+
+  fillPicks("pick-screens", screens, "monitor");
+  fillPicks("pick-windows", windows, "window");
+  fillPicks("pick-cameras", cams, "camera");
+  $("share-audio-hint").textContent = WAYLAND
+    ? "Shared audio is the whole system mix, so others may hear the call echo back unless it plays on another device."
+    : "A window shares only that app's audio. A whole screen shares everything, so others may hear the call echo back.";
+  openModal("modal-share");
+}
+
+function fillPicks(id, items, kind) {
+  const el = $(id); el.innerHTML = "";
+  if (!items.length) {
+    el.innerHTML = `<div class="pick-empty">Nothing to list: the system dialog picks windows here.</div>`;
+    return;
+  }
+  const icons = {
+    monitor: `<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>`,
+    window:  `<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/>`,
+    camera:  `<path d="M23 7 16 12l7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/>`,
+  };
+  for (const it of items) {
+    const b = document.createElement("button");
+    b.className = "pick-row";
+    b.innerHTML = `<svg class="icon" viewBox="0 0 24 24">${icons[kind]}</svg>
+      <span class="lbl">${it.label}</span>`;
+    b.onclick = () => {
+      closeModals();
+      if (kind === "camera") { state.camera = true; }
+      else { state.sharing = true; }
+      renderStage();
+      const audio = $("share-audio-check").checked && kind !== "camera";
+      toast(kind === "camera" ? "Camera is on" :
+        audio ? `Sharing ${it.label} with audio` : `Sharing ${it.label}`);
+    };
+    el.appendChild(b);
+  }
+}
+
+/* ---------------- verify ---------------- */
+
+function openVerify() {
+  const c = convo();
+  $("modal-verify").querySelector("h2").textContent =
+    c.kind === "dm" ? `Verify ${c.title}` : `Verify ${c.title}`;
+  $("verify-seal").innerHTML = sealSVG(c.safety, c.verified, 72);
+  $("safety-number").textContent = c.safety;
+  const st = $("verify-state");
+  if (c.verified) {
+    st.className = "verify-state ok";
+    st.innerHTML = `<svg class="icon sm" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>
+      <span>Verified ${c.verifiedOn}</span>`;
+    $("mark-verified").hidden = true;
+  } else {
+    st.className = "verify-state pending";
+    st.innerHTML = `<svg class="icon sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke-dasharray="4 3"/></svg>
+      <span>Not verified yet</span>`;
+    $("mark-verified").hidden = false;
+  }
+  openModal("modal-verify");
+}
+
+/* ---------------- members / new group ---------------- */
+
+function openMembers() {
+  const c = convo();
+  $("members-title").textContent = c.title;
+  const list = $("members-list"); list.innerHTML = "";
+  const names = { marc: "Marc", aria: "Aria Chen", nadia: "Nadia Osei" };
+  for (const h of c.members) {
+    const row = document.createElement("div");
+    row.className = "member-row";
+    row.innerHTML = `
+      <div class="avatar">${initials(names[h])}</div>
+      <div class="meta"><div class="display">${names[h]}${h === "marc" ? " (you)" : ""}</div>
+        <div class="handle">${h}</div></div>
+      ${h !== "marc" ? `<button class="kick" title="Remove from group">
+        <svg class="icon sm" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>` : ""}`;
+    const kick = row.querySelector(".kick");
+    if (kick) kick.onclick = () => toast(`Removed ${names[h]}; group rekeyed`, false);
+    list.appendChild(row);
+  }
+  openModal("modal-members");
+}
+
+function openNewGroup() {
+  const wrap = $("newgroup-friends"); wrap.innerHTML = "";
+  Object.values(PEOPLE).forEach(p => {
+    const row = document.createElement("label");
+    row.className = "member-row"; row.style.cursor = "pointer";
+    row.innerHTML = `<input type="checkbox" style="accent-color:var(--jade)">
+      <div class="avatar">${initials(p.display)}</div>
+      <div class="meta"><div class="display">${p.display}</div>
+        <div class="handle">${p.handle}</div></div>`;
+    wrap.appendChild(row);
+  });
+  openModal("modal-newgroup");
+}
+
+/* ---------------- modals ---------------- */
+
+function openModal(id) { closeModals(); $(id).hidden = false; }
+function closeModals() {
+  document.querySelectorAll(".overlay").forEach(o => o.hidden = true);
+}
+document.querySelectorAll("[data-close]").forEach(b => b.onclick = closeModals);
+document.querySelectorAll(".overlay").forEach(o =>
+  o.addEventListener("mousedown", e => { if (e.target === o) closeModals(); }));
+
+/* ---------------- command palette ---------------- */
+
+function paletteItems(q) {
+  const items = [];
+  for (const [id, c] of Object.entries(CONVOS))
+    items.push({ label: c.title, kind: "conversation", run: () => switchConvo(id),
+      icon: `<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>` });
+  items.push(
+    { label: state.inCall ? "Leave call" : "Start call", kind: "call",
+      run: () => state.inCall ? leaveCall() : joinCall(),
+      icon: `<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/>` },
+    { label: "Share screen", kind: "call", run: () => { if (!state.inCall) joinCall(); openSharePicker(); },
+      icon: `<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>` },
+    { label: "Verify identity", kind: "trust", run: openVerify,
+      icon: `<circle cx="12" cy="12" r="10" stroke-dasharray="4 3"/>` },
+    { label: "New group", kind: "action", run: openNewGroup,
+      icon: `<path d="M12 5v14M5 12h14"/>` },
+    { label: "Add friend", kind: "action", run: () => { setTab("people"); $("add-friend-input").focus(); },
+      icon: `<path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6M23 11h-6"/>` },
+    { label: "Export encrypted backup", kind: "action", run: () => toast("Exported enclave-marc-backup.enc"),
+      icon: `<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/>` },
+    { label: "Settings", kind: "action", run: () => openModal("modal-settings"),
+      icon: `<circle cx="12" cy="12" r="3"/>` },
+  );
+  const needle = q.trim().toLowerCase();
+  return needle ? items.filter(i => i.label.toLowerCase().includes(needle)) : items;
+}
+
+function renderPalette() {
+  const q = $("palette-input").value;
+  const items = paletteItems(q);
+  state.paletteSel = Math.min(state.paletteSel, Math.max(0, items.length - 1));
+  const box = $("palette-results"); box.innerHTML = "";
+  items.forEach((it, i) => {
+    const b = document.createElement("button");
+    b.className = "p-row" + (i === state.paletteSel ? " sel" : "");
+    b.innerHTML = `<svg class="icon" viewBox="0 0 24 24">${it.icon}</svg>
+      <span>${it.label}</span><span class="kind">${it.kind}</span>`;
+    b.onclick = () => { closeModals(); it.run(); };
+    box.appendChild(b);
+  });
+  return items;
+}
+
+function openPalette() {
+  openModal("palette-overlay");
+  const inp = $("palette-input");
+  inp.value = ""; state.paletteSel = 0;
+  renderPalette(); inp.focus();
+}
+
+/* ---------------- connection ---------------- */
+
+function setConnection(s) {
+  state.connection = s;
+  const card = $("server-card");
+  card.className = "server-card" + (s === "online" ? "" : " " + (s === "reconnecting" ? "reconnecting" : "offline"));
+  $("server-state").textContent =
+    s === "online" ? "Connected · wss"
+    : s === "reconnecting" ? "Reconnecting…" : "Offline";
+  $("banner-reconnect").hidden = s !== "reconnecting";
+}
+
+/* ---------------- login ---------------- */
+
+function showLogin(show) {
+  $("login-view").hidden = !show;
+  $("app").hidden = show;
+}
+
+$("tab-login").onclick = () => {
+  $("tab-login").classList.add("active"); $("tab-create").classList.remove("active");
+  $("f-display-wrap").hidden = true; $("login-go").textContent = "Sign in";
+};
+$("tab-create").onclick = () => {
+  $("tab-create").classList.add("active"); $("tab-login").classList.remove("active");
+  $("f-display-wrap").hidden = false; $("login-go").textContent = "Create account";
+};
+$("login-go").onclick = () => {
+  if (!$("f-user").value.trim() || !$("f-pass").value) {
+    $("login-error").textContent = "Enter your username and password.";
+    return;
+  }
+  $("login-error").textContent = "";
+  showLogin(false);
+};
+$("import-session").onclick = () => toast("Choose a .enc backup file (prototype)");
+
+/* ---------------- wiring ---------------- */
+
+$("tab-chats").onclick = () => setTab("chats");
+$("tab-people").onclick = () => setTab("people");
+$("open-settings").onclick = () => openModal("modal-settings");
+$("new-group").onclick = openNewGroup;
+$("g-create").onclick = () => { closeModals(); toast("Group created, members invited"); };
+$("btn-members").onclick = openMembers;
+$("member-add-btn").onclick = () => {
+  const v = $("member-add-input").value.trim();
+  if (v) { toast(`Invited ${v}; the group rekeys when they join`); $("member-add-input").value = ""; }
+};
+$("leave-convo").onclick = () => { closeModals(); toast("You left the conversation"); };
+$("header-seal").onclick = openVerify;
+$("btn-call").onclick = () => state.inCall && state.callConvo === state.activeConvo ? null : joinCall();
+$("ctl-leave").onclick = leaveCall;
+$("callbar-leave").onclick = leaveCall;
+$("callbar-return").onclick = () => switchConvo(state.callConvo);
+$("ctl-mic").onclick = () => { state.muted = !state.muted; renderStage(); };
+$("ctl-deafen").onclick = () => { state.deafened = !state.deafened; renderStage(); };
+$("ctl-camera").onclick = () => {
+  if (state.camera) { state.camera = false; renderStage(); }
+  else openSharePicker();
+};
+$("ctl-share").onclick = () => {
+  if (state.sharing) { state.sharing = false; renderStage(); toast("Stopped sharing"); }
+  else openSharePicker();
+};
+$("btn-watch").onclick = () => { state.watching = !state.watching; renderStage(); };
+$("ring-join").onclick = joinCall;
+$("ring-decline").onclick = () => { state.ringing = false; $("banner-ring").hidden = true; };
+$("send-btn").onclick = sendMessage;
+$("composer-input").addEventListener("keydown", e => { if (e.key === "Enter") sendMessage(); });
+$("add-friend-btn").onclick = () => {
+  const v = $("add-friend-input").value.trim();
+  if (v) { state.outgoing.push(v); $("add-friend-input").value = ""; renderPeople(); }
+};
+$("add-friend-input").addEventListener("keydown", e => { if (e.key === "Enter") $("add-friend-btn").click(); });
+$("copy-number").onclick = () => { navigator.clipboard?.writeText(convo().safety); toast("Safety number copied"); };
+$("mark-verified").onclick = () => {
+  const c = convo(); c.verified = true; c.verifiedOn = "today";
+  closeModals(); renderHeader(); renderMessages();
+  toast(`${c.title} is verified. The seal is now solid`);
+};
+$("s-export").onclick = () => toast("Exported enclave-marc-backup.enc");
+$("s-import").onclick = () => toast("Choose a .enc backup file (prototype)");
+$("s-logout").onclick = () => { closeModals(); showLogin(true); };
+$("presence-btn").onclick = () => {
+  const order = ["online", "away", "offline"];
+  const cur = $("presence-label").textContent.toLowerCase();
+  const next = order[(order.indexOf(cur) + 1) % order.length];
+  $("presence-label").textContent = next[0].toUpperCase() + next.slice(1);
+  $("self-presence-dot").className = "presence-dot " + next;
+};
+$("palette-hint").onclick = openPalette;
+
+document.addEventListener("keydown", e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
+  if (e.key === "Escape") closeModals();
+  if (!$("palette-overlay").hidden) {
+    const items = paletteItems($("palette-input").value);
+    if (e.key === "ArrowDown") { state.paletteSel = Math.min(state.paletteSel + 1, items.length - 1); renderPalette(); e.preventDefault(); }
+    if (e.key === "ArrowUp")   { state.paletteSel = Math.max(state.paletteSel - 1, 0); renderPalette(); e.preventDefault(); }
+    if (e.key === "Enter" && items[state.paletteSel]) { closeModals(); items[state.paletteSel].run(); }
+  }
+});
+$("palette-input").addEventListener("input", () => { state.paletteSel = 0; renderPalette(); });
+
+/* ---------------- prototype drawer ---------------- */
+
+$("proto-toggle").onclick = () => $("proto").classList.toggle("open");
+document.querySelectorAll("#proto [data-proto]").forEach(b => b.onclick = () => {
+  const a = b.dataset.proto;
+  if (a === "login") showLogin(true);
+  if (a === "empty") { CONVOS.aria.messages = []; switchConvo("aria"); }
+  if (a === "ring")  { showLogin(false); state.ringing = true; $("ring-from").textContent = "Tobias Fenn"; $("banner-ring").hidden = false; }
+  if (a === "call")  { showLogin(false); joinCall(); }
+  if (a === "remote-share") { showLogin(false); if (!state.inCall) joinCall(); state.remoteSharing = true; renderStage(); }
+  if (a === "end-call") leaveCall();
+  if (a === "reconnect") setConnection("reconnecting");
+  if (a === "online") setConnection("online");
+  if (a === "unverify") { CONVOS.aria.verified = false; CONVOS.aria.verifiedOn = null; renderHeader(); renderConvoList(); }
+  if (a === "toast-ok") toast("Exported enclave-marc-backup.enc");
+  if (a === "toast-err") toast("Screen share ended: the share was ended by the system", true);
+  if (a === "toast-codec") toast("This system's WebView cannot decode H.264; watching shares will not work. Install gstreamer1.0-libav.", true);
+});
+
+/* ---------------- boot ---------------- */
+
+showLogin(false);
+setTab("chats");
+renderConvoList(); renderPeople(); renderHeader(); renderMessages(); renderStage();
+setConnection("online");
+</script>
+</body>
+</html>
