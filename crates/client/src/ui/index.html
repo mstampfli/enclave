@@ -30,6 +30,7 @@
   --accent-ink: #8ec793;
   --accent-border: #3e7145;
   --accent-bg: #1e2a20;
+  --accent-bg-hover: #253327;
   --danger: #cf5f4d;
   --danger-border: #86463b;
   --danger-bg: #2a1d19;
@@ -263,17 +264,26 @@ input, select, textarea { font: inherit; }
 
 /* call mini-bar */
 .callbar {
-  margin: 0 8px 8px; padding: 8px 10px; border-radius: var(--radius);
+  margin: 0 8px 8px; border-radius: var(--radius);
   background: var(--accent-bg); border: 1px solid var(--accent-border);
-  display: flex; align-items: center; gap: 9px;
+  display: flex; align-items: center;
 }
+/* The whole bar is the way back into the call; only the X leaves it. A 26px
+   arrow was a smaller target than the thing it sat in. */
+.callbar-go {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 9px;
+  padding: 9px 6px 9px 10px; text-align: left; color: var(--accent-ink);
+  border-radius: var(--radius);
+  transition: background 130ms ease-out;
+}
+.callbar-go:hover { background: var(--accent-bg-hover); }
+.callbar-go .icon { flex: none; }
 .callbar .txt { flex: 1; min-width: 0; font-size: 13px; color: var(--accent-ink); font-weight: 500;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.callbar button { color: var(--ink); width: 26px; height: 26px; display: grid;
-  place-items: center; border-radius: var(--radius); }
-.callbar button:hover { background: var(--raised); }
-.callbar button.leave { color: var(--danger); }
-.callbar button.leave:hover { background: var(--danger-bg); }
+.callbar .leave { flex: none; color: var(--danger); width: 30px; height: 30px;
+  margin-right: 4px; display: grid; place-items: center; border-radius: var(--radius);
+  transition: background 130ms ease-out; }
+.callbar .leave:hover { background: var(--danger-bg); }
 
 /* server card */
 .server-card {
@@ -699,10 +709,9 @@ label.member-row:hover { background: var(--raised); }
     </div>
 
     <div class="callbar" id="callbar" hidden>
-      <svg class="icon sm" viewBox="0 0 24 24" style="color:var(--accent)"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
-      <span class="txt">In call &middot; <span id="callbar-with"></span></span>
-      <button id="callbar-return" title="Return to call" aria-label="Return to call">
-        <svg class="icon sm" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      <button class="callbar-go" id="callbar-return" title="Go back to the call">
+        <svg class="icon sm" viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+        <span class="txt">In call &middot; <span id="callbar-with"></span></span>
       </button>
       <button class="leave" id="callbar-leave" title="Leave call" aria-label="Leave call">
         <svg class="icon sm" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
