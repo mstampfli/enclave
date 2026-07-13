@@ -114,3 +114,29 @@ fn message_length_is_hidden_by_padding() {
         "a message past the bucket lands in a larger bucket, as expected"
     );
 }
+
+#[test]
+fn large_messages_round_trip_without_splitting() {
+    let (alice, mut alice_group, bob, mut bob_group) = two_member_group();
+
+    // Well past one 256-byte bucket: padding rounds these UP to the next
+    // multiple, it never splits them, so each must come back byte-for-byte.
+    for len in [300usize, 1000, 5000, 60_000] {
+        let plaintext: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let sealed = alice_group
+            .encrypt_text(&alice, &plaintext)
+            .expect("encrypt");
+        let opened = bob_group.decrypt_text(&bob, &sealed).expect("decrypt");
+        assert_eq!(
+            opened.plaintext, plaintext,
+            "a {len}-byte message must reassemble exactly (no split, no truncation)"
+        );
+        // One sealed message, not several: the sealed length is a single frame,
+        // larger than the plaintext but on the same order (padding, not copies).
+        assert!(
+            sealed.len() >= len && sealed.len() < len + 512,
+            "{len}-byte message sealed to {} bytes: one padded frame, not fragments",
+            sealed.len()
+        );
+    }
+}
