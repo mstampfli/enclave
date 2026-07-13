@@ -14,7 +14,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::transfer::{Reassembler, TransferMeta};
+use crate::transfer::{FileManifest, FileSink, Part, Reassembler, TransferMeta};
 use enclave_crypto::{Group, Identity};
 use enclave_protocol::{ClientMsg, DeviceId, Friend, GroupId, Presence, Sealed, ServerMsg, UserId};
 use enclave_transport::accounts::MIN_PASSWORD_LEN;
@@ -25,6 +25,12 @@ use zeroize::Zeroizing;
 mod call;
 mod session;
 mod transfer;
+
+/// Largest file the sender will try to *store* on the server for offline
+/// delivery (mirrors the server's `PER_FILE_MAX`). A bigger file is sent live
+/// (both parties online, nothing stored). Kept in sync with the server by hand;
+/// the server is the authority and rejects an over-size stored offer anyway.
+pub const STORE_FILE_MAX: u64 = 250 * 1024 * 1024;
 
 /// Why a screen share ended on its own (see [`Client::reap_ended_share`]):
 /// `Cancelled` is the user changing their mind at the system picker, `Failed`
@@ -80,6 +86,22 @@ pub enum Event {
         from: String,
         file: FileRef,
     },
+    /// Someone offered a file in conversation `conv`. It is NOT downloaded: the
+    /// UI shows a consent prompt, and the user calls `accept_file`/`decline_file`
+    /// with `offer_id`. `live` means the sender is streaming now (accept
+    /// promptly). This is the whole point of the consent flow: nothing touches
+    /// the recipient's disk until they say yes.
+    FileOffered {
+        conv: String,
+        offer_id: String,
+        from: String,
+        name: String,
+        size: u64,
+        live: bool,
+    },
+    /// An offer we were shown is gone (the sender withdrew it, it expired, or a
+    /// transfer resolved): the UI removes its prompt/row for `offer_id`.
+    FileOfferClosed { conv: String, offer_id: String },
     /// Progress of an in-flight transfer we are sending or receiving, 0..=1.
     /// `label` names it (a filename, or "message"); `done` marks completion.
     TransferProgress {
@@ -173,6 +195,32 @@ struct ChatLine {
     file: Option<FileRef>,
 }
 
+/// A file we are offering, kept until it is uploaded/streamed or resolved. The
+/// bytes stay on disk at `path`; they are read and sealed only when the server
+/// says to (stored: on `FileUploadReady`; live: on the first `FileAccepted`).
+struct OutgoingFile {
+    group: GroupId,
+    path: String,
+    name: String,
+    mime: String,
+    size: u64,
+    live: bool,
+    /// Set once we have begun sending chunks, so a second trigger (e.g. a second
+    /// recipient accepting a live offer) does not restart the stream.
+    started: bool,
+}
+
+/// A file offered to us, awaiting our consent. Nothing is written to disk until
+/// we accept; on accept a [`FileSink`] streams the chunks straight to disk.
+struct IncomingFile {
+    group: GroupId,
+    from: String,
+    name: String,
+    size: u64,
+    /// The streaming disk sink, created when we accept and the first chunk lands.
+    sink: Option<FileSink>,
+}
+
 fn presence_label(status: Presence) -> String {
     match status {
         Presence::Online => "online",
@@ -222,6 +270,11 @@ pub struct Client {
     /// reconnect can re-authenticate. Never persisted. (A session-resumption
     /// token would avoid retaining it; see the reconnect note.)
     password: Zeroizing<String>,
+    /// Files we are offering, keyed by offer id (see [`OutgoingFile`]).
+    outgoing_files: HashMap<[u8; 16], OutgoingFile>,
+    /// Files offered to us, awaiting/undergoing consented download (see
+    /// [`IncomingFile`]). An entry exists from the offer until it resolves.
+    incoming_files: HashMap<[u8; 16], IncomingFile>,
 }
 
 impl Client {
@@ -250,6 +303,8 @@ impl Client {
             output_device: None,
             server_url: server_url.to_string(),
             password: Zeroizing::new(String::new()),
+            outgoing_files: HashMap::new(),
+            incoming_files: HashMap::new(),
         })
     }
 
@@ -777,10 +832,14 @@ impl Client {
         Ok(())
     }
 
-    /// Read a file from disk and send it to the active conversation, chunked
-    /// and end-to-end encrypted like any message. Returns the [`FileRef`] for
-    /// the sender's own history. The whole file is never held in memory: it is
-    /// streamed chunk by chunk from disk.
+    /// Offer a file to the active conversation. The file is NOT sent yet: a
+    /// sealed manifest (name, size) is offered so each recipient can accept or
+    /// decline. A file up to [`STORE_FILE_MAX`] is offered for offline delivery
+    /// (the server buffers it on disk once the recipient accepts); a larger one
+    /// is offered live (streamed in real time to whoever accepts, requiring them
+    /// online). The bytes are read and sealed only when the server says to
+    /// upload/stream, never up front, so the whole file is never held in memory.
+    /// Returns the [`FileRef`] for the sender's own history.
     pub async fn send_file(&mut self, path: &str) -> Result<FileRef, ClientError> {
         let group_id = self.active.clone().ok_or(ClientError::NoGroup)?;
         let me = self.me()?;
@@ -793,46 +852,39 @@ impl Client {
         let meta_fs = std::fs::metadata(p)
             .map_err(|e| ClientError::Audio(format!("cannot read {name}: {e}")))?;
         let size = meta_fs.len();
-        if size as usize > transfer::MAX_TRANSFER_BYTES {
-            return Err(ClientError::Audio(format!(
-                "{name} is too large to send ({} MiB max)",
-                transfer::MAX_TRANSFER_BYTES / (1024 * 1024)
-            )));
-        }
         let mime = mime_from_name(&name);
-        let meta = TransferMeta::File {
-            name: name.clone(),
-            mime,
-        };
+        let live = size > STORE_FILE_MAX;
 
-        let mut file = std::fs::File::open(p)
-            .map_err(|e| ClientError::Audio(format!("cannot open {name}: {e}")))?;
-        let id = new_transfer_id();
-        let total = (size as usize).div_ceil(transfer::CHUNK_BYTES).max(1) as u32;
-        let id_hex = hex::encode(id);
-        let mut buf = vec![0u8; transfer::CHUNK_BYTES];
-        let mut sent: u64 = 0;
-        for index in 0..total {
-            let n = read_full(&mut file, &mut buf)
-                .map_err(|e| ClientError::Audio(format!("reading {name}: {e}")))?;
-            let part = transfer::Part {
-                id,
-                index,
-                total,
-                meta: meta.clone(),
-                data: buf[..n].to_vec(),
-            };
-            self.seal_and_send(&group_id, &part.encode())?;
-            sent += n as u64;
-            self.pending.push_back(Event::TransferProgress {
-                conv: hex_id(&group_id),
-                id: id_hex.clone(),
-                label: name.clone(),
-                sent,
-                total: size,
-                incoming: false,
-            });
-        }
+        // Seal the manifest so recipients learn the name/size without the bytes.
+        let manifest = FileManifest {
+            name: name.clone(),
+            mime: mime.clone(),
+            size,
+        };
+        let sealed_manifest = self.seal(&group_id, &manifest.encode())?;
+
+        let offer_id = new_transfer_id();
+        self.conn.send(ClientMsg::FileOffer {
+            offer_id,
+            group: group_id.clone(),
+            // The server only needs the size to enforce its store quota; a live
+            // transfer stores nothing, so it is not told the size.
+            size: if live { 0 } else { size },
+            manifest: Sealed(sealed_manifest),
+            live,
+        });
+        self.outgoing_files.insert(
+            offer_id,
+            OutgoingFile {
+                group: group_id.clone(),
+                path: path.to_string(),
+                name: name.clone(),
+                mime,
+                size,
+                live,
+                started: false,
+            },
+        );
 
         let file_ref = FileRef {
             name: name.clone(),
@@ -851,6 +903,86 @@ impl Client {
         Ok(file_ref)
     }
 
+    /// Consent to receive an offered file: tell the server, which then delivers
+    /// its chunks. `offer_id` is the hex id from an [`Event::FileOffered`].
+    pub fn accept_file(&mut self, offer_id: &str) -> Result<(), ClientError> {
+        let id = decode_offer_id(offer_id).ok_or(ClientError::NoGroup)?;
+        if !self.incoming_files.contains_key(&id) {
+            return Ok(()); // already gone; nothing to do
+        }
+        self.conn.send(ClientMsg::FileAccept { offer_id: id });
+        Ok(())
+    }
+
+    /// Refuse an offered file: tell the server (which drops it) and forget it.
+    pub fn decline_file(&mut self, offer_id: &str) -> Result<(), ClientError> {
+        let id = decode_offer_id(offer_id).ok_or(ClientError::NoGroup)?;
+        if let Some(inc) = self.incoming_files.remove(&id) {
+            if let Some(sink) = inc.sink {
+                sink.abort();
+            }
+            self.conn.send(ClientMsg::FileDecline { offer_id: id });
+        }
+        Ok(())
+    }
+
+    /// Withdraw a file we offered (e.g. sent by mistake): tell the server, which
+    /// deletes it and notifies any recipients.
+    pub fn cancel_file(&mut self, offer_id: &str) -> Result<(), ClientError> {
+        let id = decode_offer_id(offer_id).ok_or(ClientError::NoGroup)?;
+        if self.outgoing_files.remove(&id).is_some() {
+            self.conn.send(ClientMsg::FileCancel { offer_id: id });
+        }
+        Ok(())
+    }
+
+    /// Read the offered file from disk and stream it as sealed chunks: one
+    /// `FileChunk` per part, then `FileComplete`. Emits send progress. Marks the
+    /// offer started so a repeated trigger does not re-stream it.
+    fn upload_file(&mut self, offer_id: [u8; 16]) -> Result<(), ClientError> {
+        let (group_id, path, name, mime, size) = match self.outgoing_files.get_mut(&offer_id) {
+            Some(o) if !o.started => {
+                o.started = true;
+                (o.group.clone(), o.path.clone(), o.name.clone(), o.mime.clone(), o.size)
+            }
+            _ => return Ok(()), // unknown or already streaming
+        };
+        let meta = TransferMeta::File { name: name.clone(), mime };
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| ClientError::Audio(format!("cannot open {name}: {e}")))?;
+        let total = (size as usize).div_ceil(transfer::CHUNK_BYTES).max(1) as u32;
+        let id_hex = hex::encode(offer_id);
+        let mut buf = vec![0u8; transfer::CHUNK_BYTES];
+        let mut sent: u64 = 0;
+        for index in 0..total {
+            let n = read_full(&mut file, &mut buf)
+                .map_err(|e| ClientError::Audio(format!("reading {name}: {e}")))?;
+            let part = Part {
+                id: offer_id,
+                index,
+                total,
+                meta: meta.clone(),
+                data: buf[..n].to_vec(),
+            };
+            let sealed = self.seal(&group_id, &part.encode())?;
+            self.conn.send(ClientMsg::FileChunk {
+                offer_id,
+                data: Sealed(sealed),
+            });
+            sent += n as u64;
+            self.pending.push_back(Event::TransferProgress {
+                conv: hex_id(&group_id),
+                id: id_hex.clone(),
+                label: name.clone(),
+                sent,
+                total: size,
+                incoming: false,
+            });
+        }
+        self.conn.send(ClientMsg::FileComplete { offer_id });
+        Ok(())
+    }
+
     /// Split `data` into parts and send each one sealed to `group_id`.
     fn send_transfer(
         &mut self,
@@ -865,20 +997,271 @@ impl Client {
         Ok(())
     }
 
-    /// Seal one serialized part with the group key and hand it to the relay.
+    /// Seal one serialized part with the group key and hand it to the relay as a
+    /// Text message (used for text and large-text transfers).
     fn seal_and_send(&mut self, group_id: &GroupId, part: &[u8]) -> Result<(), ClientError> {
+        let sealed = self.seal(group_id, part)?;
+        self.conn.send(ClientMsg::Text {
+            group: group_id.clone(),
+            message: Sealed(sealed),
+        });
+        Ok(())
+    }
+
+    /// Seal `plaintext` with a group's MLS key, returning the ciphertext without
+    /// sending it (used for file manifests and file chunks).
+    fn seal(&mut self, group_id: &GroupId, plaintext: &[u8]) -> Result<Vec<u8>, ClientError> {
         let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
         let conv = self
             .conversations
             .get_mut(group_id)
             .ok_or(ClientError::NoGroup)?;
         let group = conv.group.as_mut().ok_or(ClientError::NoGroup)?;
-        let sealed = group.encrypt_text(identity, part)?;
-        self.conn.send(ClientMsg::Text {
-            group: group_id.clone(),
-            message: Sealed(sealed),
+        Ok(group.encrypt_text(identity, plaintext)?)
+    }
+
+    /// A file was offered to us. Decrypt its manifest (no download needed),
+    /// record the pending offer, and surface a consent prompt. Nothing touches
+    /// disk here: the bytes arrive only if the user accepts.
+    fn handle_file_offered(
+        &mut self,
+        offer_id: [u8; 16],
+        group: GroupId,
+        from: DeviceId,
+        manifest: Sealed,
+        live: bool,
+    ) -> Option<Event> {
+        // Decrypt the manifest with the group key.
+        let plaintext = {
+            let identity = self.identity.as_ref()?;
+            let conv = self.conversations.get_mut(&group)?;
+            let g = conv.group.as_mut()?;
+            g.decrypt_text(identity, &manifest.0).ok()?.plaintext
+        };
+        let m = FileManifest::decode(&plaintext)?;
+        let safe = safe_file_name(&m.name);
+        let from_display = self.display_of(&from.0);
+        self.incoming_files.insert(
+            offer_id,
+            IncomingFile {
+                group: group.clone(),
+                from: from.0.clone(),
+                name: safe.clone(),
+                size: m.size,
+                sink: None,
+            },
+        );
+        Some(Event::FileOffered {
+            conv: hex_id(&group),
+            offer_id: hex::encode(offer_id),
+            from: from_display,
+            name: safe,
+            size: m.size,
+            live,
+        })
+    }
+
+    /// The server refused our stored offer. If the store simply could not take
+    /// it (full, low disk, too big), retry the same file live -- the recipient
+    /// may be online. If the live attempt (or any other) is refused, give up.
+    fn handle_offer_rejected(&mut self, offer_id: [u8; 16], reason: String) -> Option<Event> {
+        let can_retry_live = self
+            .outgoing_files
+            .get(&offer_id)
+            .is_some_and(|o| !o.live);
+        if can_retry_live {
+            let (group, manifest) = {
+                let o = self.outgoing_files.get(&offer_id)?;
+                (
+                    o.group.clone(),
+                    FileManifest {
+                        name: o.name.clone(),
+                        mime: o.mime.clone(),
+                        size: o.size,
+                    },
+                )
+            };
+            let sealed = self.seal(&group, &manifest.encode()).ok()?;
+            if let Some(o) = self.outgoing_files.get_mut(&offer_id) {
+                o.live = true;
+                o.started = false;
+            }
+            self.conn.send(ClientMsg::FileOffer {
+                offer_id,
+                group,
+                size: 0,
+                manifest: Sealed(sealed),
+                live: true,
+            });
+            return None; // silent fallback; a real failure is reported below
+        }
+        let name = self
+            .outgoing_files
+            .remove(&offer_id)
+            .map(|o| o.name)
+            .unwrap_or_else(|| "file".into());
+        Some(Event::Error(format!("Could not send {name}: {reason}")))
+    }
+
+    /// A recipient declined our offer, or an offer shown to us was withdrawn /
+    /// expired (server sends an empty `by` for a lapse or a sender cancel).
+    fn handle_file_declined(&mut self, offer_id: [u8; 16], by: DeviceId) -> Option<Event> {
+        // An offer we made: a recipient declined, or it lapsed. Leave the record
+        // (a group peer may still accept a live one); just report the outcome.
+        if let Some(o) = self.outgoing_files.get(&offer_id) {
+            let name = o.name.clone();
+            let who = if by.0.is_empty() {
+                "no reply".to_string()
+            } else {
+                format!("declined by {}", self.display_of(&by.0))
+            };
+            return Some(Event::Error(format!("{name} was not delivered ({who})")));
+        }
+        // An offer shown to us: the sender withdrew it or it expired. Remove the
+        // prompt and drop any partial download.
+        if let Some(inc) = self.incoming_files.remove(&offer_id) {
+            if let Some(sink) = inc.sink {
+                sink.abort();
+            }
+            return Some(Event::FileOfferClosed {
+                conv: hex_id(&inc.group),
+                offer_id: hex::encode(offer_id),
+            });
+        }
+        None
+    }
+
+    /// A chunk of a file we accepted: decrypt it, create the streaming disk sink
+    /// on the first chunk (sized from the offered manifest), write the part, and
+    /// finalize when the last one lands. The whole file is never held in memory.
+    fn handle_file_chunk(&mut self, offer_id: [u8; 16], data: Sealed) -> Option<Event> {
+        let group = self.incoming_files.get(&offer_id)?.group.clone();
+        // Decrypt the sealed part.
+        let part = {
+            let identity = self.identity.as_ref()?;
+            let conv = self.conversations.get_mut(&group)?;
+            let g = conv.group.as_mut()?;
+            let tm = g.decrypt_text(identity, &data.0).ok()?;
+            Part::decode(&tm.plaintext)?
+        };
+        // A file chunk must carry file metadata; ignore anything else.
+        if !matches!(part.meta, TransferMeta::File { .. }) {
+            return None;
+        }
+        let dir = self.downloads_dir();
+
+        // Create the sink lazily on the first chunk, reserving a safe unique
+        // path under the downloads directory (path-traversal safe).
+        let need_sink = self
+            .incoming_files
+            .get(&offer_id)
+            .map(|i| i.sink.is_none())
+            .unwrap_or(false);
+        if need_sink {
+            let (name, size) = {
+                let inc = self.incoming_files.get(&offer_id)?;
+                (inc.name.clone(), inc.size)
+            };
+            let total = (size as usize).div_ceil(transfer::CHUNK_BYTES).max(1) as u32;
+            match reserve_download(&dir, &name) {
+                Ok((file, path)) => {
+                    let sink = FileSink::new(file, path, name, total, size);
+                    if let Some(inc) = self.incoming_files.get_mut(&offer_id) {
+                        inc.sink = Some(sink);
+                    }
+                }
+                Err(e) => {
+                    self.incoming_files.remove(&offer_id);
+                    return Some(Event::Error(format!("could not start download: {e}")));
+                }
+            }
+        }
+
+        // Write the part.
+        let (size, write) = {
+            let inc = self.incoming_files.get_mut(&offer_id)?;
+            let sink = inc.sink.as_mut()?;
+            (inc.size, sink.write_part(&part).map(|done| (done, sink.bytes())))
+        };
+        let (done, sent) = match write {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(inc) = self.incoming_files.remove(&offer_id) {
+                    if let Some(sink) = inc.sink {
+                        sink.abort();
+                    }
+                }
+                return Some(Event::Error(format!("download failed: {e}")));
+            }
+        };
+
+        // Surface progress.
+        let label = self
+            .incoming_files
+            .get(&offer_id)
+            .map(|i| i.name.clone())
+            .unwrap_or_default();
+        self.pending.push_back(Event::TransferProgress {
+            conv: hex_id(&group),
+            id: hex::encode(offer_id),
+            label,
+            sent,
+            total: size,
+            incoming: true,
         });
-        Ok(())
+        if !done {
+            return None;
+        }
+
+        // Complete: flush, record in history, and hand the UI the file.
+        let mut inc = self.incoming_files.remove(&offer_id)?;
+        let mut sink = inc.sink.take()?;
+        if let Err(e) = sink.finish() {
+            sink.abort();
+            return Some(Event::Error(format!("could not finish download: {e}")));
+        }
+        let file = FileRef {
+            name: sink.name().to_string(),
+            size: sink.bytes(),
+            path: sink.path().to_string_lossy().into_owned(),
+        };
+        let from_display = self.display_of(&inc.from);
+        if let Some(conv) = self.conversations.get_mut(&group) {
+            conv.history.push(ChatLine {
+                from: inc.from.clone(),
+                text: file.name.clone(),
+                mine: false,
+                file: Some(file.clone()),
+            });
+        }
+        self.save_session();
+        // Also close the offer prompt in the UI (it becomes a delivered file).
+        self.pending.push_back(Event::FileOfferClosed {
+            conv: hex_id(&group),
+            offer_id: hex::encode(offer_id),
+        });
+        Some(Event::File {
+            conv: hex_id(&group),
+            from: from_display,
+            file,
+        })
+    }
+
+    /// The sender says every chunk of `offer_id` has been delivered. Normally
+    /// the last chunk already completed the file, so this finds nothing. If the
+    /// download is still pending here, chunks were lost: abort it as incomplete.
+    fn handle_file_complete(&mut self, offer_id: [u8; 16]) -> Option<Event> {
+        let inc = self.incoming_files.remove(&offer_id)?;
+        let conv = hex_id(&inc.group);
+        let name = inc.name.clone();
+        if let Some(sink) = inc.sink {
+            sink.abort();
+        }
+        self.pending.push_back(Event::FileOfferClosed {
+            conv,
+            offer_id: hex::encode(offer_id),
+        });
+        Some(Event::Error(format!("{name} did not arrive completely")))
     }
 
     /// The directory received files are written to (`downloads/` under the
@@ -1545,13 +1928,15 @@ impl Client {
                     // A member sent a sealed blob that is not a valid part:
                     // authenticated but malformed, drop it quietly.
                     let part = transfer::Part::decode(&tm.plaintext)?;
-                    let summary = (part.total > 1).then(|| {
-                        let label = match &part.meta {
-                            TransferMeta::File { name, .. } => name.clone(),
-                            TransferMeta::Text => "message".to_string(),
-                        };
-                        (hex::encode(part.id), label, part.index, part.total)
-                    });
+                    // SECURITY: files must go through the consent flow (offer ->
+                    // accept -> FileChunk), never the Text channel. Drop a
+                    // File-meta part smuggled over Text so it can never
+                    // auto-download, even from a malicious or outdated peer.
+                    if matches!(part.meta, TransferMeta::File { .. }) {
+                        return None;
+                    }
+                    let summary = (part.total > 1)
+                        .then(|| (hex::encode(part.id), "message".to_string(), part.index, part.total));
                     let complete = conv.reassembler.accept(part);
                     (username, summary, complete)
                 };
@@ -1577,58 +1962,66 @@ impl Client {
                     return None;
                 };
 
-                match done.meta {
-                    TransferMeta::Text => {
-                        let text = String::from_utf8_lossy(&done.data).into_owned();
-                        if let Some(conv) = self.conversations.get_mut(&group) {
-                            conv.history.push(ChatLine {
-                                from: username,
-                                text: text.clone(),
-                                mine: false,
-                                file: None,
-                            });
-                        }
-                        self.save_session();
-                        Some(Event::Message {
-                            conv: hex_id(&group),
-                            from: from_display,
-                            text,
-                            mine: false,
-                        })
-                    }
-                    TransferMeta::File { name, .. } => {
-                        // SECURITY: the filename is attacker-controlled. Never
-                        // let it escape the downloads directory (path traversal
-                        // via `..`, absolute paths, or embedded separators), and
-                        // never overwrite an existing file. See THREAT_MODEL.md.
-                        let dir = self.downloads_dir();
-                        match write_received_file(&dir, &name, &done.data) {
-                            Ok(path) => {
-                                let file = FileRef {
-                                    name: safe_file_name(&name),
-                                    size: done.data.len() as u64,
-                                    path: path.to_string_lossy().into_owned(),
-                                };
-                                if let Some(conv) = self.conversations.get_mut(&group) {
-                                    conv.history.push(ChatLine {
-                                        from: username,
-                                        text: file.name.clone(),
-                                        mine: false,
-                                        file: Some(file.clone()),
-                                    });
-                                }
-                                self.save_session();
-                                Some(Event::File {
-                                    conv: hex_id(&group),
-                                    from: from_display,
-                                    file,
-                                })
-                            }
-                            Err(e) => Some(Event::Error(format!("could not save {name}: {e}"))),
-                        }
+                // Only Text transfers reach here (File-meta parts were dropped
+                // above); reject anything else defensively rather than treat it
+                // as text.
+                if !matches!(done.meta, TransferMeta::Text) {
+                    return None;
+                }
+                let text = String::from_utf8_lossy(&done.data).into_owned();
+                if let Some(conv) = self.conversations.get_mut(&group) {
+                    conv.history.push(ChatLine {
+                        from: username,
+                        text: text.clone(),
+                        mine: false,
+                        file: None,
+                    });
+                }
+                self.save_session();
+                Some(Event::Message {
+                    conv: hex_id(&group),
+                    from: from_display,
+                    text,
+                    mine: false,
+                })
+            }
+            ServerMsg::FileOffered {
+                offer_id,
+                group,
+                from,
+                manifest,
+                live,
+                ..
+            } => self.handle_file_offered(offer_id, group, from, manifest, live),
+            ServerMsg::FileUploadReady { offer_id } => {
+                // The server admitted our stored offer: upload the bytes now.
+                if let Err(e) = self.upload_file(offer_id) {
+                    return Some(Event::Error(format!("upload failed: {e}")));
+                }
+                None
+            }
+            ServerMsg::FileAccepted { offer_id, .. } => {
+                // For a live offer this is the cue to start streaming; for a
+                // stored one the server delivers, so it is informational.
+                if self
+                    .outgoing_files
+                    .get(&offer_id)
+                    .is_some_and(|o| o.live && !o.started)
+                {
+                    if let Err(e) = self.upload_file(offer_id) {
+                        return Some(Event::Error(format!("streaming failed: {e}")));
                     }
                 }
+                None
             }
+            ServerMsg::FileOfferRejected { offer_id, reason } => {
+                self.handle_offer_rejected(offer_id, reason)
+            }
+            ServerMsg::FileDeclined { offer_id, by } => self.handle_file_declined(offer_id, by),
+            ServerMsg::FileChunk { offer_id, from: _, data } => {
+                self.handle_file_chunk(offer_id, data)
+            }
+            ServerMsg::FileComplete { offer_id, .. } => self.handle_file_complete(offer_id),
             ServerMsg::Mls { group, message, .. } => {
                 let identity = self.identity.as_ref()?;
                 let conv = self.conversations.get_mut(&group)?;
@@ -1768,11 +2161,14 @@ fn safe_file_name(raw: &str) -> String {
     }
 }
 
-/// Write a received file into `dir` under a sanitized name, never escaping
-/// `dir` and never overwriting: if `name` exists, ` (1)`, ` (2)`, ... is
-/// appended. Verifies the final path is genuinely inside `dir` (defense in
-/// depth against any sanitization gap) before writing.
-fn write_received_file(dir: &std::path::Path, name: &str, data: &[u8]) -> std::io::Result<PathBuf> {
+/// Reserve a fresh file under `dir` for an incoming download: sanitize `name`,
+/// never escape `dir`, and never overwrite (if the name is taken, ` (1)`,
+/// ` (2)`, ... is appended). Returns the opened file handle and its path; the
+/// caller streams the bytes into it. `create_new` reserves the name atomically,
+/// so two arrivals cannot race onto one path. Verifies the path is genuinely
+/// inside `dir` (defense in depth against any sanitization gap). See
+/// THREAT_MODEL.md: the filename is attacker-controlled.
+fn reserve_download(dir: &std::path::Path, name: &str) -> std::io::Result<(std::fs::File, PathBuf)> {
     std::fs::create_dir_all(dir)?;
     // Canonicalize the target directory so the containment check compares real
     // paths, not ones with symlinks or `.` segments.
@@ -1805,11 +2201,7 @@ fn write_received_file(dir: &std::path::Path, name: &str, data: &[u8]) -> std::i
             .create_new(true)
             .open(&path)
         {
-            Ok(mut f) => {
-                use std::io::Write;
-                f.write_all(data)?;
-                return Ok(path);
-            }
+            Ok(f) => return Ok((f, path)),
             Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
@@ -1818,6 +2210,12 @@ fn write_received_file(dir: &std::path::Path, name: &str, data: &[u8]) -> std::i
         std::io::ErrorKind::AlreadyExists,
         "too many files with that name",
     ))
+}
+
+/// Parse a hex offer id from the UI back into raw bytes. `None` if malformed.
+fn decode_offer_id(hex_id: &str) -> Option<[u8; 16]> {
+    let bytes = hex::decode(hex_id).ok()?;
+    bytes.try_into().ok()
 }
 
 /// Best-effort MIME type from a filename extension. Used only as a hint in the
@@ -1893,7 +2291,17 @@ fn media_addr_from(server_url: &str) -> Option<SocketAddr> {
 
 #[cfg(test)]
 mod file_security_tests {
-    use super::{safe_file_name, write_received_file};
+    use super::{reserve_download, safe_file_name};
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    // Reserve a download path and write `data` into it, mirroring how the
+    // streaming sink lands a file. Returns the final path.
+    fn write_received(dir: &std::path::Path, name: &str, data: &[u8]) -> std::io::Result<PathBuf> {
+        let (mut file, path) = reserve_download(dir, name)?;
+        file.write_all(data)?;
+        Ok(path)
+    }
 
     #[test]
     fn path_traversal_names_are_neutralized() {
@@ -1933,7 +2341,7 @@ mod file_security_tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         // A traversal name must land INSIDE dir, not at its parent.
-        let path = write_received_file(&dir, "../escaped.txt", b"x").expect("write");
+        let path = write_received(&dir, "../escaped.txt", b"x").expect("write");
         let canon_dir = dir.canonicalize().unwrap();
         assert!(
             path.starts_with(&canon_dir),
@@ -1952,8 +2360,8 @@ mod file_security_tests {
         let dir = std::env::temp_dir().join(format!("enclave-sec2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let p1 = write_received_file(&dir, "doc.txt", b"first").unwrap();
-        let p2 = write_received_file(&dir, "doc.txt", b"second").unwrap();
+        let p1 = write_received(&dir, "doc.txt", b"first").unwrap();
+        let p2 = write_received(&dir, "doc.txt", b"second").unwrap();
         assert_ne!(p1, p2, "second file must get a distinct name");
         assert_eq!(
             std::fs::read(&p1).unwrap(),

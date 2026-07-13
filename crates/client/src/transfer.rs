@@ -19,6 +19,8 @@
 //! in flight, so a hostile or buggy peer cannot exhaust memory.
 
 use std::collections::HashMap;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +47,27 @@ pub enum TransferMeta {
     Text,
     /// A file with its original name and MIME type (best-effort).
     File { name: String, mime: String },
+}
+
+/// The sealed description of an offered file, sent with the offer so a recipient
+/// can decide (name, size) *without* downloading. Sealed like any message, so
+/// the server sees only its ciphertext length.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileManifest {
+    pub name: String,
+    pub mime: String,
+    /// Plaintext file size in bytes.
+    pub size: u64,
+}
+
+impl FileManifest {
+    pub fn encode(&self) -> Vec<u8> {
+        bincode::serialize(self).unwrap_or_default()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<FileManifest> {
+        bincode::deserialize(bytes).ok()
+    }
 }
 
 /// One piece of a transfer. Serialized with bincode, then MLS-sealed.
@@ -217,6 +240,107 @@ impl Reassembler {
     }
 }
 
+/// Largest file we will accept and stream to disk. Received files (unlike sent
+/// ones) are written to the user's disk, so this bounds the disk a single
+/// accepted transfer can consume. Generous: it covers any stored file (<=250MB)
+/// and a large live one.
+pub const MAX_RECEIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Streams an accepted file straight to disk, one decrypted [`Part`] at a time,
+/// so a large (or live, arbitrary-size) transfer never buffers the whole file
+/// in memory. Both the stored and live delivery paths hand the receiver chunks
+/// in upload order over a reliable channel, so parts are written sequentially;
+/// a part that arrives out of order (index != the next expected) fails the
+/// transfer rather than silently corrupting the file.
+///
+/// The sink is constructed over a file the caller has already reserved under a
+/// safe, unique, contained name (see the client's `reserve_download`), so this
+/// module holds none of the path-safety logic -- it only writes bytes.
+pub struct FileSink {
+    file: std::fs::File,
+    path: PathBuf,
+    name: String,
+    /// Total parts expected (from the manifest size).
+    total: u32,
+    /// Next part index expected (parts arrive in order).
+    next: u32,
+    /// Bytes written so far.
+    bytes: u64,
+    /// Hard ceiling on bytes (from the manifest size, capped at MAX_RECEIVE_BYTES).
+    cap: u64,
+}
+
+impl FileSink {
+    /// Build a sink over an already-reserved, opened file. `total` comes from
+    /// the manifest size; `cap` bounds how many bytes will be written.
+    pub fn new(file: std::fs::File, path: PathBuf, name: String, total: u32, cap: u64) -> FileSink {
+        FileSink {
+            file,
+            path,
+            name,
+            total,
+            next: 0,
+            bytes: 0,
+            cap: cap.min(MAX_RECEIVE_BYTES),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Write one decrypted part in sequence. Returns `Ok(true)` when the last
+    /// part has been written (the file is complete), `Ok(false)` while more are
+    /// expected, and `Err` if the part is inconsistent, out of order, or would
+    /// exceed the size bound -- in which case the caller aborts the transfer.
+    pub fn write_part(&mut self, part: &Part) -> std::io::Result<bool> {
+        if part.total != self.total || part.index != self.next {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file part arrived out of order or with a changed shape",
+            ));
+        }
+        if part.data.len() > CHUNK_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file part is larger than one chunk",
+            ));
+        }
+        let new_bytes = self.bytes.saturating_add(part.data.len() as u64);
+        if new_bytes > self.cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file exceeds the maximum receive size",
+            ));
+        }
+        // Seek to this part's offset (defensive: sequential writes already land
+        // here) and write it.
+        self.file
+            .seek(SeekFrom::Start(self.next as u64 * CHUNK_BYTES as u64))?;
+        self.file.write_all(&part.data)?;
+        self.next += 1;
+        self.bytes = new_bytes;
+        Ok(self.next == self.total)
+    }
+
+    /// Flush the file to disk. Call once the last part has been written.
+    pub fn finish(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+
+    /// Abandon a partial transfer: drop the handle and delete the partial file.
+    pub fn abort(self) {
+        drop(self.file);
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +490,73 @@ mod tests {
             data: vec![0u8; CHUNK_BYTES + 1],
         };
         assert!(Reassembler::new().accept(bad).is_none());
+    }
+
+    fn sink_at(tag: &str, total: u32, cap: u64) -> (FileSink, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "enclave-sink-{}-{}.bin",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("reserve");
+        (
+            FileSink::new(file, path.clone(), "f.bin".into(), total, cap),
+            path,
+        )
+    }
+
+    fn file_part(id: u8, index: u32, total: u32, data: Vec<u8>) -> Part {
+        Part {
+            id: [id; 16],
+            index,
+            total,
+            meta: TransferMeta::File {
+                name: "f.bin".into(),
+                mime: "application/octet-stream".into(),
+            },
+            data,
+        }
+    }
+
+    #[test]
+    fn a_streamed_file_is_written_to_disk_exactly() {
+        let (mut sink, path) = sink_at("ok", 3, MAX_RECEIVE_BYTES);
+        let a = vec![1u8; CHUNK_BYTES];
+        let b = vec![2u8; CHUNK_BYTES];
+        let c = vec![3u8; 100];
+        assert_eq!(sink.write_part(&file_part(1, 0, 3, a.clone())).unwrap(), false);
+        assert_eq!(sink.write_part(&file_part(1, 1, 3, b.clone())).unwrap(), false);
+        assert_eq!(sink.write_part(&file_part(1, 2, 3, c.clone())).unwrap(), true);
+        sink.finish().unwrap();
+        let got = std::fs::read(&path).unwrap();
+        let mut want = a;
+        want.extend_from_slice(&b);
+        want.extend_from_slice(&c);
+        assert_eq!(got, want, "bytes on disk match the stream exactly");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_out_of_order_part_fails_the_transfer() {
+        let (mut sink, path) = sink_at("ooo", 3, MAX_RECEIVE_BYTES);
+        sink.write_part(&file_part(1, 0, 3, vec![0u8; 10])).unwrap();
+        // Skipping index 1 (sending 2) is rejected, not silently accepted.
+        assert!(sink.write_part(&file_part(1, 2, 3, vec![0u8; 10])).is_err());
+        sink.abort();
+        assert!(!path.exists(), "aborted partial is deleted");
+    }
+
+    #[test]
+    fn a_file_over_the_receive_cap_is_refused() {
+        // cap of 5 bytes; a 10-byte part cannot be written.
+        let (mut sink, path) = sink_at("cap", 1, 5);
+        assert!(sink.write_part(&file_part(1, 0, 1, vec![0u8; 10])).is_err());
+        sink.abort();
+        let _ = std::fs::remove_file(path);
     }
 }

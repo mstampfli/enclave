@@ -281,13 +281,26 @@ addressed at the wire:
 
 ## File sharing and large messages (STRIDE + ASVS L2)
 
-A message too large for one sealed frame, and any file, is split into chunks
-(`crates/client/src/transfer.rs`), each sealed with the group's MLS key exactly
-like an ordinary text message and relayed as an opaque blob. The receiver
-reassembles the chunks and, for a file, writes it to a downloads directory. This
-adds two trust boundaries worth modeling explicitly: the **relay** (semi-trusted)
-now forwards more, larger blobs, and the **receiving client** now writes
-attacker-influenced bytes and an attacker-controlled *filename* to its own disk.
+A file is never pushed to anyone. The sender **offers** it: a sealed manifest
+(name, mime, size) that each recipient decrypts to decide, then explicitly
+**accepts** or **declines**. Nothing is written to a recipient's disk until they
+accept. Delivery then takes one of two modes:
+
+- **Stored** (file up to 250 MB): the sender uploads the already-sealed chunks
+  to an on-disk store on the server (`crates/transport/src/filestore.rs`), which
+  buffers them so the file reaches a recipient who is offline. On accept the
+  server streams the blob to that recipient; the offer is deleted when every
+  recipient has resolved, or after a 24 h TTL.
+- **Live** (larger, or when the store refuses): the sealed chunks stream in real
+  time to whoever accepts within ~90 s and are **never** stored; this needs the
+  recipient online.
+
+Each chunk is one MLS-sealed `Part` (`crates/client/src/transfer.rs`), opaque to
+the server exactly like a text message. This design adds trust boundaries worth
+modeling: the **server** now buffers (transient, on-disk) sealed blobs and their
+sizes and enforces the store quota; the **receiving client** writes
+attacker-influenced bytes and an attacker-controlled *filename* to its disk, but
+only after the user consents.
 
 Target level **L2**. Chapters touched: V1 (design), V4 (access control), V5
 (validation), V8 (data protection), V11 (business logic / anti-automation), V12
@@ -296,88 +309,132 @@ Target level **L2**. Chapters touched: V1 (design), V4 (access control), V5
 ### Trust boundaries
 
 ```
-sender client ──seal(chunk)──▶ RELAY (semi-trusted) ──fan-out──▶ receiver client
-   (reads a file                 sees: chunk count,               (reassembles,
-    from disk)                    sizes, timing; never             writes to disk)
-                                  the plaintext or name)
+sender ──offer(sealed manifest)──▶ SERVER ──offer──▶ recipient (decrypts name/size,
+  (reads file                       (sees size for      NO download yet)
+   from disk)                        quota; never             │ accept / decline
+                                     name or bytes)           ▼
+        ◀── accept ──────────────────────────────────  consent gate
+sender ──seal(chunk)──▶ SERVER ─(stored: buffer on disk, then stream on accept)─▶ recipient
+                              └─(live: relay in real time to accepters)──────────▶ (streams to disk)
 ```
 
-The filename and content are inside the sealed plaintext, so the relay never
-learns either. The dangerous flow is the last arrow: bytes and a name chosen by
-another group member, landing on the receiver's filesystem.
+The filename and content are inside sealed plaintext, so the server never learns
+either. It does see the file **size** (stored offers only -- needed for the
+quota; live offers send size 0). The dangerous flow remains the last arrow, now
+gated by explicit consent.
 
-### STRIDE at the receiving client (the new attack surface)
+### STRIDE at the receiving client
 
+- **Elevation of privilege -- unwanted / hostile files auto-landing on disk.**
+  The primary risk this feature is designed around: a member dropping malware,
+  or simply unwanted files, straight onto peers' disks. *Mitigation (V4, by
+  design):* no auto-download. An incoming file is only ever an *offer*
+  (`ServerMsg::FileOffered` -> `Event::FileOffered`); the bytes are requested
+  only by an explicit `accept_file`. As defense in depth, a `File`-metadata part
+  smuggled over the plain text channel is dropped, never written, so files cannot
+  bypass the consent flow. Proven end-to-end by
+  `client_flow::large_message_and_file_transfer_between_two_clients` (Bob must
+  see the offer and accept before anything is written) and at the relay by
+  `relay_core::a_stored_file_is_offered_not_pushed_and_delivered_only_on_accept`.
 - **Tampering / Elevation of privilege -- path traversal via the filename.** A
-  malicious (or compromised) group member names a file `../../.ssh/authorized_keys`
-  or `/etc/cron.d/x` to write outside the downloads directory and gain code
-  execution or persistence. *Mitigation (V5, V12):* the filename is never used as
-  a path. `safe_file_name` reduces it to the final component only, strips path
-  separators, control characters, and NUL, and rejects `.`/`..`/empty with a
-  `file` fallback. `write_received_file` then joins the sanitized name to the
-  canonicalized downloads directory and re-checks that the target's parent is
-  still that directory before writing (defense in depth). Proven by
-  `file_security_tests::{path_traversal_names_are_neutralized,
+  member names a file `../../.ssh/authorized_keys` to write outside the downloads
+  directory. *Mitigation (V5, V12):* the filename is never used as a path.
+  `safe_file_name` reduces it to the final component, strips separators, control
+  chars, and NUL, and rejects `.`/`..`/empty with a `file` fallback.
+  `reserve_download` joins the sanitized name to the *canonicalized* downloads
+  directory and re-checks the target's parent is still that directory before
+  creating it. Proven by `file_security_tests::{path_traversal_names_are_neutralized,
   a_written_file_never_escapes_the_downloads_dir}`.
-- **Tampering -- overwriting an existing file.** A peer sends `doc.txt` twice, or
-  a name matching a file already there, to clobber it. *Mitigation (V12):* writes
-  use `create_new` (atomic O_EXCL); a name collision appends ` (1)`, ` (2)`, ...
-  so nothing is ever overwritten, and two arrivals cannot race onto one name.
-  Proven by `an_existing_file_is_never_overwritten`.
-- **Denial of service -- memory exhaustion.** A peer opens a transfer declaring
-  a huge `total`, or streams unbounded chunks, to exhaust RAM. *Mitigation (V11):*
-  the reassembler refuses a transfer whose declared or actual size exceeds
-  `MAX_TRANSFER_BYTES` (256 MiB), caps concurrent in-flight transfers
-  (`MAX_INFLIGHT`, evicting the oldest), and rejects a chunk larger than
-  `CHUNK_BYTES`. Proven by the `transfer::tests` bound cases.
-- **Denial of service -- disk exhaustion.** A peer sends many large files to fill
-  the disk. *Accepted / partial:* the per-transfer cap bounds any single file;
-  a cumulative download quota is future work, recorded below. In practice the
-  sender is an accepted friend in a group the user joined, which raises the bar.
-- **Tampering -- MIME spoofing / dangerous content.** A peer sends an executable
-  named `photo.png`, or a malformed file to exploit a viewer. *Mitigation (V5):*
-  the MIME type is a display hint only; a received file is **never** opened or
-  executed automatically. `OpenFile` runs only on an explicit user click, and
-  hands the path to the OS default handler (`open::that_detached`) rather than
-  interpreting the content itself. The user, not Enclave, decides to open it.
-- **Information disclosure -- the content is E2E encrypted.** Each chunk is
-  MLS-sealed and Ed25519-signed like any message (V8), so the relay and any
-  non-member see only ciphertext. A tampered chunk fails AEAD and is dropped
-  (the panic-in-debug openmls behavior is contained in `decrypt_text`).
+- **Tampering -- overwriting an existing file.** *Mitigation (V12):* the download
+  is reserved with `create_new` (atomic O_EXCL); a name collision appends ` (1)`,
+  ` (2)`, ..., so nothing is overwritten and two arrivals cannot race onto one
+  name. Proven by `an_existing_file_is_never_overwritten`.
+- **Denial of service -- memory exhaustion on receive.** *Mitigation (V11):* an
+  accepted file streams straight to disk one chunk at a time via `FileSink`; the
+  whole file is never buffered in RAM (this is what makes arbitrary-size live
+  transfers safe). The sink writes parts strictly in order, rejects a chunk
+  larger than `CHUNK_BYTES` or one that arrives out of order, and caps total
+  bytes at `MAX_RECEIVE_BYTES` (4 GiB), aborting and deleting the partial file on
+  any violation. Proven by `transfer::tests::{a_streamed_file_is_written_to_disk_exactly,
+  an_out_of_order_part_fails_the_transfer, a_file_over_the_receive_cap_is_refused}`.
+- **Tampering -- MIME spoofing / dangerous content.** *Mitigation (V5):* the MIME
+  type is a display hint only; a received file is **never** opened or executed
+  automatically. `OpenFile` runs only on an explicit user click and hands the
+  path to the OS default handler (`open::that_detached`). The consent prompt shows
+  the name and size before any download, so the user decides with the file's real
+  name in view.
+- **Information disclosure -- content is E2E encrypted.** Every chunk and the
+  manifest are MLS-sealed and Ed25519-signed (V8); the server and non-members see
+  only ciphertext. A tampered chunk fails AEAD and is dropped.
 
-### STRIDE at the relay (semi-trusted, unchanged trust level)
+### STRIDE at the server file store (the DoS surface)
 
-- **Denial of service -- chunk floods / amplification.** Splitting a file into
-  many chunks is many `Text` sends. *Mitigation (V11):* the existing
-  per-connection signaling token bucket (`SIGNALING_BURST`/`RATE`) already caps
-  message rate, and each sealed chunk still must fit the 1 MiB frame limit; a
-  flood is throttled exactly like a text flood. No relay change was needed.
-- **Information disclosure -- metadata.** The relay sees the number and sizes of
-  chunks and their timing, which reveals the approximate file size and that a
-  transfer happened (not its name or content). *Accepted:* this is the same
-  metadata tradeoff as the SFU topology already documents above; chunk sizes are
-  uniform (`CHUNK_BYTES`) except the tail, so only a coarse size leaks. Constant
-  size would need constant-rate cover traffic, out of scope.
-- **Access control (V4).** A chunk is a `Text` to a group; the relay's existing
-  deny-by-default routing already forwards it only to members who have
-  (re)affirmed membership. A non-member can neither inject nor receive chunks.
-  No new authorization path was added.
+The store buffers sealed blobs on disk to reach offline recipients. Because a
+peer can make the server hold bytes, it is the main new denial-of-service
+surface, and every axis is bounded (`filestore.rs`, `relay.rs`).
 
-### Base64 on the wire (introduced with this feature)
-
-Sealed blobs now serialize as base64 in the JSON signaling channel rather than a
-numeric array (`enclave_protocol::Sealed`), so a 512 KiB chunk stays under the
-1 MiB frame limit. This is an encoding change, not a security one: the bytes are
-already ciphertext, base64 is not a confidentiality measure, and the binary
-media path still gets raw bytes. Noted so the change is not mistaken for a
-control.
+- **Denial of service -- disk / store exhaustion.** A peer uploads huge or many
+  files to fill the server's disk. *Mitigation (V11, V12):* admission is gated
+  three ways before a byte is written -- per file (`PER_FILE_MAX`, 250 MB), whole
+  store (`STORE_TOTAL_MAX`, 2 GB), and a free-disk floor (`DISK_FREE_FLOOR`, 4 GB:
+  an upload that would drop free space below it is refused). The blob is on disk,
+  not in RAM, so many concurrent offers cost disk (floor-bounded), not memory.
+  Proven by `filestore::tests::{a_file_over_the_per_file_cap_is_refused,
+  the_store_total_cap_is_enforced_across_offers, the_disk_floor_refuses_when_space_is_low}`
+  and `relay_core::{an_over_cap_stored_file_is_rejected_before_upload,
+  a_low_disk_server_refuses_to_store_a_file}`.
+- **Denial of service -- unbounded retention.** Offers that are never answered
+  accumulate. *Mitigation (V11):* every offer has a 24 h TTL swept periodically,
+  and is deleted immediately once all recipients accept/decline. Metadata is in
+  memory and not persisted, so a restart drops pending offers (safe: the sender
+  re-offers) and state cannot accumulate across restarts.
+- **Denial of service -- under-declaring the size.** A peer declares a small size
+  to pass admission, then uploads far more. *Mitigation (V11):* the store enforces
+  a per-offer sealed write ceiling (declared size + a bounded sealing slack) and
+  drops the whole offer on overrun. Proven by
+  `filestore::tests::under_declaring_the_size_is_caught_on_overrun`.
+- **Denial of service -- offer spam.** A peer opens thousands of tiny offers to
+  exhaust store metadata/inodes. *Mitigation (V11):* at most
+  `MAX_OFFERS_PER_SENDER` (32) concurrent offers per sender; offer creation is on
+  the rate-limited control path.
+- **Denial of service -- head-of-line blocking on delivery.** A 250 MB blob read
+  must not stall every other connection. *Mitigation:* on accept the blob is
+  streamed off the global relay lock on a blocking thread, one chunk at a time;
+  the lock is only re-taken to resolve the delivery. A TTL sweep never unlinks a
+  blob with a delivery in flight.
+- **Denial of service -- chunk-rate throttle would corrupt transfers.** File
+  chunks cannot share the tight signaling rate limit, since dropping one corrupts
+  the file. *Mitigation (V11):* a separate per-connection budget (`FILE_BURST`
+  600 / `FILE_RATE` 300/s) gates all traffic and bounds decode cost; its burst
+  exceeds the chunks in one maximum-size file, so a legitimate upload never
+  drops, while control-plane messages still obey the tight signaling budget on
+  top. Chunk *volume* is already bounded by the store quota (stored) or by
+  consent (live), so a high message rate here is safe.
+- **Access control (V4).** Only a routing member of the group may offer a file;
+  only the offer's own sender may upload its chunks or cancel it; only a targeted
+  recipient may accept/decline; a stored blob is readable only by a pending
+  recipient. A live sender's disconnect tears down its offers and tells the
+  recipients. Proven by `relay_core::{a_non_member_cannot_offer_a_file_to_a_group,
+  a_chunk_from_someone_who_is_not_the_sender_is_ignored}`.
+- **Information disclosure -- the server sees the file size.** Enforcing a 250 MB
+  quota requires knowing the size, so a stored offer's plaintext size is visible
+  to the server (unlike padded text messages). *Accepted, deliberate:* it is the
+  minimum needed for DoS control; the name and content stay sealed, and a live
+  offer sends size 0 (the server stores nothing, so needs no size).
 
 ### Residual / accepted risks
 
-- **No cumulative download quota.** A single file is bounded (256 MiB) and the
-  sender must be a group member, but a determined member could send many files to
-  fill disk. A per-conversation or per-day byte quota is future work.
+- **Outbound channel backpressure is unbounded.** Server->client delivery uses an
+  unbounded channel (as all message types do), so a recipient who accepts a large
+  file and then reads slowly can make the server buffer that file in its own
+  outbound channel. This is a pre-existing property of the whole delivery path,
+  bounded per-file by the 250 MB stored cap and by consent; a bounded,
+  backpressured writer is a future improvement noted here, not silently skipped.
+- **Group + live: a late accepter misses the stream.** A live transfer is
+  one-shot: the sender streams once to whoever has accepted. A group member who
+  accepts after the stream finished does not receive it (they can be re-offered).
+  Stored transfers do not have this limitation.
 - **No malware scanning.** Enclave does not (and by its E2E design cannot at the
   server) scan file content. Received files are inert on disk until the user
-  chooses to open them with an external application, which is where OS-level
-  protections apply. This is the same model as any E2E messenger.
+  chooses to open them externally, where OS protections apply. The consent gate
+  and name-in-prompt are the user's first line of defense.

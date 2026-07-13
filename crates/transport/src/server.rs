@@ -40,6 +40,15 @@ const SIGNALING_MSG_LIMIT: usize = 1 << 20; // 1 MiB
 const SIGNALING_BURST: f64 = 40.0;
 const SIGNALING_RATE_PER_SEC: f64 = 25.0;
 
+/// Per-connection high gate applied to every message (mainly file chunks). The
+/// burst exceeds the number of chunks in one maximum-size file (256 MiB /
+/// 512 KiB = 512), so an entire file can be uploaded in one burst without a
+/// drop; the sustained rate then allows a healthy multi-file throughput. File
+/// chunk volume is separately bounded by the store quota and by consent, so a
+/// high message rate here is safe.
+const FILE_BURST: f64 = 600.0;
+const FILE_RATE_PER_SEC: f64 = 300.0;
+
 /// Per-source UDP media rate limit (ASVS V11). Audio is ~50 datagrams/sec, but
 /// a screen-share stream is fragmented video: ~30 fps at several Mbps is many
 /// hundreds of ~1 KB fragments per second, with larger keyframe bursts. This
@@ -272,7 +281,14 @@ where
         }
     });
 
-    // Reader loop: decode ClientMsgs, route, dispatch.
+    // Reader loop: decode ClientMsgs, route, dispatch. Two rate budgets:
+    //  - a high gate on *every* message, to bound decode cost and absorb a whole
+    //    file's chunk burst (its burst exceeds the chunks in one max-size file,
+    //    so a legitimate upload is never throttled into a corrupting drop);
+    //  - the tight signaling budget on top, for control-plane messages only.
+    // File chunks pay only the high gate: dropping one would corrupt a transfer,
+    // and their volume is already bounded by the store quota and consent.
+    let mut file_gate = TokenBucket::new(FILE_BURST, FILE_RATE_PER_SEC, Instant::now());
     let mut bucket = TokenBucket::new(SIGNALING_BURST, SIGNALING_RATE_PER_SEC, Instant::now());
     while let Some(Ok(msg)) = read.next().await {
         if matches!(msg, Message::Close(_)) {
@@ -281,13 +297,18 @@ where
         let Some(bytes) = frame_bytes(msg) else {
             continue;
         };
-        // Drop messages from a connection that is over its rate (ASVS V11).
-        if !bucket.try_take(Instant::now()) {
+        // High gate on all traffic (bounds decode cost even under a flood).
+        if !file_gate.try_take(Instant::now()) {
             continue;
         }
         let Ok(client_msg) = serde_json::from_slice::<ClientMsg>(&bytes) else {
             continue;
         };
+        // Control-plane messages additionally obey the tight signaling budget;
+        // file chunks are exempt (see above).
+        if !matches!(client_msg, ClientMsg::FileChunk { .. }) && !bucket.try_take(Instant::now()) {
+            continue;
+        }
 
         // Route under the lock; resolve target senders; release before sending.
         // Also collect any stored-blob deliveries scheduled by this message, to

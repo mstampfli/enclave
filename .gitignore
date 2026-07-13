@@ -14,6 +14,7 @@ enclave-accounts.json
 enclave-friends.json
 enclave-groups.json
 enclave-queue.json
+enclave-files/
 enclave-audio.json
 # Server's long-term OPAQUE setup (OPRF seed + keypair). Secret; never commit.
 enclave-opaque.setup

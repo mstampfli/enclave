@@ -455,6 +455,22 @@ input, select, textarea { font: inherit; }
 .file-att .open { flex: none; color: var(--accent-ink); font-size: 13px;
   padding: 3px 8px; border-radius: var(--radius); }
 .file-att .open:hover { background: var(--accent-bg); }
+.file-offer { max-width: 380px; margin-top: 4px; padding: 11px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
+.file-offer .head { display: flex; align-items: center; gap: 10px; }
+.file-offer .ico { flex: none; color: var(--muted); }
+.file-offer .meta { min-width: 0; flex: 1; }
+.file-offer .fname { font-size: 14px; color: var(--ink); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.file-offer .fsize { font-size: 12px; color: var(--muted); }
+.file-offer .note { font-size: 12px; color: var(--muted); margin-top: 7px; }
+.file-offer .actions { display: flex; gap: 8px; margin-top: 10px; }
+.file-offer .actions button { font-size: 13px; padding: 6px 12px;
+  border-radius: var(--radius); }
+.file-offer .accept { background: var(--accent); color: #10150f; font-weight: 600; }
+.file-offer .accept:hover { background: #74bb7c; }
+.file-offer .decline { color: var(--muted); }
+.file-offer .decline:hover { background: var(--raised); color: var(--ink); }
 #xfers { max-width: 720px; margin: 0 auto; padding: 0 24px;
   display: flex; flex-direction: column; gap: 6px; }
 #xfers:empty { display: none; }
@@ -1081,6 +1097,21 @@ function fileRowHTML(file, mine) {
       <div class="fsize">${humanSize(file.size)}${mine ? " · sent" : ""}</div></div>
     <button class="open" type="button">Open</button></div>`;
 }
+// A file offered to us: a consent prompt, not a download. Nothing lands on disk
+// until Download is clicked; the two actions are siblings, each its own target.
+function offerRowHTML(offer) {
+  return `<div class="file-offer">
+    <div class="head">
+      <svg class="icon ico" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7"/></svg>
+      <div class="meta"><div class="fname" title="${offer.name}">${offer.name}</div>
+        <div class="fsize">${humanSize(offer.size)}</div></div></div>
+    <div class="note">${offer.live
+      ? "Sent live — accept promptly, the sender is streaming it now."
+      : "This file has not been downloaded. Choose whether to receive it."}</div>
+    <div class="actions">
+      <button class="accept" type="button">Download</button>
+      <button class="decline" type="button">Decline</button></div></div>`;
+}
 
 const CONVOS = {
   aria: {
@@ -1101,6 +1132,8 @@ const CONVOS = {
         "the relay never saw a byte of it" ] },
       { from: "Aria Chen", me: false, time: "09:03",
         file: { name: "floor-plans-level-3.pdf", size: 4823000 } },
+      { from: "Aria Chen", me: false, time: "09:05",
+        offer: { name: "site-survey-raw.zip", size: 214000000, live: false } },
     ],
   },
   tobias: {
@@ -1347,9 +1380,15 @@ function renderMessages() {
           <span class="author${m.me ? " me" : ""}">${m.me ? "Marc" : m.from}</span>
           <span class="time">${m.time}</span>
         </div>
-        ${m.file ? fileRowHTML(m.file, m.me) : m.lines.map(l => `<p>${l}</p>`).join("")}
+        ${m.offer ? offerRowHTML(m.offer)
+          : m.file ? fileRowHTML(m.file, m.me)
+          : m.lines.map(l => `<p>${l}</p>`).join("")}
       </div>`;
     if (m.file) g.querySelector(".open").onclick = () => toast("Opening " + m.file.name);
+    if (m.offer) {
+      g.querySelector(".accept").onclick = () => toast("Downloading " + m.offer.name);
+      g.querySelector(".decline").onclick = () => toast("Declined " + m.offer.name);
+    }
     col.appendChild(g);
   }
   $("messages").scrollTop = $("messages").scrollHeight;

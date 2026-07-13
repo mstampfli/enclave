@@ -140,6 +140,19 @@ enum UiCommand {
     OpenFile {
         path: String,
     },
+    /// Consent to download a file that was offered to us (`offer_id` from a
+    /// FileOffered event). Nothing was downloaded until this.
+    AcceptFile {
+        offer_id: String,
+    },
+    /// Refuse a file that was offered to us; the server drops it.
+    DeclineFile {
+        offer_id: String,
+    },
+    /// Withdraw a file we offered (sent by mistake).
+    CancelFile {
+        offer_id: String,
+    },
     /// Send a friend request to a full handle.
     AddFriend {
         user: String,
@@ -245,6 +258,22 @@ enum UiEvent {
         sent: u64,
         total: u64,
         incoming: bool,
+    },
+    /// A file was offered to us; the UI shows a consent prompt (Accept /
+    /// Decline). Nothing has been downloaded. `live` means accept promptly.
+    FileOffered {
+        conv: String,
+        offer_id: String,
+        from: String,
+        name: String,
+        size: u64,
+        live: bool,
+    },
+    /// An offer we were shown is gone (withdrawn, expired, or now delivered):
+    /// the UI removes its prompt for `offer_id`.
+    FileOfferClosed {
+        conv: String,
+        offer_id: String,
     },
     Presence {
         user: String,
@@ -747,6 +776,32 @@ async fn run_client(
                         incoming,
                     },
                 ),
+                Event::FileOffered {
+                    conv,
+                    offer_id,
+                    from,
+                    name,
+                    size,
+                    live,
+                } => {
+                    if !focused.load(Ordering::Relaxed) {
+                        notify_os(from.clone(), format!("wants to send a file: {name}"));
+                    }
+                    emit(
+                        &proxy,
+                        UiEvent::FileOffered {
+                            conv,
+                            offer_id,
+                            from,
+                            name,
+                            size,
+                            live,
+                        },
+                    );
+                }
+                Event::FileOfferClosed { conv, offer_id } => {
+                    emit(&proxy, UiEvent::FileOfferClosed { conv, offer_id });
+                }
                 Event::Error(message) => error_status(&proxy, message),
             },
             Ok(None) => {
@@ -1108,6 +1163,23 @@ async fn handle_command(
                 let _ = open::that_detached(&path);
             })
             .await;
+        }
+        UiCommand::AcceptFile { offer_id } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.accept_file(&offer_id) {
+                    error_status(proxy, format!("Could not accept file: {e}"));
+                }
+            }
+        }
+        UiCommand::DeclineFile { offer_id } => {
+            if let Some(c) = client.as_mut() {
+                let _ = c.decline_file(&offer_id);
+            }
+        }
+        UiCommand::CancelFile { offer_id } => {
+            if let Some(c) = client.as_mut() {
+                let _ = c.cancel_file(&offer_id);
+            }
         }
         UiCommand::SendText { text } => {
             if let Some(c) = client.as_mut() {

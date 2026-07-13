@@ -72,13 +72,16 @@ crypto  media  transport
   signaling channel and a low-latency UDP media channel (`Server` runs both over
   shared state; `Connection` and `MediaSocket` are the client sides). TLS (wss)
   on the signaling hop and zero-knowledge account auth (OPAQUE, the `opaque`
-  module) are implemented here.
+  module) are implemented here. `msgqueue` is the bounded store-and-forward queue
+  for offline members; `filestore` is the on-disk, quota-and-TTL-bounded store
+  for offered files awaiting a recipient's consent (see "File sharing" below).
 - `enclave-client` -- lib + bin. The lib is the high-level `Client` controller
   (the app-logic API the UI drives); the bin is the self-contained WebView
-  window (see "UI" below) that bridges IPC to the controller. `transfer`
-  chunks a message or file too large for one 1 MiB frame into sealed parts and
-  reassembles them on receive (memory-bounded); received files are written to
-  a downloads directory under a sanitized name (see THREAT_MODEL.md).
+  window (see "UI" below) that bridges IPC to the controller. `transfer` chunks a
+  message or file too large for one 1 MiB frame into sealed parts; text is
+  reassembled in memory (bounded), while a consented file streams straight to
+  disk via `FileSink` (never buffered whole) under a sanitized name in a
+  downloads directory (see THREAT_MODEL.md).
 - `enclave-server` -- signaling relay + SFU fan-out; holds no media keys.
 
 ## UI (self-contained window -- hard requirement)
@@ -125,7 +128,11 @@ window by default and only add the WASM/browser target when we choose to.
    per-sender counter owned by the frame sealer (Phase 3).
 3. Group membership changes only via a client-signed MLS Commit. The server
    cannot add a member.
-4. Docs update in the same commit as the change they describe.
+4. A file is never delivered to a recipient without their explicit consent. An
+   incoming file is only ever an offer (a sealed manifest); its bytes are
+   requested only by an explicit accept, and a file smuggled over the text
+   channel is dropped rather than written.
+5. Docs update in the same commit as the change they describe.
 
 ## Dependency plan (added per-phase, in the crate that first uses them)
 

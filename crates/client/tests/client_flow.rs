@@ -287,6 +287,8 @@ async fn large_message_and_file_transfer_between_two_clients() {
     assert_eq!(got, big, "the large message reassembled byte-for-byte");
 
     // 2) A file with binary content, including bytes that are not valid UTF-8.
+    // It must be OFFERED, not auto-downloaded: Bob sees an offer, accepts, and
+    // only then does the file stream to his disk.
     let file_bytes: Vec<u8> = (0..(1024 * 1024 + 777))
         .map(|i| (i * 7 % 256) as u8)
         .collect();
@@ -295,8 +297,13 @@ async fn large_message_and_file_transfer_between_two_clients() {
     alice
         .send_file(&src.to_string_lossy())
         .await
-        .expect("send file");
-    let saved_path = recv_file(&mut bob).await;
+        .expect("offer file");
+
+    // Pump both sides until Bob is OFFERED the file (never auto-downloaded).
+    let offer_id = pump_until_offer(&mut alice, &mut bob).await;
+    // Nothing should have been written to disk yet: consent gates the download.
+    bob.accept_file(&offer_id).expect("accept");
+    let saved_path = pump_until_file(&mut alice, &mut bob).await;
     let received = std::fs::read(&saved_path).expect("read received file");
     assert_eq!(received, file_bytes, "the file arrived byte-for-byte");
     assert!(
@@ -305,6 +312,39 @@ async fn large_message_and_file_transfer_between_two_clients() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Drive both clients until Bob receives a file offer; return its id. Driving
+/// Alice lets her process `FileUploadReady` and upload the chunks.
+async fn pump_until_offer(alice: &mut Client, bob: &mut Client) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "no file offer arrived");
+        tokio::select! {
+            _ = tokio::time::timeout(Duration::from_millis(150), alice.next_event()) => {}
+            e = tokio::time::timeout(Duration::from_millis(150), bob.next_event()) => {
+                if let Ok(Some(Event::FileOffered { offer_id, .. })) = e {
+                    return offer_id;
+                }
+            }
+        }
+    }
+}
+
+/// Drive both clients until Bob's accepted download completes; return the path.
+async fn pump_until_file(alice: &mut Client, bob: &mut Client) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "no file arrived");
+        tokio::select! {
+            _ = tokio::time::timeout(Duration::from_millis(150), alice.next_event()) => {}
+            e = tokio::time::timeout(Duration::from_millis(150), bob.next_event()) => {
+                if let Ok(Some(Event::File { file, .. })) = e {
+                    return file.path;
+                }
+            }
+        }
+    }
 }
 
 /// Pump events until a text message arrives; return its text.
@@ -320,15 +360,3 @@ async fn recv_message(c: &mut Client) -> String {
     }
 }
 
-/// Pump events until a file arrives; return the path it was written to.
-async fn recv_file(c: &mut Client) -> String {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        assert!(tokio::time::Instant::now() < deadline, "no file arrived");
-        if let Some(Ok(Some(Event::File { file, .. }))) =
-            Some(tokio::time::timeout(Duration::from_millis(200), c.next_event()).await)
-        {
-            return file.path;
-        }
-    }
-}

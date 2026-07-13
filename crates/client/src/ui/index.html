@@ -459,6 +459,28 @@ input, select, textarea { font: inherit; }
   padding: 3px 8px; border-radius: var(--radius); }
 .file-att .open:hover { background: var(--accent-bg); }
 
+/* An offered file, awaiting the user's consent. It is NOT downloaded until they
+   choose: the two actions are siblings, each its own target, never nested. */
+.file-offer { max-width: 380px; margin-top: 4px; padding: 11px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
+.file-offer .head { display: flex; align-items: center; gap: 10px; }
+.file-offer .ico { flex: none; color: var(--muted); }
+.file-offer .meta { min-width: 0; flex: 1; }
+.file-offer .fname { font-size: 14px; color: var(--ink); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.file-offer .fsize { font-size: 12px; color: var(--muted); }
+.file-offer .note { font-size: 12px; color: var(--muted); margin-top: 7px; }
+.file-offer .actions { display: flex; gap: 8px; margin-top: 10px; }
+.file-offer .actions button { font-size: 13px; padding: 6px 12px;
+  border-radius: var(--radius); }
+.file-offer .accept { background: var(--accent); color: #10150f; font-weight: 600; }
+.file-offer .accept:hover { background: #74bb7c; }
+.file-offer .decline { color: var(--muted); }
+.file-offer .decline:hover { background: var(--raised); color: var(--ink); }
+.file-offer[data-state="busy"] .actions { display: none; }
+.file-offer .status { display: none; font-size: 12px; color: var(--muted); margin-top: 9px; }
+.file-offer[data-state="busy"] .status { display: block; }
+
 /* In-flight transfers: a thin bar above the composer, one row per transfer. */
 #xfers { max-width: 720px; margin: 0 auto; padding: 0 24px;
   display: flex; flex-direction: column; gap: 6px; }
@@ -1779,10 +1801,53 @@ function messageGroup(m) {
   return g;
 }
 function lineContent(m) {
+  if (m.offer) return offerRow(m.offer);
   if (m.file) return fileRow(m.file, m.mine);
   const p = document.createElement("p");
   p.textContent = m.text;
   return p;
+}
+// A consent prompt for an offered file. Nothing is downloaded until the user
+// clicks Download; Decline tells the server to drop it. The whole thing is one
+// row with two sibling action buttons, never a nested target.
+function offerRow(offer) {
+  const row = document.createElement("div");
+  row.className = "file-offer";
+  row.dataset.offer = offer.offer_id;
+  row.innerHTML =
+    '<div class="head">' +
+    '<svg class="icon ico" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7"/></svg>' +
+    '<div class="meta"><div class="fname"></div><div class="fsize"></div></div></div>' +
+    '<div class="note"></div>' +
+    '<div class="actions">' +
+    '<button class="accept" type="button">Download</button>' +
+    '<button class="decline" type="button">Decline</button></div>' +
+    '<div class="status">Downloading…</div>';
+  row.querySelector(".fname").textContent = offer.name;
+  row.querySelector(".fname").title = offer.name;
+  row.querySelector(".fsize").textContent = humanSize(offer.size);
+  row.querySelector(".note").textContent = offer.live
+    ? "Sent live — accept promptly, the sender is streaming it now."
+    : "This file has not been downloaded. Choose whether to receive it.";
+  row.querySelector(".accept").addEventListener("click", () => {
+    row.dataset.state = "busy";
+    send({ type: "AcceptFile", offer_id: offer.offer_id });
+  });
+  row.querySelector(".decline").addEventListener("click", () => {
+    send({ type: "DeclineFile", offer_id: offer.offer_id });
+    removeOffer(activeConv, offer.offer_id);
+  });
+  return row;
+}
+// Drop an offer message from a conversation and re-render if it is open.
+function removeOffer(conv, offerId) {
+  const list = messages[conv];
+  if (!list) return;
+  const i = list.findIndex((m) => m.offer && m.offer.offer_id === offerId);
+  if (i >= 0) {
+    list.splice(i, 1);
+    if (conv === activeConv) renderChat();
+  }
 }
 function fileRow(file, mine) {
   const row = document.createElement("div");
@@ -1807,10 +1872,11 @@ function humanSize(n) {
   return v.toFixed(v < 10 ? 1 : 0) + " " + u[i];
 }
 function appendInto(col, m, prev) {
-  // Consecutive plain-text lines from one author fold into a group; a file is
-  // always its own group so its row is not stitched onto a text bubble.
-  const key = (m.mine ? "__me__" : m.from) + (m.file ? ":file" : "");
-  if (prev && prev.key === key && !m.file) {
+  // Consecutive plain-text lines from one author fold into a group; a file or an
+  // offer is always its own group so its row is not stitched onto a text bubble.
+  const standalone = m.file || m.offer;
+  const key = (m.mine ? "__me__" : m.from) + (standalone ? ":att" : "");
+  if (prev && prev.key === key && !standalone) {
     prev.el.querySelector(".body").appendChild(lineContent(m));
     return prev;
   }
@@ -2310,6 +2376,28 @@ window.onEnclaveEvent = (ev) => {
       }
       break;
     }
+    case "FileOffered": {
+      // A file was offered to us: show a consent prompt. Nothing is downloaded
+      // until the user clicks Download.
+      const m = {
+        from: ev.from, mine: false, text: ev.name,
+        offer: { offer_id: ev.offer_id, name: ev.name, size: ev.size, live: ev.live },
+      };
+      if (!messages[ev.conv]) messages[ev.conv] = [];
+      messages[ev.conv].push(m);
+      if (ev.conv === activeConv) {
+        appendMessage(m);
+        renderConvoList();
+      } else {
+        unread[ev.conv] = (unread[ev.conv] || 0) + 1;
+        ding();
+        renderConvoList();
+      }
+      break;
+    }
+    case "FileOfferClosed":
+      removeOffer(ev.conv, ev.offer_id);
+      break;
     case "TransferProgress":
       updateXfer(ev);
       break;
