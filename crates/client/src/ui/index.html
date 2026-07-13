@@ -1199,8 +1199,15 @@ function streamEnded() {
   currentSharer = "";
   renderCall();
 }
+// Show the first video failure to the user (once) instead of a silent black.
+let videoErrShown = false;
+function videoErr(msg) {
+  console.error(msg);
+  if (!videoErrShown) { videoErrShown = true; toast(msg, true); }
+}
 function ensureDecoder() {
   if (svDecoder) return;
+  if (!H264_CODEC) { videoErr("This WebView cannot decode H.264 video (no supported codec)."); return; }
   const ctx = svCanvas.getContext("2d");
   svDecoder = new VideoDecoder({
     output: (frame) => {
@@ -1208,10 +1215,10 @@ function ensureDecoder() {
       ctx.drawImage(frame, 0, 0, svCanvas.width, svCanvas.height);
       frame.close();
     },
-    error: (e) => { console.error("screen decoder", e); closeDecoder(); },
+    error: (e) => { videoErr("Screen video decode failed: " + (e && e.message || e)); closeDecoder(); },
   });
-  try { svDecoder.configure({ codec: "avc1.42E033", optimizeForLatency: true }); }
-  catch (e) { console.error("configure", e); closeDecoder(); }
+  try { svDecoder.configure({ codec: H264_CODEC, optimizeForLatency: true }); }
+  catch (e) { videoErr("Video decoder setup failed: " + (e && e.message || e)); closeDecoder(); }
 }
 function handleScreenFrame(ev) {
   if (typeof VideoDecoder === "undefined") return; // no WebCodecs support
@@ -1248,6 +1255,7 @@ function handleCameraFrame(ev) {
   const name = ev.from;
   const fresh = !camState[name];
   if (fresh) {
+    if (!H264_CODEC) { videoErr("This WebView cannot decode H.264 video (no supported codec)."); return; }
     const canvas = document.createElement("canvas");
     camCanvas[name] = canvas;
     const ctx = canvas.getContext("2d");
@@ -1257,10 +1265,10 @@ function handleCameraFrame(ev) {
         ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
         frame.close();
       },
-      error: (e) => { console.error("camera decoder", e); camGone(name); },
+      error: (e) => { videoErr("Camera video decode failed: " + (e && e.message || e)); camGone(name); },
     });
-    try { decoder.configure({ codec: "avc1.42E033", optimizeForLatency: true }); }
-    catch (e) { console.error("camera configure", e); delete camCanvas[name]; return; }
+    try { decoder.configure({ codec: H264_CODEC, optimizeForLatency: true }); }
+    catch (e) { videoErr("Camera decoder setup failed: " + (e && e.message || e)); delete camCanvas[name]; return; }
     camState[name] = { decoder, gotKey: false, ts: 0, timer: null };
   }
   const st = camState[name];
@@ -2595,18 +2603,27 @@ const BRAND_SAFETY = "Enclave".split("").map((c) => c.charCodeAt(0)).join("");
 $("brand-seal").innerHTML = sealSVG(BRAND_SAFETY, true, 32);
 
 // Boot diagnostic: the share viewer decodes H.264 with WebCodecs, which the
-// WebView must provide (WebKitGTK needs its GStreamer H.264 decoder). Ask
-// for the exact config the viewer uses, so a missing decoder is visible
-// instead of a silently black share.
+// WebView must provide (WebKitGTK needs its GStreamer H.264 decoder). We probe
+// a range of H.264 codec strings and use the first the WebView accepts, rather
+// than pinning one level -- the encoder's actual level rises with resolution,
+// and different WebViews advertise different strings. `H264_CODEC` is the chosen
+// one (null if none work); the decoders below use it.
+let H264_CODEC = null;
 (async () => {
-  let ok = false;
-  try {
-    if (typeof window.VideoDecoder === "function") {
-      const res = await VideoDecoder.isConfigSupported({ codec: "avc1.42E033" });
-      ok = !!(res && res.supported);
+  const candidates = [
+    "avc1.42E033", "avc1.42E028", "avc1.42E01F", "avc1.42E01E", // Constrained Baseline, L5.1..3.0
+    "avc1.4D4033", "avc1.640033",                               // Main / High L5.1 fallbacks
+  ];
+  if (typeof window.VideoDecoder === "function") {
+    for (const codec of candidates) {
+      try {
+        const res = await VideoDecoder.isConfigSupported({ codec });
+        if (res && res.supported) { H264_CODEC = codec; break; }
+      } catch (e) { /* try the next */ }
     }
-  } catch (e) { /* unsupported -> ok stays false */ }
-  send({ type: "UiReady", webcodecs: ok });
+  }
+  if (H264_CODEC) console.info("video decode codec:", H264_CODEC);
+  send({ type: "UiReady", webcodecs: !!H264_CODEC });
 })();
 
 </script>
