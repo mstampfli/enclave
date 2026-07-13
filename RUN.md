@@ -129,6 +129,12 @@ file-sharing threat model.
 - **A real two-machine call.** Everything below the portal dialog is verified
   on one box; two boxes over a network is not.
 
+Chat messages are delivered reliably: text and MLS handshakes are acked by the
+server, retransmitted (on reconnect and on a timer) until acked, and deduped on
+the receiver, with the retransmit buffer persisted across restarts, so a
+connection drop, a server restart, or the app closing mid-send does not lose a
+message.
+
 The crypto, transport, calls, screen/window/camera share, per-app and system
-audio share, friends, presence, groups, large messages, and file transfer are
-done and tested; see `ARCHITECTURE.md`.
+audio share, friends, presence, groups, large messages, consent-gated file
+transfer, and reliable delivery are done and tested; see `ARCHITECTURE.md`.

@@ -448,16 +448,17 @@ the_file_budget_backpressures_instead_of_dropping}`.
 **Nothing reliable is dropped short of true exhaustion.** A reliable message
 (text, MLS, Welcome, file offer) that will not fit a stuck online reader's
 control budget is not dropped: it is spilled into that recipient's persistent
-offline queue and delivered on their next reconnect. A message is dropped only at
-a genuine global resource cap -- the offline queue's 128 MiB total -- and there
-the sender is told with an `Error` rather than losing it silently
+offline queue and delivered on their next reconnect
 (`relay::{spill_offline, queue_for_offline}`, proven by
-`relay_core::a_spilled_message_reaches_the_recipient_on_reconnect`). The offline
-queue itself is the separately-bounded `msgqueue` (4 MiB/device, 2000 msgs/device,
-128 MiB total): below the global cap it evicts a device's *own* oldest to make
-room, so an incoming message is never silently lost. Real-time / latest-wins
-messages (media, presence, call/friend state) are still dropped when a stuck
-reader's budget is full, since a stale one is superseded by the next update.
+`relay_core::a_spilled_message_reaches_the_recipient_on_reconnect`). Even at a
+genuine global resource cap -- the offline queue's 128 MiB total -- a reliable
+message is not dropped: the server withholds its ack, so the sender's
+reliable-delivery layer (below) keeps retransmitting until space frees and the
+message lands. The offline queue itself is the separately-bounded `msgqueue`
+(4 MiB/device, 2000 msgs/device, 128 MiB total): below the global cap it evicts a
+device's *own* oldest to make room. Real-time / latest-wins messages (media,
+presence, call/friend state) are still dropped when a stuck reader's budget is
+full, since a stale one is superseded by the next update.
 
 **The sender is paced, not buffered.** The client's outbound has a bounded
 file-chunk queue: a large (or arbitrary-size live) upload is a pump that seals
@@ -465,6 +466,26 @@ and sends one chunk at a time only while the queue has room, so TCP backpressure
 from a slow server or slow relayed recipient stalls the pump instead of buffering
 the whole file in the sender's memory. Control/text keep a separate latency-first
 channel.
+
+### Message delivery reliability (integrity/availability, not censorship)
+
+Text and MLS handshakes are delivered with an application-level ack + retransmit
++ dedup layer (`ClientMsg::Reliable`, `ServerMsg::Ack`): the server acks a
+message only after durably accepting it (delivered to online members, persisted
+for offline ones); the sender retransmits until acked, replaying on reconnect and
+from a persisted buffer on restart; the receiver dedups a resent message by its
+transfer id. This defends against **faults** -- a dropped connection, a server
+restart, the app closing mid-send, a transient queue-full -- so no chat message
+is silently lost to them.
+
+It is explicitly **not** a defense against a malicious relay. Delivery ultimately
+depends on the semi-trusted server, which by its nature can refuse to route
+(censor) a message; the ack layer does not, and cannot, prevent that, and a
+server that lies with an `Ack` it did not honor is no worse than one that simply
+drops -- both are the existing "the relay can censor" property of the trust
+model. E2E encryption protects the *content* of what is delivered; it does not
+promise *availability* against an adversarial server. What the reliability layer
+buys is that an honest server plus an unreliable network never loses a message.
 
 ### Residual / accepted risks
 
