@@ -442,6 +442,35 @@ input, select, textarea { font: inherit; }
 .send-btn { width: 32px; height: 32px; display: grid; place-items: center;
   border-radius: var(--radius); color: var(--muted); }
 .send-btn:hover { background: var(--raised); color: var(--ink); }
+.attach-btn { width: 32px; height: 32px; display: grid; place-items: center;
+  border-radius: var(--radius); color: var(--muted); flex: none; }
+.attach-btn:hover { background: var(--raised); color: var(--ink); }
+
+/* A file attachment is a discrete unit, so it earns one bordered row. */
+.file-att { display: flex; align-items: center; gap: 10px; margin-top: 4px;
+  max-width: 360px; padding: 9px 11px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg); }
+.file-att .ico { flex: none; color: var(--muted); }
+.file-att .meta { min-width: 0; flex: 1; }
+.file-att .fname { font-size: 14px; color: var(--ink); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.file-att .fsize { font-size: 12px; color: var(--muted); }
+.file-att .open { flex: none; color: var(--accent-ink); font-size: 13px;
+  padding: 3px 8px; border-radius: var(--radius); }
+.file-att .open:hover { background: var(--accent-bg); }
+
+/* In-flight transfers: a thin bar above the composer, one row per transfer. */
+#xfers { max-width: 720px; margin: 0 auto; padding: 0 24px;
+  display: flex; flex-direction: column; gap: 6px; }
+#xfers:empty { display: none; }
+.xfer { display: flex; align-items: center; gap: 10px; padding: 6px 0;
+  font-size: 12.5px; color: var(--muted); }
+.xfer .label { min-width: 0; flex: none; max-width: 200px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.xfer .track { flex: 1; height: 4px; border-radius: 2px; background: var(--raised);
+  overflow: hidden; }
+.xfer .fill { height: 100%; background: var(--accent); width: 0; }
+.xfer .pct { flex: none; font-variant-numeric: tabular-nums; }
 
 /* ============ MODALS ============ */
 
@@ -799,8 +828,12 @@ label.member-row:hover { background: var(--raised); }
     <div id="messages"><div class="msg-col" id="msg-col"></div></div>
 
     <footer id="composer-bar">
+      <div id="xfers"></div>
       <form class="composer-inner" id="composer">
         <div class="composer-box">
+          <button class="attach-btn" type="button" id="attach-btn" title="Send a file" aria-label="Send a file">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          </button>
           <input id="message" placeholder="Message" autocomplete="off">
           <button class="send-btn" type="submit" title="Send" aria-label="Send">
             <svg class="icon" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/></svg>
@@ -1745,21 +1778,76 @@ function messageGroup(m) {
   g.appendChild(body);
   return g;
 }
+function lineContent(m) {
+  if (m.file) return fileRow(m.file, m.mine);
+  const p = document.createElement("p");
+  p.textContent = m.text;
+  return p;
+}
+function fileRow(file, mine) {
+  const row = document.createElement("div");
+  row.className = "file-att";
+  row.innerHTML =
+    '<svg class="icon ico" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7"/></svg>' +
+    '<div class="meta"><div class="fname"></div><div class="fsize"></div></div>' +
+    '<button class="open" type="button">Open</button>';
+  row.querySelector(".fname").textContent = file.name;
+  row.querySelector(".fname").title = file.name;
+  row.querySelector(".fsize").textContent =
+    humanSize(file.size) + (mine ? " · sent" : "");
+  row.querySelector(".open").addEventListener("click", () =>
+    send({ type: "OpenFile", path: file.path }));
+  return row;
+}
+function humanSize(n) {
+  if (n < 1024) return n + " B";
+  const u = ["KB", "MB", "GB"];
+  let v = n / 1024, i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v < 10 ? 1 : 0) + " " + u[i];
+}
 function appendInto(col, m, prev) {
-  // Consecutive lines from the same author fold into one group.
-  const key = m.mine ? "__me__" : m.from;
-  if (prev && prev.key === key) {
-    const p = document.createElement("p");
-    p.textContent = m.text;
-    prev.el.querySelector(".body").appendChild(p);
+  // Consecutive plain-text lines from one author fold into a group; a file is
+  // always its own group so its row is not stitched onto a text bubble.
+  const key = (m.mine ? "__me__" : m.from) + (m.file ? ":file" : "");
+  if (prev && prev.key === key && !m.file) {
+    prev.el.querySelector(".body").appendChild(lineContent(m));
     return prev;
   }
   const g = messageGroup(m);
-  const p = document.createElement("p");
-  p.textContent = m.text;
-  g.querySelector(".body").appendChild(p);
+  g.querySelector(".body").appendChild(lineContent(m));
   col.appendChild(g);
   return { key, el: g };
+}
+
+// ---- in-flight transfer progress ----
+const xfers = {}; // id -> { conv, el }
+function updateXfer(ev) {
+  if (ev.conv !== activeConv) return; // only show for the open conversation
+  const pct = ev.total ? Math.min(100, Math.round((ev.sent / ev.total) * 100)) : 0;
+  let x = xfers[ev.id];
+  if (!x) {
+    const el = document.createElement("div");
+    el.className = "xfer";
+    el.innerHTML =
+      '<span class="label"></span><span class="track"><span class="fill"></span></span><span class="pct"></span>';
+    el.querySelector(".label").textContent =
+      (ev.incoming ? "Receiving " : "Sending ") + ev.label;
+    $("xfers").appendChild(el);
+    x = xfers[ev.id] = { conv: ev.conv, el };
+  }
+  x.el.querySelector(".fill").style.width = pct + "%";
+  x.el.querySelector(".pct").textContent = pct + "%";
+  if (ev.sent >= ev.total) removeXfer(ev.id);
+}
+function removeXfer(id) {
+  const x = xfers[id];
+  if (x) { x.el.remove(); delete xfers[id]; }
+}
+function clearXfers(conv) {
+  for (const id of Object.keys(xfers)) {
+    if (xfers[conv] === undefined || xfers[id].conv === conv) removeXfer(id);
+  }
 }
 let lastGroup = null;
 function renderChat() {
@@ -1796,7 +1884,7 @@ function renderChat() {
       "Only the members hold the keys. Say something; the server relays ciphertext and nothing else.";
     col.appendChild(d);
   }
-  for (const m of list) lastGroup = appendInto(col, m, lastGroup);
+  for (const m of list) lastGroup = appendInto(col, { ...m, file: m.file || null }, lastGroup);
   if (conv.pending) {
     const n = document.createElement("div");
     n.className = "pending-note";
@@ -1998,6 +2086,7 @@ $("add-friend").addEventListener("click", () => {
 $("friend").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("add-friend").click(); } });
 
 // ---- composer ----
+$("attach-btn").addEventListener("click", () => send({ type: "SendFile" }));
 $("composer").addEventListener("submit", (e) => {
   e.preventDefault();
   const input = $("message");
@@ -2188,18 +2277,41 @@ window.onEnclaveEvent = (ev) => {
       if (ev.conv) { messages[ev.conv] = ev.history.slice(); delete unread[ev.conv]; }
       renderConvoList(); renderHeader(); renderChat();
       break;
-    case "Message":
+    case "Message": {
+      const m = { from: ev.from, text: ev.text, mine: ev.mine, file: null };
       if (!messages[ev.conv]) messages[ev.conv] = [];
-      messages[ev.conv].push({ from: ev.from, text: ev.text, mine: ev.mine });
+      messages[ev.conv].push(m);
+      clearXfers(ev.conv);
       if (ev.conv === activeConv) {
-        appendMessage({ from: ev.from, text: ev.text, mine: ev.mine });
-        renderConvoList(); // refresh the preview line
+        appendMessage(m);
+        renderConvoList();
       } else if (!ev.mine) {
-        // Not the open conversation: bump the unread badge and ding in-app.
         unread[ev.conv] = (unread[ev.conv] || 0) + 1;
         ding();
         renderConvoList();
       }
+      break;
+    }
+    case "FileMessage": {
+      const m = {
+        from: ev.from, mine: ev.mine, text: ev.name,
+        file: { name: ev.name, size: ev.size, path: ev.path },
+      };
+      if (!messages[ev.conv]) messages[ev.conv] = [];
+      messages[ev.conv].push(m);
+      clearXfers(ev.conv);
+      if (ev.conv === activeConv) {
+        appendMessage(m);
+        renderConvoList();
+      } else if (!ev.mine) {
+        unread[ev.conv] = (unread[ev.conv] || 0) + 1;
+        ding();
+        renderConvoList();
+      }
+      break;
+    }
+    case "TransferProgress":
+      updateXfer(ev);
       break;
     case "CallState":
       inCall = ev.in_call;

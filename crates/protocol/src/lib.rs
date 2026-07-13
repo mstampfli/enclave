@@ -31,8 +31,41 @@ pub struct GroupId(pub [u8; 32]);
 /// Opaque, end-to-end-encrypted bytes. The server can store and forward these
 /// but cannot open them: it holds no key. Newtype (not a bare `Vec<u8>`) so the
 /// "server never sees plaintext" boundary is visible at every call site.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+///
+/// Serialization is format-aware: in a human-readable format (the JSON
+/// signaling channel) the bytes are base64, not a numeric array. A JSON array
+/// of `u8` costs ~3.4 bytes per byte, which would push a sealed message chunk
+/// past the 1 MiB frame limit; base64 costs ~1.33 and keeps a 512 KiB chunk
+/// comfortably under it. A binary format (the UDP media path) still gets raw
+/// bytes, with no overhead.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Sealed(pub Vec<u8>);
+
+impl Serialize for Sealed {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            use base64::Engine;
+            s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(&self.0))
+        } else {
+            s.serialize_bytes(&self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Sealed {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        if d.is_human_readable() {
+            use base64::Engine;
+            let s = String::deserialize(d)?;
+            base64::engine::general_purpose::STANDARD
+                .decode(s.as_bytes())
+                .map(Sealed)
+                .map_err(serde::de::Error::custom)
+        } else {
+            Ok(Sealed(Vec::<u8>::deserialize(d)?))
+        }
+    }
+}
 
 /// Kind of real-time media a frame carries. Drives jitter-buffer/codec routing
 /// only; the payload is always [`Sealed`].

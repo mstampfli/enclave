@@ -39,6 +39,19 @@ pub struct PersistLine {
     pub from: String,
     pub text: String,
     pub mine: bool,
+    /// Present when the line is a file rather than plain text. Old sessions
+    /// without this field default to `None` (a text line).
+    #[serde(default)]
+    pub file: Option<PersistFile>,
+}
+
+/// A file line, persisted so file history survives a restart. The bytes are
+/// on disk at `path`; only the descriptor is stored.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PersistFile {
+    pub name: String,
+    pub size: u64,
+    pub path: String,
 }
 
 /// The full persisted session for one account on this device.

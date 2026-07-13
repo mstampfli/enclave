@@ -14,6 +14,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::transfer::{Reassembler, TransferMeta};
 use enclave_crypto::{Group, Identity};
 use enclave_protocol::{ClientMsg, DeviceId, Friend, GroupId, Presence, Sealed, ServerMsg, UserId};
 use enclave_transport::accounts::MIN_PASSWORD_LEN;
@@ -23,6 +24,7 @@ use zeroize::Zeroizing;
 
 mod call;
 mod session;
+mod transfer;
 
 /// Why a screen share ended on its own (see [`Client::reap_ended_share`]):
 /// `Cancelled` is the user changing their mind at the system picker, `Failed`
@@ -50,6 +52,17 @@ pub enum ClientError {
     Audio(String),
 }
 
+/// A file that arrived (or was sent) in a conversation. The bytes live on
+/// disk at `path`; only this descriptor crosses the IPC bridge.
+#[derive(Debug, Clone)]
+pub struct FileRef {
+    pub name: String,
+    pub size: u64,
+    /// Local path: where a received file was written, or the source of a sent
+    /// one.
+    pub path: String,
+}
+
 /// Something the UI should react to.
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -59,6 +72,23 @@ pub enum Event {
         from: String,
         text: String,
         mine: bool,
+    },
+    /// A file finished arriving in conversation `conv`, from display name
+    /// `from`, and was written to `file.path`.
+    File {
+        conv: String,
+        from: String,
+        file: FileRef,
+    },
+    /// Progress of an in-flight transfer we are sending or receiving, 0..=1.
+    /// `label` names it (a filename, or "message"); `done` marks completion.
+    TransferProgress {
+        conv: String,
+        id: String,
+        label: String,
+        sent: u64,
+        total: u64,
+        incoming: bool,
     },
     /// The set of conversations changed (a DM or group was created or joined);
     /// the UI re-reads them via `conversations()`.
@@ -127,13 +157,20 @@ struct Conversation {
     /// The safety number the user confirmed out of band. Compared against the
     /// live number, so a rekey (which changes it) drops back to unverified.
     verified: Option<String>,
+    /// Reassembles incoming chunked messages/files. In-flight transfers do not
+    /// survive a restart (they complete within a session over reliable TCP).
+    #[allow(dead_code)]
+    reassembler: Reassembler,
 }
 
 #[derive(Clone)]
 struct ChatLine {
     from: String,
+    /// For a text message, the text. For a file, a human label (the filename).
     text: String,
     mine: bool,
+    /// Present when this line is a file rather than plain text.
+    file: Option<FileRef>,
 }
 
 fn presence_label(status: Presence) -> String {
@@ -540,6 +577,7 @@ impl Client {
                     members: vec![me, friend.to_string()],
                     history: Vec::new(),
                     verified: None,
+                    reassembler: Reassembler::new(),
                 },
             );
             self.invite_peer(&dm_id, friend, "").await?;
@@ -559,6 +597,7 @@ impl Client {
                     members: vec![me, friend.to_string()],
                     history: Vec::new(),
                     verified: None,
+                    reassembler: Reassembler::new(),
                 },
             );
         }
@@ -591,6 +630,7 @@ impl Client {
                 members: vec![me],
                 history: Vec::new(),
                 verified: None,
+                reassembler: Reassembler::new(),
             },
         );
         for member in members {
@@ -717,29 +757,134 @@ impl Client {
         }
     }
 
-    /// Encrypt and send a text message to the active conversation. Also records
-    /// it in that conversation's local history.
+    /// Encrypt and send a text message to the active conversation. A message
+    /// that fits in one sealed frame is a single part; a larger one is split
+    /// into chunks (see [`crate::transfer`]) that the peer reassembles. Records
+    /// the message in local history.
     pub async fn send_text(&mut self, text: &str) -> Result<(), ClientError> {
         let group_id = self.active.clone().ok_or(ClientError::NoGroup)?;
         let me = self.me()?;
+        self.send_transfer(&group_id, TransferMeta::Text, text.as_bytes())?;
+        if let Some(conv) = self.conversations.get_mut(&group_id) {
+            conv.history.push(ChatLine {
+                from: me,
+                text: text.to_string(),
+                mine: true,
+                file: None,
+            });
+        }
+        self.save_session();
+        Ok(())
+    }
+
+    /// Read a file from disk and send it to the active conversation, chunked
+    /// and end-to-end encrypted like any message. Returns the [`FileRef`] for
+    /// the sender's own history. The whole file is never held in memory: it is
+    /// streamed chunk by chunk from disk.
+    pub async fn send_file(&mut self, path: &str) -> Result<FileRef, ClientError> {
+        let group_id = self.active.clone().ok_or(ClientError::NoGroup)?;
+        let me = self.me()?;
+        let p = std::path::Path::new(path);
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+            .ok_or_else(|| ClientError::Audio("that path has no file name".into()))?;
+        let meta_fs = std::fs::metadata(p)
+            .map_err(|e| ClientError::Audio(format!("cannot read {name}: {e}")))?;
+        let size = meta_fs.len();
+        if size as usize > transfer::MAX_TRANSFER_BYTES {
+            return Err(ClientError::Audio(format!(
+                "{name} is too large to send ({} MiB max)",
+                transfer::MAX_TRANSFER_BYTES / (1024 * 1024)
+            )));
+        }
+        let mime = mime_from_name(&name);
+        let meta = TransferMeta::File {
+            name: name.clone(),
+            mime,
+        };
+
+        let mut file = std::fs::File::open(p)
+            .map_err(|e| ClientError::Audio(format!("cannot open {name}: {e}")))?;
+        let id = new_transfer_id();
+        let total = (size as usize).div_ceil(transfer::CHUNK_BYTES).max(1) as u32;
+        let id_hex = hex::encode(id);
+        let mut buf = vec![0u8; transfer::CHUNK_BYTES];
+        let mut sent: u64 = 0;
+        for index in 0..total {
+            let n = read_full(&mut file, &mut buf)
+                .map_err(|e| ClientError::Audio(format!("reading {name}: {e}")))?;
+            let part = transfer::Part {
+                id,
+                index,
+                total,
+                meta: meta.clone(),
+                data: buf[..n].to_vec(),
+            };
+            self.seal_and_send(&group_id, &part.encode())?;
+            sent += n as u64;
+            self.pending.push_back(Event::TransferProgress {
+                conv: hex_id(&group_id),
+                id: id_hex.clone(),
+                label: name.clone(),
+                sent,
+                total: size,
+                incoming: false,
+            });
+        }
+
+        let file_ref = FileRef {
+            name: name.clone(),
+            size,
+            path: path.to_string(),
+        };
+        if let Some(conv) = self.conversations.get_mut(&group_id) {
+            conv.history.push(ChatLine {
+                from: me,
+                text: name,
+                mine: true,
+                file: Some(file_ref.clone()),
+            });
+        }
+        self.save_session();
+        Ok(file_ref)
+    }
+
+    /// Split `data` into parts and send each one sealed to `group_id`.
+    fn send_transfer(
+        &mut self,
+        group_id: &GroupId,
+        meta: TransferMeta,
+        data: &[u8],
+    ) -> Result<(), ClientError> {
+        let id = new_transfer_id();
+        for part in transfer::split(id, meta, data) {
+            self.seal_and_send(group_id, &part)?;
+        }
+        Ok(())
+    }
+
+    /// Seal one serialized part with the group key and hand it to the relay.
+    fn seal_and_send(&mut self, group_id: &GroupId, part: &[u8]) -> Result<(), ClientError> {
         let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
         let conv = self
             .conversations
-            .get_mut(&group_id)
+            .get_mut(group_id)
             .ok_or(ClientError::NoGroup)?;
         let group = conv.group.as_mut().ok_or(ClientError::NoGroup)?;
-        let sealed = group.encrypt_text(identity, text.as_bytes())?;
-        conv.history.push(ChatLine {
-            from: me,
-            text: text.to_string(),
-            mine: true,
-        });
+        let sealed = group.encrypt_text(identity, part)?;
         self.conn.send(ClientMsg::Text {
-            group: group_id,
+            group: group_id.clone(),
             message: Sealed(sealed),
         });
-        self.save_session();
         Ok(())
+    }
+
+    /// The directory received files are written to (`downloads/` under the
+    /// keystore). Created on demand.
+    fn downloads_dir(&self) -> PathBuf {
+        self.keystore_dir.join("enclave-downloads")
     }
 
     /// A summary of every conversation, for the sidebar. DM titles resolve to the
@@ -778,14 +923,21 @@ impl Client {
     }
 
     /// The scoped history (from, text, mine) of a conversation by hex id.
-    pub fn conversation_history(&self, conv: &str) -> Vec<(String, String, bool)> {
+    pub fn conversation_history(&self, conv: &str) -> Vec<(String, String, bool, Option<FileRef>)> {
         self.conversations
             .iter()
             .find(|(id, _)| hex_id(id) == conv)
             .map(|(_, c)| {
                 c.history
                     .iter()
-                    .map(|l| (self.display_of(&l.from), l.text.clone(), l.mine))
+                    .map(|l| {
+                        (
+                            self.display_of(&l.from),
+                            l.text.clone(),
+                            l.mine,
+                            l.file.clone(),
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -1143,6 +1295,11 @@ impl Client {
                         from: l.from.clone(),
                         text: l.text.clone(),
                         mine: l.mine,
+                        file: l.file.as_ref().map(|f| session::PersistFile {
+                            name: f.name.clone(),
+                            size: f.size,
+                            path: f.path.clone(),
+                        }),
                     })
                     .collect(),
             })
@@ -1180,6 +1337,11 @@ impl Client {
                     from: l.from,
                     text: l.text,
                     mine: l.mine,
+                    file: l.file.map(|f| FileRef {
+                        name: f.name,
+                        size: f.size,
+                        path: f.path,
+                    }),
                 })
                 .collect();
             loaded.push((
@@ -1195,6 +1357,7 @@ impl Client {
                     title: pc.title,
                     members: pc.members,
                     verified: pc.verified,
+                    reassembler: Reassembler::new(),
                     history,
                 },
             ));
@@ -1357,6 +1520,7 @@ impl Client {
                                 members: vec![me, from.0],
                                 history: Vec::new(),
                                 verified: None,
+                                reassembler: Reassembler::new(),
                             },
                         );
                     }
@@ -1365,33 +1529,104 @@ impl Client {
                 Some(Event::ConversationsChanged)
             }
             ServerMsg::Text { group, message, .. } => {
-                let identity = self.identity.as_ref()?;
-                let conv = self.conversations.get_mut(&group)?;
-                let g = conv.group.as_mut()?;
-                match g.decrypt_text(identity, &message.0) {
-                    Ok(tm) => {
-                        let username = String::from_utf8_lossy(&tm.sender).into_owned();
-                        let text = String::from_utf8_lossy(&tm.plaintext).into_owned();
-                        conv.history.push(ChatLine {
-                            from: username.clone(),
-                            text: text.clone(),
-                            mine: false,
-                        });
-                        let from = self
-                            .display_names
-                            .get(&username)
-                            .cloned()
-                            .unwrap_or(username);
-                        let event = Event::Message {
+                // Decrypt one sealed part and hand it to this conversation's
+                // reassembler, all inside a tight borrow of `conv` so the rest
+                // of the handler can touch `self` freely. A message/file becomes
+                // visible only once its last part arrives.
+                let (username, part_summary, complete) = {
+                    let identity = self.identity.as_ref()?;
+                    let conv = self.conversations.get_mut(&group)?;
+                    let g = conv.group.as_mut()?;
+                    let tm = match g.decrypt_text(identity, &message.0) {
+                        Ok(tm) => tm,
+                        Err(e) => return Some(Event::Error(format!("decrypt failed: {e}"))),
+                    };
+                    let username = String::from_utf8_lossy(&tm.sender).into_owned();
+                    // A member sent a sealed blob that is not a valid part:
+                    // authenticated but malformed, drop it quietly.
+                    let part = transfer::Part::decode(&tm.plaintext)?;
+                    let summary = (part.total > 1).then(|| {
+                        let label = match &part.meta {
+                            TransferMeta::File { name, .. } => name.clone(),
+                            TransferMeta::Text => "message".to_string(),
+                        };
+                        (hex::encode(part.id), label, part.index, part.total)
+                    });
+                    let complete = conv.reassembler.accept(part);
+                    (username, summary, complete)
+                };
+
+                let from_display = self
+                    .display_names
+                    .get(&username)
+                    .cloned()
+                    .unwrap_or_else(|| username.clone());
+
+                let Some(done) = complete else {
+                    // Still assembling: surface progress if this was multi-part.
+                    if let Some((id, label, index, total)) = part_summary {
+                        self.pending.push_back(Event::TransferProgress {
                             conv: hex_id(&group),
-                            from,
+                            id,
+                            label,
+                            sent: (index as u64 + 1) * transfer::CHUNK_BYTES as u64,
+                            total: total as u64 * transfer::CHUNK_BYTES as u64,
+                            incoming: true,
+                        });
+                    }
+                    return None;
+                };
+
+                match done.meta {
+                    TransferMeta::Text => {
+                        let text = String::from_utf8_lossy(&done.data).into_owned();
+                        if let Some(conv) = self.conversations.get_mut(&group) {
+                            conv.history.push(ChatLine {
+                                from: username,
+                                text: text.clone(),
+                                mine: false,
+                                file: None,
+                            });
+                        }
+                        self.save_session();
+                        Some(Event::Message {
+                            conv: hex_id(&group),
+                            from: from_display,
                             text,
                             mine: false,
-                        };
-                        self.save_session();
-                        Some(event)
+                        })
                     }
-                    Err(e) => Some(Event::Error(format!("decrypt failed: {e}"))),
+                    TransferMeta::File { name, .. } => {
+                        // SECURITY: the filename is attacker-controlled. Never
+                        // let it escape the downloads directory (path traversal
+                        // via `..`, absolute paths, or embedded separators), and
+                        // never overwrite an existing file. See THREAT_MODEL.md.
+                        let dir = self.downloads_dir();
+                        match write_received_file(&dir, &name, &done.data) {
+                            Ok(path) => {
+                                let file = FileRef {
+                                    name: safe_file_name(&name),
+                                    size: done.data.len() as u64,
+                                    path: path.to_string_lossy().into_owned(),
+                                };
+                                if let Some(conv) = self.conversations.get_mut(&group) {
+                                    conv.history.push(ChatLine {
+                                        from: username,
+                                        text: file.name.clone(),
+                                        mine: false,
+                                        file: Some(file.clone()),
+                                    });
+                                }
+                                self.save_session();
+                                Some(Event::File {
+                                    conv: hex_id(&group),
+                                    from: from_display,
+                                    file,
+                                })
+                            }
+                            Err(e) => Some(Event::Error(format!("could not save {name}: {e}"))),
+                        }
+                    }
                 }
             }
             ServerMsg::Mls { group, message, .. } => {
@@ -1483,6 +1718,127 @@ fn hex_id(id: &GroupId) -> String {
     s
 }
 
+/// A fresh random 128-bit transfer id.
+fn new_transfer_id() -> [u8; 16] {
+    let mut id = [0u8; 16];
+    let _ = getrandom::getrandom(&mut id);
+    id
+}
+
+/// Read up to `buf.len()` bytes, retrying short reads so a full chunk is
+/// returned even if the OS hands back the file in pieces. Returns the count
+/// (less than `buf.len()` only at end of file).
+fn read_full(reader: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
+/// Reduce an attacker-controlled filename to a safe base name: the final path
+/// component only, with separators and control characters stripped, never
+/// empty, never `.`/`..`. This is the primary defense against path traversal
+/// (a peer naming a file `../../.ssh/authorized_keys`) -- see THREAT_MODEL.md.
+fn safe_file_name(raw: &str) -> String {
+    // Take only the last component under either separator, so any directory
+    // prefix (`../`, `/etc/`, `C:\`) is discarded before we look at the name.
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\' && *c != '\0')
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        // Cap the length so a pathological name cannot blow past filesystem
+        // limits; keep the tail (extension) rather than the head.
+        let max = 200;
+        if trimmed.len() <= max {
+            trimmed.to_string()
+        } else {
+            trimmed[trimmed.len() - max..].to_string()
+        }
+    }
+}
+
+/// Write a received file into `dir` under a sanitized name, never escaping
+/// `dir` and never overwriting: if `name` exists, ` (1)`, ` (2)`, ... is
+/// appended. Verifies the final path is genuinely inside `dir` (defense in
+/// depth against any sanitization gap) before writing.
+fn write_received_file(dir: &std::path::Path, name: &str, data: &[u8]) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    // Canonicalize the target directory so the containment check compares real
+    // paths, not ones with symlinks or `.` segments.
+    let base = dir.canonicalize()?;
+    let safe = safe_file_name(name);
+    let (stem, ext) = match safe.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (safe.clone(), String::new()),
+    };
+
+    for n in 0..10_000 {
+        let candidate = if n == 0 {
+            format!("{stem}{ext}")
+        } else {
+            format!("{stem} ({n}){ext}")
+        };
+        let path = base.join(&candidate);
+        // Containment: the parent of the target must still be `base`. A crafted
+        // name that somehow reintroduced a separator would fail this.
+        if path.parent() != Some(base.as_path()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to write outside the downloads directory",
+            ));
+        }
+        // create_new is atomic: it fails if the file exists, so two arrivals
+        // cannot race onto the same name.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(data)?;
+                return Ok(path);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "too many files with that name",
+    ))
+}
+
+/// Best-effort MIME type from a filename extension. Used only as a hint in the
+/// UI; a received file is never opened or executed based on it.
+fn mime_from_name(name: &str) -> String {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("pdf") => "application/pdf",
+        Some("txt" | "md" | "log") => "text/plain",
+        Some("mp3") => "audio/mpeg",
+        Some("mp4") => "video/mp4",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
 /// The available audio devices plus the current selection, for the settings
 /// picker. An empty `input`/`output` means the host default is in use.
 #[derive(Debug, Clone)]
@@ -1533,4 +1889,80 @@ fn media_addr_from(server_url: &str) -> Option<SocketAddr> {
         .map(|(h, _)| h)
         .unwrap_or(authority);
     format!("{host}:8444").to_socket_addrs().ok()?.next()
+}
+
+#[cfg(test)]
+mod file_security_tests {
+    use super::{safe_file_name, write_received_file};
+
+    #[test]
+    fn path_traversal_names_are_neutralized() {
+        // Every one of these must reduce to a harmless base name, never a path.
+        for evil in [
+            "../../../../etc/passwd",
+            "/etc/shadow",
+            "..\\..\\Windows\\System32\\cmd.exe",
+            "....//....//secret",
+            "foo/bar/baz.txt",
+            "a/../../b",
+        ] {
+            let safe = safe_file_name(evil);
+            assert!(!safe.contains('/'), "{evil} -> {safe} still has /");
+            assert!(!safe.contains('\\'), "{evil} -> {safe} still has \\");
+            assert_ne!(safe, "..", "{evil} -> {safe}");
+            assert_ne!(safe, ".", "{evil} -> {safe}");
+            assert!(!safe.is_empty());
+        }
+    }
+
+    #[test]
+    fn degenerate_names_get_a_fallback() {
+        for empty in ["", "   ", "..", ".", "/", "\\", "///", "..."] {
+            assert_eq!(safe_file_name(empty), "file", "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn control_chars_and_nulls_are_stripped() {
+        assert_eq!(safe_file_name("re\0port\n.pdf"), "report.pdf");
+    }
+
+    #[test]
+    fn a_written_file_never_escapes_the_downloads_dir() {
+        let dir = std::env::temp_dir().join(format!("enclave-sec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A traversal name must land INSIDE dir, not at its parent.
+        let path = write_received_file(&dir, "../escaped.txt", b"x").expect("write");
+        let canon_dir = dir.canonicalize().unwrap();
+        assert!(
+            path.starts_with(&canon_dir),
+            "{path:?} escaped {canon_dir:?}"
+        );
+        assert!(
+            !std::fs::metadata(dir.join("../escaped.txt")).is_ok_and(|_| true)
+                || !dir.parent().unwrap().join("escaped.txt").exists()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_existing_file_is_never_overwritten() {
+        let dir = std::env::temp_dir().join(format!("enclave-sec2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let p1 = write_received_file(&dir, "doc.txt", b"first").unwrap();
+        let p2 = write_received_file(&dir, "doc.txt", b"second").unwrap();
+        assert_ne!(p1, p2, "second file must get a distinct name");
+        assert_eq!(
+            std::fs::read(&p1).unwrap(),
+            b"first",
+            "first file untouched"
+        );
+        assert_eq!(std::fs::read(&p2).unwrap(), b"second");
+        assert!(p2.to_string_lossy().contains("(1)"), "got {p2:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

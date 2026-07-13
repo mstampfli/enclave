@@ -91,19 +91,30 @@ cargo run -p enclave-media --example screen_probe         # Linux/Wayland: inter
 cargo run -p enclave-media --example mic_loopback         # hear yourself via Opus (headphones!)
 ```
 
+## Sending files and large messages
+
+The paperclip in the composer opens a native file picker; the chosen file is
+chunked, encrypted, and sent like any message, and arrives in the peer's
+`enclave-downloads/` directory (under the keystore) under a sanitized name.
+A text message larger than one frame is split and reassembled the same way.
+Both show a progress bar while in flight. A received file is inert until you
+click **Open**, which hands it to the OS default application; Enclave never
+opens or executes it automatically. See THREAT_MODEL.md for the file-sharing
+threat model.
+
 ## Still to come
 
 - **Message timestamps.** The wire format has no time field, so the UI cannot
   show one.
-- **Verification marks are not persisted.** Confirming a safety number lasts
-  one run of the app; the mark belongs in the keystore.
 - **Presence rules live in the UI.** Idle-to-away, status durations, and
   "a set status never upgrades" should be enforced by the core, with idle
   measured at the OS level rather than from window events.
+- **A cumulative download quota.** A single file is capped at 256 MiB, but a
+  per-conversation or per-day byte quota against a flood is future work.
 - **A macOS capture backend.** The media API stubs cleanly there today.
 - **A real two-machine call.** Everything below the portal dialog is verified
   on one box; two boxes over a network is not.
 
 The crypto, transport, calls, screen/window/camera share, per-app and system
-audio share, friends, presence, and groups are done and tested; see
-`ARCHITECTURE.md`.
+audio share, friends, presence, groups, large messages, and file transfer are
+done and tested; see `ARCHITECTURE.md`.

@@ -191,7 +191,7 @@ async fn conversations_and_history_survive_restart() {
         alice2
             .conversation_history(&gid)
             .iter()
-            .any(|(_, t, mine)| t == "before restart" && *mine),
+            .any(|(_, t, mine, _)| t == "before restart" && *mine),
         "history restored after restart"
     );
 
@@ -220,4 +220,115 @@ async fn conversations_and_history_survive_restart() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A message larger than one sealed frame is split, sent as multiple sealed
+/// parts, and reassembled by the peer byte-for-byte. And a file sent by one
+/// client is written to the other's downloads directory with identical bytes.
+#[tokio::test]
+async fn large_message_and_file_transfer_between_two_clients() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let dir = std::env::temp_dir().join(format!("enclave-xfer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut alice = Client::connect(&url).await.unwrap();
+    alice.set_keystore_dir(&dir);
+    alice
+        .create_account("xferalice", "", "test-password-1234")
+        .await
+        .unwrap();
+    let mut bob = account(&url, "xferbob").await;
+    let (an, bn) = (alice.name().to_string(), bob.name().to_string());
+
+    alice.send_friend_request(&bn);
+    loop {
+        if let Event::FriendRequest { from } = next_event(&mut bob).await {
+            assert_eq!(from, an);
+            break;
+        }
+    }
+    bob.accept_friend(&an);
+
+    // Establish the DM (drive both sides until the group is live).
+    let conv = alice.open_dm(&bn).await.unwrap();
+    alice.switch(&conv);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while alice.safety_number().is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "DM never established"
+        );
+        tokio::select! {
+            _ = tokio::time::timeout(Duration::from_millis(150), alice.next_event()) => {}
+            _ = tokio::time::timeout(Duration::from_millis(150), bob.next_event()) => {}
+        }
+        alice.switch(&conv);
+    }
+    // Bob opens his side of the DM so incoming text routes to a live group.
+    // Pump him until his join has landed and the conversation exists.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while bob.conversations().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Bob never joined the DM"
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(150), bob.next_event()).await;
+    }
+    let bob_conv = bob.conversations().first().unwrap().id.clone();
+    bob.switch(&bob_conv);
+
+    // 1) A ~1.3 MiB message: larger than one frame, so it is chunked.
+    let big: String = "The quick brown fox. ".repeat(65_536); // ~1.35 MiB
+    assert!(big.len() > 1024 * 1024, "message must exceed one frame");
+    alice.send_text(&big).await.unwrap();
+    let got = recv_message(&mut bob).await;
+    assert_eq!(got, big, "the large message reassembled byte-for-byte");
+
+    // 2) A file with binary content, including bytes that are not valid UTF-8.
+    let file_bytes: Vec<u8> = (0..(1024 * 1024 + 777))
+        .map(|i| (i * 7 % 256) as u8)
+        .collect();
+    let src = dir.join("payload.bin");
+    std::fs::write(&src, &file_bytes).unwrap();
+    alice
+        .send_file(&src.to_string_lossy())
+        .await
+        .expect("send file");
+    let saved_path = recv_file(&mut bob).await;
+    let received = std::fs::read(&saved_path).expect("read received file");
+    assert_eq!(received, file_bytes, "the file arrived byte-for-byte");
+    assert!(
+        saved_path.contains("enclave-downloads"),
+        "received file lands in the downloads directory, got {saved_path}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pump events until a text message arrives; return its text.
+async fn recv_message(c: &mut Client) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "no message arrived");
+        if let Ok(Some(Event::Message { text, .. })) =
+            tokio::time::timeout(Duration::from_millis(200), c.next_event()).await
+        {
+            return text;
+        }
+    }
+}
+
+/// Pump events until a file arrives; return the path it was written to.
+async fn recv_file(c: &mut Client) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "no file arrived");
+        if let Some(Ok(Some(Event::File { file, .. }))) =
+            Some(tokio::time::timeout(Duration::from_millis(200), c.next_event()).await)
+        {
+            return file.path;
+        }
+    }
 }

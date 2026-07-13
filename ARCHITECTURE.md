@@ -75,7 +75,10 @@ crypto  media  transport
   module) are implemented here.
 - `enclave-client` -- lib + bin. The lib is the high-level `Client` controller
   (the app-logic API the UI drives); the bin is the self-contained WebView
-  window (see "UI" below) that bridges IPC to the controller.
+  window (see "UI" below) that bridges IPC to the controller. `transfer`
+  chunks a message or file too large for one 1 MiB frame into sealed parts and
+  reassembles them on receive (memory-bounded); received files are written to
+  a downloads directory under a sanitized name (see THREAT_MODEL.md).
 - `enclave-server` -- signaling relay + SFU fan-out; holds no media keys.
 
 ## UI (self-contained window -- hard requirement)

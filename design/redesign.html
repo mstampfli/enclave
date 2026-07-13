@@ -441,6 +441,30 @@ input, select, textarea { font: inherit; }
 .send-btn { width: 32px; height: 32px; display: grid; place-items: center;
   border-radius: var(--radius); color: var(--muted); }
 .send-btn:hover { background: var(--raised); color: var(--ink); }
+.attach-btn { width: 32px; height: 32px; display: grid; place-items: center;
+  border-radius: var(--radius); color: var(--muted); flex: none; }
+.attach-btn:hover { background: var(--raised); color: var(--ink); }
+.file-att { display: flex; align-items: center; gap: 10px; margin-top: 4px;
+  max-width: 360px; padding: 9px 11px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg); }
+.file-att .ico { flex: none; color: var(--muted); }
+.file-att .meta { min-width: 0; flex: 1; }
+.file-att .fname { font-size: 14px; color: var(--ink); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.file-att .fsize { font-size: 12px; color: var(--muted); }
+.file-att .open { flex: none; color: var(--accent-ink); font-size: 13px;
+  padding: 3px 8px; border-radius: var(--radius); }
+.file-att .open:hover { background: var(--accent-bg); }
+#xfers { max-width: 720px; margin: 0 auto; padding: 0 24px;
+  display: flex; flex-direction: column; gap: 6px; }
+#xfers:empty { display: none; }
+.xfer { display: flex; align-items: center; gap: 10px; padding: 6px 0;
+  font-size: 12.5px; color: var(--muted); }
+.xfer .label { flex: none; max-width: 200px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.xfer .track { flex: 1; height: 4px; border-radius: 2px; background: var(--raised); overflow: hidden; }
+.xfer .fill { height: 100%; background: var(--accent); }
+.xfer .pct { flex: none; font-variant-numeric: tabular-nums; }
 
 /* ============ MODALS ============ */
 
@@ -784,6 +808,9 @@ label.member-row:hover { background: var(--raised); }
     <footer id="composer">
       <div class="composer-inner">
         <div class="composer-box">
+          <button class="attach-btn" type="button" id="attach-btn" title="Send a file" aria-label="Send a file">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          </button>
           <input id="composer-input" placeholder="Message Aria Chen" autocomplete="off">
           <button class="send-btn" id="send-btn" title="Send" aria-label="Send">
             <svg class="icon" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/></svg>
@@ -1041,6 +1068,20 @@ const state = {
   paletteSel: 0,
 };
 
+function humanSize(n) {
+  if (n < 1024) return n + " B";
+  const u = ["KB", "MB", "GB"]; let v = n / 1024, i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v < 10 ? 1 : 0) + " " + u[i];
+}
+function fileRowHTML(file, mine) {
+  return `<div class="file-att">
+    <svg class="icon ico" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7"/></svg>
+    <div class="meta"><div class="fname" title="${file.name}">${file.name}</div>
+      <div class="fsize">${humanSize(file.size)}${mine ? " · sent" : ""}</div></div>
+    <button class="open" type="button">Open</button></div>`;
+}
+
 const CONVOS = {
   aria: {
     kind: "dm", title: "Aria Chen", with: "aria",
@@ -1058,6 +1099,8 @@ const CONVOS = {
       { from: "Aria Chen", me: false, time: "09:02", lines: [
         "sending you the floor plans tonight",
         "the relay never saw a byte of it" ] },
+      { from: "Aria Chen", me: false, time: "09:03",
+        file: { name: "floor-plans-level-3.pdf", size: 4823000 } },
     ],
   },
   tobias: {
@@ -1304,8 +1347,9 @@ function renderMessages() {
           <span class="author${m.me ? " me" : ""}">${m.me ? "Marc" : m.from}</span>
           <span class="time">${m.time}</span>
         </div>
-        ${m.lines.map(l => `<p>${l}</p>`).join("")}
+        ${m.file ? fileRowHTML(m.file, m.me) : m.lines.map(l => `<p>${l}</p>`).join("")}
       </div>`;
+    if (m.file) g.querySelector(".open").onclick = () => toast("Opening " + m.file.name);
     col.appendChild(g);
   }
   $("messages").scrollTop = $("messages").scrollHeight;
@@ -1704,6 +1748,7 @@ $("camera-stop").onclick = () => {
 $("btn-watch").onclick = () => { state.watching = !state.watching; renderStage(); };
 $("ring-join").onclick = joinCall;
 $("ring-decline").onclick = () => { state.ringing = false; $("banner-ring").hidden = true; };
+$("attach-btn").onclick = () => toast("Native file picker opens here (prototype)");
 $("send-btn").onclick = sendMessage;
 $("composer-input").addEventListener("keydown", e => { if (e.key === "Enter") sendMessage(); });
 $("add-friend-btn").onclick = () => {

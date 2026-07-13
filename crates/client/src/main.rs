@@ -131,6 +131,15 @@ enum UiCommand {
     SendText {
         text: String,
     },
+    /// Open a native file picker and send the chosen file to the active
+    /// conversation. The bytes never cross this bridge: the core reads and
+    /// chunks the file itself.
+    SendFile,
+    /// Open a received (or sent) file with the OS default application. `path`
+    /// must be a path the core previously reported; the UI never invents one.
+    OpenFile {
+        path: String,
+    },
     /// Send a friend request to a full handle.
     AddFriend {
         user: String,
@@ -155,6 +164,18 @@ struct Line {
     from: String,
     text: String,
     mine: bool,
+    /// Present when this line is a file. The UI shows a file row instead of a
+    /// text bubble and can ask the core to open it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<FileLine>,
+}
+
+/// A file attached to a message line, for the UI.
+#[derive(serde::Serialize, Clone)]
+struct FileLine {
+    name: String,
+    size: u64,
+    path: String,
 }
 
 /// A shareable video source for the picker. `id` is an opaque token the UI
@@ -204,6 +225,26 @@ enum UiEvent {
         from: String,
         text: String,
         mine: bool,
+    },
+    /// A file arrived (or was sent) in `conv`: show a file row and offer Open.
+    FileMessage {
+        conv: String,
+        from: String,
+        name: String,
+        size: u64,
+        path: String,
+        mine: bool,
+    },
+    /// Progress of an in-flight transfer, so the UI can show a bar for a large
+    /// message or file. `sent`/`total` are byte counts; `incoming` marks a
+    /// download vs an upload.
+    TransferProgress {
+        conv: String,
+        id: String,
+        label: String,
+        sent: u64,
+        total: u64,
+        incoming: bool,
     },
     Presence {
         user: String,
@@ -444,7 +485,16 @@ fn active_conversation_event(c: &Client) -> UiEvent {
             let history = c
                 .conversation_history(id)
                 .into_iter()
-                .map(|(from, text, mine)| Line { from, text, mine })
+                .map(|(from, text, mine, file)| Line {
+                    from,
+                    text,
+                    mine,
+                    file: file.map(|f| FileLine {
+                        name: f.name,
+                        size: f.size,
+                        path: f.path,
+                    }),
+                })
                 .collect();
             (title, history)
         }
@@ -663,6 +713,40 @@ async fn run_client(
                         );
                     }
                 }
+                Event::File { conv, from, file } => {
+                    if !focused.load(Ordering::Relaxed) {
+                        notify_os(from.clone(), format!("sent a file: {}", file.name));
+                    }
+                    emit(
+                        &proxy,
+                        UiEvent::FileMessage {
+                            conv,
+                            from,
+                            name: file.name,
+                            size: file.size,
+                            path: file.path,
+                            mine: false,
+                        },
+                    );
+                }
+                Event::TransferProgress {
+                    conv,
+                    id,
+                    label,
+                    sent,
+                    total,
+                    incoming,
+                } => emit(
+                    &proxy,
+                    UiEvent::TransferProgress {
+                        conv,
+                        id,
+                        label,
+                        sent,
+                        total,
+                        incoming,
+                    },
+                ),
                 Event::Error(message) => error_status(&proxy, message),
             },
             Ok(None) => {
@@ -982,6 +1066,48 @@ async fn handle_command(
                 c.switch(&conv);
                 emit(proxy, active_conversation_event(c));
             }
+        }
+        UiCommand::SendFile => {
+            if let Some(c) = client.as_mut() {
+                let conv = c.active_id();
+                let from = c.display_name().to_string();
+                // The native picker blocks; run it off the async loop's thread.
+                let chosen = tokio::task::spawn_blocking(|| {
+                    rfd::FileDialog::new().set_title("Send a file").pick_file()
+                })
+                .await
+                .ok()
+                .flatten();
+                let Some(path) = chosen else { return };
+                let path = path.to_string_lossy().into_owned();
+                match c.send_file(&path).await {
+                    Ok(file) => {
+                        if let Some(conv) = conv {
+                            emit(
+                                proxy,
+                                UiEvent::FileMessage {
+                                    conv,
+                                    from,
+                                    name: file.name,
+                                    size: file.size,
+                                    path: file.path,
+                                    mine: true,
+                                },
+                            );
+                        }
+                    }
+                    Err(e) => error_status(proxy, format!("Could not send file: {e}")),
+                }
+            }
+        }
+        UiCommand::OpenFile { path } => {
+            // Best-effort open with the OS default handler. This runs a file
+            // the peer sent, so it is only ever triggered by an explicit user
+            // click, never automatically.
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = open::that_detached(&path);
+            })
+            .await;
         }
         UiCommand::SendText { text } => {
             if let Some(c) = client.as_mut() {

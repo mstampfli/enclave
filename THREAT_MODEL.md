@@ -278,3 +278,106 @@ addressed at the wire:
   (a mixnet, or sealed-sender with per-message tokens the server cannot link to
   an account), which is a separate design, not a routing tweak. Recorded here as
   a known, accepted limitation of the SFU model.
+
+## File sharing and large messages (STRIDE + ASVS L2)
+
+A message too large for one sealed frame, and any file, is split into chunks
+(`crates/client/src/transfer.rs`), each sealed with the group's MLS key exactly
+like an ordinary text message and relayed as an opaque blob. The receiver
+reassembles the chunks and, for a file, writes it to a downloads directory. This
+adds two trust boundaries worth modeling explicitly: the **relay** (semi-trusted)
+now forwards more, larger blobs, and the **receiving client** now writes
+attacker-influenced bytes and an attacker-controlled *filename* to its own disk.
+
+Target level **L2**. Chapters touched: V1 (design), V4 (access control), V5
+(validation), V8 (data protection), V11 (business logic / anti-automation), V12
+(files).
+
+### Trust boundaries
+
+```
+sender client ──seal(chunk)──▶ RELAY (semi-trusted) ──fan-out──▶ receiver client
+   (reads a file                 sees: chunk count,               (reassembles,
+    from disk)                    sizes, timing; never             writes to disk)
+                                  the plaintext or name)
+```
+
+The filename and content are inside the sealed plaintext, so the relay never
+learns either. The dangerous flow is the last arrow: bytes and a name chosen by
+another group member, landing on the receiver's filesystem.
+
+### STRIDE at the receiving client (the new attack surface)
+
+- **Tampering / Elevation of privilege -- path traversal via the filename.** A
+  malicious (or compromised) group member names a file `../../.ssh/authorized_keys`
+  or `/etc/cron.d/x` to write outside the downloads directory and gain code
+  execution or persistence. *Mitigation (V5, V12):* the filename is never used as
+  a path. `safe_file_name` reduces it to the final component only, strips path
+  separators, control characters, and NUL, and rejects `.`/`..`/empty with a
+  `file` fallback. `write_received_file` then joins the sanitized name to the
+  canonicalized downloads directory and re-checks that the target's parent is
+  still that directory before writing (defense in depth). Proven by
+  `file_security_tests::{path_traversal_names_are_neutralized,
+  a_written_file_never_escapes_the_downloads_dir}`.
+- **Tampering -- overwriting an existing file.** A peer sends `doc.txt` twice, or
+  a name matching a file already there, to clobber it. *Mitigation (V12):* writes
+  use `create_new` (atomic O_EXCL); a name collision appends ` (1)`, ` (2)`, ...
+  so nothing is ever overwritten, and two arrivals cannot race onto one name.
+  Proven by `an_existing_file_is_never_overwritten`.
+- **Denial of service -- memory exhaustion.** A peer opens a transfer declaring
+  a huge `total`, or streams unbounded chunks, to exhaust RAM. *Mitigation (V11):*
+  the reassembler refuses a transfer whose declared or actual size exceeds
+  `MAX_TRANSFER_BYTES` (256 MiB), caps concurrent in-flight transfers
+  (`MAX_INFLIGHT`, evicting the oldest), and rejects a chunk larger than
+  `CHUNK_BYTES`. Proven by the `transfer::tests` bound cases.
+- **Denial of service -- disk exhaustion.** A peer sends many large files to fill
+  the disk. *Accepted / partial:* the per-transfer cap bounds any single file;
+  a cumulative download quota is future work, recorded below. In practice the
+  sender is an accepted friend in a group the user joined, which raises the bar.
+- **Tampering -- MIME spoofing / dangerous content.** A peer sends an executable
+  named `photo.png`, or a malformed file to exploit a viewer. *Mitigation (V5):*
+  the MIME type is a display hint only; a received file is **never** opened or
+  executed automatically. `OpenFile` runs only on an explicit user click, and
+  hands the path to the OS default handler (`open::that_detached`) rather than
+  interpreting the content itself. The user, not Enclave, decides to open it.
+- **Information disclosure -- the content is E2E encrypted.** Each chunk is
+  MLS-sealed and Ed25519-signed like any message (V8), so the relay and any
+  non-member see only ciphertext. A tampered chunk fails AEAD and is dropped
+  (the panic-in-debug openmls behavior is contained in `decrypt_text`).
+
+### STRIDE at the relay (semi-trusted, unchanged trust level)
+
+- **Denial of service -- chunk floods / amplification.** Splitting a file into
+  many chunks is many `Text` sends. *Mitigation (V11):* the existing
+  per-connection signaling token bucket (`SIGNALING_BURST`/`RATE`) already caps
+  message rate, and each sealed chunk still must fit the 1 MiB frame limit; a
+  flood is throttled exactly like a text flood. No relay change was needed.
+- **Information disclosure -- metadata.** The relay sees the number and sizes of
+  chunks and their timing, which reveals the approximate file size and that a
+  transfer happened (not its name or content). *Accepted:* this is the same
+  metadata tradeoff as the SFU topology already documents above; chunk sizes are
+  uniform (`CHUNK_BYTES`) except the tail, so only a coarse size leaks. Constant
+  size would need constant-rate cover traffic, out of scope.
+- **Access control (V4).** A chunk is a `Text` to a group; the relay's existing
+  deny-by-default routing already forwards it only to members who have
+  (re)affirmed membership. A non-member can neither inject nor receive chunks.
+  No new authorization path was added.
+
+### Base64 on the wire (introduced with this feature)
+
+Sealed blobs now serialize as base64 in the JSON signaling channel rather than a
+numeric array (`enclave_protocol::Sealed`), so a 512 KiB chunk stays under the
+1 MiB frame limit. This is an encoding change, not a security one: the bytes are
+already ciphertext, base64 is not a confidentiality measure, and the binary
+media path still gets raw bytes. Noted so the change is not mistaken for a
+control.
+
+### Residual / accepted risks
+
+- **No cumulative download quota.** A single file is bounded (256 MiB) and the
+  sender must be a group member, but a determined member could send many files to
+  fill disk. A per-conversation or per-day byte quota is future work.
+- **No malware scanning.** Enclave does not (and by its E2E design cannot at the
+  server) scan file content. Received files are inert on disk until the user
+  chooses to open them with an external application, which is where OS-level
+  protections apply. This is the same model as any E2E messenger.
