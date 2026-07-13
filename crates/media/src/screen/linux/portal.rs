@@ -1,15 +1,14 @@
-//! Screen and window capture (Linux): XDG desktop portal + PipeWire.
+//! Wayland screen and window capture: XDG desktop portal + PipeWire.
 //!
 //! On Wayland an app cannot enumerate or grab other windows -- by design, the
 //! compositor only shares what the user picks in the *system* dialog (the XDG
-//! ScreenCast portal; the same path works on X11 sessions, where the portal
-//! backend does the picking). The flow is:
+//! ScreenCast portal). The flow is:
 //!
 //!   CreateSession -> SelectSources (monitor|window) -> Start (system dialog)
 //!   -> PipeWire node id + remote fd -> a pw video stream delivers frames.
 //!
-//! So [`monitor_sources`] returns a single "choose in the system dialog" entry
-//! and [`window_sources`] is empty; the portal dialog is the real picker.
+//! So the dispatcher ([`super`]) offers a single "choose in the system dialog"
+//! entry and no window list on Wayland; the portal dialog is the real picker.
 //! Starting is asynchronous (a human sits between "start" and "frames" and may
 //! cancel), which the shared [`SharedStatus`] reports: `Starting` while the
 //! dialog is up, `Live` at the first frame, `Ended` on cancel/revoke/death.
@@ -39,24 +38,10 @@ use ashpd::desktop::PersistMode;
 use pipewire as pw;
 use pw::{properties::properties, spa};
 
-use super::{
-    store, tighten_to_bgra, CaptureStatus, CapturedFrame, EndedReason, ScreenSource, SharedStatus,
-    Slot, WindowSource,
+use super::super::{
+    store, tighten_to_bgra, CaptureStatus, CapturedFrame, EndedReason, SharedStatus, Slot,
 };
 use crate::MediaError;
-
-/// The one pseudo-source on Linux: the system picker chooses the real target.
-pub fn monitor_sources() -> Vec<ScreenSource> {
-    vec![ScreenSource {
-        index: 0,
-        name: "Screen or window (choose in the system dialog)".into(),
-    }]
-}
-
-/// Always empty on Linux: only the portal dialog may list other apps' windows.
-pub fn window_sources() -> Vec<WindowSource> {
-    Vec::new()
-}
 
 /// The portal restore token from the last approved share, kept for this
 /// process's lifetime so a re-share can skip the dialog if the compositor
@@ -66,7 +51,7 @@ static RESTORE_TOKEN: Mutex<Option<String>> = Mutex::new(None);
 
 /// Captures the portal-picked monitor or window on a dedicated thread,
 /// exposing the latest frame. Dropping it stops the capture.
-pub struct ScreenCapture {
+pub struct PortalCapture {
     latest: Slot,
     status: SharedStatus,
     /// Flags the capture thread to wind down at its next phase boundary.
@@ -77,19 +62,7 @@ pub struct ScreenCapture {
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl ScreenCapture {
-    /// Start the portal flow. The `index` from [`monitor_sources`] is ignored:
-    /// the system dialog picks the actual monitor or window.
-    pub fn start_index(_index: usize) -> Result<Self, MediaError> {
-        Self::start_portal()
-    }
-
-    /// Windows enumeration is empty on Linux, so no picker can produce a
-    /// handle; anything that does end up here goes through the portal too.
-    pub fn start_window(_hwnd: isize) -> Result<Self, MediaError> {
-        Self::start_portal()
-    }
-
+impl PortalCapture {
     /// Start capturing whatever the user picks in the system dialog. Returns
     /// immediately; watch [`Self::status`] for `Live`/`Ended`.
     pub fn start_portal() -> Result<Self, MediaError> {
@@ -99,7 +72,6 @@ impl ScreenCapture {
     /// Capture a specific PipeWire video node on the default remote, skipping
     /// the portal. Hardware-validation hook (`examples/screen_probe.rs`) --
     /// real shares always go through the portal.
-    #[doc(hidden)]
     pub fn start_node(node_id: u32) -> Result<Self, MediaError> {
         Self::spawn(Some(node_id))
     }
@@ -149,7 +121,7 @@ impl ScreenCapture {
     }
 }
 
-impl Drop for ScreenCapture {
+impl Drop for PortalCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         // Wake the PipeWire loop if it is running; harmless if not yet there.

@@ -18,8 +18,9 @@ pub mod device;
 pub mod error;
 pub mod frame;
 pub mod jitter;
-/// Screen/window capture (WGC/DXGI on Windows, XDG portal + PipeWire on
-/// Linux, a clean-failing stub elsewhere).
+/// Screen/window capture (WGC/DXGI on Windows; XDG portal + PipeWire on
+/// Wayland and raw MIT-SHM/XComposite grabs on X11 for Linux; a clean-failing
+/// stub elsewhere).
 pub mod screen;
 /// System-audio loopback capture (WASAPI on Windows, PipeWire on Linux, a
 /// clean-failing stub elsewhere).
@@ -34,8 +35,8 @@ pub use device::{
 pub use error::MediaError;
 pub use jitter::{JitterBuffer, Popped};
 pub use screen::{
-    monitor_sources, window_sources, CaptureStatus, CapturedFrame, EndedReason, ScreenCapture,
-    ScreenSource, SharedStatus, WindowSource,
+    monitor_sources, per_window_audio_supported, window_sources, CaptureStatus, CapturedFrame,
+    EndedReason, ScreenCapture, ScreenSource, SharedStatus, WindowSource,
 };
 pub use system_audio::{window_pid, AudioMix, LoopbackMode, SystemAudioCapture};
 pub use video::H264Encoder;

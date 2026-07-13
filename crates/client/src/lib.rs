@@ -911,9 +911,15 @@ impl Client {
     }
 
     /// The process id owning a window, for per-app audio (`None` where the
-    /// platform cannot know, e.g. Linux portal shares).
+    /// platform cannot know, e.g. Wayland portal shares).
     pub fn window_pid(&self, hwnd: isize) -> Option<u32> {
         enclave_media::window_pid(hwnd)
+    }
+
+    /// Whether sharing a window here can carry just that app's audio
+    /// (Windows, Linux X11) or shared audio is always the whole mix (Wayland).
+    pub fn per_window_audio(&self) -> bool {
+        enclave_media::per_window_audio_supported()
     }
 
     /// Start sharing system audio into the call. `pid` = one app (echo-free);

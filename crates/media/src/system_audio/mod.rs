@@ -50,15 +50,20 @@ pub enum LoopbackMode {
     System,
 }
 
-/// Resolve the process id that owns a window, for [`LoopbackMode::Process`].
-/// `None` where the platform cannot know (Linux: the portal hides the picked
-/// window's identity; the stub platforms have no windows to resolve).
+/// Resolve the process id that owns a window, for [`LoopbackMode::Process`]:
+/// `GetWindowThreadProcessId` on Windows, EWMH `_NET_WM_PID` on Linux X11.
+/// `None` where the platform cannot know (Wayland: the portal hides the
+/// picked window's identity; the stub platforms have no windows to resolve).
 pub fn window_pid(hwnd: isize) -> Option<u32> {
     #[cfg(windows)]
     {
         windows::window_pid(hwnd)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        crate::screen::linux_window_pid(hwnd)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = hwnd;
         None

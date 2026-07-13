@@ -64,12 +64,15 @@ Capture happens entirely on the user's machine, before the sealed-frame
 boundary; the wire story is unchanged (captured frames are H.264/Opus encoded,
 then sealed and signed like all media). What the capture layer itself trusts:
 
-- **User consent.** On Linux, screen/window selection is *mediated by the OS*:
-  the XDG portal's own dialog picks the source and the compositor enforces the
-  grant (spoofing the picker is out of our reach by design; the restore token
-  is kept in-process only, never on disk). On Windows the app enumerates
-  sources itself, as is native there. Shared system/app audio is opt-in per
-  share and stops with it.
+- **User consent.** On Wayland, screen/window selection is *mediated by the
+  OS*: the XDG portal's own dialog picks the source and the compositor
+  enforces the grant (spoofing the picker is out of our reach by design; the
+  restore token is kept in-process only, never on disk). On Windows and on
+  X11 the app enumerates sources and grabs directly, as is native there --
+  X11 in particular has no capture permission model at all (any client may
+  read the screen), so the in-app picker *is* the consent step, same as every
+  X11 screen sharer. Shared system/app audio is opt-in per share and stops
+  with it.
 - **The media daemons are in the user's trust domain.** PipeWire (Linux) and
   the audio engine (Windows) run as the same user; a compromised daemon could
   already read the screen and mic, so we defend integrity, not against them:

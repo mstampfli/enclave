@@ -862,7 +862,7 @@ async fn handle_command(
                         screens,
                         windows,
                         cameras,
-                        per_app_audio: cfg!(windows),
+                        per_app_audio: c.per_window_audio(),
                     },
                 );
             }

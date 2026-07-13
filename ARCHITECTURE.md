@@ -54,18 +54,19 @@ crypto  media  transport
   H.264 encode (`video`), webcam capture (`camera`), and the per-platform
   capture backends (`screen`, `system_audio`) behind one platform-neutral API:
 
-  | Capability | Windows | Linux |
-  |---|---|---|
-  | Screen/window share | DXGI duplication / WGC; the app enumerates sources | XDG portal ScreenCast: the *system* dialog picks, frames arrive over a PipeWire video stream |
-  | System audio share | WASAPI endpoint loopback | PipeWire capture of the default sink monitor |
-  | Per-app audio share | WASAPI process loopback (pid from the shared window) | PipeWire capture of the app's output node (pid matched via the client's kernel-verified `pipewire.sec.pid`); the client app cannot use it for window shares because the portal hides the picked window's identity, so shared audio falls back to the system mix |
-  | Camera | Media Foundation (via nokhwa) | V4L2 (via nokhwa; metadata nodes filtered by `device_caps`) |
+  | Capability | Windows | Linux (Wayland) | Linux (X11) |
+  |---|---|---|---|
+  | Screen/window share | DXGI duplication / WGC; the app enumerates sources | XDG portal ScreenCast: the *system* dialog picks, frames arrive over a PipeWire video stream | Raw grabs: RandR/EWMH enumeration in-app (same picker experience as Windows), MIT-SHM root grabs for monitors, XComposite pixmaps for windows |
+  | System audio share | WASAPI endpoint loopback | PipeWire capture of the default sink monitor | same |
+  | Per-app audio share | WASAPI process loopback (pid from the shared window) | not possible: the portal hides the picked window's identity, so shared audio falls back to the system mix | works: `_NET_WM_PID` gives the pid, PipeWire captures that app's output node (matched via the client's kernel-verified `pipewire.sec.pid`) |
+  | Camera | Media Foundation (via nokhwa) | V4L2 (via nokhwa; metadata nodes filtered by `device_caps`) | same |
 
-  Starting a Linux share is asynchronous (a human sits behind the portal
+  The session type picks the Linux backend (`WAYLAND_DISPLAY` else `DISPLAY`).
+  Starting a Wayland share is asynchronous (a human sits behind the portal
   dialog and may cancel), so every `ScreenCapture` carries a shared
   `CaptureStatus` (`Starting -> Live -> Ended(reason)`); the client polls it
-  and reaps a share that ended on its own (cancel, compositor revoke, death),
-  tearing down the paired system-audio capture with it.
+  and reaps a share that ended on its own (cancel, compositor revoke, closed
+  window, death), tearing down the paired system-audio capture with it.
 - `enclave-transport` -- signaling + media transport. A pure `relay` routing
   core (metadata only; every payload opaque) drives both a reliable WebSocket
   signaling channel and a low-latency UDP media channel (`Server` runs both over
@@ -178,10 +179,10 @@ window by default and only add the WASM/browser target when we choose to.
    inside the same sealed-frame path as audio (`MediaKind::Screen` for the
    share viewer, `MediaKind::Video` for camera tiles); decoded in the UI by
    WebCodecs. Capture backends per platform (see the `enclave-media` table):
-   WGC/DXGI + WASAPI loopback on Windows, XDG portal + PipeWire on Linux
-   (validated end to end by `crates/media/examples/{screen,system_audio,
-   camera,mic}_probe` on real hardware; the interactive portal-dialog leg is
-   validated on a real desktop session).
+   WGC/DXGI + WASAPI loopback on Windows; XDG portal + PipeWire (Wayland) and
+   raw MIT-SHM/XComposite grabs (X11) on Linux (validated end to end by
+   `crates/media/examples/{screen,system_audio,camera,mic}_probe` on real
+   hardware; the interactive portal-dialog leg on a real desktop session).
 6. [MOSTLY DONE] Self-contained window + client controller. `enclave-client` is
    now a lib + bin: the lib is a high-level `Client` controller (connect, start
    group, invite, send text, safety number, event pump) proven by

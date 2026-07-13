@@ -62,10 +62,14 @@ windows.
 
 - **Windows** lists every monitor and window in the share picker; sharing a
   window can carry just that app's audio (echo-free).
-- **Linux** shows one "Screen or window (choose in the system dialog)" entry:
-  the desktop portal's own picker chooses what to share (that is the only way
-  a Wayland app may see other windows). Shared audio is the whole system mix,
-  so the picker warns that others may hear the call echo back.
+- **Linux on X11** works like Windows: the picker lists RandR monitors and
+  every titled window, captured with raw X grabs (MIT-SHM / XComposite), and
+  a window share can carry just that app's audio (`_NET_WM_PID` + PipeWire).
+- **Linux on Wayland** shows one "Screen or window (choose in the system
+  dialog)" entry: the desktop portal's own picker chooses what to share (that
+  is the only way a Wayland app may see other windows). Shared audio is the
+  whole system mix, so the picker warns that others may hear the call echo
+  back.
 
 ## 4. Check the capture paths on real hardware
 
@@ -76,8 +80,9 @@ machine (all `[PASS]`/`[FAIL]`-scored, non-zero exit on failure):
 cargo run -p enclave-media --example mic_probe            # mic frames flow
 cargo run -p enclave-media --example camera_probe         # webcam -> BGRA frames
 cargo run -p enclave-media --example system_audio_probe   # Linux: loopback hears a tone (audible!)
-cargo run -p enclave-media --example screen_probe -- --self-test  # Linux: PipeWire video leg, pixel-exact
-cargo run -p enclave-media --example screen_probe         # Linux: interactive portal dialog leg
+cargo run -p enclave-media --example screen_probe -- --self-test      # Linux: PipeWire video leg, pixel-exact
+cargo run -p enclave-media --example screen_probe -- --x11-self-test  # Linux: raw X11 leg, pixel-exact (works under Xvfb)
+cargo run -p enclave-media --example screen_probe         # Linux/Wayland: interactive portal dialog leg
 cargo run -p enclave-media --example mic_loopback         # hear yourself via Opus (headphones!)
 ```
 

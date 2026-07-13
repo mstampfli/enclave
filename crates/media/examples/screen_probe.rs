@@ -1,14 +1,19 @@
 //! Hardware check for Linux screen capture.
 //!
-//! Two modes:
+//! Three modes:
 //! - `--self-test`: fully headless proof of the PipeWire leg. Publishes a
 //!   synthetic BGRx video source stream with a known pixel pattern, captures
 //!   it with `ScreenCapture::start_node` (the same stream code real shares
 //!   use), and verifies dimensions and pixel values end to end.
+//! - `--x11-self-test`: proof of the raw X11 leg against the `DISPLAY` server
+//!   (a real one or Xvfb). Creates a window, draws the same known pattern,
+//!   captures it via the XComposite backend, verifies pixels, then grabs
+//!   monitor 0 via the SHM root path.
 //! - default: the real interactive flow -- opens the XDG portal's system
 //!   picker; pick a screen or window and frames are reported for ~5 seconds.
 //!
 //! Run: `cargo run -p enclave-media --example screen_probe -- --self-test`
+//!      `cargo run -p enclave-media --example screen_probe -- --x11-self-test`
 //!      `cargo run -p enclave-media --example screen_probe`
 
 #[cfg(target_os = "linux")]
@@ -340,6 +345,186 @@ mod probe {
         true
     }
 
+    /// Raw X11 leg: draw the known pattern into our own window, capture it
+    /// through the XComposite backend, verify pixel-exact; then grab monitor
+    /// 0 off the root via MIT-SHM and sanity-check the frame.
+    pub fn x11_self_test() -> bool {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::{
+            ConnectionExt as _, CreateGCAux, CreateWindowAux, ImageFormat, WindowClass,
+        };
+
+        let (conn, screen_num) = match x11rb::rust_connection::RustConnection::connect(None) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("[FAIL] X connect (is DISPLAY set?): {e}");
+                return false;
+            }
+        };
+        let screen = &conn.setup().roots[screen_num];
+
+        let run = || -> Result<u32, Box<dyn std::error::Error>> {
+            let win = conn.generate_id()?;
+            // Override-redirect: no window manager needed (bare Xvfb works).
+            conn.create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                win,
+                screen.root,
+                0,
+                0,
+                W as u16,
+                H as u16,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                screen.root_visual,
+                &CreateWindowAux::new().override_redirect(1),
+            )?
+            .check()?;
+            conn.map_window(win)?.check()?;
+
+            // Draw the pattern (BGRX bytes, little-endian ZPixmap).
+            let gc = conn.generate_id()?;
+            conn.create_gc(gc, win, &CreateGCAux::new())?.check()?;
+            let mut pixels = Vec::with_capacity(W * H * 4);
+            for y in 0..H {
+                for x in 0..W {
+                    pixels.extend_from_slice(&expected_bgra(x, y));
+                }
+            }
+            conn.put_image(
+                ImageFormat::Z_PIXMAP,
+                win,
+                gc,
+                W as u16,
+                H as u16,
+                0,
+                0,
+                0,
+                24,
+                &pixels,
+            )?
+            .check()?;
+            conn.flush()?;
+            Ok(win)
+        };
+        let win = match run() {
+            Ok(w) => w,
+            Err(e) => {
+                println!("[FAIL] creating the test window: {e}");
+                return false;
+            }
+        };
+
+        // Capture our window through the real backend.
+        let cap = match ScreenCapture::start_x11_window(win as isize) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("[FAIL] start X11 window capture: {e}");
+                return false;
+            }
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let frame = loop {
+            if let Some(f) = cap.latest() {
+                break f;
+            }
+            if Instant::now() > deadline {
+                println!("[FAIL] no X11 window frame within 10s ({:?})", cap.status());
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        if frame.width != W || frame.height != H {
+            println!(
+                "[FAIL] window frame is {}x{}, wanted {W}x{H}",
+                frame.width, frame.height
+            );
+            return false;
+        }
+        for (x, y) in [(0, 0), (W - 1, 0), (0, H - 1), (W - 1, H - 1), (41, 77)] {
+            let off = (y * W + x) * 4;
+            let got = &frame.bgra[off..off + 3]; // alpha is server-defined; check BGR
+            let want = &expected_bgra(x, y)[..3];
+            if got != want {
+                println!("[FAIL] window pixel ({x},{y}): got {got:?}, want {want:?}");
+                return false;
+            }
+        }
+        drop(cap);
+        println!("[PASS] X11 window capture: {W}x{H}, pixels exact");
+
+        // Per-app audio plumbing: a window's pid must resolve via
+        // _NET_WM_PID, exactly as the client does for a window share.
+        let pid_check = || -> Result<(), Box<dyn std::error::Error>> {
+            use x11rb::wrapper::ConnectionExt as _;
+            let atom = conn.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
+            conn.change_property32(
+                x11rb::protocol::xproto::PropMode::REPLACE,
+                win,
+                atom,
+                x11rb::protocol::xproto::AtomEnum::CARDINAL,
+                &[std::process::id()],
+            )?
+            .check()?;
+            Ok(())
+        };
+        if let Err(e) = pid_check() {
+            println!("[FAIL] setting _NET_WM_PID: {e}");
+            return false;
+        }
+        match enclave_media::window_pid(win as isize) {
+            Some(pid) if pid == std::process::id() => {
+                println!("[PASS] window_pid resolves _NET_WM_PID ({pid})");
+            }
+            other => {
+                println!("[FAIL] window_pid returned {other:?}");
+                return false;
+            }
+        }
+        println!(
+            "shareable windows here: {:?}",
+            enclave_media::window_sources()
+                .iter()
+                .map(|w| &w.name)
+                .collect::<Vec<_>>()
+        );
+
+        // Monitor leg: enumerate and grab whatever monitor 0 shows.
+        let monitors = enclave_media::monitor_sources();
+        println!(
+            "monitors: {:?}",
+            monitors.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+        let cap = match ScreenCapture::start_x11_index(0) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("[FAIL] start X11 monitor capture: {e}");
+                return false;
+            }
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(f) = cap.latest() {
+                let ok = f.width > 0 && f.height > 0 && f.bgra.len() == f.width * f.height * 4;
+                println!(
+                    "[{}] X11 monitor capture: {}x{} frame",
+                    if ok { "PASS" } else { "FAIL" },
+                    f.width,
+                    f.height
+                );
+                return ok;
+            }
+            if Instant::now() > deadline {
+                println!(
+                    "[FAIL] no X11 monitor frame within 10s ({:?})",
+                    cap.status()
+                );
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     pub fn portal() -> bool {
         println!("opening the system picker; choose a screen or window...");
         let cap = match ScreenCapture::start_index(0) {
@@ -391,9 +576,11 @@ mod probe {
 
 #[cfg(target_os = "linux")]
 fn main() {
-    let self_test = std::env::args().any(|a| a == "--self-test");
-    let ok = if self_test {
+    let args: Vec<String> = std::env::args().collect();
+    let ok = if args.iter().any(|a| a == "--self-test") {
         probe::self_test()
+    } else if args.iter().any(|a| a == "--x11-self-test") {
+        probe::x11_self_test()
     } else {
         probe::portal()
     };

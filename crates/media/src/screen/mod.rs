@@ -7,13 +7,13 @@
 //! - **Windows** ([`windows`]): DXGI Desktop Duplication for monitors, Windows
 //!   Graphics Capture for single windows. The app enumerates sources itself and
 //!   starting a capture either works or fails immediately.
-//! - **Linux** ([`linux`]): the XDG desktop portal's ScreenCast interface. The
-//!   *system* picker dialog chooses the monitor or window (apps cannot
-//!   enumerate other windows on Wayland by design), then the compositor
-//!   delivers frames over a PipeWire video stream. Because a human sits
-//!   between "start" and "frames" (and may cancel), starting is asynchronous:
-//!   the capture is created immediately and reports its life cycle through
-//!   [`CaptureStatus`].
+//! - **Linux** ([`linux`]): two backends picked by session type. On Wayland,
+//!   the XDG portal's *system* dialog chooses the source (apps cannot
+//!   enumerate other windows there by design) and the compositor streams
+//!   frames over PipeWire -- a human sits between "start" and "frames", so
+//!   starting is asynchronous and reports through [`CaptureStatus`]. On X11,
+//!   raw grabs like every screen sharer there: RandR/EWMH enumeration in-app,
+//!   MIT-SHM root grabs for monitors, XComposite pixmaps for windows.
 //! - Anything else ([`stub`]): enumerations are empty and starting fails
 //!   cleanly, so the client stays portable.
 //!
@@ -34,6 +34,32 @@ pub use linux::{monitor_sources, window_sources, ScreenCapture};
 pub use stub::{monitor_sources, window_sources, ScreenCapture};
 #[cfg(windows)]
 pub use windows::{monitor_sources, window_sources, ScreenCapture};
+
+/// The process id owning an X11 window, for per-app audio (see
+/// [`crate::system_audio::window_pid`], the public entry point).
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_window_pid(hwnd: isize) -> Option<u32> {
+    linux::window_pid(hwnd)
+}
+
+/// Whether sharing a window can carry only that window's own audio on this
+/// platform/session: yes on Windows (process loopback) and Linux X11
+/// (`_NET_WM_PID` + per-app PipeWire capture); no on Wayland, where the
+/// portal hides which window was picked, and on stub platforms.
+pub fn per_window_audio_supported() -> bool {
+    #[cfg(windows)]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::per_window_audio_supported()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        false
+    }
+}
 
 /// One captured frame: tightly packed BGRA (`width*height*4`, no row padding).
 #[derive(Clone)]
@@ -121,7 +147,7 @@ impl SharedStatus {
         Self(Arc::new(Mutex::new(CaptureStatus::Starting)))
     }
 
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     pub(crate) fn live() -> Self {
         Self(Arc::new(Mutex::new(CaptureStatus::Live)))
     }
