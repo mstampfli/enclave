@@ -47,16 +47,21 @@ cargo run -p enclave-client --bin enclave
 
 A native window opens (no browser). Steps in the UI:
 
-1. Enter the server (`ws://127.0.0.1:8443`) and a name, then **Connect**.
-2. **Start a group**, then **Invite** a friend by their name (they must be
-   connected too).
-3. Type in the message box. The **safety number** in the sidebar should match on
-   both machines -- read it aloud to confirm no one is in the middle.
-4. Add friends by name to see their online/away/offline presence; set your own
-   status from the **Status** dropdown.
+1. Enter the server (`ws://127.0.0.1:8443`), pick a username and password,
+   and **Create account** (or **Sign in** on later runs).
+2. In the **People** tab, add a friend by username; they accept the request
+   on their side. Click the message action (or double-click them) to open a
+   DM; the **+** by Conversations starts a named group.
+3. Type in the message box. Click the **seal** next to the conversation title
+   (or "verify now") to see the safety number: read it aloud on both machines,
+   then confirm with "We compared, it matches" -- the seal turns solid.
+4. **Call** starts or joins a call; the stage docks into the conversation
+   with labeled mute/deafen/camera/share controls. Your own status lives on
+   the menu under your name (Online/Away/Offline, with an optional duration).
+5. `Ctrl+K` opens the command palette for jumping and actions.
 
-Run two clients (two names) against one server to talk to yourself across
-windows.
+Run two clients (two usernames) against one server to talk to yourself
+across windows.
 
 ### Sharing on Linux vs Windows
 

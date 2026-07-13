@@ -1,1110 +1,2162 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Enclave</title>
 <style>
-  :root {
-    --rail: #1e1f22;
-    --sidebar: #2b2d31;
-    --chat: #313338;
-    --input: #383a40;
-    --hover: #35373c;
-    --active: #404249;
-    --text: #dbdee1;
-    --muted: #949ba4;
-    --bright: #f2f3f5;
-    --accent: #5865f2;
-    --accent-hover: #4752c4;
-    --online: #23a55a;
-    --away: #f0b232;
-    --offline: #80848e;
-    --danger: #da373c;
-    --green: #248046;
-    --border: rgba(255, 255, 255, 0.06);
-    --radius: 8px;
-  }
-  * { box-sizing: border-box; }
-  [hidden] { display: none !important; }
-  html, body { height: 100%; margin: 0; }
-  body {
-    background: var(--chat);
-    color: var(--text);
-    font: 15px/1.4 "gg sans", -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    overflow: hidden;
-  }
-  button {
-    font: inherit;
-    cursor: pointer;
-    border: none;
-    border-radius: var(--radius);
-    color: var(--bright);
-    background: var(--input);
-    padding: 9px 14px;
-    transition: background-color 120ms ease;
-  }
-  button:hover { background: var(--hover); }
-  button.primary { background: var(--accent); }
-  button.primary:hover { background: var(--accent-hover); }
-  button.small { padding: 5px 10px; font-size: 13px; }
-  button:disabled { opacity: 0.5; cursor: default; }
-  input, select {
-    font: inherit;
-    background: var(--rail);
-    border: 1px solid transparent;
-    border-radius: 4px;
-    color: var(--text);
-    padding: 10px 11px;
-    width: 100%;
-  }
-  input:focus, select:focus { outline: none; border-color: var(--accent); }
-  label { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.02em; }
-  .error { color: #f38688; font-size: 13px; min-height: 18px; }
+/* ============================================================
+   Enclave design prototype, take 2: graphite instrument panel.
+   One warm-neutral gray ramp. Hairline borders carry structure.
+   Radius 2px. No colored controls: the primary action is
+   inverted ink. Color is semantic only: sage = trust/presence,
+   brick = danger. Mono = labels, timestamps, cryptographic truth.
+   ============================================================ */
 
-  /* Login view */
-  #login-view { height: 100%; display: flex; align-items: center; justify-content: center; }
-  .login-card {
-    width: 420px; max-width: calc(100% - 32px);
-    background: var(--sidebar);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 28px;
-    display: flex; flex-direction: column; gap: 8px;
-  }
-  .login-card h1 { margin: 0; font-size: 22px; letter-spacing: -0.01em; }
-  .login-card .sub { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
-  .login-card label { margin-top: 8px; }
-  .login-row { display: flex; gap: 8px; margin-top: 12px; }
-  .login-row button { flex: 1; }
-  .login-card details { margin-top: 10px; }
-  .login-card summary { color: var(--muted); font-size: 12px; cursor: pointer; }
-  .login-card details input { margin-top: 6px; }
+:root {
+  --bg: #141414;            /* page */
+  --panel: #191919;         /* sidebar, headers, modals */
+  --room: #1d1d1d;          /* conversation canvas */
+  --raised: #232323;        /* inputs, buttons, rows */
+  --hover: #2b2b2b;
+  --border: #2d2d2d;
+  --border-strong: #404040;
+  --ink: #d9d9d9;
+  --ink-strong: #f1f1f1;
+  --muted: #909090;
+  --faint: #6d6d6d;
 
-  /* App: three columns */
-  #app-view { height: 100%; display: grid; grid-template-columns: 72px 260px 1fr; }
+  --accent: #62ad6a;        /* true green: trust, presence, primary */
+  --accent-ink: #8ec793;
+  --accent-border: #3e7145;
+  --accent-bg: #1e2a20;
+  --danger: #cf5f4d;
+  --danger-border: #86463b;
+  --danger-bg: #2a1d19;
+  --warn: #c99f4f;
+  --warn-bg: #292213;
 
-  .rail { background: var(--rail); display: flex; flex-direction: column; align-items: center; padding: 12px 0; gap: 10px; }
-  .rail .home {
-    width: 48px; height: 48px; border-radius: 16px; background: var(--accent);
-    display: flex; align-items: center; justify-content: center;
-    font-weight: 700; color: #fff; font-size: 18px;
-  }
+  --radius: 2px;
+  --radius-lg: 4px;
 
-  .sidebar { background: var(--sidebar); display: flex; flex-direction: column; min-height: 0; }
-  .side-scroll { flex: 1; overflow-y: auto; padding: 8px; }
-  .side-head { display: flex; align-items: center; justify-content: space-between; padding: 4px 6px; }
-  .side-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
-  .add-row { display: flex; gap: 6px; padding: 6px; }
-  .add-row input { flex: 1; }
-  ul.list { list-style: none; margin: 6px 0; padding: 0; }
-  ul.list li {
-    display: flex; align-items: center; gap: 8px;
-    padding: 7px 8px; border-radius: 6px; cursor: pointer; color: var(--muted);
-  }
-  ul.list li:hover { background: var(--hover); color: var(--text); }
-  ul.list li.active { background: var(--active); color: var(--bright); }
-  .avatar {
-    width: 30px; height: 30px; border-radius: 50%; background: var(--accent);
-    display: flex; align-items: center; justify-content: center;
-    color: #fff; font-weight: 600; font-size: 13px; flex: none; text-transform: uppercase;
-  }
-  .avatar.group { border-radius: 30%; background: #5c6069; }
-  .row-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--offline); flex: none; }
-  .badge { flex: none; background: var(--danger); color: #fff; border-radius: 10px; font-size: 11px; font-weight: 600; padding: 0 6px; min-width: 18px; height: 18px; line-height: 18px; text-align: center; }
-  .call-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: #3ba55d; }
-  #conn-banner { position: fixed; top: 0; left: 0; right: 0; z-index: 50; text-align: center; padding: 6px; font-size: 13px; background: var(--danger); color: #fff; }
-  #conn-banner.online { background: #3ba55d; }
-  #screen-viewer { position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,0.9); display: flex; flex-direction: column; }
-  .sv-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; color: var(--text); font-size: 13px; }
-  #sv-canvas { flex: 1; min-height: 0; width: 100%; object-fit: contain; background: #000; }
-  .dot.online { background: var(--online); }
-  .dot.away { background: var(--away); }
-  .dot.offline { background: var(--offline); }
-  .req-actions { display: flex; gap: 4px; }
-  .icon-btn { background: transparent; padding: 4px 7px; color: var(--muted); border-radius: 4px; }
-  .icon-btn:hover { background: var(--hover); color: var(--bright); }
-  .icon-btn.ok:hover { color: var(--online); }
-  .icon-btn.no:hover { color: var(--danger); }
-  .muted-empty { color: var(--muted); font-size: 12px; padding: 4px 8px; }
+  --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
 
-  .user-panel {
-    display: flex; flex-direction: column; gap: 8px; padding: 10px;
-    background: rgba(0,0,0,0.15); border-top: 1px solid var(--border);
-  }
-  .user-id { display: flex; align-items: center; gap: 8px; padding: 4px; min-width: 0; }
-  .user-meta { min-width: 0; flex: 1; }
-  .user-name { font-weight: 600; font-size: 14px; color: var(--bright); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
-  .user-name:hover { text-decoration: underline; }
-  .user-handle { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
-  .user-handle:hover { color: var(--text); }
-  .user-controls { display: flex; gap: 8px; }
-  .user-controls select { flex: 1; padding: 6px; font-size: 12px; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
 
-  /* Chat area */
-  .chat { display: flex; flex-direction: column; min-width: 0; }
-  .chat-header {
-    height: 48px; display: flex; align-items: center; gap: 10px;
-    padding: 0 16px; border-bottom: 1px solid var(--border); flex: none;
-  }
-  .chat-title { font-weight: 600; color: var(--bright); }
-  .safety { margin-left: auto; color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; }
-  .chat-header .hdr-btn { margin-left: 8px; }
-  .hdr-btn.in-call { background: var(--danger); }
-  .hdr-btn.in-call:hover { background: #a12b2f; }
-  .log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 2px; }
-  .msg { padding: 2px 0; max-width: 80%; }
-  .msg .who { font-size: 12px; color: var(--muted); font-weight: 600; margin-top: 8px; }
-  .msg .body { background: var(--input); padding: 8px 11px; border-radius: 10px; display: inline-block; white-space: pre-wrap; word-break: break-word; }
-  .msg.self { align-self: flex-end; text-align: right; }
-  .msg.self .body { background: var(--accent); color: #fff; }
-  .composer { padding: 0 16px 16px; flex: none; }
-  .composer input:disabled { opacity: 0.6; }
-  .empty-chat { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--muted); }
+html, body { height: 100%; }
+body {
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.55;
+  background: var(--bg);
+  color: var(--ink);
+  overflow: hidden;
+}
 
-  /* Modal */
-  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; }
-  .modal { width: 400px; max-width: calc(100% - 32px); background: var(--sidebar); border-radius: 10px; padding: 20px; display: flex; flex-direction: column; gap: 10px; }
-  .modal h2 { margin: 0; font-size: 18px; }
-  .pick-list { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
-  .pick { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-radius: 6px; cursor: pointer; }
-  .pick:hover { background: var(--hover); }
-  .pick input { width: auto; }
-  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
-  .hint { margin: 0; color: var(--muted); font-size: 12px; }
-  .call-banner { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 16px; background: rgba(88,101,242,0.16); border-bottom: 1px solid var(--border); font-size: 13px; color: var(--text); }
-  .call-banner button { background: var(--accent); }
-  .call-banner button:hover { background: var(--accent-hover); }
-  .call-panel { display: flex; flex-direction: column; gap: 14px; padding: 16px; background: var(--rail); border-bottom: 1px solid var(--border); }
-  .call-tiles { display: flex; flex-wrap: wrap; gap: 14px; justify-content: center; }
-  .call-tile { display: flex; flex-direction: column; align-items: center; gap: 6px; width: 92px; }
-  .call-avatar { width: 60px; height: 60px; border-radius: 50%; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: 600; border: 2px solid transparent; }
-  .call-tile.speaking .call-avatar { border-color: #3ba55d; }
-  .call-tile.muted .call-avatar { border-color: var(--danger); }
-  .call-name { font-size: 12px; color: var(--text); max-width: 92px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .call-controls { display: flex; gap: 8px; justify-content: center; }
-  .cc-btn { background: var(--sidebar); color: var(--text); border-radius: 20px; padding: 8px 14px; font-size: 13px; }
-  .cc-btn:hover { background: var(--hover); }
-  .cc-btn.active { background: var(--accent); color: #fff; }
-  .cc-leave { background: var(--danger); color: #fff; }
-  .cc-leave:hover { background: #b02c30; }
-  .ring-modal { align-items: center; text-align: center; }
-  .ring-modal h2 { text-align: center; margin: 4px 0 0; }
-  .ring-avatar { width: 64px; height: 64px; border-radius: 50%; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: 600; margin: 4px auto 0; }
-  .ring-actions { justify-content: center; margin-top: 8px; }
-  .danger-btn { background: var(--danger); color: #fff; }
-  .danger-btn:hover { background: #b02c30; }
-  .status { padding: 0 16px 8px; color: var(--muted); font-size: 12px; min-height: 16px; }
-  .status.err { color: #f38688; }
-  /* Camera tiles: a live webcam turns the circle into a 16:9 rounded rect. */
-  .call-tile.cam { width: auto; }
-  .call-tile.cam .call-avatar { width: 128px; height: 72px; border-radius: 10px; background: #000; overflow: hidden; padding: 0; }
-  .call-tile.cam .call-letter { display: none; }
-  .call-avatar canvas { display: none; }
-  .call-tile.cam .call-avatar canvas { display: block; width: 100%; height: 100%; object-fit: cover; }
-  .call-tile.cam.self .call-avatar canvas { transform: scaleX(-1); } /* mirror own preview */
-  /* Share-source picker */
-  .share-list { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow-y: auto; }
-  .share-row { display: flex; align-items: center; gap: 10px; padding: 9px 11px; border-radius: 8px; background: var(--sidebar); cursor: pointer; text-align: left; }
-  .share-row:hover { background: var(--hover); }
-  .share-row .ico { font-size: 13px; font-family: monospace; color: var(--muted); flex: none; }
-  .share-row .lbl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .share-empty { color: var(--muted); font-size: 13px; padding: 6px 2px; }
-  .share-head { margin: 12px 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
-  .share-head:first-child { margin-top: 0; }
-  .share-audio { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: var(--muted); font-size: 13px; }
+button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+input, select, textarea { font: inherit; }
+
+* { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+::-webkit-scrollbar { width: 10px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border: 2px solid transparent;
+  background-clip: content-box; }
+::-webkit-scrollbar-track { background: transparent; }
+
+::selection { background: var(--accent); color: #101510; }
+
+:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}
+
+/* ---------- shared bits ---------- */
+
+.btn {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 6px 13px; border-radius: var(--radius);
+  background: var(--raised); border: 1px solid var(--border);
+  color: var(--ink); font-weight: 500; font-size: 13.5px;
+  transition: background 130ms ease-out, border-color 130ms ease-out;
+}
+.btn:hover { border-color: var(--border-strong); background: var(--hover); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #10150f; font-weight: 600; }
+.btn.primary:hover { background: #74bb7c; border-color: #74bb7c; }
+.btn.danger { color: var(--danger); }
+.btn.danger:hover { background: var(--danger-bg); border-color: var(--danger-border); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--muted); }
+.btn.ghost:hover { background: var(--raised); color: var(--ink); }
+.btn:disabled { opacity: .45; cursor: default; }
+
+.icon { width: 18px; height: 18px; flex: none; stroke: currentColor; stroke-width: 1.6;
+        fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.icon.sm { width: 15px; height: 15px; }
+
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field label { font-size: 12.5px; font-weight: 550; color: var(--muted); }
+.field input, .field select {
+  padding: 8px 10px; border-radius: var(--radius);
+  background: var(--bg); border: 1px solid var(--border);
+  color: var(--ink);
+  transition: border-color 130ms ease-out;
+}
+.field input:focus, .field select:focus { outline: none; border-color: var(--border-strong); }
+.field input::placeholder { color: var(--faint); }
+.field .hint { font-size: 12.5px; color: var(--muted); }
+
+.avatar {
+  width: 32px; height: 32px; border-radius: 3px; flex: none;
+  display: grid; place-items: center;
+  font-size: 12px; font-weight: 600;
+  background: var(--raised);
+  color: var(--muted);
+}
+.avatar.lg { width: 44px; height: 44px; font-size: 15px; }
+
+.presence-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.presence-dot.online  { background: var(--accent); }
+.presence-dot.away    { background: var(--warn); }
+.presence-dot.offline { background: none; border: 1px solid var(--faint); }
+
+/* ============ LOGIN ============ */
+
+#login-view { height: 100%; display: grid; place-items: center; background: var(--bg); }
+.login-card {
+  width: 380px; padding: 34px 32px 26px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  display: flex; flex-direction: column; gap: 18px;
+}
+.login-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 2px; }
+.login-brand svg { width: 30px; height: 30px; }
+.login-brand .name {
+  font-size: 26px; font-weight: 650; color: var(--ink-strong);
+  transform: translateY(-3px);
+}
+.login-tagline { font-size: 13.5px; color: var(--muted); margin-top: -10px; }
+.login-tabs { display: flex; border: 1px solid var(--border); border-radius: var(--radius); }
+.login-tabs button { flex: 1; padding: 7px 0; font-size: 13px; color: var(--muted);
+  font-weight: 500; }
+.login-tabs button + button { border-left: 1px solid var(--border); }
+.login-tabs button.active { background: var(--raised); color: var(--ink); }
+.login-error { color: var(--danger); font-size: 13px; min-height: 1em; }
+.login-footer { display: flex; justify-content: space-between; align-items: center;
+  border-top: 1px solid var(--border); padding-top: 14px; }
+.login-footer button { font-size: 13px; color: var(--muted); }
+.login-footer button:hover { color: var(--ink); }
+
+/* ============ APP SHELL ============ */
+
+#app-view { height: 100%; display: grid; grid-template-columns: 288px 1fr; }
+
+/* ---------- sidebar ---------- */
+
+#sidebar {
+  background: var(--panel); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; min-height: 0;
+}
+
+.self-card { display: flex; align-items: center; gap: 10px; padding: 13px 14px 11px;
+  position: relative; }
+.self-card .who { flex: 1; min-width: 0; }
+.self-card .who .display { font-weight: 600; font-size: 14px; color: var(--ink-strong);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.presence-btn { display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+  color: var(--muted); padding: 1px 5px; margin-left: -5px; border-radius: var(--radius); }
+.presence-btn:hover { background: var(--raised); color: var(--ink); }
+
+.presence-menu {
+  position: absolute; left: 12px; top: 56px; z-index: 30; width: 248px;
+  background: var(--panel); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg); padding: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.presence-menu button.pm-item { display: flex; align-items: center; gap: 9px; width: 100%;
+  padding: 7px 9px; border-radius: var(--radius); text-align: left; font-size: 13.5px;
+  color: var(--ink); }
+.presence-menu button.pm-item:hover { background: var(--raised); }
+.presence-menu button.pm-item .pm-sub { margin-left: auto; font-size: 11.5px; color: var(--faint); white-space: nowrap; }
+.presence-menu button.pm-item .check { width: 14px; height: 14px; margin-left: auto;
+  color: var(--accent-ink); }
+.presence-menu .pm-divider { height: 1px; background: var(--border); margin: 4px 2px; }
+.pm-keep { display: flex; align-items: center; gap: 8px; padding: 4px 9px 6px; }
+.pm-keep label { font-size: 12.5px; color: var(--muted); flex: none; }
+.pm-keep select { flex: 1; padding: 4px 6px; border-radius: var(--radius);
+  background: var(--bg); border: 1px solid var(--border); color: var(--ink); font-size: 12.5px; }
+.pm-note { font-size: 11.5px; color: var(--faint); padding: 0 9px 6px; }
+
+.side-tabs { display: flex; padding: 0 14px; gap: 16px; border-bottom: 1px solid var(--border); }
+.side-tabs button {
+  padding: 7px 2px 8px; font-size: 13px; font-weight: 550; color: var(--muted);
+  border-bottom: 1px solid transparent; margin-bottom: -1px;
+  transition: color 130ms ease-out;
+}
+.side-tabs button:hover { color: var(--ink); }
+.side-tabs button.active { color: var(--ink-strong); border-bottom-color: var(--ink-strong); }
+.side-tabs .count { font-size: 11px; margin-left: 4px; color: var(--muted); }
+.side-tabs .count.attention { color: var(--accent-ink); }
+
+.side-scroll { flex: 1; overflow-y: auto; min-height: 0; padding: 10px 8px; }
+
+.side-section { margin-bottom: 14px; }
+.side-section > .head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 2px 8px 6px; font-size: 12px; font-weight: 550; color: var(--faint);
+}
+.side-section > .head button { color: var(--muted); display: grid; place-items: center;
+  width: 20px; height: 20px; border-radius: var(--radius); }
+.side-section > .head button:hover { background: var(--raised); color: var(--ink); }
+
+.convo-row {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 7px 8px; border-radius: var(--radius); text-align: left;
+  border: 1px solid transparent;
+  transition: background 120ms ease-out;
+}
+.convo-row:hover { background: var(--raised); }
+.convo-row.active { background: var(--hover); }
+.convo-row .meta { flex: 1; min-width: 0; }
+.convo-row .name { font-size: 14px; font-weight: 500; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: flex; align-items: center; gap: 7px; }
+.convo-row.active .name { color: var(--ink-strong); }
+.convo-row .last { font-size: 12.5px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.convo-row .unread {
+  font-size: 12px; font-weight: 600; color: var(--ink-strong);
+  font-variant-numeric: tabular-nums;
+}
+.convo-row .live {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 12px; font-weight: 500; color: var(--accent-ink);
+}
+.live .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+
+.avatar-wrap { position: relative; }
+.avatar-wrap .presence-dot { position: absolute; right: -2px; bottom: -2px;
+  box-shadow: 0 0 0 3px var(--panel); }
+
+/* people tab */
+.person-row { display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 6px 8px; border-radius: var(--radius); }
+.person-row:hover { background: var(--raised); }
+.person-row .meta { flex: 1; min-width: 0; text-align: left; }
+.person-row .display { font-size: 14px; color: var(--ink); }
+.person-row .handle { font-size: 11.5px; color: var(--faint); }
+.person-row .row-actions { display: flex; gap: 4px; opacity: 0; }
+.person-row:hover .row-actions, .person-row:focus-within .row-actions { opacity: 1; }
+.row-actions button { width: 26px; height: 26px; display: grid; place-items: center;
+  border-radius: var(--radius); color: var(--muted); }
+.row-actions button:hover { background: var(--hover); color: var(--ink); }
+.row-actions button.ok:hover { color: var(--accent-ink); }
+.row-actions button.no:hover { color: var(--danger); }
+
+.add-friend { display: flex; gap: 6px; padding: 4px 8px 10px; }
+.add-friend input { flex: 1; padding: 8px 11px; font-size: 13.5px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+  color: var(--ink); }
+.add-friend input:focus { outline: none; border-color: var(--border-strong); }
+.add-friend input::placeholder { color: var(--faint); }
+
+/* call mini-bar */
+.callbar {
+  margin: 0 8px 8px; padding: 8px 10px; border-radius: var(--radius);
+  background: var(--accent-bg); border: 1px solid var(--accent-border);
+  display: flex; align-items: center; gap: 9px;
+}
+.callbar .txt { flex: 1; min-width: 0; font-size: 13px; color: var(--accent-ink); font-weight: 500;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.callbar button { color: var(--ink); width: 26px; height: 26px; display: grid;
+  place-items: center; border-radius: var(--radius); }
+.callbar button:hover { background: var(--raised); }
+.callbar button.leave { color: var(--danger); }
+.callbar button.leave:hover { background: var(--danger-bg); }
+
+/* server card */
+.server-card {
+  border-top: 1px solid var(--border);
+  padding: 11px 14px; display: flex; align-items: center; gap: 10px;
+}
+.server-card .state-dot { width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent); flex: none; }
+.server-card.reconnecting .state-dot { background: var(--warn); }
+.server-card.offline .state-dot { background: var(--danger); }
+.server-card .meta { flex: 1; min-width: 0; }
+.server-card .host { font-size: 12px; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.server-card .sub { font-size: 11px; color: var(--faint); }
+.server-card button { color: var(--muted); width: 28px; height: 28px;
+  display: grid; place-items: center; border-radius: var(--radius); }
+.server-card button:hover { background: var(--raised); color: var(--ink); }
+
+/* ============ CONVERSATION ============ */
+
+#room { display: flex; flex-direction: column; min-width: 0; min-height: 0;
+  background: var(--room); }
+
+.room-header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 18px; background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.room-header .seal-btn { display: flex; align-items: center; }
+.room-header .title-wrap { flex: 1; min-width: 0; }
+.room-header .title { font-size: 15px; font-weight: 600; color: var(--ink-strong);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-header .subtitle { font-size: 12px; color: var(--muted);
+  display: flex; align-items: center; gap: 6px; }
+.room-header .subtitle .verify-link { color: var(--ink); font-size: 12px;
+  text-decoration: underline; text-underline-offset: 2px; }
+.room-header .subtitle .verify-link:hover { color: var(--ink-strong); }
+.room-header .subtitle .verified-tag { color: var(--accent-ink); }
+.header-actions { display: flex; gap: 4px; }
+.header-actions > button {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 5px 11px; border-radius: var(--radius); font-size: 13px; font-weight: 500;
+  color: var(--muted); border: 1px solid transparent;
+  transition: background 130ms ease-out, color 130ms ease-out, border-color 130ms ease-out;
+}
+.header-actions > button:hover { background: var(--raised); border-color: var(--border);
+  color: var(--ink); }
+.header-actions > button.accent { color: var(--accent-ink); }
+.header-actions > button.accent:hover { background: var(--accent-bg); border-color: transparent; }
+
+/* thin state banners */
+.banner { display: flex; align-items: center; gap: 10px; padding: 7px 18px; font-size: 13px;
+  border-bottom: 1px solid var(--border); }
+.banner.reconnect { background: var(--warn-bg); color: var(--warn); }
+.banner.offline-b { background: var(--danger-bg); color: var(--danger); }
+.banner.ring { background: var(--accent-bg); color: var(--ink); }
+.banner .spacer { flex: 1; }
+.banner .btn { padding: 3px 11px; font-size: 12.5px; }
+
+/* ---------- call stage ---------- */
+
+#stage {
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  padding: 14px 18px 12px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.tiles { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+.tile {
+  position: relative; width: 200px; aspect-ratio: 16/10;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: grid; place-items: center; overflow: hidden;
+}
+.tile .avatar { width: 48px; height: 48px; font-size: 16px; }
+.tile .nameplate {
+  position: absolute; left: 6px; bottom: 6px;
+  font-size: 12px; font-weight: 500; color: var(--ink);
+  background: rgba(16, 16, 16, 0.88);
+  padding: 2px 7px; border-radius: var(--radius);
+  display: flex; align-items: center; gap: 5px;
+}
+.tile .nameplate .icon { width: 11px; height: 11px; color: var(--danger); }
+.tile.sharing-tile { width: 420px; }
+.tile .fake-screen { position: absolute; inset: 0;
+  background: repeating-linear-gradient(45deg, #1f1f1f 0 14px, #191919 14px 28px); }
+.tile .fake-cam { position: absolute; inset: 0; background: #262626; }
+
+.stage-controls { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; }
+.ctl {
+  display: inline-flex; flex-direction: column; align-items: center; gap: 3px;
+  min-width: 76px; padding: 8px 12px 6px; border-radius: var(--radius);
+  color: var(--ink); font-size: 12px; font-weight: 500;
+  background: var(--raised); border: 1px solid var(--border);
+  transition: background 130ms ease-out, border-color 130ms ease-out, color 130ms ease-out;
+}
+.ctl:hover { border-color: var(--border-strong); }
+.ctl.engaged { background: var(--accent-bg); border-color: var(--accent-border); color: var(--accent-ink); }
+.ctl.off { background: var(--danger-bg); border-color: var(--danger-border); color: var(--danger); }
+.ctl.leave { color: var(--danger); }
+.ctl.leave:hover { background: var(--danger-bg); border-color: var(--danger-border); }
+
+.share-offer {
+  display: flex; align-items: center; gap: 10px; justify-content: center;
+  font-size: 13px; color: var(--muted);
+}
+.share-offer .btn { padding: 3px 12px; font-size: 12.5px; }
+
+/* ---------- messages ---------- */
+
+#messages { flex: 1; overflow-y: auto; min-height: 0; }
+.msg-col { max-width: 720px; margin: 0 auto; padding: 22px 24px 10px; }
+
+.day-divider { display: flex; align-items: center; gap: 12px; margin: 18px 0 14px;
+  color: var(--faint); font-size: 12px; font-weight: 500; }
+.day-divider::before, .day-divider::after { content: ""; flex: 1; height: 1px;
+  background: var(--border); }
+
+.msg-group { display: flex; gap: 12px; padding: 5px 0; }
+.msg-group .avatar { margin-top: 2px; }
+.msg-group .body { flex: 1; min-width: 0; }
+.msg-group .byline { display: flex; align-items: baseline; gap: 8px; }
+.msg-group .author { font-weight: 600; font-size: 14px; color: var(--ink-strong); }
+.msg-group .author.me { color: var(--muted); }
+.msg-group .time { font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.msg-group p { color: var(--ink); font-size: 14.5px; margin-top: 1px;
+  overflow-wrap: anywhere; }
+.msg-group p + p { margin-top: 3px; }
+
+.sys-line { text-align: center; font-size: 12.5px; color: var(--faint); padding: 8px 0; }
+
+.empty-room { height: 100%; display: grid; place-items: center; }
+.empty-room .inner { text-align: center; max-width: 360px; display: flex;
+  flex-direction: column; align-items: center; gap: 10px; color: var(--muted); }
+.empty-room .inner .big { font-size: 15.5px; font-weight: 600; color: var(--ink-strong); }
+
+/* ---------- composer ---------- */
+
+#composer { padding: 10px 24px 18px; }
+.composer-inner { max-width: 720px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+.composer-box {
+  flex: 1; display: flex; align-items: center; gap: 8px;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 3px 5px 3px 13px;
+  transition: border-color 130ms ease-out;
+}
+.composer-box:focus-within { border-color: var(--border-strong); }
+.composer-box input { flex: 1; background: none; border: none; color: var(--ink);
+  font-size: 14.5px; padding: 8px 0; }
+.composer-box input:focus { outline: none; }
+.composer-box input::placeholder { color: var(--faint); }
+.send-btn { width: 32px; height: 32px; display: grid; place-items: center;
+  border-radius: var(--radius); color: var(--muted); }
+.send-btn:hover { background: var(--raised); color: var(--ink); }
+
+/* ============ MODALS ============ */
+
+.overlay {
+  position: fixed; inset: 0; background: rgba(10, 10, 9, 0.75);
+  display: grid; place-items: center; z-index: 40;
+}
+.modal {
+  width: min(460px, calc(100vw - 48px)); max-height: min(640px, calc(100vh - 48px));
+  overflow-y: auto;
+  background: var(--panel); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg); padding: 22px;
+  display: flex; flex-direction: column; gap: 16px;
+}
+.modal.wide { width: min(560px, calc(100vw - 48px)); }
+.modal h2 { font-size: 15.5px; font-weight: 650; color: var(--ink-strong); }
+.modal .m-head { display: flex; align-items: center; justify-content: space-between; }
+.modal .m-head button { color: var(--muted); width: 28px; height: 28px;
+  display: grid; place-items: center; border-radius: var(--radius); }
+.modal .m-head button:hover { background: var(--raised); color: var(--ink); }
+.modal .m-section { display: flex; flex-direction: column; gap: 10px; }
+.modal .m-section > .s-head { font-size: 12px; font-weight: 550; color: var(--faint); }
+.modal .m-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.modal .divider { height: 1px; background: var(--border); }
+
+/* share picker */
+.pick-list { display: flex; flex-direction: column; gap: 3px; max-height: 200px; overflow-y: auto; }
+.pick-row { display: flex; align-items: center; gap: 11px; padding: 8px 11px;
+  border-radius: var(--radius); text-align: left; width: 100%;
+  border: 1px solid transparent;
+  transition: background 120ms ease-out, border-color 120ms ease-out; }
+.pick-row:hover { background: var(--raised); }
+.pick-row .icon { color: var(--muted); }
+.pick-row .lbl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-size: 14px; }
+.pick-empty { font-size: 13px; color: var(--muted); padding: 6px 2px; }
+.share-audio-row { display: flex; align-items: flex-start; gap: 9px; }
+.share-audio-row input { margin-top: 3px; accent-color: var(--accent); }
+.share-audio-row .lbl { font-size: 14px; }
+.share-audio-row .hint { font-size: 12.5px; color: var(--muted); }
+
+/* verification */
+.verify-hero { display: flex; flex-direction: column; align-items: center; gap: 14px;
+  padding: 8px 0 2px; }
+.safety-number {
+  font-size: 16px; font-weight: 550; font-variant-numeric: tabular-nums;
+  color: var(--ink-strong); text-align: center; line-height: 1.9;
+  user-select: all;
+}
+.verify-copy { font-size: 13.5px; color: var(--muted); text-align: center; max-width: 340px; }
+.verify-state { display: flex; align-items: center; gap: 8px; font-size: 13.5px; }
+.verify-state.ok { color: var(--accent-ink); }
+.verify-state.pending { color: var(--muted); }
+
+/* members */
+.member-row { display: flex; align-items: center; gap: 10px; padding: 6px 4px; }
+.member-row .meta { flex: 1; }
+.member-row .display { font-size: 14px; }
+.member-row .handle { font-size: 11.5px; color: var(--faint); }
+.member-row .kick { opacity: 0; color: var(--muted); width: 26px; height: 26px;
+  display: grid; place-items: center; border-radius: var(--radius); }
+.member-row:hover .kick { opacity: 1; }
+.member-row .kick:hover { background: var(--danger-bg); color: var(--danger); }
+
+/* command palette */
+#palette-overlay { align-items: start; padding-top: 14vh; display: grid; justify-items: center; }
+.palette { width: min(560px, calc(100vw - 48px)); background: var(--panel);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-lg); overflow: hidden; }
+.palette input { width: 100%; padding: 13px 16px; background: none; border: none;
+  border-bottom: 1px solid var(--border); color: var(--ink-strong); font-size: 15px; }
+.palette input:focus { outline: none; }
+.palette input::placeholder { color: var(--faint); }
+.palette .results { max-height: 320px; overflow-y: auto; padding: 6px; }
+.palette .p-row { display: flex; align-items: center; gap: 11px; width: 100%;
+  padding: 8px 11px; border-radius: var(--radius); text-align: left; font-size: 14px;
+  border: 1px solid transparent; }
+.palette .p-row .icon { color: var(--muted); }
+.palette .p-row .kind { margin-left: auto; font-size: 11.5px; color: var(--faint); }
+.palette .p-row.sel { background: var(--hover); }
+.palette .p-hint { padding: 8px 16px; font-size: 12px; color: var(--faint);
+  border-top: 1px solid var(--border); display: flex; gap: 14px; }
+kbd { font-size: 11px; background: var(--raised);
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 0 5px; }
+
+/* toasts */
+#toasts { position: fixed; right: 18px; bottom: 18px; display: flex;
+  flex-direction: column; gap: 8px; z-index: 60; }
+.toast { display: flex; align-items: center; gap: 10px; min-width: 260px; max-width: 380px;
+  background: var(--panel); border: 1px solid var(--border-strong);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--radius); padding: 10px 14px; font-size: 13.5px; }
+.toast.error { border-left-color: var(--danger); }
+.toast .close { margin-left: auto; color: var(--muted); }
+
+[hidden] { display: none !important; }
+
+
+/* ---------- app-specific additions ---------- */
+
+/* live video canvases inside call tiles */
+.tile canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.tile.sharing-tile { width: min(560px, 60vw); }
+.tile.sharing-tile canvas { object-fit: contain; background: #0e0e0e; }
+
+/* connection banner states */
+.banner.ok { background: var(--accent-bg); color: var(--accent-ink); }
+
+/* pending conversation note */
+.pending-note { text-align: center; font-size: 12.5px; color: var(--faint); padding: 6px 0; }
+
+/* group-picker rows reuse member-row; make the checkbox visible */
+.member-row input[type="checkbox"] { accent-color: var(--accent); }
+label.member-row { cursor: pointer; border-radius: var(--radius); padding: 6px; }
+label.member-row:hover { background: var(--raised); }
+
+/* own messages carry a quiet marker instead of a color shout */
+.msg-group .author.me { color: var(--muted); }
 </style>
 </head>
 <body>
-  <div id="login-view">
-    <div class="login-card">
-      <h1>Enclave</h1>
-      <p class="sub">End-to-end encrypted. The server never sees your password or messages.</p>
+
+<!-- ================= LOGIN ================= -->
+<div id="login-view">
+  <div class="login-card">
+    <div class="login-brand">
+      <span id="brand-seal" aria-hidden="true"></span>
+      <span class="name">Enclave</span>
+    </div>
+    <div class="login-tagline">Your server. Your keys. Your people.</div>
+
+    <div class="login-tabs" role="tablist">
+      <button class="active" id="tab-login">Sign in</button>
+      <button id="tab-create">Create account</button>
+    </div>
+
+    <div class="field">
+      <label for="login-server">Server</label>
+      <input id="login-server" value="ws://127.0.0.1:8443" spellcheck="false">
+      <span class="hint">The relay you or a friend runs. It never sees your messages.</span>
+    </div>
+    <div class="field">
       <label for="login-username">Username</label>
-      <input id="login-username" autocomplete="off" spellcheck="false" placeholder="unique username (letters, digits, . _ -)" />
-      <label for="login-display">Display name <span style="text-transform:none;font-weight:400">(optional, for sign up)</span></label>
-      <input id="login-display" autocomplete="off" spellcheck="false" placeholder="shown to friends; defaults to your username" />
+      <input id="login-username" spellcheck="false" autocomplete="username">
+    </div>
+    <div class="field" id="login-display-wrap" hidden>
+      <label for="login-display">Display name</label>
+      <input id="login-display">
+    </div>
+    <div class="field">
       <label for="login-password">Password</label>
-      <input id="login-password" type="password" autocomplete="off" placeholder="at least 12 characters" />
-      <div class="login-row">
-        <button id="login-btn">Log in</button>
-        <button id="register-btn" class="primary">Create account</button>
-      </div>
-      <details>
-        <summary>Server</summary>
-        <input id="login-server" value="ws://127.0.0.1:8443" spellcheck="false" />
-      </details>
-      <div id="login-error" class="error"></div>
+      <input id="login-password" type="password" autocomplete="current-password">
+      <span class="hint">Never sent to the server: it proves you without revealing itself.</span>
+    </div>
+    <div class="login-error" id="login-error"></div>
+    <button class="btn primary" id="login-go" style="justify-content:center">Sign in</button>
+    <div class="login-footer">
+      <span class="hint" style="font-size:11.5px">Have a backup? Import it from Settings after signing in.</span>
+      <span class="hint" style="font-size:11.5px">AGPL</span>
     </div>
   </div>
+</div>
 
-  <div id="conn-banner" hidden>Reconnecting to server...</div>
+<!-- ================= APP ================= -->
+<div id="app-view" hidden>
 
-  <div id="app-view" hidden>
-    <nav class="rail">
-      <div class="home" title="Enclave">E</div>
-    </nav>
-
-    <aside class="sidebar">
-      <div class="side-scroll">
-        <div class="add-row">
-          <input id="friend" placeholder="Add friend by username" spellcheck="false" />
-          <button id="add-friend" class="small" title="Send friend request">Add</button>
-        </div>
-
-        <div id="requests-section" hidden>
-          <div class="side-head"><span class="side-title">Requests</span></div>
-          <ul id="requests" class="list"></ul>
-        </div>
-
-        <div class="side-head">
-          <span class="side-title">Direct Messages</span>
-        </div>
-        <ul id="friends" class="list"></ul>
-        <div id="friends-empty" class="muted-empty">No friends yet. Add someone by their handle.</div>
-
-        <div class="side-head">
-          <span class="side-title">Groups</span>
-          <button id="new-group" class="icon-btn" title="New group">+</button>
-        </div>
-        <ul id="groups" class="list"></ul>
-
-        <div class="side-head" style="margin-top:12px">
-          <span class="side-title">Backup</span>
-        </div>
-        <div class="add-row">
-          <button id="export-btn" class="small">Export chats</button>
-          <button id="import-btn" class="small">Import</button>
-        </div>
+  <aside id="sidebar">
+    <div class="self-card">
+      <div class="avatar-wrap">
+        <div class="avatar" id="self-avatar">?</div>
+        <span class="presence-dot online" id="self-presence-dot"></span>
       </div>
-
-      <div class="user-panel">
-        <div class="user-id">
-          <div class="avatar" id="avatar"></div>
-          <div class="user-meta">
-            <div class="user-name" id="me-name" title="Click to change your display name"></div>
-            <div class="user-handle" id="me-handle" title="Click to copy your username so friends can add you"></div>
-          </div>
-        </div>
-        <div class="user-controls">
-          <select id="presence" title="Set your status">
-            <option value="online">Online</option>
-            <option value="away">Away</option>
-            <option value="offline">Invisible</option>
+      <div class="who">
+        <div class="display" id="self-display" title="Click to change your display name">?</div>
+        <button class="presence-btn" id="presence-btn" aria-haspopup="menu">
+          <span id="presence-label">Online</span>
+          <svg class="icon sm" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+      </div>
+      <button class="btn ghost" id="open-settings" title="Settings" aria-label="Settings" style="padding:6px">
+        <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+      <div class="presence-menu" id="presence-menu" hidden>
+        <button class="pm-item" data-mode="online">
+          <span class="presence-dot online"></span> Online</button>
+        <button class="pm-item" data-mode="away">
+          <span class="presence-dot away"></span> Away</button>
+        <button class="pm-item" data-mode="offline">
+          <span class="presence-dot offline"></span> Offline
+          <span class="pm-sub">appear offline</span></button>
+        <div class="pm-divider"></div>
+        <div class="pm-keep">
+          <label for="presence-duration">Keep for</label>
+          <select id="presence-duration">
+            <option value="0">until I change it</option>
+            <option value="30">30 minutes</option>
+            <option value="60">1 hour</option>
+            <option value="120">2 hours</option>
+            <option value="480">8 hours</option>
           </select>
-          <button id="audio-btn" class="small" title="Choose your microphone and speaker">Audio</button>
-          <button id="logout" class="small">Log out</button>
         </div>
+        <div class="pm-note">While set to online, 15 idle minutes show you away. A set status never upgrades: disconnecting always shows you offline.</div>
       </div>
-    </aside>
+    </div>
 
-    <main class="chat">
-      <header class="chat-header">
-        <span id="chat-title" class="chat-title">No conversation</span>
-        <span id="safety" class="safety" title="Compare this with your friend out-of-band to verify no one is in the middle"></span>
-        <button id="call-btn" class="hdr-btn small" hidden title="Start or join a voice call in this conversation">Call</button>
-        <button id="mute-btn" class="hdr-btn small" hidden title="Mute or unmute your microphone">Mute</button>
-        <button id="share-btn" class="hdr-btn small" hidden title="Share your screen into the call">Share screen</button>
-        <button id="watch-btn" class="hdr-btn small" hidden title="Watch the shared screen">Watch screen</button>
-        <button id="add-to-group" class="hdr-btn small" hidden title="Add a friend to this group">Add member</button>
-        <button id="remove-member" class="hdr-btn small" hidden title="Remove a member from this group">Remove member</button>
-        <button id="leave-conv" class="hdr-btn small" hidden title="Leave and delete this conversation">Leave</button>
-      </header>
-      <div id="call-banner" class="call-banner" hidden>
-        <span id="call-banner-text"></span>
-        <button id="call-banner-btn" class="small">Join</button>
-      </div>
-      <div id="call-panel" class="call-panel" hidden>
-        <div id="call-tiles" class="call-tiles"></div>
-        <div class="call-controls">
-          <button id="cc-mute" class="cc-btn" title="Mute your microphone">Mute</button>
-          <button id="cc-deafen" class="cc-btn" title="Deafen (silence everyone)">Deafen</button>
-          <button id="cc-share" class="cc-btn" title="Share your screen">Share</button>
-          <button id="cc-camera" class="cc-btn" title="Turn on your camera">Camera</button>
-          <button id="cc-leave" class="cc-btn cc-leave" title="Leave the call">Leave</button>
+    <div class="side-tabs">
+      <button class="active" id="tab-chats">Chats</button>
+      <button id="tab-people">People <span class="count attention" id="req-count" hidden>0</span></button>
+    </div>
+
+    <div class="side-scroll" id="pane-chats">
+      <div class="side-section">
+        <div class="head">
+          <span>Conversations</span>
+          <button id="new-group" title="New group" aria-label="New group">
+            <svg class="icon sm" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
         </div>
+        <div id="convo-list"></div>
+        <div class="pick-empty" id="convos-empty" hidden>No conversations yet. Find your people in the People tab.</div>
       </div>
-      <div id="empty-chat" class="empty-chat">Pick a friend or group to start talking.</div>
-      <div id="log" class="log" hidden></div>
-      <div id="status" class="status"></div>
-      <form id="composer" class="composer" hidden>
-        <input id="message" placeholder="Message" autocomplete="off" />
+    </div>
+
+    <div class="side-scroll" id="pane-people" hidden>
+      <div class="add-friend">
+        <input id="friend" placeholder="add by username" spellcheck="false">
+        <button class="btn" id="add-friend" style="padding:7px 10px" title="Send friend request" aria-label="Send friend request">
+          <svg class="icon sm" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+      </div>
+      <div class="side-section" id="sec-incoming" hidden>
+        <div class="head"><span>Requests for you</span></div>
+        <div id="incoming-list"></div>
+      </div>
+      <div class="side-section" id="sec-outgoing" hidden>
+        <div class="head"><span>Sent requests</span></div>
+        <div id="outgoing-list"></div>
+      </div>
+      <div class="side-section">
+        <div class="head"><span>Friends</span></div>
+        <div id="friend-list"></div>
+        <div class="pick-empty" id="friends-empty">No friends yet. Add one by username above.</div>
+      </div>
+    </div>
+
+    <div class="callbar" id="callbar" hidden>
+      <svg class="icon sm" viewBox="0 0 24 24" style="color:var(--accent)"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+      <span class="txt">In call &middot; <span id="callbar-with"></span></span>
+      <button id="callbar-return" title="Return to call" aria-label="Return to call">
+        <svg class="icon sm" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </button>
+      <button class="leave" id="callbar-leave" title="Leave call" aria-label="Leave call">
+        <svg class="icon sm" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+
+    <div class="server-card" id="server-card">
+      <span class="state-dot"></span>
+      <div class="meta" title="Your relay sees ciphertext and routing only, never a message.">
+        <div class="host" id="server-host">&nbsp;</div>
+        <div class="sub" id="server-state">Connected</div>
+      </div>
+      <button id="palette-hint" title="Command palette (Ctrl+K)" aria-label="Command palette">
+        <svg class="icon sm" viewBox="0 0 24 24"><path d="M4 17V7l6 5 6-5v10"/><path d="M20 7v10"/></svg>
+      </button>
+    </div>
+  </aside>
+
+  <main id="room">
+    <header class="room-header">
+      <button class="seal-btn" id="header-seal" title="Verify identity"></button>
+      <div class="title-wrap">
+        <div class="title" id="room-title">Enclave</div>
+        <div class="subtitle" id="room-subtitle"></div>
+      </div>
+      <div class="header-actions">
+        <button id="btn-members" hidden>
+          <svg class="icon" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          <span id="member-count"></span>
+        </button>
+        <button class="accent" id="btn-call" hidden>
+          <svg class="icon" viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+          <span id="btn-call-label">Call</span>
+        </button>
+      </div>
+    </header>
+
+    <div class="banner reconnect" id="conn-banner" hidden></div>
+
+    <div class="banner ring" id="banner-ring" hidden>
+      <svg class="icon sm" viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+      <span id="ring-text"></span>
+      <span class="spacer"></span>
+      <button class="btn primary" id="ring-accept">Join</button>
+      <button class="btn" id="ring-decline">Decline</button>
+    </div>
+
+    <div class="banner ring" id="banner-live" hidden>
+      <svg class="icon sm" viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+      <span id="live-text"></span>
+      <span class="spacer"></span>
+      <button class="btn primary" id="live-join">Join</button>
+    </div>
+
+    <section id="stage" hidden>
+      <div class="share-offer" id="share-offer" hidden>
+        <span><strong id="share-from"></strong> is sharing a screen</span>
+        <button class="btn" id="btn-watch">Watch</button>
+      </div>
+      <div class="tiles" id="tiles"></div>
+      <div class="stage-controls">
+        <button class="ctl" id="ctl-mic">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v4"/></svg>
+          <span>Mute</span>
+        </button>
+        <button class="ctl" id="ctl-deafen">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg>
+          <span>Deafen</span>
+        </button>
+        <button class="ctl" id="ctl-camera">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M23 7 16 12l7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+          <span>Camera</span>
+        </button>
+        <button class="ctl" id="ctl-share">
+          <svg class="icon" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          <span>Share</span>
+        </button>
+        <button class="ctl leave" id="ctl-leave">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          <span>Leave</span>
+        </button>
+      </div>
+    </section>
+
+    <div id="messages"><div class="msg-col" id="msg-col"></div></div>
+
+    <footer id="composer-bar">
+      <form class="composer-inner" id="composer">
+        <div class="composer-box">
+          <input id="message" placeholder="Message" autocomplete="off">
+          <button class="send-btn" type="submit" title="Send" aria-label="Send">
+            <svg class="icon" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/></svg>
+          </button>
+        </div>
       </form>
-    </main>
-  </div>
+    </footer>
+  </main>
+</div>
 
-  <div id="group-modal" class="overlay" hidden>
-    <div class="modal">
+<!-- ================= MODALS ================= -->
+
+<div class="overlay" id="modal-verify" hidden>
+  <div class="modal">
+    <div class="m-head">
+      <h2 id="verify-title">Verify</h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="verify-hero">
+      <span id="verify-seal"></span>
+      <div class="safety-number" id="safety-number"></div>
+      <div class="verify-copy">
+        Read this number aloud on a call, or compare it in person.
+        If it matches on both machines, no one, not even your server,
+        sits between you.
+      </div>
+      <div class="verify-state pending" id="verify-state"></div>
+    </div>
+    <div class="m-actions">
+      <button class="btn" id="copy-number">Copy number</button>
+      <button class="btn primary" id="mark-verified">We compared, it matches</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="share-modal" hidden>
+  <div class="modal wide">
+    <div class="m-head">
+      <h2>Share to the call</h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="m-section">
+      <div class="s-head">Screens</div>
+      <div class="pick-list" id="share-screens"></div>
+    </div>
+    <div class="m-section">
+      <div class="s-head">Windows</div>
+      <div class="pick-list" id="share-windows"></div>
+    </div>
+    <div class="m-section">
+      <div class="s-head">Cameras</div>
+      <div class="pick-list" id="share-cameras"></div>
+    </div>
+    <div class="divider"></div>
+    <div class="share-audio-row">
+      <input type="checkbox" id="share-audio">
+      <div>
+        <div class="lbl"><label for="share-audio">Also share audio</label></div>
+        <div class="hint" id="share-audio-hint"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="modal-settings" hidden>
+  <div class="modal">
+    <div class="m-head">
+      <h2>Settings</h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="m-section">
+      <div class="s-head">Profile</div>
+      <div class="field">
+        <label for="s-display">Display name</label>
+        <input id="s-display">
+      </div>
+      <div class="field">
+        <label>Username</label>
+        <input id="s-username" disabled title="Click Copy to share it">
+        <span class="hint">Your username is bound to your keys and cannot change.
+          <button id="copy-username" style="color:var(--ink);text-decoration:underline">Copy</button></span>
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div class="m-section">
+      <div class="s-head">Audio</div>
+      <div class="field">
+        <label for="audio-input">Microphone</label>
+        <select id="audio-input"></select>
+      </div>
+      <div class="field">
+        <label for="audio-output">Speaker</label>
+        <select id="audio-output"></select>
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div class="m-section">
+      <div class="s-head">Session</div>
+      <div style="display:flex; gap:8px">
+        <button class="btn" id="export-btn">
+          <svg class="icon sm" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
+          Export encrypted backup</button>
+        <button class="btn" id="import-btn">
+          <svg class="icon sm" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>
+          Import backup</button>
+      </div>
+      <span class="hint" style="font-size:12.5px;color:var(--muted)">
+        The backup holds your keys and history, sealed with your password.</span>
+    </div>
+    <div class="divider"></div>
+    <div class="m-actions" style="justify-content:space-between">
+      <button class="btn danger" id="logout">Log out</button>
+      <button class="btn primary" data-close>Done</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="modal-members" hidden>
+  <div class="modal">
+    <div class="m-head">
+      <h2 id="members-title"></h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="m-section">
+      <div class="s-head">Members</div>
+      <div id="members-list"></div>
+    </div>
+    <div class="m-section">
+      <div class="s-head">Add someone</div>
+      <div class="add-friend" style="padding:0">
+        <input placeholder="friend's username" spellcheck="false" id="member-add-input">
+        <button class="btn" style="padding:7px 12px" id="member-add-btn">Add</button>
+      </div>
+      <span class="hint" style="font-size:12.5px;color:var(--muted)">
+        Adding rekeys the group; the newcomer cannot read anything sent before.</span>
+    </div>
+    <div class="divider"></div>
+    <div class="m-actions" style="justify-content:flex-start">
+      <button class="btn danger" id="leave-conv">Leave conversation</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="group-modal" hidden>
+  <div class="modal">
+    <div class="m-head">
       <h2>New group</h2>
-      <input id="group-name" placeholder="Group name" autocomplete="off" />
-      <label>Members</label>
-      <div id="group-picks" class="pick-list"></div>
-      <div class="modal-actions">
-        <button id="group-cancel">Cancel</button>
-        <button id="group-create" class="primary">Create</button>
-      </div>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="field">
+      <label for="group-name">Name</label>
+      <input id="group-name">
+    </div>
+    <div class="m-section">
+      <div class="s-head">Invite friends</div>
+      <div id="group-picks"></div>
+    </div>
+    <div class="m-actions">
+      <button class="btn" data-close>Cancel</button>
+      <button class="btn primary" id="group-create">Create group</button>
     </div>
   </div>
+</div>
 
-  <div id="audio-modal" class="overlay" hidden>
-    <div class="modal">
-      <h2>Audio settings</h2>
-      <label for="audio-input">Microphone</label>
-      <select id="audio-input" class="device-select"></select>
-      <label for="audio-output">Speaker</label>
-      <select id="audio-output" class="device-select"></select>
-      <p class="hint">Changes apply immediately, even during a call.</p>
-      <div class="modal-actions">
-        <button id="audio-close" class="primary">Done</button>
-      </div>
+<div class="overlay" id="palette-overlay" hidden>
+  <div class="palette">
+    <input id="palette-input" placeholder="Jump to a conversation or run a command..." autocomplete="off">
+    <div class="results" id="palette-results"></div>
+    <div class="p-hint">
+      <span><kbd>&#8593;&#8595;</kbd> navigate</span><span><kbd>Enter</kbd> run</span><span><kbd>Esc</kbd> close</span>
     </div>
   </div>
+</div>
 
-  <div id="share-modal" class="overlay" hidden>
-    <div class="modal">
-      <h2>Share to call</h2>
-      <div class="share-head">Screens</div>
-      <div id="share-screens" class="share-list"><div class="share-empty">Looking for displays...</div></div>
-      <div class="share-head">Windows</div>
-      <div id="share-windows" class="share-list"><div class="share-empty">Looking for windows...</div></div>
-      <div class="share-head">Cameras</div>
-      <div id="share-cameras" class="share-list"><div class="share-empty">Looking for cameras...</div></div>
-      <label class="share-audio"><input id="share-audio" type="checkbox" /> Also share audio</label>
-      <p class="hint" id="share-audio-hint">A window shares only that app's audio. A whole screen shares all system audio, so others may hear the call echo back.</p>
-      <div class="modal-actions">
-        <button id="share-close" class="primary">Cancel</button>
-      </div>
-    </div>
-  </div>
-
-  <div id="screen-viewer" hidden>
-    <div class="sv-head">
-      <span id="sv-title"></span>
-      <button id="sv-close" class="small">Close</button>
-    </div>
-    <canvas id="sv-canvas"></canvas>
-  </div>
-
-  <div id="ring-modal" class="overlay" hidden>
-    <div class="modal ring-modal">
-      <div class="ring-avatar" id="ring-avatar"></div>
-      <h2 id="ring-title">Incoming call</h2>
-      <p class="hint" id="ring-sub"></p>
-      <div class="modal-actions ring-actions">
-        <button id="ring-decline" class="danger-btn">Decline</button>
-        <button id="ring-accept" class="primary">Accept</button>
-      </div>
-    </div>
-  </div>
+<div id="toasts"></div>
 
 <script>
-  const $ = (id) => document.getElementById(id);
-  const send = (cmd) => window.ipc.postMessage(JSON.stringify(cmd));
+"use strict";
+const $ = (id) => document.getElementById(id);
+const send = (cmd) => window.ipc.postMessage(JSON.stringify(cmd));
 
-  // ---- client state (mirrors the controller) ----
-  let myUsername = "", myDisplay = "";
-  let friends = [], incoming = [], outgoing = [];   // arrays of {username, display}
-  const presence = {};           // username -> "online"/"away"/"offline"
-  let conversations = [];        // {id, title, is_dm, pending, members}
-  let activeConv = null;
-  const messages = {};           // conv id -> [{from, text, mine}]
-  let inCall = false;            // am I in any call
-  let myCallConv = null;         // conv id my call is in
-  const callPart = {};           // conv id -> [participant display names]
-  let ringConv = null;           // conv id currently ringing (incoming)
-  const unread = {};             // conv id -> unread message count
-  let sharing = false;           // am I sharing my screen
-  let muted = false;             // is my mic muted
-  let deafened = false;          // is my incoming audio silenced
-  let cameraOn = false;          // is my camera on
-  let watchingStream = true;     // do I want to see an incoming screen share
-  let currentSharer = "";        // who is currently sharing (empty = nobody)
+// ---- client state (mirrors the controller) ----
+let myUsername = "", myDisplay = "";
+let friends = [], incoming = [], outgoing = [];   // arrays of {username, display}
+const presence = {};           // username -> "online"/"away"/"offline"
+let conversations = [];        // {id, title, is_dm, pending, members}
+let activeConv = null;
+let activeSafety = "";         // the active conversation's safety number
+const messages = {};           // conv id -> [{from, text, mine}]
+let inCall = false;            // am I in any call
+let myCallConv = null;         // conv id my call is in
+const callPart = {};           // conv id -> [participant display names]
+let ringConv = null;           // conv id currently ringing (incoming)
+const unread = {};             // conv id -> unread message count
+let sharing = false;           // am I sharing my screen
+let muted = false;             // is my mic muted
+let deafened = false;          // is my incoming audio silenced
+let cameraOn = false;          // is my camera on
+let watchingStream = true;     // do I want to see an incoming screen share
+let currentSharer = "";        // who is currently sharing (empty = nobody)
+let connection = "online";     // server link: online | reconnecting
 
-  // ---- screen share viewer (WebCodecs H.264 -> canvas) ----
-  let svDecoder = null, svGotKey = false, svTs = 0, svTimer = null;
-  function b64ToBytes(b64) {
-    const bin = atob(b64), bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return bytes;
+const initial = (s) => (s || "?").trim().charAt(0).toUpperCase();
+const initials = (name) => (name || "?").split(/\s+/).map(w => w[0] || "").slice(0, 2).join("").toUpperCase();
+const convById = (id) => conversations.find((c) => c.id === id);
+const displayOf = (username) => {
+  const f = friends.find((f) => f.username === username);
+  return f ? f.display : username;
+};
+function serverUrl() { return $("login-server").value.trim() || "ws://127.0.0.1:8443"; }
+
+// ---- the seal: a deterministic glyph from a safety number (hex groups) ----
+// Solid ring = verified, dashed = not. The same generator draws the brand
+// mark at login, keyed by the app's name.
+function sealSVG(safety, verified, size) {
+  const vals = (safety || "").replace(/[^0-9A-Fa-f]/g, "").split("").map((c) => parseInt(c, 16));
+  if (!vals.length) vals.push(0);
+  const seg = (r, a0, a1) => {
+    const p = (a) => [16 + r * Math.cos(a), 16 + r * Math.sin(a)];
+    const [x0, y0] = p(a0), [x1, y1] = p(a1);
+    const large = (a1 - a0) > Math.PI ? 1 : 0;
+    return `M ${x0.toFixed(2)} ${y0.toFixed(2)} A ${r} ${r} 0 ${large} 1 ${x1.toFixed(2)} ${y1.toFixed(2)}`;
+  };
+  let inner = "", mid = "";
+  for (let i = 0; i < 8; i++) {
+    if (vals[i % vals.length] % 2) {
+      const a = (i / 8) * 2 * Math.PI - Math.PI / 2;
+      mid += `<path d="${seg(9.5, a, a + Math.PI / 5)}"/>`;
+    }
+    if (vals[(i + 11) % vals.length] % 3 === 0) {
+      const a = (i / 8) * 2 * Math.PI - Math.PI / 3;
+      inner += `<path d="${seg(5.5, a, a + Math.PI / 3.2)}"/>`;
+    }
   }
-  function closeDecoder() {
-    if (svDecoder) { try { svDecoder.close(); } catch (e) {} svDecoder = null; }
-    svGotKey = false; svTs = 0;
-  }
-  // The sharer stopped (no frames for a while): forget them and drop the viewer.
-  function streamEnded() {
-    closeDecoder();
-    if (svTimer) { clearTimeout(svTimer); svTimer = null; }
-    currentSharer = "";
-    $("screen-viewer").hidden = true;
-    renderCall();
-  }
-  // The user closes the viewer but the sharer keeps going: stop watching, keep
-  // the Watch button available to resume.
-  function stopViewing() {
-    watchingStream = false;
-    closeDecoder();
-    $("screen-viewer").hidden = true;
-    renderCall();
-  }
-  function ensureDecoder() {
-    if (svDecoder) return;
-    const canvas = $("sv-canvas"), ctx = canvas.getContext("2d");
-    svDecoder = new VideoDecoder({
+  const ring = verified
+    ? `<circle cx="16" cy="16" r="13.5" stroke="var(--accent)" stroke-width="2"/>`
+    : `<circle cx="16" cy="16" r="13.5" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="3.4 2.6"/>`;
+  const tone = verified ? "var(--accent-ink)" : "var(--muted)";
+  return `<svg width="${size}" height="${size}" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+    ${ring}
+    <g stroke="${tone}" stroke-width="1.6" stroke-linecap="round">${mid}${inner}</g>
+    <circle cx="16" cy="16" r="1.6" fill="${tone}"/>
+  </svg>`;
+}
+
+// Verified marks live in localStorage keyed by conversation + number, so a
+// rekey (new number) naturally resets to unverified. NOTE: the WebView's
+// storage directory is per-run today, so marks persist only within a run;
+// persisting them in the keystore is a backend follow-up.
+function verifyKey(conv, safety) { return "enclave.verified." + conv + "." + (safety || ""); }
+function isVerified() {
+  if (!activeConv || !activeSafety) return false;
+  try { return localStorage.getItem(verifyKey(activeConv, activeSafety)) === "1"; }
+  catch (e) { return false; }
+}
+function markVerified() {
+  try { localStorage.setItem(verifyKey(activeConv, activeSafety), "1"); } catch (e) {}
+}
+
+// ---- toasts ----
+function toast(text, error) {
+  const t = document.createElement("div");
+  t.className = "toast" + (error ? " error" : "");
+  const span = document.createElement("span");
+  span.textContent = text;
+  t.appendChild(span);
+  const close = document.createElement("button");
+  close.className = "close";
+  close.setAttribute("aria-label", "Dismiss");
+  close.innerHTML = '<svg class="icon sm" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+  close.onclick = () => t.remove();
+  t.appendChild(close);
+  $("toasts").appendChild(t);
+  setTimeout(() => t.remove(), 6000);
+}
+function setStatus(message, isError) { if (message) toast(message, isError); }
+
+// ---- screen share viewer (WebCodecs H.264 -> stage tile canvas) ----
+const svCanvas = document.createElement("canvas");
+let svDecoder = null, svGotKey = false, svTs = 0, svTimer = null;
+function b64ToBytes(b64) {
+  const bin = atob(b64), bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+function closeDecoder() {
+  if (svDecoder) { try { svDecoder.close(); } catch (e) {} svDecoder = null; }
+  svGotKey = false; svTs = 0;
+}
+// The sharer stopped (no frames for a while): forget them and drop the tile.
+function streamEnded() {
+  closeDecoder();
+  if (svTimer) { clearTimeout(svTimer); svTimer = null; }
+  currentSharer = "";
+  renderCall();
+}
+function ensureDecoder() {
+  if (svDecoder) return;
+  const ctx = svCanvas.getContext("2d");
+  svDecoder = new VideoDecoder({
+    output: (frame) => {
+      if (svCanvas.width !== frame.displayWidth) { svCanvas.width = frame.displayWidth; svCanvas.height = frame.displayHeight; }
+      ctx.drawImage(frame, 0, 0, svCanvas.width, svCanvas.height);
+      frame.close();
+    },
+    error: (e) => { console.error("screen decoder", e); closeDecoder(); },
+  });
+  try { svDecoder.configure({ codec: "avc1.42E01E", optimizeForLatency: true }); }
+  catch (e) { console.error("configure", e); closeDecoder(); }
+}
+function handleScreenFrame(ev) {
+  if (typeof VideoDecoder === "undefined") return; // no WebCodecs support
+  if (ev.camera) { handleCameraFrame(ev); return; }
+  const hadSharer = currentSharer;
+  currentSharer = ev.from;
+  if (svTimer) clearTimeout(svTimer);
+  svTimer = setTimeout(streamEnded, 2500); // the sharer went quiet
+  if (hadSharer !== currentSharer) renderCall();
+  if (!watchingStream) return; // not watching: the offer strip stays up
+  ensureDecoder();
+  if (!svDecoder) return;
+  if (!svGotKey && !ev.keyframe) return; // a decoder must start on a keyframe
+  svGotKey = true;
+  try {
+    svDecoder.decode(new EncodedVideoChunk({ type: ev.keyframe ? "key" : "delta", timestamp: svTs, data: b64ToBytes(ev.data) }));
+    svTs += 33333;
+  } catch (e) { console.error("decode", e); }
+}
+
+// ---- per-participant camera tiles (WebCodecs H.264 -> tile canvas) ----
+// Each sharer gets a persistent canvas + decoder so the stream survives tile
+// re-renders; a quiet stream (no frames for 2.5 s) drops the tile.
+const camCanvas = {};   // display name -> HTMLCanvasElement
+const camState = {};    // display name -> { decoder, gotKey, ts, timer }
+function camGone(name) {
+  const st = camState[name];
+  if (st) { if (st.timer) clearTimeout(st.timer); try { st.decoder.close(); } catch (e) {} }
+  delete camState[name];
+  delete camCanvas[name];
+  renderCall();
+}
+function handleCameraFrame(ev) {
+  const name = ev.from;
+  const fresh = !camState[name];
+  if (fresh) {
+    const canvas = document.createElement("canvas");
+    camCanvas[name] = canvas;
+    const ctx = canvas.getContext("2d");
+    const decoder = new VideoDecoder({
       output: (frame) => {
         if (canvas.width !== frame.displayWidth) { canvas.width = frame.displayWidth; canvas.height = frame.displayHeight; }
         ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
         frame.close();
       },
-      error: (e) => { console.error("screen decoder", e); closeDecoder(); },
+      error: (e) => { console.error("camera decoder", e); camGone(name); },
     });
-    try { svDecoder.configure({ codec: "avc1.42E01E", optimizeForLatency: true }); }
-    catch (e) { console.error("configure", e); closeDecoder(); }
+    try { decoder.configure({ codec: "avc1.42E01E", optimizeForLatency: true }); }
+    catch (e) { console.error("camera configure", e); delete camCanvas[name]; return; }
+    camState[name] = { decoder, gotKey: false, ts: 0, timer: null };
   }
-  function handleScreenFrame(ev) {
-    if (typeof VideoDecoder === "undefined") return; // no WebCodecs support
-    if (ev.camera) { handleCameraFrame(ev); return; }
-    currentSharer = ev.from;
-    if (svTimer) clearTimeout(svTimer);
-    svTimer = setTimeout(streamEnded, 2500); // the sharer went quiet
-    if (!watchingStream) { renderCall(); return; } // not watching: just offer Watch
-    $("sv-title").textContent = ev.from + " is sharing their screen";
-    $("screen-viewer").hidden = false;
-    ensureDecoder();
-    if (!svDecoder) return;
-    if (!svGotKey && !ev.keyframe) return; // a decoder must start on a keyframe
-    svGotKey = true;
-    try {
-      svDecoder.decode(new EncodedVideoChunk({ type: ev.keyframe ? "key" : "delta", timestamp: svTs, data: b64ToBytes(ev.data) }));
-      svTs += 33333;
-    } catch (e) { console.error("decode", e); }
-  }
-
-  // ---- per-participant camera tiles (WebCodecs H.264 -> tile canvas) ----
-  // Each sharer gets a persistent canvas + decoder so the stream survives tile
-  // re-renders; a quiet stream (no frames for 2.5 s) drops the tile.
-  const camCanvas = {};   // display name -> HTMLCanvasElement
-  const camState = {};    // display name -> { decoder, gotKey, ts, timer }
-  function camGone(name) {
-    const st = camState[name];
-    if (st) { if (st.timer) clearTimeout(st.timer); try { st.decoder.close(); } catch (e) {} }
-    delete camState[name];
-    delete camCanvas[name];
-    renderCall();
-  }
-  function handleCameraFrame(ev) {
-    const name = ev.from;
-    const fresh = !camState[name];
-    if (fresh) {
-      const canvas = document.createElement("canvas");
-      camCanvas[name] = canvas;
-      const ctx = canvas.getContext("2d");
-      const decoder = new VideoDecoder({
-        output: (frame) => {
-          if (canvas.width !== frame.displayWidth) { canvas.width = frame.displayWidth; canvas.height = frame.displayHeight; }
-          ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-          frame.close();
-        },
-        error: (e) => { console.error("camera decoder", e); camGone(name); },
-      });
-      try { decoder.configure({ codec: "avc1.42E01E", optimizeForLatency: true }); }
-      catch (e) { console.error("camera configure", e); delete camCanvas[name]; return; }
-      camState[name] = { decoder, gotKey: false, ts: 0, timer: null };
-    }
+  const st = camState[name];
+  if (st.timer) clearTimeout(st.timer);
+  st.timer = setTimeout(() => camGone(name), 2500);
+  if (!st.gotKey && !ev.keyframe) { if (fresh) renderCall(); return; }
+  st.gotKey = true;
+  try {
+    st.decoder.decode(new EncodedVideoChunk({ type: ev.keyframe ? "key" : "delta", timestamp: st.ts, data: b64ToBytes(ev.data) }));
+    st.ts += 33333;
+  } catch (e) { console.error("camera decode", e); }
+  if (fresh) renderCall(); // place the new tile canvas
+}
+function clearAllCameras() {
+  for (const name of Object.keys(camState)) {
     const st = camState[name];
     if (st.timer) clearTimeout(st.timer);
-    st.timer = setTimeout(() => camGone(name), 2500);
-    if (!st.gotKey && !ev.keyframe) { if (fresh) renderCall(); return; }
-    st.gotKey = true;
-    try {
-      st.decoder.decode(new EncodedVideoChunk({ type: ev.keyframe ? "key" : "delta", timestamp: st.ts, data: b64ToBytes(ev.data) }));
-      st.ts += 33333;
-    } catch (e) { console.error("camera decode", e); }
-    if (fresh) renderCall(); // place the new tile canvas
+    try { st.decoder.close(); } catch (e) {}
+    delete camState[name]; delete camCanvas[name];
   }
-  function clearAllCameras() {
-    for (const name of Object.keys(camState)) {
-      const st = camState[name];
-      if (st.timer) clearTimeout(st.timer);
-      try { st.decoder.close(); } catch (e) {}
-      delete camState[name]; delete camCanvas[name];
+}
+
+// ---- share-source picker ----
+function openShareModal() {
+  fillPickEmpty("share-screens", "Looking for displays...");
+  fillPickEmpty("share-windows", "Looking for windows...");
+  fillPickEmpty("share-cameras", "Looking for cameras...");
+  $("share-audio").checked = false;
+  openModal("share-modal");
+  send({ type: "ListShareSources" });
+}
+function fillPickEmpty(id, text) {
+  const box = $(id);
+  box.innerHTML = "";
+  const d = document.createElement("div");
+  d.className = "pick-empty"; d.textContent = text;
+  box.appendChild(d);
+}
+const PICK_ICONS = {
+  screen: '<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>',
+  window: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/>',
+  camera: '<path d="M23 7 16 12l7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/>',
+};
+const PICK_EMPTY = {
+  screen: "No displays found",
+  window: "No windows to list here; the system dialog picks them.",
+  camera: "No cameras found",
+};
+function fillShareList(boxId, items, kind) {
+  const box = $(boxId);
+  box.innerHTML = "";
+  if (!items || !items.length) { fillPickEmpty(boxId, PICK_EMPTY[kind]); return; }
+  for (const it of items) {
+    const row = document.createElement("button");
+    row.className = "pick-row";
+    row.innerHTML = '<svg class="icon" viewBox="0 0 24 24">' + PICK_ICONS[kind] + '</svg><span class="lbl"></span>';
+    row.querySelector(".lbl").textContent = it.name || it.id;
+    row.title = it.name || it.id;
+    row.addEventListener("click", () => {
+      closeModals();
+      // it.id already encodes the kind; audio applies to screens/windows only.
+      send({ type: "StartShare", source: it.id, audio: $("share-audio").checked });
+    });
+    box.appendChild(row);
+  }
+}
+
+// A short in-app "ding" for a message arriving in a non-focused conversation.
+function ding() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = "sine"; o.frequency.value = 660;
+    o.connect(g); g.connect(ctx.destination);
+    const t = ctx.currentTime;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.15, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
+    o.start(t); o.stop(t + 0.27);
+    setTimeout(() => { try { ctx.close(); } catch (e) {} }, 400);
+  } catch (e) {}
+}
+
+// ---- ringtone (WebAudio, no bundled asset) ----
+let ringCtx = null, ringInterval = null, ringTimeout = null;
+function ringBeep() {
+  if (!ringCtx) return;
+  const t = ringCtx.currentTime;
+  for (const off of [0, 0.45]) {
+    const o = ringCtx.createOscillator(), g = ringCtx.createGain();
+    o.type = "sine"; o.frequency.value = 480;
+    o.connect(g); g.connect(ringCtx.destination);
+    g.gain.setValueAtTime(0.0001, t + off);
+    g.gain.exponentialRampToValueAtTime(0.16, t + off + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + off + 0.35);
+    o.start(t + off); o.stop(t + off + 0.37);
+  }
+}
+function startRing() {
+  if (ringInterval) return;
+  try { ringCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+  ringBeep();
+  ringInterval = setInterval(ringBeep, 2500);
+}
+function stopRing() {
+  if (ringInterval) { clearInterval(ringInterval); ringInterval = null; }
+  if (ringTimeout) { clearTimeout(ringTimeout); ringTimeout = null; }
+  if (ringCtx) { try { ringCtx.close(); } catch (e) {} ringCtx = null; }
+}
+function dismissRing() { stopRing(); ringConv = null; $("banner-ring").hidden = true; }
+
+// ---- call control ----
+function joinCall(convId) {
+  if (!convId) return;
+  if (inCall && myCallConv !== convId) send({ type: "LeaveCall" });
+  if (activeConv !== convId) send({ type: "SwitchConversation", conv: convId });
+  myCallConv = convId; inCall = true;
+  send({ type: "StartCall" });
+  dismissRing();
+  renderCall();
+}
+function leaveCall() {
+  send({ type: "LeaveCall" });
+  inCall = false; myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false;
+  watchingStream = true; streamEnded(); clearAllCameras();
+  renderCall();
+}
+// Am I in the active conversation's call? Trust the client flag OR the server's
+// participant list (authoritative), so Leave is always reachable once I have
+// joined, even if myCallConv drifts.
+function amInThisCall() {
+  if (!inCall || !activeConv) return false;
+  if (myCallConv === activeConv) return true;
+  return (callPart[activeConv] || []).includes(myDisplay);
+}
+
+function renderCallTiles(parts) {
+  const box = $("tiles");
+  box.innerHTML = "";
+  for (const name of parts) {
+    const me = name === myDisplay;
+    const tile = document.createElement("div");
+    tile.className = "tile";
+    const cam = camCanvas[name];
+    if (cam) tile.appendChild(cam); // the live webcam fills the tile
+    else {
+      const av = document.createElement("div");
+      av.className = "avatar lg";
+      av.textContent = initials(name);
+      tile.appendChild(av);
     }
+    const plate = document.createElement("span");
+    plate.className = "nameplate";
+    plate.textContent = me ? "You" : name;
+    if (me && muted) plate.innerHTML += ' <svg class="icon" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v4"/><path d="M4 4l16 16"/></svg>';
+    tile.appendChild(plate);
+    box.appendChild(tile);
+  }
+  // The incoming screen share becomes a wide tile while we watch it.
+  if (currentSharer && watchingStream) {
+    const tile = document.createElement("div");
+    tile.className = "tile sharing-tile";
+    tile.appendChild(svCanvas);
+    const plate = document.createElement("span");
+    plate.className = "nameplate";
+    plate.textContent = currentSharer + "'s screen";
+    tile.appendChild(plate);
+    box.appendChild(tile);
+  }
+}
+
+function setCtl(id, on, label, cls) {
+  const b = $(id);
+  b.classList.remove("engaged", "off");
+  if (on) b.classList.add(cls);
+  b.querySelector("span").textContent = label;
+}
+
+// Drive the header affordance, the docked stage, the banners, and the mini bar.
+function renderCall() {
+  const conv = convById(activeConv);
+  const parts = callPart[activeConv] || [];
+  const active = parts.length > 0;
+  const mineHere = amInThisCall();
+  if (mineHere && myCallConv !== activeConv) myCallConv = activeConv;
+
+  // Header call button: hidden while in this call (Leave lives on the stage).
+  const btn = $("btn-call");
+  if (!conv || conv.pending) btn.hidden = true;
+  else { btn.hidden = mineHere; $("btn-call-label").textContent = active ? "Join call" : "Call"; }
+
+  // Mini bar: in a call somewhere else.
+  const showBar = inCall && myCallConv && myCallConv !== activeConv;
+  $("callbar").hidden = !showBar;
+  if (showBar) {
+    const c = convById(myCallConv);
+    $("callbar-with").textContent = c ? c.title : "";
   }
 
-  // ---- share-source picker ----
-  function openShareModal() {
-    $("share-screens").innerHTML = '<div class="share-empty">Looking for displays...</div>';
-    $("share-windows").innerHTML = '<div class="share-empty">Looking for windows...</div>';
-    $("share-cameras").innerHTML = '<div class="share-empty">Looking for cameras...</div>';
-    $("share-audio").checked = false;
-    $("share-modal").hidden = false;
-    send({ type: "ListShareSources" });
+  // Live-call banner offers Join when there is a call here I am not in.
+  const live = $("banner-live");
+  if (conv && active && !mineHere && ringConv !== activeConv) {
+    live.hidden = false;
+    $("live-text").textContent = "Call in progress: " + parts.join(", ");
+  } else {
+    live.hidden = true;
   }
-  const SHARE_ICON = { screen: "[ ]", window: "[_]", camera: "( )" };
-  const SHARE_EMPTY = { screen: "No displays found", window: "No windows found", camera: "No cameras found" };
-  function fillShareList(boxId, items, kind) {
-    const box = $(boxId);
-    box.innerHTML = "";
-    if (!items || !items.length) {
-      box.innerHTML = '<div class="share-empty">' + SHARE_EMPTY[kind] + "</div>";
-      return;
+
+  // The stage while in this call.
+  $("stage").hidden = !mineHere;
+  if (mineHere) {
+    renderCallTiles(parts);
+    setCtl("ctl-mic", muted, muted ? "Unmute" : "Mute", "off");
+    setCtl("ctl-deafen", deafened, deafened ? "Undeafen" : "Deafen", "off");
+    setCtl("ctl-camera", cameraOn, cameraOn ? "Camera off" : "Camera", "engaged");
+    setCtl("ctl-share", sharing, sharing ? "Stop sharing" : "Share", "engaged");
+    const offer = $("share-offer");
+    offer.hidden = !currentSharer;
+    if (currentSharer) {
+      $("share-from").textContent = currentSharer;
+      $("btn-watch").textContent = watchingStream ? "Stop watching" : "Watch";
     }
-    for (const it of items) {
-      const row = document.createElement("button");
-      row.className = "share-row";
-      row.innerHTML = '<span class="ico"></span><span class="lbl"></span>';
-      row.querySelector(".ico").textContent = SHARE_ICON[kind];
-      row.querySelector(".lbl").textContent = it.name || it.id;
-      row.title = it.name || it.id;
-      row.addEventListener("click", () => {
-        $("share-modal").hidden = true;
-        // it.id already encodes the kind; audio applies to screens/windows only.
-        send({ type: "StartShare", source: it.id, audio: $("share-audio").checked });
+  }
+}
+
+// ---- presence: set status + duration; idle only ever downgrades ----
+// The shown status = min(set status, reality): 15 idle minutes cap online at
+// away, and the server shows offline on disconnect no matter what. A timed
+// status expires back to online.
+const IDLE_MS = 15 * 60 * 1000;
+const selfPresence = { mode: "online", until: null };
+let lastActivity = Date.now();
+let lastSent = "";
+const cap = (w) => w[0].toUpperCase() + w.slice(1);
+["mousemove", "keydown", "pointerdown"].forEach((ev) =>
+  document.addEventListener(ev, () => { lastActivity = Date.now(); }, { passive: true }));
+
+function shownPresence() {
+  if (selfPresence.mode === "online" && Date.now() - lastActivity > IDLE_MS) return "away";
+  return selfPresence.mode;
+}
+function applyPresence() {
+  const shown = shownPresence();
+  if (myUsername && shown !== lastSent) {
+    send({ type: "SetPresence", status: shown });
+    lastSent = shown;
+  }
+  $("self-presence-dot").className = "presence-dot " +
+    (connection === "online" ? shown : "offline");
+  let label = cap(shown);
+  if (shown === "away" && selfPresence.mode === "online") label += " · idle";
+  if (selfPresence.until) {
+    const mins = Math.max(1, Math.ceil((selfPresence.until - Date.now()) / 60000));
+    label += mins >= 60 ? ` · ${Math.round(mins / 60)} h left` : ` · ${mins} min left`;
+  }
+  $("presence-label").textContent = label;
+}
+setInterval(() => {
+  if (selfPresence.until && Date.now() > selfPresence.until) {
+    selfPresence.mode = "online"; selfPresence.until = null;
+    toast("Status expired; you are online again");
+  }
+  if (myUsername) applyPresence();
+}, 1000);
+
+$("presence-btn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const menu = $("presence-menu");
+  menu.hidden = !menu.hidden;
+  if (!menu.hidden) {
+    menu.querySelectorAll(".pm-item .check").forEach((c) => c.remove());
+    const cur = menu.querySelector(`[data-mode="${selfPresence.mode}"]`);
+    if (cur) cur.insertAdjacentHTML("beforeend",
+      '<svg class="icon check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>');
+  }
+});
+document.querySelectorAll("#presence-menu .pm-item").forEach((b) => b.addEventListener("click", () => {
+  selfPresence.mode = b.dataset.mode;
+  const mins = +$("presence-duration").value;
+  selfPresence.until = mins ? Date.now() + mins * 60000 : null;
+  $("presence-menu").hidden = true;
+  applyPresence();
+}));
+document.addEventListener("mousedown", (e) => {
+  if (!$("presence-menu").hidden && !e.target.closest(".self-card")) $("presence-menu").hidden = true;
+});
+
+// ---- auth ----
+let creating = false;
+function setAuthMode(create) {
+  creating = create;
+  $("tab-login").classList.toggle("active", !create);
+  $("tab-create").classList.toggle("active", create);
+  $("login-display-wrap").hidden = !create;
+  $("login-go").textContent = create ? "Create account" : "Sign in";
+  $("login-error").textContent = "";
+}
+$("tab-login").addEventListener("click", () => setAuthMode(false));
+$("tab-create").addEventListener("click", () => setAuthMode(true));
+function doAuth() {
+  const username = $("login-username").value.trim();
+  const display = $("login-display").value.trim();
+  const password = $("login-password").value;
+  $("login-error").textContent = "";
+  if (!username || !password) { $("login-error").textContent = "Enter a username and password."; return; }
+  if (creating && password.length < 12) { $("login-error").textContent = "Password must be at least 12 characters."; return; }
+  const cmd = { type: creating ? "CreateAccount" : "Login", server: serverUrl(), username, password };
+  if (creating) cmd.display = display;
+  send(cmd);
+}
+$("login-go").addEventListener("click", doAuth);
+$("login-password").addEventListener("keydown", (e) => { if (e.key === "Enter") doAuth(); });
+
+function copyText(t) {
+  try { navigator.clipboard.writeText(t); return; } catch (e) {}
+  const ta = document.createElement("textarea");
+  ta.value = t; ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); } catch (e) {}
+  document.body.removeChild(ta);
+}
+
+// ---- sidebar: tabs, conversations, people ----
+function setTab(tab) {
+  $("tab-chats").classList.toggle("active", tab === "chats");
+  $("tab-people").classList.toggle("active", tab === "people");
+  $("pane-chats").hidden = tab !== "chats";
+  $("pane-people").hidden = tab !== "people";
+}
+$("tab-chats").addEventListener("click", () => setTab("chats"));
+$("tab-people").addEventListener("click", () => setTab("people"));
+
+function statusOf(u) { return presence[u] || "offline"; }
+function dmPeer(conv) {
+  if (!conv.is_dm || !conv.members) return null;
+  return conv.members.find((m) => m !== myUsername) || null;
+}
+function lastLine(convId) {
+  const list = messages[convId] || [];
+  if (!list.length) return "";
+  const m = list[list.length - 1];
+  return (m.mine ? "you: " : "") + m.text;
+}
+
+function renderConvoList() {
+  const el = $("convo-list");
+  el.innerHTML = "";
+  $("convos-empty").hidden = conversations.length > 0;
+  for (const c of conversations) {
+    const row = document.createElement("button");
+    row.className = "convo-row" + (c.id === activeConv ? " active" : "");
+    const peer = dmPeer(c);
+    const avWrap = document.createElement("div");
+    if (peer) {
+      avWrap.className = "avatar-wrap";
+      avWrap.innerHTML = '<div class="avatar"></div><span class="presence-dot"></span>';
+      avWrap.querySelector(".avatar").textContent = initials(c.title);
+      avWrap.querySelector(".presence-dot").classList.add(statusOf(peer));
+    } else {
+      avWrap.className = "avatar";
+      avWrap.textContent = initials(c.title);
+    }
+    row.appendChild(avWrap);
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const name = document.createElement("div");
+    name.className = "name"; name.textContent = c.title;
+    const last = document.createElement("div");
+    last.className = "last";
+    last.textContent = c.pending ? "starting conversation..." :
+      lastLine(c.id) || (c.is_dm ? "" : (c.members || []).length + " members");
+    meta.appendChild(name); meta.appendChild(last);
+    row.appendChild(meta);
+    const inThat = inCall && myCallConv === c.id;
+    if (inThat || (callPart[c.id] || []).length) {
+      const live = document.createElement("span");
+      live.className = "live";
+      live.innerHTML = '<span class="live-dot"></span>' + (inThat ? "in call" : "live");
+      row.appendChild(live);
+    } else if (unread[c.id]) {
+      const b = document.createElement("span");
+      b.className = "unread"; b.textContent = unread[c.id] > 99 ? "99+" : unread[c.id];
+      row.appendChild(b);
+    }
+    row.addEventListener("click", () => send({ type: "SwitchConversation", conv: c.id }));
+    el.appendChild(row);
+  }
+}
+
+function personRow(p, dotStatus) {
+  const row = document.createElement("div");
+  row.className = "person-row";
+  const av = document.createElement("div");
+  av.className = "avatar-wrap";
+  av.innerHTML = '<div class="avatar"></div>' + (dotStatus ? '<span class="presence-dot"></span>' : "");
+  av.querySelector(".avatar").textContent = initials(p.display || p.username);
+  if (dotStatus) av.querySelector(".presence-dot").classList.add(dotStatus);
+  row.appendChild(av);
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.innerHTML = '<div class="display"></div><div class="handle"></div>';
+  meta.querySelector(".display").textContent = p.display || p.username;
+  meta.querySelector(".handle").textContent = p.username;
+  row.appendChild(meta);
+  const actions = document.createElement("div");
+  actions.className = "row-actions";
+  row.appendChild(actions);
+  return row;
+}
+function actionBtn(cls, title, svg) {
+  const b = document.createElement("button");
+  b.className = cls; b.title = title; b.setAttribute("aria-label", title);
+  b.innerHTML = svg;
+  return b;
+}
+const SVG_CHECK = '<svg class="icon sm" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>';
+const SVG_X = '<svg class="icon sm" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+const SVG_MSG = '<svg class="icon sm" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>';
+const SVG_TRASH = '<svg class="icon sm" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>';
+
+function renderPeople() {
+  const inc = $("incoming-list"); inc.innerHTML = "";
+  for (const f of incoming) {
+    const row = personRow(f, null);
+    const acts = row.querySelector(".row-actions");
+    const ok = actionBtn("ok", "Accept", SVG_CHECK);
+    ok.addEventListener("click", () => send({ type: "AcceptFriend", handle: f.username }));
+    const no = actionBtn("no", "Decline", SVG_X);
+    no.addEventListener("click", () => send({ type: "DeclineFriend", handle: f.username }));
+    acts.appendChild(ok); acts.appendChild(no);
+    inc.appendChild(row);
+  }
+  $("sec-incoming").hidden = !incoming.length;
+
+  const out = $("outgoing-list"); out.innerHTML = "";
+  for (const f of outgoing) {
+    const row = personRow(f, null);
+    const acts = row.querySelector(".row-actions");
+    const no = actionBtn("no", "Cancel request", SVG_X);
+    no.addEventListener("click", () => send({ type: "RemoveFriend", handle: f.username }));
+    acts.appendChild(no);
+    out.appendChild(row);
+  }
+  $("sec-outgoing").hidden = !outgoing.length;
+
+  const fr = $("friend-list"); fr.innerHTML = "";
+  $("friends-empty").hidden = friends.length > 0;
+  for (const f of friends) {
+    const row = personRow(f, statusOf(f.username));
+    const acts = row.querySelector(".row-actions");
+    const msg = actionBtn("", "Message", SVG_MSG);
+    msg.addEventListener("click", () => { setTab("chats"); send({ type: "OpenDm", handle: f.username }); });
+    const rm = actionBtn("no", "Remove friend", SVG_TRASH);
+    rm.addEventListener("click", () => {
+      if (confirm("Remove " + f.display + " from your friends?")) send({ type: "RemoveFriend", handle: f.username });
+    });
+    acts.appendChild(msg); acts.appendChild(rm);
+    row.addEventListener("dblclick", () => { setTab("chats"); send({ type: "OpenDm", handle: f.username }); });
+    fr.appendChild(row);
+  }
+
+  const n = incoming.length;
+  $("req-count").textContent = n;
+  $("req-count").hidden = !n;
+}
+
+// ---- conversation header + messages ----
+function renderHeader() {
+  const conv = convById(activeConv);
+  const sub = $("room-subtitle");
+  if (!conv) {
+    $("room-title").textContent = "Enclave";
+    sub.textContent = "Pick a conversation, or press Ctrl+K";
+    $("header-seal").innerHTML = "";
+    $("btn-members").hidden = true;
+    return;
+  }
+  $("room-title").textContent = conv.title;
+  $("header-seal").innerHTML = activeSafety ? sealSVG(activeSafety, isVerified(), 30) : "";
+  if (conv.pending) {
+    sub.textContent = "Starting the conversation...";
+  } else if (!activeSafety) {
+    sub.textContent = "End-to-end encrypted";
+  } else if (isVerified()) {
+    sub.innerHTML = 'End-to-end encrypted &middot; <span class="verified-tag">verified</span>';
+  } else {
+    sub.innerHTML = 'End-to-end encrypted &middot; not verified: <button class="verify-link" id="verify-link">verify now</button>';
+    sub.querySelector("#verify-link").addEventListener("click", openVerify);
+  }
+  const isGroup = !conv.is_dm;
+  $("btn-members").hidden = !isGroup;
+  if (isGroup) $("member-count").textContent = (conv.members || []).length + " members";
+}
+
+function messageGroup(m) {
+  const g = document.createElement("div");
+  g.className = "msg-group";
+  const av = document.createElement("div");
+  av.className = "avatar";
+  av.textContent = initials(m.mine ? myDisplay : m.from);
+  g.appendChild(av);
+  const body = document.createElement("div");
+  body.className = "body";
+  const byline = document.createElement("div");
+  byline.className = "byline";
+  const author = document.createElement("span");
+  author.className = "author" + (m.mine ? " me" : "");
+  author.textContent = m.mine ? "You" : m.from;
+  byline.appendChild(author);
+  body.appendChild(byline);
+  g.appendChild(body);
+  return g;
+}
+function appendInto(col, m, prev) {
+  // Consecutive lines from the same author fold into one group.
+  const key = m.mine ? "__me__" : m.from;
+  if (prev && prev.key === key) {
+    const p = document.createElement("p");
+    p.textContent = m.text;
+    prev.el.querySelector(".body").appendChild(p);
+    return prev;
+  }
+  const g = messageGroup(m);
+  const p = document.createElement("p");
+  p.textContent = m.text;
+  g.querySelector(".body").appendChild(p);
+  col.appendChild(g);
+  return { key, el: g };
+}
+let lastGroup = null;
+function renderChat() {
+  const conv = convById(activeConv);
+  const col = $("msg-col");
+  col.innerHTML = "";
+  lastGroup = null;
+  $("composer-bar").hidden = !conv;
+  if (!conv) {
+    const d = document.createElement("div");
+    d.className = "empty-room";
+    d.style.padding = "80px 0";
+    d.innerHTML = '<div class="inner"><span id="empty-brand"></span>' +
+      '<div class="big">Nothing open</div>' +
+      '<div>Pick a conversation on the left, message a friend from the People tab, or press Ctrl+K.</div></div>';
+    col.appendChild(d);
+    d.querySelector("#empty-brand").innerHTML = sealSVG(BRAND_SAFETY, true, 44);
+    renderCall();
+    return;
+  }
+  $("message").disabled = conv.pending;
+  $("message").placeholder = conv.pending ? "Starting conversation..." : "Message " + conv.title;
+  const list = messages[activeConv] || [];
+  if (!list.length && !conv.pending) {
+    const d = document.createElement("div");
+    d.className = "empty-room";
+    d.style.padding = "60px 0";
+    d.innerHTML = '<div class="inner"><span id="empty-seal"></span>' +
+      '<div class="big">This room is sealed</div>' +
+      '<div class="empty-sub"></div></div>';
+    d.querySelector("#empty-seal").innerHTML = activeSafety ? sealSVG(activeSafety, isVerified(), 44) : "";
+    d.querySelector(".empty-sub").textContent =
+      "Only the members hold the keys. Say something; the server relays ciphertext and nothing else.";
+    col.appendChild(d);
+  }
+  for (const m of list) lastGroup = appendInto(col, m, lastGroup);
+  if (conv.pending) {
+    const n = document.createElement("div");
+    n.className = "pending-note";
+    n.textContent = "Waiting for the other side to come online so keys can be exchanged.";
+    col.appendChild(n);
+  }
+  $("messages").scrollTop = $("messages").scrollHeight;
+  renderCall();
+}
+function appendMessage(m) {
+  // The empty-state placeholder is no longer true once a message lands.
+  const placeholder = $("msg-col").querySelector(".empty-room");
+  if (placeholder) { placeholder.remove(); lastGroup = null; }
+  lastGroup = appendInto($("msg-col"), m, lastGroup);
+  $("messages").scrollTop = $("messages").scrollHeight;
+}
+
+// ---- verify modal ----
+function openVerify() {
+  const conv = convById(activeConv);
+  if (!conv || !activeSafety) return;
+  $("verify-title").textContent = "Verify " + conv.title;
+  $("verify-seal").innerHTML = sealSVG(activeSafety, isVerified(), 72);
+  $("safety-number").textContent = activeSafety;
+  const st = $("verify-state");
+  if (isVerified()) {
+    st.className = "verify-state ok";
+    st.innerHTML = SVG_CHECK + "<span>Verified on this device</span>";
+    $("mark-verified").hidden = true;
+  } else {
+    st.className = "verify-state pending";
+    st.innerHTML = '<svg class="icon sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke-dasharray="4 3"/></svg><span>Not verified yet</span>';
+    $("mark-verified").hidden = false;
+  }
+  openModal("modal-verify");
+}
+$("header-seal").addEventListener("click", openVerify);
+$("copy-number").addEventListener("click", () => { copyText(activeSafety); toast("Safety number copied"); });
+$("mark-verified").addEventListener("click", () => {
+  markVerified();
+  closeModals();
+  renderHeader();
+  const conv = convById(activeConv);
+  toast((conv ? conv.title : "Conversation") + " is verified; the seal is now solid");
+});
+
+// ---- members modal ----
+function openMembers() {
+  const conv = convById(activeConv);
+  if (!conv) return;
+  $("members-title").textContent = conv.title;
+  const list = $("members-list");
+  list.innerHTML = "";
+  for (const u of conv.members || []) {
+    const row = document.createElement("div");
+    row.className = "member-row";
+    const av = document.createElement("div");
+    av.className = "avatar"; av.textContent = initials(displayOf(u));
+    row.appendChild(av);
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.innerHTML = '<div class="display"></div><div class="handle"></div>';
+    meta.querySelector(".display").textContent = displayOf(u) + (u === myUsername ? " (you)" : "");
+    meta.querySelector(".handle").textContent = u;
+    row.appendChild(meta);
+    if (u !== myUsername && !conv.is_dm) {
+      const kick = actionBtn("kick", "Remove from group", SVG_X);
+      kick.addEventListener("click", () => {
+        if (confirm("Remove " + displayOf(u) + " from " + conv.title + "? The group rekeys.")) {
+          send({ type: "RemoveMember", conv: conv.id, member: u });
+          closeModals();
+        }
       });
-      box.appendChild(row);
+      row.appendChild(kick);
     }
+    list.appendChild(row);
   }
+  openModal("modal-members");
+}
+$("btn-members").addEventListener("click", openMembers);
+$("member-add-btn").addEventListener("click", () => {
+  const v = $("member-add-input").value.trim();
+  if (v) { send({ type: "AddToGroup", handle: v }); $("member-add-input").value = ""; closeModals(); }
+});
+$("leave-conv").addEventListener("click", () => {
+  const conv = convById(activeConv);
+  if (!conv) return;
+  if (confirm("Leave and delete " + conv.title + "? It is removed from this device.")) {
+    send({ type: "LeaveConversation", conv: activeConv });
+    closeModals();
+  }
+});
 
-  // A short in-app "ding" for a message arriving in a non-focused conversation.
-  function ding() {
-    try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const o = ctx.createOscillator(), g = ctx.createGain();
-      o.type = "sine"; o.frequency.value = 660;
-      o.connect(g); g.connect(ctx.destination);
-      const t = ctx.currentTime;
-      g.gain.setValueAtTime(0.0001, t);
-      g.gain.exponentialRampToValueAtTime(0.15, t + 0.01);
-      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
-      o.start(t); o.stop(t + 0.27);
-      setTimeout(() => { try { ctx.close(); } catch (e) {} }, 400);
-    } catch (e) {}
+// ---- new-group modal ----
+function openGroupModal() {
+  $("group-name").value = "";
+  const box = $("group-picks");
+  box.innerHTML = "";
+  if (!friends.length) {
+    const d = document.createElement("div");
+    d.className = "pick-empty"; d.textContent = "Add friends first.";
+    box.appendChild(d);
   }
+  for (const f of friends) {
+    const row = document.createElement("label");
+    row.className = "member-row";
+    row.innerHTML = '<input type="checkbox"><div class="avatar"></div>' +
+      '<div class="meta"><div class="display"></div><div class="handle"></div></div>';
+    row.querySelector("input").value = f.username;
+    row.querySelector(".avatar").textContent = initials(f.display);
+    row.querySelector(".display").textContent = f.display;
+    row.querySelector(".handle").textContent = f.username;
+    box.appendChild(row);
+  }
+  openModal("group-modal");
+}
+$("new-group").addEventListener("click", openGroupModal);
+$("group-create").addEventListener("click", () => {
+  const name = $("group-name").value.trim() || "New group";
+  const members = Array.from(document.querySelectorAll("#group-picks input:checked")).map((el) => el.value);
+  if (!members.length) return;
+  send({ type: "CreateGroup", name, members });
+  closeModals();
+});
 
-  // Unread count + call-active indicators for a sidebar row.
-  function rowBadge(convId) {
-    if (!convId) return "";
-    let h = "";
-    if (callPart[convId] && callPart[convId].length) h += '<span class="call-dot" title="Call in progress"></span>';
-    const n = unread[convId] || 0;
-    if (n > 0) h += '<span class="badge">' + (n > 99 ? "99+" : n) + '</span>';
-    return h;
+// ---- settings modal ----
+function openSettings() {
+  $("s-display").value = myDisplay;
+  $("s-username").value = myUsername;
+  send({ type: "ListAudioDevices" });
+  openModal("modal-settings");
+}
+$("open-settings").addEventListener("click", openSettings);
+$("s-display").addEventListener("change", () => {
+  const name = $("s-display").value.trim();
+  if (name && name !== myDisplay) {
+    myDisplay = name;
+    $("self-display").textContent = myDisplay;
+    $("self-avatar").textContent = initials(myDisplay);
+    send({ type: "SetDisplayName", display: myDisplay });
   }
+});
+$("copy-username").addEventListener("click", () => { copyText(myUsername); toast("Copied your username: " + myUsername); });
+$("audio-input").addEventListener("change", (e) => send({ type: "SetInputDevice", name: e.target.value }));
+$("audio-output").addEventListener("change", (e) => send({ type: "SetOutputDevice", name: e.target.value }));
+$("export-btn").addEventListener("click", () => send({ type: "ExportSession" }));
+$("import-btn").addEventListener("click", () => {
+  const path = prompt("Full path to your exported backup file:");
+  if (path && path.trim()) send({ type: "ImportSession", path: path.trim() });
+});
+$("logout").addEventListener("click", () => send({ type: "Logout" }));
 
-  function serverUrl() { return $("login-server").value.trim() || "ws://127.0.0.1:8443"; }
-  const initial = (s) => (s || "?").trim().charAt(0);
-  const convById = (id) => conversations.find((c) => c.id === id);
+// Display-name edit from the self card too.
+$("self-display").addEventListener("click", () => {
+  const name = prompt("Display name", myDisplay);
+  if (name !== null && name.trim()) {
+    myDisplay = name.trim();
+    $("self-display").textContent = myDisplay;
+    $("self-avatar").textContent = initials(myDisplay);
+    send({ type: "SetDisplayName", display: myDisplay });
+  }
+});
 
-  // ---- ringtone (WebAudio, no bundled asset) ----
-  let ringCtx = null, ringInterval = null, ringTimeout = null;
-  function ringBeep() {
-    if (!ringCtx) return;
-    const t = ringCtx.currentTime;
-    for (const off of [0, 0.45]) {
-      const o = ringCtx.createOscillator(), g = ringCtx.createGain();
-      o.type = "sine"; o.frequency.value = 480;
-      o.connect(g); g.connect(ringCtx.destination);
-      g.gain.setValueAtTime(0.0001, t + off);
-      g.gain.exponentialRampToValueAtTime(0.16, t + off + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.0001, t + off + 0.35);
-      o.start(t + off); o.stop(t + off + 0.37);
-    }
+function fillDevices(sel, names, current) {
+  sel.innerHTML = "";
+  const def = document.createElement("option");
+  def.value = ""; def.textContent = "System default";
+  sel.appendChild(def);
+  for (const name of names) {
+    const opt = document.createElement("option");
+    opt.value = name; opt.textContent = name;
+    sel.appendChild(opt);
   }
-  function startRing() {
-    if (ringInterval) return;
-    try { ringCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
-    ringBeep();
-    ringInterval = setInterval(ringBeep, 2500);
-  }
-  function stopRing() {
-    if (ringInterval) { clearInterval(ringInterval); ringInterval = null; }
-    if (ringTimeout) { clearTimeout(ringTimeout); ringTimeout = null; }
-    if (ringCtx) { try { ringCtx.close(); } catch (e) {} ringCtx = null; }
-  }
-  function dismissRing() { stopRing(); ringConv = null; $("ring-modal").hidden = true; }
+  sel.value = current || "";
+}
 
-  // ---- call control ----
-  function joinCall(convId) {
-    if (!convId) return;
-    if (inCall && myCallConv !== convId) send({ type: "LeaveCall" });
-    if (activeConv !== convId) send({ type: "SwitchConversation", conv: convId });
-    myCallConv = convId; inCall = true;
-    send({ type: "StartCall" });
-    dismissRing();
-    renderCall();
-  }
-  function leaveCall() {
-    send({ type: "LeaveCall" });
-    inCall = false; myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false;
-    clearAllCameras();
-    renderCall();
-  }
-  // Am I in the active conversation's call? Trust the client flag OR the server's
-  // participant list (authoritative), so the Leave button is always reachable
-  // once I have joined -- even if myCallConv drifts.
-  function amInThisCall() {
-    if (!inCall || !activeConv) return false;
-    if (myCallConv === activeConv) return true;
-    return (callPart[activeConv] || []).includes(myDisplay);
-  }
-  // Build the participant circles for the call panel.
-  function renderCallTiles(parts) {
-    const box = $("call-tiles");
-    box.innerHTML = "";
-    for (const name of parts) {
-      const tile = document.createElement("div");
-      tile.className = "call-tile";
-      if (name === myDisplay && muted) tile.classList.add("muted");
-      const cam = camCanvas[name];
-      if (cam) { tile.classList.add("cam"); if (name === myDisplay) tile.classList.add("self"); }
-      tile.innerHTML = '<div class="call-avatar"><span class="call-letter"></span></div><span class="call-name"></span>';
-      const avatar = tile.querySelector(".call-avatar");
-      avatar.querySelector(".call-letter").textContent = initial(name);
-      if (cam) avatar.appendChild(cam); // live webcam replaces the letter
-      tile.querySelector(".call-name").textContent = name === myDisplay ? (name + " (you)") : name;
-      box.appendChild(tile);
-    }
-  }
-  // Drive the header affordance, the in-call panel, and the join banner.
-  function renderCall() {
-    const conv = convById(activeConv);
-    if (!conv || conv.pending) {
-      for (const id of ["call-btn", "mute-btn", "share-btn", "watch-btn", "call-banner", "call-panel"]) $(id).hidden = true;
-      return;
-    }
-    const parts = callPart[activeConv] || [];
-    const active = parts.length > 0;
-    const mineHere = amInThisCall();
-    if (mineHere && myCallConv !== activeConv) myCallConv = activeConv;
+// ---- friends ----
+$("add-friend").addEventListener("click", () => {
+  const user = $("friend").value.trim();
+  if (user) { send({ type: "AddFriend", user }); $("friend").value = ""; toast("Friend request sent to " + user); }
+});
+$("friend").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("add-friend").click(); } });
 
-    // Header keeps only the start/join affordance; in-call controls live in the panel.
-    $("call-btn").hidden = mineHere;
-    if (!mineHere) { $("call-btn").textContent = active ? "Join call" : "Call"; $("call-btn").classList.remove("in-call"); }
-    $("mute-btn").hidden = true;
-    $("share-btn").hidden = true;
-    $("watch-btn").hidden = !(currentSharer && !watchingStream);
+// ---- composer ----
+$("composer").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const input = $("message");
+  if (input.value.trim() && activeConv) { send({ type: "SendText", text: input.value }); input.value = ""; }
+});
 
-    // The Discord-style call panel while we are in this call.
-    const panel = $("call-panel");
-    if (mineHere) {
-      panel.hidden = false;
-      renderCallTiles(parts);
-      $("cc-mute").textContent = muted ? "Unmute" : "Mute"; $("cc-mute").classList.toggle("active", muted);
-      $("cc-deafen").textContent = deafened ? "Undeafen" : "Deafen"; $("cc-deafen").classList.toggle("active", deafened);
-      $("cc-share").textContent = sharing ? "Stop share" : "Share"; $("cc-share").classList.toggle("active", sharing);
-      $("cc-camera").textContent = cameraOn ? "Stop cam" : "Camera"; $("cc-camera").classList.toggle("active", cameraOn);
-    } else {
-      panel.hidden = true;
-    }
+// ---- calls: buttons ----
+$("btn-call").addEventListener("click", () => joinCall(activeConv));
+$("live-join").addEventListener("click", () => joinCall(activeConv));
+$("ctl-leave").addEventListener("click", leaveCall);
+$("callbar-leave").addEventListener("click", leaveCall);
+$("callbar-return").addEventListener("click", () => { if (myCallConv) send({ type: "SwitchConversation", conv: myCallConv }); });
+$("ctl-mic").addEventListener("click", () => { muted = !muted; send({ type: "SetMuted", muted }); renderCall(); });
+$("ctl-deafen").addEventListener("click", () => { deafened = !deafened; send({ type: "SetDeafened", deafened }); renderCall(); });
+$("ctl-share").addEventListener("click", () => { if (sharing) send({ type: "StopScreenShare" }); else openShareModal(); });
+$("ctl-camera").addEventListener("click", () => { if (cameraOn) { send({ type: "StopCamera" }); camGone(myDisplay); } else openShareModal(); });
+$("btn-watch").addEventListener("click", () => {
+  watchingStream = !watchingStream;
+  if (!watchingStream) closeDecoder(); // resume needs a fresh keyframe anyway
+  renderCall();
+});
+$("ring-accept").addEventListener("click", () => { if (ringConv) joinCall(ringConv); });
+$("ring-decline").addEventListener("click", () => {
+  if (ringConv) send({ type: "DeclineCall", conv: ringConv });
+  dismissRing();
+  renderCall();
+});
 
-    // Banner offers Join when there is a call we are not in.
-    const banner = $("call-banner");
-    if (active && !mineHere) {
-      banner.hidden = false;
-      $("call-banner-text").textContent = "Call in progress - " + parts.join(", ");
-      $("call-banner-btn").hidden = false;
-    } else {
-      banner.hidden = true;
-    }
-  }
+// ---- modals + palette plumbing ----
+function openModal(id) { closeModals(); $(id).hidden = false; }
+function closeModals() {
+  document.querySelectorAll(".overlay").forEach((o) => { o.hidden = true; });
+}
+document.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", closeModals));
+document.querySelectorAll(".overlay").forEach((o) =>
+  o.addEventListener("mousedown", (e) => { if (e.target === o) closeModals(); }));
 
-  function doAuth(create) {
-    const username = $("login-username").value.trim();
-    const display = $("login-display").value.trim();
-    const password = $("login-password").value;
-    $("login-error").textContent = "";
-    if (!username || !password) { $("login-error").textContent = "Enter a username and password."; return; }
-    if (create && password.length < 12) { $("login-error").textContent = "Password must be at least 12 characters."; return; }
-    const cmd = { type: create ? "CreateAccount" : "Login", server: serverUrl(), username, password };
-    if (create) cmd.display = display;
-    send(cmd);
-  }
-  $("login-btn").addEventListener("click", () => doAuth(false));
-  $("register-btn").addEventListener("click", () => doAuth(true));
-  $("login-password").addEventListener("keydown", (e) => { if (e.key === "Enter") doAuth(false); });
-
-  $("logout").addEventListener("click", () => send({ type: "Logout" }));
-  $("presence").addEventListener("change", (e) => send({ type: "SetPresence", status: e.target.value }));
-
-  function copyText(t) {
-    try { navigator.clipboard.writeText(t); return; } catch (e) {}
-    const ta = document.createElement("textarea");
-    ta.value = t; ta.style.position = "fixed"; ta.style.opacity = "0";
-    document.body.appendChild(ta); ta.select();
-    try { document.execCommand("copy"); } catch (e) {}
-    document.body.removeChild(ta);
-  }
-  $("me-handle").addEventListener("click", () => {
-    if (myUsername) { copyText(myUsername); setStatus("Copied your username: " + myUsername, false); }
+let paletteSel = 0;
+function paletteItems(q) {
+  const items = [];
+  for (const c of conversations)
+    items.push({ label: c.title, kind: "conversation", icon: SVG_MSG.replace('icon sm', 'icon'),
+      run: () => send({ type: "SwitchConversation", conv: c.id }) });
+  const callable = convById(activeConv) && !convById(activeConv).pending;
+  if (amInThisCall()) items.push({ label: "Leave call", kind: "call", icon: SVG_X.replace('icon sm', 'icon'), run: leaveCall });
+  else if (callable) items.push({ label: "Start call", kind: "call",
+    icon: '<svg class="icon" viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>',
+    run: () => joinCall(activeConv) });
+  if (amInThisCall()) items.push({ label: sharing ? "Stop sharing" : "Share screen", kind: "call",
+    icon: '<svg class="icon" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>',
+    run: () => { if (sharing) send({ type: "StopScreenShare" }); else openShareModal(); } });
+  if (activeSafety) items.push({ label: "Verify identity", kind: "trust",
+    icon: '<svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke-dasharray="4 3"/></svg>',
+    run: openVerify });
+  items.push(
+    { label: "New group", kind: "action", icon: '<svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>', run: openGroupModal },
+    { label: "Add friend", kind: "action",
+      icon: '<svg class="icon" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6M23 11h-6"/></svg>',
+      run: () => { setTab("people"); $("friend").focus(); } },
+    { label: "Export encrypted backup", kind: "action",
+      icon: '<svg class="icon" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>',
+      run: () => send({ type: "ExportSession" }) },
+    { label: "Settings", kind: "action", icon: '<svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></svg>', run: openSettings },
+  );
+  const needle = q.trim().toLowerCase();
+  return needle ? items.filter((i) => i.label.toLowerCase().includes(needle)) : items;
+}
+function renderPalette() {
+  const q = $("palette-input").value;
+  const items = paletteItems(q);
+  paletteSel = Math.min(paletteSel, Math.max(0, items.length - 1));
+  const box = $("palette-results");
+  box.innerHTML = "";
+  items.forEach((it, i) => {
+    const b = document.createElement("button");
+    b.className = "p-row" + (i === paletteSel ? " sel" : "");
+    b.innerHTML = it.icon + '<span class="p-label"></span><span class="kind">' + it.kind + '</span>';
+    b.querySelector(".p-label").textContent = it.label;
+    b.addEventListener("click", () => { closeModals(); it.run(); });
+    box.appendChild(b);
   });
-  $("me-name").addEventListener("click", () => {
-    const name = prompt("Display name", myDisplay);
-    if (name !== null && name.trim()) {
-      myDisplay = name.trim();
-      $("me-name").textContent = myDisplay;
-      $("avatar").textContent = initial(myDisplay);
-      send({ type: "SetDisplayName", display: myDisplay });
-    }
-  });
-
-  $("add-friend").addEventListener("click", () => {
-    const user = $("friend").value.trim();
-    if (user) { send({ type: "AddFriend", user }); $("friend").value = ""; setStatus("Friend request sent to " + user, false); }
-  });
-  $("export-btn").addEventListener("click", () => send({ type: "ExportSession" }));
-  $("import-btn").addEventListener("click", () => {
-    const path = prompt("Full path to your exported backup file:");
-    if (path && path.trim()) send({ type: "ImportSession", path: path.trim() });
-  });
-  $("friend").addEventListener("keydown", (e) => { if (e.key === "Enter") $("add-friend").click(); });
-
-  $("composer").addEventListener("submit", (e) => {
-    e.preventDefault();
-    const input = $("message");
-    if (input.value.trim() && activeConv) { send({ type: "SendText", text: input.value }); input.value = ""; }
-  });
-
-  $("add-to-group").addEventListener("click", () => {
-    const conv = conversations.find((c) => c.id === activeConv);
-    if (!conv) return;
-    const handle = prompt("Add which friend? (their username)");
-    if (handle && handle.trim()) send({ type: "AddToGroup", handle: handle.trim() });
-  });
-  $("remove-member").addEventListener("click", () => {
-    if (!activeConv) return;
-    const member = prompt("Remove which member? (their username)");
-    if (member && member.trim()) send({ type: "RemoveMember", conv: activeConv, member: member.trim() });
-  });
-  $("leave-conv").addEventListener("click", () => {
-    if (!activeConv) return;
-    const conv = convById(activeConv);
-    if (confirm("Leave and delete " + (conv ? conv.title : "this conversation") + "? It is removed from this device.")) {
-      send({ type: "LeaveConversation", conv: activeConv });
-    }
-  });
-  $("call-btn").addEventListener("click", () => {
-    if (amInThisCall()) leaveCall();
-    else joinCall(activeConv);
-  });
-  $("call-banner-btn").addEventListener("click", () => joinCall(activeConv));
-  $("share-btn").addEventListener("click", () => {
-    if (sharing) send({ type: "StopScreenShare" }); else openShareModal();
-  });
-  $("mute-btn").addEventListener("click", () => {
-    muted = !muted;
-    send({ type: "SetMuted", muted });
-    renderCall();
-  });
-  $("watch-btn").addEventListener("click", () => { watchingStream = true; renderCall(); });
-  $("sv-close").addEventListener("click", stopViewing);
-  // Call-panel controls.
-  $("cc-mute").addEventListener("click", () => { muted = !muted; send({ type: "SetMuted", muted }); renderCall(); });
-  $("cc-deafen").addEventListener("click", () => { deafened = !deafened; send({ type: "SetDeafened", deafened }); renderCall(); });
-  $("cc-share").addEventListener("click", () => { if (sharing) send({ type: "StopScreenShare" }); else openShareModal(); });
-  $("cc-camera").addEventListener("click", () => { if (cameraOn) { send({ type: "StopCamera" }); camGone(myDisplay); } else openShareModal(); });
-  $("share-close").addEventListener("click", () => { $("share-modal").hidden = true; });
-  $("cc-leave").addEventListener("click", leaveCall);
-  $("ring-accept").addEventListener("click", () => { if (ringConv) joinCall(ringConv); });
-  $("ring-decline").addEventListener("click", () => {
-    if (ringConv) send({ type: "DeclineCall", conv: ringConv });
-    dismissRing();
-    renderCall();
-  });
-
-  // ---- new-group modal ----
-  $("new-group").addEventListener("click", openGroupModal);
-  $("group-cancel").addEventListener("click", () => $("group-modal").hidden = true);
-  $("group-create").addEventListener("click", () => {
-    const name = $("group-name").value.trim() || "New group";
-    const members = Array.from(document.querySelectorAll("#group-picks input:checked")).map((el) => el.value);
-    if (members.length === 0) { return; }
-    send({ type: "CreateGroup", name, members });
-    $("group-modal").hidden = true;
-  });
-  function openGroupModal() {
-    $("group-name").value = "";
-    const box = $("group-picks");
-    box.innerHTML = "";
-    if (friends.length === 0) { box.innerHTML = '<div class="muted-empty">Add friends first.</div>'; }
-    for (const f of friends) {
-      const row = document.createElement("label");
-      row.className = "pick";
-      row.innerHTML = '<input type="checkbox" value="' + f.username + '"><span class="avatar">' + initial(f.display) + '</span><span class="row-name"></span>';
-      row.querySelector(".row-name").textContent = f.display;
-      box.appendChild(row);
-    }
-    $("group-modal").hidden = false;
+  return items;
+}
+function openPalette() {
+  if ($("app-view").hidden) return;
+  openModal("palette-overlay");
+  const inp = $("palette-input");
+  inp.value = ""; paletteSel = 0;
+  renderPalette(); inp.focus();
+}
+$("palette-hint").addEventListener("click", openPalette);
+$("palette-input").addEventListener("input", () => { paletteSel = 0; renderPalette(); });
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
+  if (e.key === "Escape") closeModals();
+  if (!$("palette-overlay").hidden) {
+    const items = paletteItems($("palette-input").value);
+    if (e.key === "ArrowDown") { paletteSel = Math.min(paletteSel + 1, items.length - 1); renderPalette(); e.preventDefault(); }
+    if (e.key === "ArrowUp") { paletteSel = Math.max(paletteSel - 1, 0); renderPalette(); e.preventDefault(); }
+    if (e.key === "Enter" && items[paletteSel]) { closeModals(); items[paletteSel].run(); }
   }
+});
 
-  // ---- audio settings modal ----
-  $("audio-btn").addEventListener("click", () => {
-    send({ type: "ListAudioDevices" });
-    $("audio-modal").hidden = false;
-  });
-  $("audio-close").addEventListener("click", () => $("audio-modal").hidden = true);
-  $("audio-input").addEventListener("change", (e) => send({ type: "SetInputDevice", name: e.target.value }));
-  $("audio-output").addEventListener("change", (e) => send({ type: "SetOutputDevice", name: e.target.value }));
+// ---- app/login switching ----
+function showApp(username, display) {
+  $("login-view").hidden = true;
+  $("app-view").hidden = false;
+  myUsername = username; myDisplay = display || username;
+  $("self-display").textContent = myDisplay;
+  $("self-avatar").textContent = initials(myDisplay);
+  $("login-password").value = "";
+  try { $("server-host").textContent = new URL(serverUrl()).host; }
+  catch (e) { $("server-host").textContent = serverUrl(); }
+  connection = "online";
+  updateServerCard();
+  selfPresence.mode = "online"; selfPresence.until = null; lastSent = "online";
+  lastActivity = Date.now();
+  applyPresence();
+  setTab("chats");
+}
+function showLogin() {
+  $("app-view").hidden = true;
+  $("login-view").hidden = false;
+  myUsername = ""; myDisplay = ""; friends = []; incoming = []; outgoing = []; conversations = [];
+  activeConv = null; activeSafety = "";
+  inCall = false; myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false;
+  watchingStream = true; currentSharer = ""; lastSent = "";
+  dismissRing(); streamEnded(); clearAllCameras(); closeModals();
+  $("stage").hidden = true; $("callbar").hidden = true;
+  $("banner-live").hidden = true; $("conn-banner").hidden = true;
+  $("presence-menu").hidden = true;
+  for (const k in callPart) delete callPart[k];
+  for (const k in unread) delete unread[k];
+  for (const k in messages) delete messages[k];
+  for (const k in presence) delete presence[k];
+}
 
-  // Fill a device <select> with a "System default" option plus each device,
-  // marking the current selection ("" means the host default is in use).
-  function fillDevices(sel, names, current) {
-    sel.innerHTML = "";
-    const def = document.createElement("option");
-    def.value = ""; def.textContent = "System default";
-    sel.appendChild(def);
-    for (const name of names) {
-      const opt = document.createElement("option");
-      opt.value = name; opt.textContent = name;
-      sel.appendChild(opt);
-    }
-    sel.value = current || "";
-  }
+function updateServerCard() {
+  const card = $("server-card");
+  card.className = "server-card" + (connection === "online" ? "" : " reconnecting");
+  const scheme = serverUrl().startsWith("wss") ? "wss" : "ws";
+  $("server-state").textContent = connection === "online" ? "Connected · " + scheme : "Reconnecting...";
+}
 
-  // ---- rendering ----
-  function statusOf(h) { return presence[h] || "offline"; }
-
-  function renderSidebar() {
-    // Requests (incoming get accept/decline; outgoing show as pending)
-    const reqSec = $("requests-section"), reqUl = $("requests");
-    reqUl.innerHTML = "";
-    reqSec.hidden = incoming.length + outgoing.length === 0;
-    for (const f of incoming) {
-      const li = document.createElement("li");
-      li.innerHTML = '<span class="avatar">' + initial(f.display) + '</span><span class="row-name"></span>' +
-        '<span class="req-actions"><button class="icon-btn ok" title="Accept">✓</button>' +
-        '<button class="icon-btn no" title="Decline">✕</button></span>';
-      li.querySelector(".row-name").textContent = f.display;
-      li.querySelector(".ok").addEventListener("click", (e) => { e.stopPropagation(); send({ type: "AcceptFriend", handle: f.username }); });
-      li.querySelector(".no").addEventListener("click", (e) => { e.stopPropagation(); send({ type: "DeclineFriend", handle: f.username }); });
-      reqUl.appendChild(li);
-    }
-    for (const f of outgoing) {
-      const li = document.createElement("li");
-      li.innerHTML = '<span class="avatar">' + initial(f.display) + '</span><span class="row-name"></span><span class="muted-empty">pending</span>';
-      li.querySelector(".row-name").textContent = f.display;
-      reqUl.appendChild(li);
-    }
-
-    // Friends (open a DM on click)
-    const ul = $("friends");
-    ul.innerHTML = "";
-    $("friends-empty").hidden = friends.length > 0;
-    for (const f of friends) {
-      const dm = conversations.find((c) => c.is_dm && c.members && c.members.includes(f.username));
-      const li = document.createElement("li");
-      if (dm && dm.id === activeConv) li.className = "active";
-      li.innerHTML = '<span class="avatar">' + initial(f.display) + '</span><span class="row-name"></span>' + rowBadge(dm ? dm.id : null) + '<span class="dot ' + statusOf(f.username) + '"></span>';
-      li.querySelector(".row-name").textContent = f.display;
-      li.addEventListener("click", () => send({ type: "OpenDm", handle: f.username }));
-      ul.appendChild(li);
-    }
-
-    // Groups
-    const gul = $("groups");
-    gul.innerHTML = "";
-    for (const c of conversations.filter((c) => !c.is_dm)) {
-      const li = document.createElement("li");
-      if (c.id === activeConv) li.className = "active";
-      li.innerHTML = '<span class="avatar group">' + initial(c.title) + '</span><span class="row-name"></span>' + rowBadge(c.id);
-      li.querySelector(".row-name").textContent = c.title;
-      li.addEventListener("click", () => send({ type: "SwitchConversation", conv: c.id }));
-      gul.appendChild(li);
-    }
-  }
-
-  function renderChat() {
-    const conv = conversations.find((c) => c.id === activeConv);
-    const hasConv = !!conv;
-    $("empty-chat").hidden = hasConv;
-    $("log").hidden = !hasConv;
-    $("composer").hidden = !hasConv;
-    $("add-to-group").hidden = !(conv && !conv.is_dm);
-    $("remove-member").hidden = !(conv && !conv.is_dm);
-    $("leave-conv").hidden = !(conv && !conv.pending);
-    renderCall();
-    $("chat-title").textContent = conv ? conv.title : "No conversation";
-    $("message").disabled = !(conv && !conv.pending);
-    $("message").placeholder = conv && conv.pending ? "Starting conversation…" : "Message";
-    const log = $("log");
-    log.innerHTML = "";
-    const list = messages[activeConv] || [];
-    let lastFrom = null;
-    for (const m of list) {
-      const el = document.createElement("div");
-      el.className = "msg" + (m.mine ? " self" : "");
-      if (!m.mine && m.from !== lastFrom) {
-        const w = document.createElement("div"); w.className = "who"; w.textContent = m.from; el.appendChild(w);
+// ---- events from the core ----
+window.onEnclaveEvent = (ev) => {
+  switch (ev.type) {
+    case "LoggedIn":
+      showApp(ev.username, ev.display); renderConvoList(); renderPeople(); renderHeader(); renderChat();
+      break;
+    case "LoggedOut":
+      showLogin();
+      break;
+    case "Conversations":
+      conversations = ev.conversations; renderConvoList(); renderHeader(); renderCall();
+      break;
+    case "ActiveConversation":
+      activeConv = ev.conv;
+      activeSafety = ev.safety || "";
+      if (ev.conv) { messages[ev.conv] = ev.history.slice(); delete unread[ev.conv]; }
+      renderConvoList(); renderHeader(); renderChat();
+      break;
+    case "Message":
+      if (!messages[ev.conv]) messages[ev.conv] = [];
+      messages[ev.conv].push({ from: ev.from, text: ev.text, mine: ev.mine });
+      if (ev.conv === activeConv) {
+        appendMessage({ from: ev.from, text: ev.text, mine: ev.mine });
+        renderConvoList(); // refresh the preview line
+      } else if (!ev.mine) {
+        // Not the open conversation: bump the unread badge and ding in-app.
+        unread[ev.conv] = (unread[ev.conv] || 0) + 1;
+        ding();
+        renderConvoList();
       }
-      const b = document.createElement("div"); b.className = "body"; b.textContent = m.text; el.appendChild(b);
-      log.appendChild(el);
-      lastFrom = m.from;
-    }
-    log.scrollTop = log.scrollHeight;
-  }
-
-  function appendMessage(m) {
-    const log = $("log");
-    const el = document.createElement("div");
-    el.className = "msg" + (m.mine ? " self" : "");
-    if (!m.mine) { const w = document.createElement("div"); w.className = "who"; w.textContent = m.from; el.appendChild(w); }
-    const b = document.createElement("div"); b.className = "body"; b.textContent = m.text; el.appendChild(b);
-    log.appendChild(el);
-    log.scrollTop = log.scrollHeight;
-  }
-
-  function setStatus(message, isError) {
-    const s = $("status"); s.textContent = message || ""; s.className = "status" + (isError ? " err" : "");
-  }
-
-  function showApp(username, display) {
-    $("login-view").hidden = true; $("app-view").hidden = false;
-    myUsername = username; myDisplay = display || username;
-    $("me-name").textContent = myDisplay;
-    $("me-handle").textContent = "@" + username;
-    $("avatar").textContent = initial(myDisplay);
-    $("login-password").value = "";
-  }
-  function showLogin() {
-    $("app-view").hidden = true; $("login-view").hidden = false;
-    myUsername = ""; myDisplay = ""; friends = []; incoming = []; outgoing = []; conversations = []; activeConv = null;
-    inCall = false; myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false;
-    watchingStream = true; currentSharer = ""; dismissRing(); streamEnded(); clearAllCameras();
-    for (const k in callPart) delete callPart[k];
-    for (const k in unread) delete unread[k];
-    $("call-btn").classList.remove("in-call"); $("call-banner").hidden = true; $("call-panel").hidden = true;
-    $("conn-banner").hidden = true;
-    $("audio-modal").hidden = true; $("group-modal").hidden = true;
-    for (const k in messages) delete messages[k];
-    for (const k in presence) delete presence[k];
-  }
-
-  window.onEnclaveEvent = (ev) => {
-    switch (ev.type) {
-      case "LoggedIn":
-        showApp(ev.username, ev.display); renderSidebar(); renderChat();
-        break;
-      case "LoggedOut":
-        showLogin();
-        break;
-      case "Conversations":
-        conversations = ev.conversations; renderSidebar();
-        break;
-      case "ActiveConversation":
-        activeConv = ev.conv;
-        if (ev.conv) { messages[ev.conv] = ev.history.slice(); delete unread[ev.conv]; }
-        $("safety").textContent = ev.safety || "";
-        renderSidebar(); renderChat();
-        break;
-      case "Message":
-        if (!messages[ev.conv]) messages[ev.conv] = [];
-        messages[ev.conv].push({ from: ev.from, text: ev.text, mine: ev.mine });
-        if (ev.conv === activeConv) {
-          appendMessage({ from: ev.from, text: ev.text, mine: ev.mine });
-        } else if (!ev.mine) {
-          // Not the open conversation: bump the unread badge and ding in-app.
-          unread[ev.conv] = (unread[ev.conv] || 0) + 1;
-          ding();
-          renderSidebar();
-        }
-        break;
-      case "CallState":
-        inCall = ev.in_call;
-        if (!inCall) { myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false; clearAllCameras(); }
-        renderCall();
-        break;
-      case "CallOffer":
-        // Someone started a call in ev.conv; ring unless I'm already in it.
-        if (!(inCall && myCallConv === ev.conv)) {
-          ringConv = ev.conv;
-          const c = convById(ev.conv);
-          $("ring-avatar").textContent = initial(ev.from);
-          $("ring-title").textContent = ev.from + " is calling";
-          $("ring-sub").textContent = c ? ("in " + c.title) : "";
-          $("ring-modal").hidden = false;
-          startRing();
-          if (ringTimeout) clearTimeout(ringTimeout);
-          ringTimeout = setTimeout(() => { dismissRing(); renderCall(); }, 30000);
-        }
-        break;
-      case "CallParticipants":
-        if (ev.participants.length === 0) delete callPart[ev.conv];
-        else callPart[ev.conv] = ev.participants;
-        if (ev.participants.length === 0 && ringConv === ev.conv) dismissRing();
-        renderCall();
-        renderSidebar();
-        break;
-      case "CallDeclined":
-        setStatus(ev.from + " declined the call", false);
-        break;
-      case "ScreenFrame":
-        handleScreenFrame(ev);
-        break;
-      case "ScreenShareState":
-        sharing = ev.sharing;
-        renderCall();
-        break;
-      case "CameraState":
-        cameraOn = ev.on;
-        if (!ev.on) camGone(myDisplay); // drop my own preview immediately
-        renderCall();
-        break;
-      case "ShareSources":
-        fillShareList("share-screens", ev.screens, "screen");
-        fillShareList("share-windows", ev.windows, "window");
-        fillShareList("share-cameras", ev.cameras, "camera");
-        // Without per-app audio (Linux), shared audio is always the whole
-        // system mix; say so instead of promising per-window audio.
-        $("share-audio-hint").textContent = ev.per_app_audio
-          ? "A window shares only that app's audio. A whole screen shares all system audio, so others may hear the call echo back."
-          : "Shared audio is the whole system mix, so others may hear the call echo back unless it plays on another device.";
-        break;
-      case "Connection": {
-        const b = $("conn-banner");
-        if (ev.state === "reconnecting") {
-          b.textContent = "Reconnecting to server..."; b.classList.remove("online"); b.hidden = false;
-        } else if (ev.state === "online") {
-          b.textContent = "Reconnected"; b.classList.add("online"); b.hidden = false;
-          setTimeout(() => { b.hidden = true; }, 1500);
-        } else {
-          b.hidden = true;
-        }
-        break;
+      break;
+    case "CallState":
+      inCall = ev.in_call;
+      if (!inCall) {
+        myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false;
+        watchingStream = true; streamEnded(); clearAllCameras();
       }
-      case "AudioDevices":
-        fillDevices($("audio-input"), ev.inputs, ev.input);
-        fillDevices($("audio-output"), ev.outputs, ev.output);
-        break;
-      case "Presence":
-        presence[ev.user] = ev.status; renderSidebar();
-        break;
-      case "FriendRequest":
-        setStatus("Friend request from " + ev.from, false);
-        break;
-      case "Friends":
-        friends = ev.friends; incoming = ev.incoming; outgoing = ev.outgoing; renderSidebar();
-        break;
-      case "Status":
-        if ($("login-view").hidden) setStatus(ev.message, ev.error);
-        else $("login-error").textContent = ev.message;
-        break;
-    }
-  };
-
-  // Boot diagnostic: the share viewer decodes H.264 with WebCodecs, which the
-  // WebView must provide (WebKitGTK needs its GStreamer H.264 decoder). Ask
-  // for the exact config the viewer uses, so a missing decoder is visible
-  // instead of a silently black share.
-  (async () => {
-    let ok = false;
-    try {
-      if (typeof window.VideoDecoder === "function") {
-        const res = await VideoDecoder.isConfigSupported({ codec: "avc1.42E01E" });
-        ok = !!(res && res.supported);
+      renderCall(); renderConvoList();
+      break;
+    case "CallOffer":
+      // Someone started a call in ev.conv; ring unless I'm already in it.
+      if (!(inCall && myCallConv === ev.conv)) {
+        ringConv = ev.conv;
+        const c = convById(ev.conv);
+        $("ring-text").innerHTML = "<strong></strong> is calling" + (c && !c.is_dm ? " in " + c.title : "");
+        $("ring-text").querySelector("strong").textContent = ev.from;
+        $("banner-ring").hidden = false;
+        startRing();
+        if (ringTimeout) clearTimeout(ringTimeout);
+        ringTimeout = setTimeout(() => { dismissRing(); renderCall(); }, 30000);
       }
-    } catch (e) { /* unsupported -> ok stays false */ }
-    send({ type: "UiReady", webcodecs: ok });
-  })();
+      break;
+    case "CallParticipants":
+      if (ev.participants.length === 0) delete callPart[ev.conv];
+      else callPart[ev.conv] = ev.participants;
+      if (ev.participants.length === 0 && ringConv === ev.conv) dismissRing();
+      renderCall();
+      renderConvoList();
+      break;
+    case "CallDeclined":
+      toast(ev.from + " declined the call");
+      break;
+    case "ScreenFrame":
+      handleScreenFrame(ev);
+      break;
+    case "ScreenShareState":
+      sharing = ev.sharing;
+      renderCall();
+      break;
+    case "CameraState":
+      cameraOn = ev.on;
+      if (!ev.on) camGone(myDisplay); // drop my own preview immediately
+      renderCall();
+      break;
+    case "ShareSources":
+      fillShareList("share-screens", ev.screens, "screen");
+      fillShareList("share-windows", ev.windows, "window");
+      fillShareList("share-cameras", ev.cameras, "camera");
+      // Without per-app audio (Wayland), shared audio is always the whole
+      // system mix; say so instead of promising per-window audio.
+      $("share-audio-hint").textContent = ev.per_app_audio
+        ? "A window shares only that app's audio. A whole screen shares all system audio, so others may hear the call echo back."
+        : "Shared audio is the whole system mix, so others may hear the call echo back unless it plays on another device.";
+      break;
+    case "Connection": {
+      const b = $("conn-banner");
+      connection = ev.state === "online" ? "online" : "reconnecting";
+      updateServerCard();
+      applyPresence();
+      if (ev.state === "reconnecting") {
+        b.textContent = "Reconnecting to your server..."; b.className = "banner reconnect"; b.hidden = false;
+      } else if (ev.state === "online") {
+        b.textContent = "Reconnected"; b.className = "banner ok"; b.hidden = false;
+        setTimeout(() => { b.hidden = true; }, 1500);
+      } else {
+        b.hidden = true;
+      }
+      break;
+    }
+    case "AudioDevices":
+      fillDevices($("audio-input"), ev.inputs, ev.input);
+      fillDevices($("audio-output"), ev.outputs, ev.output);
+      break;
+    case "Presence":
+      presence[ev.user] = ev.status; renderConvoList(); renderPeople();
+      break;
+    case "FriendRequest":
+      toast("Friend request from " + ev.from);
+      renderPeople();
+      break;
+    case "Friends":
+      friends = ev.friends; incoming = ev.incoming; outgoing = ev.outgoing;
+      renderConvoList(); renderPeople();
+      break;
+    case "Status":
+      if ($("login-view").hidden) setStatus(ev.message, ev.error);
+      else $("login-error").textContent = ev.message;
+      break;
+  }
+};
+
+// ---- boot ----
+// The logo is a seal: the same glyph that marks a verified conversation,
+// keyed by the app's name (its character codes).
+const BRAND_SAFETY = "Enclave".split("").map((c) => c.charCodeAt(0)).join("");
+$("brand-seal").innerHTML = sealSVG(BRAND_SAFETY, true, 32);
+
+// Boot diagnostic: the share viewer decodes H.264 with WebCodecs, which the
+// WebView must provide (WebKitGTK needs its GStreamer H.264 decoder). Ask
+// for the exact config the viewer uses, so a missing decoder is visible
+// instead of a silently black share.
+(async () => {
+  let ok = false;
+  try {
+    if (typeof window.VideoDecoder === "function") {
+      const res = await VideoDecoder.isConfigSupported({ codec: "avc1.42E01E" });
+      ok = !!(res && res.supported);
+    }
+  } catch (e) { /* unsupported -> ok stays false */ }
+  send({ type: "UiReady", webcodecs: ok });
+})();
+
 </script>
 </body>
 </html>
