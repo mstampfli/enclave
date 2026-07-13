@@ -26,19 +26,42 @@ pub struct CameraSource {
 /// Enumerate the cameras attached to this machine. Best-effort: returns an empty
 /// list if the platform query fails (e.g. no backend / permissions).
 pub fn camera_sources() -> Vec<CameraSource> {
-    match nokhwa::query(ApiBackend::Auto) {
+    let mut sources: Vec<CameraSource> = match nokhwa::query(ApiBackend::Auto) {
         Ok(infos) => infos
             .into_iter()
             .filter_map(|info| {
                 let index = info.index().as_index().ok()?;
-                Some(CameraSource {
+                can_capture(index).then(|| CameraSource {
                     index,
                     name: info.human_name(),
                 })
             })
             .collect(),
         Err(_) => Vec::new(),
-    }
+    };
+    // Stable order, lowest device index (the usual default camera) first.
+    sources.sort_by_key(|s| s.index);
+    sources
+}
+
+/// On Linux one physical webcam exposes several /dev/video* nodes, and the
+/// metadata/output siblings enumerate as "cameras" too but cannot stream
+/// (opening them fails). Keep only nodes whose V4L2 `device_caps` say
+/// VIDEO_CAPTURE.
+#[cfg(target_os = "linux")]
+fn can_capture(index: u32) -> bool {
+    v4l::Device::new(index as usize)
+        .and_then(|d| d.query_caps())
+        .map(|caps| {
+            caps.capabilities
+                .contains(v4l::capability::Flags::VIDEO_CAPTURE)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn can_capture(_index: u32) -> bool {
+    true
 }
 
 /// A live webcam stream. [`Self::next_bgra`] blocks for the next frame and

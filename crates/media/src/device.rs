@@ -32,7 +32,7 @@ fn codec_err(e: impl std::fmt::Display) -> MediaError {
 pub fn input_device_names() -> Vec<String> {
     let host = cpal::default_host();
     match host.input_devices() {
-        Ok(devs) => devs.filter_map(|d| device_name(&d)).collect(),
+        Ok(devs) => pickable_names(devs.filter_map(|d| device_name(&d))),
         Err(_) => Vec::new(),
     }
 }
@@ -41,9 +41,21 @@ pub fn input_device_names() -> Vec<String> {
 pub fn output_device_names() -> Vec<String> {
     let host = cpal::default_host();
     match host.output_devices() {
-        Ok(devs) => devs.filter_map(|d| device_name(&d)).collect(),
+        Ok(devs) => pickable_names(devs.filter_map(|d| device_name(&d))),
         Err(_) => Vec::new(),
     }
+}
+
+/// Devices are selected by name (first match), so a picker entry is only
+/// meaningful if its name is unique -- ALSA exposes one truncated name for
+/// many subdevices; keep the first. The ALSA `null` device ("Discard all
+/// samples...") is a bit bucket no one shares a call through; hide it.
+fn pickable_names(names: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    names
+        .filter(|n| !n.starts_with("Discard all samples"))
+        .filter(|n| seen.insert(n.clone()))
+        .collect()
 }
 
 /// The human-readable name of a device, or `None` if it cannot be described
