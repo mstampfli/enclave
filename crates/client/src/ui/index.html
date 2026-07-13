@@ -321,6 +321,10 @@ input, select, textarea { font: inherit; }
   color: var(--ink); }
 .header-actions > button.accent { color: var(--accent-ink); }
 .header-actions > button.accent:hover { background: var(--accent-bg); border-color: transparent; }
+/* While the call is live the header shows state, not an action: no hover,
+   no pointer, nothing that invites a click. */
+.header-actions > button.state { color: var(--accent-ink); cursor: default; }
+.header-actions > button.state:hover { background: transparent; border-color: transparent; }
 
 /* thin state banners */
 .banner { display: flex; align-items: center; gap: 10px; padding: 7px 18px; font-size: 13px;
@@ -534,9 +538,28 @@ input, select, textarea { font: inherit; }
 .pending-note { text-align: center; font-size: 12.5px; color: var(--faint); padding: 6px 0; }
 
 /* group-picker rows reuse member-row; make the checkbox visible */
-.member-row input[type="checkbox"] { accent-color: var(--accent); }
+.member-row input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
 label.member-row { cursor: pointer; border-radius: var(--radius); padding: 6px; }
 label.member-row:hover { background: var(--raised); }
+
+/* sidebar + modal search */
+.side-search { padding: 8px 8px 4px; }
+.side-search input {
+  width: 100%; padding: 7px 10px; border-radius: var(--radius);
+  background: var(--bg); border: 1px solid var(--border); color: var(--ink);
+  font-size: 13.5px;
+}
+.side-search input:focus { outline: none; border-color: var(--border-strong); }
+.side-search input::placeholder { color: var(--faint); }
+.modal-search { margin-bottom: 2px; }
+.modal-search input {
+  width: 100%; padding: 7px 10px; border-radius: var(--radius);
+  background: var(--bg); border: 1px solid var(--border); color: var(--ink);
+  font-size: 13.5px;
+}
+.modal-search input:focus { outline: none; border-color: var(--border-strong); }
+.modal-search input::placeholder { color: var(--faint); }
+.picks-scroll { max-height: 240px; overflow-y: auto; }
 
 /* own messages carry a quiet marker instead of a color shout */
 .msg-group .author.me { color: var(--muted); }
@@ -565,7 +588,7 @@ label.member-row:hover { background: var(--raised); }
     </div>
     <div class="field">
       <label for="login-username">Username</label>
-      <input id="login-username" spellcheck="false" autocomplete="username">
+      <input id="login-username" spellcheck="false" autocomplete="username" autofocus>
     </div>
     <div class="field" id="login-display-wrap" hidden>
       <label for="login-display">Display name</label>
@@ -630,6 +653,10 @@ label.member-row:hover { background: var(--raised); }
     <div class="side-tabs">
       <button class="active" id="tab-chats">Chats</button>
       <button id="tab-people">People <span class="count attention" id="req-count" hidden>0</span></button>
+    </div>
+
+    <div class="side-search">
+      <input id="side-search" placeholder="Search conversations" autocomplete="off" spellcheck="false">
     </div>
 
     <div class="side-scroll" id="pane-chats">
@@ -810,10 +837,6 @@ label.member-row:hover { background: var(--raised); }
       <div class="s-head">Windows</div>
       <div class="pick-list" id="share-windows"></div>
     </div>
-    <div class="m-section">
-      <div class="s-head">Cameras</div>
-      <div class="pick-list" id="share-cameras"></div>
-    </div>
     <div class="divider"></div>
     <div class="share-audio-row">
       <input type="checkbox" id="share-audio">
@@ -821,6 +844,18 @@ label.member-row:hover { background: var(--raised); }
         <div class="lbl"><label for="share-audio">Also share audio</label></div>
         <div class="hint" id="share-audio-hint"></div>
       </div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="camera-modal" hidden>
+  <div class="modal">
+    <div class="m-head">
+      <h2>Turn on a camera</h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="m-section">
+      <div class="pick-list" id="share-cameras"></div>
     </div>
   </div>
 </div>
@@ -916,7 +951,11 @@ label.member-row:hover { background: var(--raised); }
     </div>
     <div class="m-section">
       <div class="s-head">Invite friends</div>
-      <div id="group-picks"></div>
+      <div class="modal-search">
+        <input id="group-search" placeholder="Search friends" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="picks-scroll"><div id="group-picks"></div>
+      <div class="pick-empty" id="group-none" hidden>No friend matches that.</div></div>
     </div>
     <div class="m-actions">
       <button class="btn" data-close>Cancel</button>
@@ -1143,9 +1182,15 @@ function clearAllCameras() {
 function openShareModal() {
   fillPickEmpty("share-screens", "Looking for displays...");
   fillPickEmpty("share-windows", "Looking for windows...");
-  fillPickEmpty("share-cameras", "Looking for cameras...");
   $("share-audio").checked = false;
   openModal("share-modal");
+  send({ type: "ListShareSources" });
+}
+// Sharing a screen and turning on a camera are separate acts, so they are
+// separate dialogs; both read the same source list from the core.
+function openCameraModal() {
+  fillPickEmpty("share-cameras", "Looking for cameras...");
+  openModal("camera-modal");
   send({ type: "ListShareSources" });
 }
 function fillPickEmpty(id, text) {
@@ -1305,8 +1350,18 @@ function renderCall() {
 
   // Header call button: hidden while in this call (Leave lives on the stage).
   const btn = $("btn-call");
-  if (!conv || conv.pending) btn.hidden = true;
-  else { btn.hidden = mineHere; $("btn-call-label").textContent = active ? "Join call" : "Call"; }
+  if (!conv || conv.pending) {
+    btn.hidden = true;
+  } else {
+    btn.hidden = false;
+    // In the call: the header reports state and cannot be clicked (Leave
+    // lives on the stage, where the rest of the call controls are).
+    btn.disabled = mineHere;
+    btn.classList.toggle("state", mineHere);
+    btn.classList.toggle("accent", !mineHere);
+    btn.title = mineHere ? "You are in this call" : "";
+    $("btn-call-label").textContent = mineHere ? "In call" : (active ? "Join call" : "Call");
+  }
 
   // Mini bar: in a call somewhere else.
   const showBar = inCall && myCallConv && myCallConv !== activeConv;
@@ -1445,9 +1500,22 @@ function setTab(tab) {
   $("tab-people").classList.toggle("active", tab === "people");
   $("pane-chats").hidden = tab !== "chats";
   $("pane-people").hidden = tab !== "people";
+  $("side-search").placeholder = tab === "chats" ? "Search conversations" : "Search friends";
 }
 $("tab-chats").addEventListener("click", () => setTab("chats"));
 $("tab-people").addEventListener("click", () => setTab("people"));
+
+let sideQuery = "";
+const matches = (...fields) => {
+  const q = sideQuery.trim().toLowerCase();
+  if (!q) return true;
+  return fields.some((f) => (f || "").toLowerCase().includes(q));
+};
+$("side-search").addEventListener("input", (e) => {
+  sideQuery = e.target.value;
+  renderConvoList();
+  renderPeople();
+});
 
 function statusOf(u) { return presence[u] || "offline"; }
 function dmPeer(conv) {
@@ -1464,8 +1532,15 @@ function lastLine(convId) {
 function renderConvoList() {
   const el = $("convo-list");
   el.innerHTML = "";
+  const shown = conversations.filter((c) => matches(c.title));
   $("convos-empty").hidden = conversations.length > 0;
-  for (const c of conversations) {
+  if (conversations.length && !shown.length) {
+    const d = document.createElement("div");
+    d.className = "pick-empty";
+    d.textContent = "No conversation matches that.";
+    el.appendChild(d);
+  }
+  for (const c of shown) {
     const row = document.createElement("button");
     row.className = "convo-row" + (c.id === activeConv ? " active" : "");
     const peer = dmPeer(c);
@@ -1564,8 +1639,15 @@ function renderPeople() {
   $("sec-outgoing").hidden = !outgoing.length;
 
   const fr = $("friend-list"); fr.innerHTML = "";
+  const shownFriends = friends.filter((f) => matches(f.display, f.username));
   $("friends-empty").hidden = friends.length > 0;
-  for (const f of friends) {
+  if (friends.length && !shownFriends.length) {
+    const d = document.createElement("div");
+    d.className = "pick-empty";
+    d.textContent = "No friend matches that.";
+    fr.appendChild(d);
+  }
+  for (const f of shownFriends) {
     const row = personRow(f, statusOf(f.username));
     const acts = row.querySelector(".row-actions");
     const msg = actionBtn("", "Message", SVG_MSG);
@@ -1668,6 +1750,7 @@ function renderChat() {
   }
   $("message").disabled = conv.pending;
   $("message").placeholder = conv.pending ? "Starting conversation..." : "Message " + conv.title;
+  setTimeout(focusComposer, 0); // opening a conversation puts the caret in it
   const list = messages[activeConv] || [];
   if (!list.length && !conv.pending) {
     const d = document.createElement("div");
@@ -1788,6 +1871,7 @@ function openGroupModal() {
   for (const f of friends) {
     const row = document.createElement("label");
     row.className = "member-row";
+    row.dataset.search = (f.display + " " + f.username).toLowerCase();
     row.innerHTML = '<input type="checkbox"><div class="avatar"></div>' +
       '<div class="meta"><div class="display"></div><div class="handle"></div></div>';
     row.querySelector("input").value = f.username;
@@ -1796,8 +1880,25 @@ function openGroupModal() {
     row.querySelector(".handle").textContent = f.username;
     box.appendChild(row);
   }
+  $("group-search").value = "";
+  filterGroupPicks();
   openModal("group-modal");
+  $("group-name").focus();
 }
+// Rows are hidden rather than rebuilt, so a friend ticked before you typed
+// stays ticked (and still joins the group) after you filter.
+function filterGroupPicks() {
+  const q = $("group-search").value.trim().toLowerCase();
+  let any = false;
+  for (const row of $("group-picks").querySelectorAll(".member-row")) {
+    const hit = !q || row.dataset.search.includes(q);
+    row.style.display = hit ? "" : "none";
+    any = any || hit;
+  }
+  const none = $("group-none");
+  if (none) none.hidden = any || !friends.length;
+}
+$("group-search").addEventListener("input", filterGroupPicks);
 $("new-group").addEventListener("click", openGroupModal);
 $("group-create").addEventListener("click", () => {
   const name = $("group-name").value.trim() || "New group";
@@ -1881,7 +1982,7 @@ $("callbar-return").addEventListener("click", () => { if (myCallConv) send({ typ
 $("ctl-mic").addEventListener("click", () => { muted = !muted; send({ type: "SetMuted", muted }); renderCall(); });
 $("ctl-deafen").addEventListener("click", () => { deafened = !deafened; send({ type: "SetDeafened", deafened }); renderCall(); });
 $("ctl-share").addEventListener("click", () => { if (sharing) send({ type: "StopScreenShare" }); else openShareModal(); });
-$("ctl-camera").addEventListener("click", () => { if (cameraOn) { send({ type: "StopCamera" }); camGone(myDisplay); } else openShareModal(); });
+$("ctl-camera").addEventListener("click", () => { if (cameraOn) { send({ type: "StopCamera" }); camGone(myDisplay); } else openCameraModal(); });
 $("btn-watch").addEventListener("click", () => {
   watchingStream = !watchingStream;
   if (!watchingStream) closeDecoder(); // resume needs a fresh keyframe anyway
@@ -1898,6 +1999,7 @@ $("ring-decline").addEventListener("click", () => {
 function openModal(id) { closeModals(); $(id).hidden = false; }
 function closeModals() {
   document.querySelectorAll(".overlay").forEach((o) => { o.hidden = true; });
+  setTimeout(focusComposer, 0);
 }
 document.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", closeModals));
 document.querySelectorAll(".overlay").forEach((o) =>
@@ -1989,6 +2091,7 @@ function showApp(username, display) {
 function showLogin() {
   $("app-view").hidden = true;
   $("login-view").hidden = false;
+  setTimeout(() => $("login-username").focus(), 0);
   myUsername = ""; myDisplay = ""; friends = []; incoming = []; outgoing = []; conversations = [];
   activeConv = null; activeSafety = "";
   inCall = false; myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false;
@@ -2130,6 +2233,24 @@ window.onEnclaveEvent = (ev) => {
       break;
   }
 };
+
+// ---- focus: the composer is where typing goes ----
+function focusComposer() {
+  const box = $("message");
+  if ($("app-view").hidden || $("composer-bar").hidden || box.disabled) return;
+  if (document.querySelector(".overlay:not([hidden])")) return;
+  box.focus();
+}
+// Start typing anywhere and the words land in the message box, as they would
+// in any chat: no hunting for the input first.
+document.addEventListener("keydown", (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key.length !== 1) return; // control keys keep their meaning
+  const t = e.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+  if (document.querySelector(".overlay:not([hidden])")) return;
+  focusComposer();
+});
 
 // ---- boot ----
 // The logo is a seal: the same glyph that marks a verified conversation,

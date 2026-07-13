@@ -321,6 +321,9 @@ input, select, textarea { font: inherit; }
   color: var(--ink); }
 .header-actions > button.accent { color: var(--accent-ink); }
 .header-actions > button.accent:hover { background: var(--accent-bg); border-color: transparent; }
+/* While the call is live the header shows state, not an action. */
+.header-actions > button.state { color: var(--accent-ink); cursor: default; }
+.header-actions > button.state:hover { background: transparent; border-color: transparent; }
 
 /* thin state banners */
 .banner { display: flex; align-items: center; gap: 10px; padding: 7px 18px; font-size: 13px;
@@ -480,11 +483,25 @@ input, select, textarea { font: inherit; }
 .verify-state.ok { color: var(--accent-ink); }
 .verify-state.pending { color: var(--muted); }
 
+/* sidebar + modal search */
+.side-search { padding: 8px 8px 4px; }
+.side-search input, .modal-search input {
+  width: 100%; padding: 7px 10px; border-radius: var(--radius);
+  background: var(--bg); border: 1px solid var(--border); color: var(--ink);
+  font-size: 13.5px;
+}
+.side-search input:focus, .modal-search input:focus { outline: none; border-color: var(--border-strong); }
+.side-search input::placeholder, .modal-search input::placeholder { color: var(--faint); }
+.picks-scroll { max-height: 240px; overflow-y: auto; }
+
 /* members */
 .member-row { display: flex; align-items: center; gap: 10px; padding: 6px 4px; }
 .member-row .meta { flex: 1; }
 .member-row .display { font-size: 14px; }
 .member-row .handle { font-size: 11.5px; color: var(--faint); }
+.member-row input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
+label.member-row { cursor: pointer; border-radius: var(--radius); }
+label.member-row:hover { background: var(--raised); }
 .member-row .kick { opacity: 0; color: var(--muted); width: 26px; height: 26px;
   display: grid; place-items: center; border-radius: var(--radius); }
 .member-row:hover .kick { opacity: 1; }
@@ -625,6 +642,10 @@ input, select, textarea { font: inherit; }
     <div class="side-tabs">
       <button class="active" id="tab-chats">Chats</button>
       <button id="tab-people">People <span class="count attention" id="req-count">1</span></button>
+    </div>
+
+    <div class="side-search">
+      <input id="side-search" placeholder="Search conversations" autocomplete="off" spellcheck="false">
     </div>
 
     <div class="side-scroll" id="pane-chats">
@@ -802,10 +823,6 @@ input, select, textarea { font: inherit; }
       <div class="s-head">Windows</div>
       <div class="pick-list" id="pick-windows"></div>
     </div>
-    <div class="m-section">
-      <div class="s-head">Cameras</div>
-      <div class="pick-list" id="pick-cameras"></div>
-    </div>
     <div class="divider"></div>
     <div class="share-audio-row">
       <input type="checkbox" id="share-audio-check">
@@ -814,6 +831,18 @@ input, select, textarea { font: inherit; }
         <div class="hint" id="share-audio-hint">A window shares only that app's audio. A whole screen
           shares everything, so others may hear the call echo back.</div>
       </div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="modal-camera" hidden>
+  <div class="modal">
+    <div class="m-head">
+      <h2>Turn on a camera</h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="m-section">
+      <div class="pick-list" id="pick-cameras"></div>
     </div>
   </div>
 </div>
@@ -916,7 +945,11 @@ input, select, textarea { font: inherit; }
     </div>
     <div class="m-section">
       <div class="s-head">Invite friends</div>
-      <div id="newgroup-friends"></div>
+      <div class="modal-search">
+        <input id="group-search" placeholder="Search friends" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="picks-scroll"><div id="newgroup-friends"></div>
+        <div class="pick-empty" id="group-none" hidden>No friend matches that.</div></div>
     </div>
     <div class="m-actions">
       <button class="btn" data-close>Cancel</button>
@@ -1089,10 +1122,24 @@ function toast(text, error) {
 
 /* ---------------- sidebar ---------------- */
 
+let sideQuery = "";
+const matchQ = (...fields) => {
+  const q = sideQuery.trim().toLowerCase();
+  return !q || fields.some(f => (f || "").toLowerCase().includes(q));
+};
+$("side-search").addEventListener("input", e => {
+  sideQuery = e.target.value;
+  renderConvoList(); renderPeople();
+});
+
 function renderConvoList() {
   const el = $("convo-list");
   el.innerHTML = "";
-  for (const [id, c] of Object.entries(CONVOS)) {
+  const shown = Object.entries(CONVOS).filter(([, c]) => matchQ(c.title));
+  if (!shown.length) {
+    el.innerHTML = '<div class="pick-empty">No conversation matches that.</div>';
+  }
+  for (const [id, c] of shown) {
     const row = document.createElement("button");
     row.className = "convo-row" + (id === state.activeConvo ? " active" : "");
     const av = c.kind === "dm"
@@ -1152,7 +1199,11 @@ function renderPeople() {
   $("sec-outgoing").hidden = !state.outgoing.length;
 
   const fr = $("friend-list"); fr.innerHTML = "";
-  Object.values(PEOPLE).forEach(p => {
+  const shownFriends = Object.values(PEOPLE).filter(p => matchQ(p.display, p.handle));
+  if (!shownFriends.length) {
+    fr.innerHTML = '<div class="pick-empty">No friend matches that.</div>';
+  }
+  shownFriends.forEach(p => {
     const row = personRow(p, `
       <button title="Message"><svg class="icon sm" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></button>
       <button class="no" title="Remove friend"><svg class="icon sm" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg></button>`);
@@ -1170,6 +1221,7 @@ function renderPeople() {
 
 function setTab(tab) {
   state.tab = tab;
+  $("side-search").placeholder = tab === "chats" ? "Search conversations" : "Search friends";
   $("tab-chats").classList.toggle("active", tab === "chats");
   $("tab-people").classList.toggle("active", tab === "people");
   $("pane-chats").hidden = tab !== "chats";
@@ -1243,6 +1295,7 @@ function switchConvo(id) {
   state.activeConvo = id;
   CONVOS[id].unread = 0;
   renderConvoList(); renderHeader(); renderMessages(); renderStage();
+  setTimeout(focusComposer, 0); // opening a conversation puts the caret in it
 }
 
 function sendMessage() {
@@ -1267,8 +1320,12 @@ function renderStage() {
   if (state.inCall) $("callbar-with").textContent = CONVOS[state.callConvo].title;
 
   const callBtn = $("btn-call");
+  // In the call the header reports state, not an action: no hover, no pointer.
+  callBtn.disabled = inThisCall;
+  callBtn.classList.toggle("state", inThisCall);
+  callBtn.classList.toggle("accent", !inThisCall);
   callBtn.querySelector("span").textContent =
-    inThisCall ? "In call" : (convo().liveCall || (state.inCall && state.callConvo === state.activeConvo)) ? "Join call" : "Call";
+    inThisCall ? "In call" : (convo().liveCall ? "Join call" : "Call");
 
   if (!inThisCall) return;
 
@@ -1340,6 +1397,13 @@ function leaveCall() {
 
 const WAYLAND = false;   // flip to preview the Wayland variant of the picker
 
+// Sharing a screen and turning on a camera are separate acts, so they get
+// separate dialogs.
+function openCameraPicker() {
+  fillPicks("pick-cameras", [{ label: "HD Webcam" }], "camera");
+  openModal("modal-camera");
+}
+
 function openSharePicker() {
   const screens = WAYLAND
     ? [{ label: "Screen or window (choose in the system dialog)" }]
@@ -1350,7 +1414,6 @@ function openSharePicker() {
 
   fillPicks("pick-screens", screens, "monitor");
   fillPicks("pick-windows", windows, "window");
-  fillPicks("pick-cameras", cams, "camera");
   $("share-audio-hint").textContent = WAYLAND
     ? "Shared audio is the whole system mix, so others may hear the call echo back unless it plays on another device."
     : "A window shares only that app's audio. A whole screen shares everything, so others may hear the call echo back.";
@@ -1436,21 +1499,39 @@ function openNewGroup() {
   const wrap = $("newgroup-friends"); wrap.innerHTML = "";
   Object.values(PEOPLE).forEach(p => {
     const row = document.createElement("label");
-    row.className = "member-row"; row.style.cursor = "pointer";
-    row.innerHTML = `<input type="checkbox" style="accent-color:var(--accent)">
+    row.className = "member-row";
+    row.dataset.search = (p.display + " " + p.handle).toLowerCase();
+    row.innerHTML = `<input type="checkbox">
       <div class="avatar">${initials(p.display)}</div>
       <div class="meta"><div class="display">${p.display}</div>
         <div class="handle">${p.handle}</div></div>`;
     wrap.appendChild(row);
   });
+  $("group-search").value = "";
+  filterGroupPicks();
   openModal("modal-newgroup");
+  $("g-name").focus();
 }
+// Rows hide rather than rebuild, so a friend ticked before you typed stays
+// ticked after you filter.
+function filterGroupPicks() {
+  const q = $("group-search").value.trim().toLowerCase();
+  let any = false;
+  for (const row of $("newgroup-friends").querySelectorAll(".member-row")) {
+    const hit = !q || row.dataset.search.includes(q);
+    row.style.display = hit ? "" : "none";
+    any = any || hit;
+  }
+  $("group-none").hidden = any;
+}
+$("group-search").addEventListener("input", filterGroupPicks);
 
 /* ---------------- modals ---------------- */
 
 function openModal(id) { closeModals(); $(id).hidden = false; }
 function closeModals() {
   document.querySelectorAll(".overlay").forEach(o => o.hidden = true);
+  setTimeout(focusComposer, 0);
 }
 document.querySelectorAll("[data-close]").forEach(b => b.onclick = closeModals);
 document.querySelectorAll(".overlay").forEach(o =>
@@ -1565,7 +1646,7 @@ $("ctl-mic").onclick = () => { state.muted = !state.muted; renderStage(); };
 $("ctl-deafen").onclick = () => { state.deafened = !state.deafened; renderStage(); };
 $("ctl-camera").onclick = () => {
   if (state.camera) { state.camera = false; renderStage(); }
-  else openSharePicker();
+  else openCameraPicker();
 };
 $("ctl-share").onclick = () => {
   if (state.sharing) { state.sharing = false; renderStage(); toast("Stopped sharing"); }
@@ -1686,6 +1767,23 @@ document.querySelectorAll("#proto [data-proto]").forEach(b => b.onclick = () => 
   if (a === "toast-codec") toast("This system's WebView cannot decode H.264; watching shares will not work. Install gstreamer1.0-libav.", true);
 });
 
+/* ---------------- focus ---------------- */
+
+function focusComposer() {
+  const box = $("composer-input");
+  if (!$("login-view").hidden) return;
+  if (document.querySelector(".overlay:not([hidden])")) return;
+  box.focus();
+}
+// Start typing anywhere and the words land in the message box.
+document.addEventListener("keydown", e => {
+  if (e.ctrlKey || e.metaKey || e.altKey || e.key.length !== 1) return;
+  const t = e.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT")) return;
+  if (document.querySelector(".overlay:not([hidden])")) return;
+  focusComposer();
+});
+
 /* ---------------- boot ---------------- */
 
 // The logo is a seal: the same glyph that marks a verified conversation,
@@ -1695,6 +1793,7 @@ $("brand-seal").innerHTML = sealSVG(BRAND_SAFETY, true, 32);
 
 showLogin(false);
 setTab("chats");
+setTimeout(focusComposer, 0);
 renderConvoList(); renderPeople(); renderHeader(); renderMessages(); renderStage();
 setConnection("online");
 </script>
