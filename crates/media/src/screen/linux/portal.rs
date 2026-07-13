@@ -47,7 +47,6 @@ use crate::MediaError;
 /// process's lifetime so a re-share can skip the dialog if the compositor
 /// remembered the user's choice. (Persisting it across runs would need a
 /// state file; a fresh run re-asks, which is the common desktop behavior.)
-static RESTORE_TOKEN: Mutex<Option<String>> = Mutex::new(None);
 
 /// Captures the portal-picked monitor or window on a dedicated thread,
 /// exposing the latest frame. Dropping it stops the capture.
@@ -200,7 +199,6 @@ fn portal_handshake() -> Result<PwTarget, EndedReason> {
         .build()
         .map_err(|e| EndedReason::Failed(format!("portal runtime: {e}")))?;
 
-    let restore = RESTORE_TOKEN.lock().unwrap().clone();
     let failed = |what: &'static str| {
         move |e: ashpd::Error| match e {
             ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled) => {
@@ -218,17 +216,18 @@ fn portal_handshake() -> Result<PwTarget, EndedReason> {
             .await
             .map_err(failed("portal session"))?;
 
-        let mut options = SelectSourcesOptions::default()
+        let options = SelectSourcesOptions::default()
             .set_multiple(false)
             .set_cursor_mode(CursorMode::Embedded)
             .set_sources(
                 ashpd::enumflags2::BitFlags::from(ashpd::desktop::screencast::SourceType::Monitor)
                     | ashpd::desktop::screencast::SourceType::Window,
             )
-            .set_persist_mode(PersistMode::Application);
-        if let Some(token) = restore.as_deref() {
-            options = options.set_restore_token(token);
-        }
+            // Do NOT persist a restore token: with it, the compositor silently
+            // restores the previous selection on the next share with no dialog,
+            // and a restored-but-stale session left re-sharing broken (no picker,
+            // no frames). A fresh dialog + fresh session every time is reliable.
+            .set_persist_mode(PersistMode::DoNot);
         portal
             .select_sources(&session, options)
             .await
@@ -245,9 +244,6 @@ fn portal_handshake() -> Result<PwTarget, EndedReason> {
             .response()
             .map_err(failed("portal start"))?;
 
-        if let Some(token) = streams.restore_token() {
-            *RESTORE_TOKEN.lock().unwrap() = Some(token.to_owned());
-        }
         let stream = streams
             .streams()
             .first()
