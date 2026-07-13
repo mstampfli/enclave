@@ -9,19 +9,29 @@ that matters: **trust**.
 
 ## Status
 
-Phase 7 -- the full premise end to end, multi-party groups, a self-contained
-window, and a hardening pass (`cargo test`, 38 tests): audio is Opus-encoded,
-sealed per-frame, relayed through the live server (which sees only ciphertext),
-then opened and decoded back to clear audio; groups rekey on join/leave, cutting
-departed members off; sealed frames stream over a low-latency UDP carrier; a
-`Client` controller drives a wry/WebView2 window whose UI is bundled into the
-binary; and the relay has deny-by-default access control, size-bounded panic-safe
-parsing, optional TLS (wss) on the signaling hop, and per-connection rate
-limiting, gated by CI (fmt, clippy, tests, dependency audit, secret scan). The
-ASVS L2 review is complete. Remaining: presence and a friends roster,
-video/screenshare, and on-hardware validation of the audio devices and window.
-See `ARCHITECTURE.md` for the roadmap and `THREAT_MODEL.md` for the STRIDE + ASVS
-analysis. Nothing here is secure to rely on yet.
+The whole premise runs end to end on **Windows and Linux** (`cargo test`, 101
+tests): audio is Opus-encoded, sealed per-frame, relayed through the live server
+(which sees only ciphertext), then opened and decoded back to clear audio;
+groups rekey on join/leave, cutting departed members off; sealed frames stream
+over a low-latency UDP carrier. Calls carry **screen share, window share, and
+camera**, plus system or per-app audio, with capture backends per platform
+(WGC/DXGI and WASAPI on Windows; the XDG portal with PipeWire on Wayland, raw
+MIT-SHM/XComposite grabs on X11) -- all validated on real hardware, not just
+compiled. Friends, requests, presence, and named groups are in; the relay has
+deny-by-default access control, size-bounded panic-safe parsing, optional TLS
+(wss) on the signaling hop, and per-connection rate limiting; and CI gates every
+push on both platforms (fmt, clippy, tests, dependency audit, secret scan). The
+ASVS L2 review is complete.
+
+The client is a self-contained native window (WebView2 on Windows, WebKitGTK on
+Linux) with its own interface; `design/redesign.html` is a runnable prototype
+of it.
+
+**Remaining:** message timestamps on the wire, verification marks persisted in
+the keystore, presence rules moved into the core, a macOS capture backend, and a
+real two-machine call. See `ARCHITECTURE.md` for the roadmap and
+`THREAT_MODEL.md` for the STRIDE + ASVS analysis. Nothing here is audited or
+secure to rely on yet.
 
 ## Workspace
 

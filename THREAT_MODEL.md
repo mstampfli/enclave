@@ -226,8 +226,24 @@ function. Implemented as one tested primitive in `enclave-transport::opaque`.
 
 ## Deferred mitigations (scheduled, not skipped)
 
-No outstanding security mitigations: the ASVS L2 chapters above are addressed
-(TLS and rate limiting are now implemented). The only tracked security item is
-the waived, verified-non-exploitable upstream advisory above. Remaining work is
-product features (presence, a persistent friends roster, video) plus on-hardware
-validation of the audio devices and the window.
+The ASVS L2 chapters above are addressed (TLS and rate limiting are
+implemented), and the only tracked upstream item is the waived,
+verified-non-exploitable advisory above. Two security-relevant gaps remain, both
+in the client:
+
+- **Verification marks do not persist.** Confirming a peer's safety number is
+  recorded per conversation and per number (so a rekey correctly resets it), but
+  it lives in the WebView's storage, whose directory is per-process today. The
+  mark therefore lasts one run: after a restart a verified peer shows as
+  unverified again. That fails safe (it under-claims trust, never over-claims
+  it) but it trains users to ignore the indicator, which is the real risk. The
+  mark belongs in the Rust keystore, alongside the pinned identity keys.
+- **Presence rules are enforced in the UI, not the core.** Idle-to-away, status
+  durations, and the invariant that a set status never upgrades (a disconnect
+  always shows offline) are implemented in the front end. They are privacy
+  behaviour, not access control, so a bug leaks activity metadata to friends
+  rather than content to strangers. They still belong in the controller, where
+  the front end cannot get them wrong, with idle measured at the OS level.
+
+Neither weakens the sealed-frame or MLS invariants: the server still never
+possesses a key or a plaintext.

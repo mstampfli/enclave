@@ -183,14 +183,16 @@ window by default and only add the WASM/browser target when we choose to.
    raw MIT-SHM/XComposite grabs (X11) on Linux (validated end to end by
    `crates/media/examples/{screen,system_audio,camera,mic}_probe` on real
    hardware; the interactive portal-dialog leg on a real desktop session).
-6. [MOSTLY DONE] Self-contained window + client controller. `enclave-client` is
-   now a lib + bin: the lib is a high-level `Client` controller (connect, start
-   group, invite, send text, safety number, event pump) proven by
+6. [DONE] Self-contained window + client controller. `enclave-client` is a lib +
+   bin: the lib is a high-level `Client` controller (connect, start group,
+   invite, send text, safety number, event pump) proven by
    `crates/client/tests/client_flow.rs` (two clients chat via the API); the bin
-   is a wry/WebView2 window whose UI is bundled into the binary (`src/ui/`,
-   never a browser or localhost) and driven over an IPC bridge. **Remaining:**
-   presence broadcast and a persistent friends roster (currently invite-by-name),
-   and on-hardware validation of the window (it compiles; GUI can't run in CI).
+   is a wry window whose UI is bundled into the binary (`src/ui/index.html`,
+   never a browser or localhost) and driven over an IPC bridge. Presence and a
+   persistent friends roster (requests, accept/decline, per-user status) are
+   served by the relay (`transport::friends`, disk-backed) and rendered by the
+   client. The window runs on Windows and Linux; only CI cannot open a GUI.
+   A runnable prototype of the interface lives in `design/redesign.html`.
 7. [DONE] Hardening. ASVS L2 review (`THREAT_MODEL.md`); relay access control is
    deny-by-default (non-members cannot join/invite/inject); untrusted
    deserialization is size-bounded (UDP 64 KiB, WS 1 MiB); parsers fuzzed for

@@ -968,7 +968,7 @@ label.member-row:hover { background: var(--raised); }
   <div class="palette">
     <input id="palette-input" placeholder="Jump to a conversation or run a command..." autocomplete="off">
     <div class="results" id="palette-results"></div>
-    <div class="p-hint">Up and down to move, Enter to run, Esc to close.</div>
+    <div class="p-hint">Arrows to move, Enter to run, Esc to close.</div>
   </div>
 </div>
 
@@ -2035,6 +2035,16 @@ function paletteItems(q) {
   const needle = q.trim().toLowerCase();
   return needle ? items.filter((i) => i.label.toLowerCase().includes(needle)) : items;
 }
+// The mouse and the arrow keys drive the same cursor: whatever the pointer is
+// over is what Enter runs. Moved by class swap, not a re-render, so the list
+// never flickers under the pointer.
+function selectPaletteRow(i) {
+  const rows = document.querySelectorAll("#palette-results .p-row");
+  if (i < 0 || i >= rows.length || i === paletteSel) return;
+  paletteSel = i;
+  rows.forEach((r, j) => r.classList.toggle("sel", j === i));
+}
+
 function renderPalette() {
   const q = $("palette-input").value;
   const items = paletteItems(q);
@@ -2047,8 +2057,11 @@ function renderPalette() {
     b.innerHTML = it.icon + '<span class="p-label"></span>';
     b.querySelector(".p-label").textContent = it.label;
     b.addEventListener("click", () => { closeModals(); it.run(); });
+    b.addEventListener("mousemove", () => selectPaletteRow(i));
     box.appendChild(b);
   });
+  const sel = box.querySelector(".p-row.sel");
+  if (sel) sel.scrollIntoView({ block: "nearest" });
   return items;
 }
 function openPalette() {

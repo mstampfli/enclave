@@ -93,7 +93,17 @@ cargo run -p enclave-media --example mic_loopback         # hear yourself via Op
 
 ## Still to come
 
-Presence broadcast polish and a persistent friends roster beyond
-invite-by-name; a macOS capture backend (the media API stubs cleanly there).
-The crypto, transport, calls, screen/window/camera share, and per-app or
-system audio share are done and tested; see `ARCHITECTURE.md`.
+- **Message timestamps.** The wire format has no time field, so the UI cannot
+  show one.
+- **Verification marks are not persisted.** Confirming a safety number lasts
+  one run of the app; the mark belongs in the keystore.
+- **Presence rules live in the UI.** Idle-to-away, status durations, and
+  "a set status never upgrades" should be enforced by the core, with idle
+  measured at the OS level rather than from window events.
+- **A macOS capture backend.** The media API stubs cleanly there today.
+- **A real two-machine call.** Everything below the portal dialog is verified
+  on one box; two boxes over a network is not.
+
+The crypto, transport, calls, screen/window/camera share, per-app and system
+audio share, friends, presence, and groups are done and tested; see
+`ARCHITECTURE.md`.
