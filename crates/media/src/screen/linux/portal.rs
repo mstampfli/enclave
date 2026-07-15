@@ -43,11 +43,6 @@ use super::super::{
 };
 use crate::MediaError;
 
-/// The portal restore token from the last approved share, kept for this
-/// process's lifetime so a re-share can skip the dialog if the compositor
-/// remembered the user's choice. (Persisting it across runs would need a
-/// state file; a fresh run re-asks, which is the common desktop behavior.)
-
 /// Captures the portal-picked monitor or window on a dedicated thread,
 /// exposing the latest frame. Dropping it stops the capture.
 pub struct PortalCapture {
