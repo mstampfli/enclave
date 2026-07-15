@@ -1040,7 +1040,13 @@ impl Client {
         let (group, path, name, mime, size) = match self.outgoing_files.get_mut(&offer_id) {
             Some(o) if !o.started => {
                 o.started = true;
-                (o.group.clone(), o.path.clone(), o.name.clone(), o.mime.clone(), o.size)
+                (
+                    o.group.clone(),
+                    o.path.clone(),
+                    o.name.clone(),
+                    o.mime.clone(),
+                    o.size,
+                )
             }
             _ => return, // unknown or already streaming
         };
@@ -1112,7 +1118,8 @@ impl Client {
                 match chunk {
                     None => {
                         // Every chunk sent: signal completion and finish.
-                        self.conn.try_send_file(ClientMsg::FileComplete { offer_id: id });
+                        self.conn
+                            .try_send_file(ClientMsg::FileComplete { offer_id: id });
                         self.uploads.remove(&id);
                         break;
                     }
@@ -1300,7 +1307,6 @@ impl Client {
         None
     }
 
-
     /// A file was offered to us. Decrypt its manifest (no download needed),
     /// record the pending offer, and surface a consent prompt. Nothing touches
     /// disk here: the bytes arrive only if the user accepts.
@@ -1347,10 +1353,7 @@ impl Client {
     /// it (full, low disk, too big), retry the same file live -- the recipient
     /// may be online. If the live attempt (or any other) is refused, give up.
     fn handle_offer_rejected(&mut self, offer_id: [u8; 16], reason: String) -> Option<Event> {
-        let can_retry_live = self
-            .outgoing_files
-            .get(&offer_id)
-            .is_some_and(|o| !o.live);
+        let can_retry_live = self.outgoing_files.get(&offer_id).is_some_and(|o| !o.live);
         if can_retry_live {
             let (group, manifest) = {
                 let o = self.outgoing_files.get(&offer_id)?;
@@ -1469,7 +1472,10 @@ impl Client {
         let (size, write) = {
             let inc = self.incoming_files.get_mut(&offer_id)?;
             let sink = inc.sink.as_mut()?;
-            (inc.size, sink.write_part(&part).map(|done| (done, sink.bytes())))
+            (
+                inc.size,
+                sink.write_part(&part).map(|done| (done, sink.bytes())),
+            )
         };
         let (done, sent) = match write {
             Ok(v) => v,
@@ -2248,8 +2254,14 @@ impl Client {
                     if matches!(part.meta, TransferMeta::File { .. }) {
                         return None;
                     }
-                    let summary = (part.total > 1)
-                        .then(|| (hex::encode(part.id), "message".to_string(), part.index, part.total));
+                    let summary = (part.total > 1).then(|| {
+                        (
+                            hex::encode(part.id),
+                            "message".to_string(),
+                            part.index,
+                            part.total,
+                        )
+                    });
                     let complete = conv.reassembler.accept(part);
                     (username, summary, complete)
                 };
@@ -2333,9 +2345,11 @@ impl Client {
                 self.handle_offer_rejected(offer_id, reason)
             }
             ServerMsg::FileDeclined { offer_id, by } => self.handle_file_declined(offer_id, by),
-            ServerMsg::FileChunk { offer_id, from: _, data } => {
-                self.handle_file_chunk(offer_id, data)
-            }
+            ServerMsg::FileChunk {
+                offer_id,
+                from: _,
+                data,
+            } => self.handle_file_chunk(offer_id, data),
             ServerMsg::FileComplete { offer_id, .. } => self.handle_file_complete(offer_id),
             ServerMsg::Ack { seq } => {
                 // The server durably accepted this reliable message: stop tracking
@@ -2491,7 +2505,10 @@ fn safe_file_name(raw: &str) -> String {
 /// so two arrivals cannot race onto one path. Verifies the path is genuinely
 /// inside `dir` (defense in depth against any sanitization gap). See
 /// THREAT_MODEL.md: the filename is attacker-controlled.
-fn reserve_download(dir: &std::path::Path, name: &str) -> std::io::Result<(std::fs::File, PathBuf)> {
+fn reserve_download(
+    dir: &std::path::Path,
+    name: &str,
+) -> std::io::Result<(std::fs::File, PathBuf)> {
     std::fs::create_dir_all(dir)?;
     // Canonicalize the target directory so the containment check compares real
     // paths, not ones with symlinks or `.` segments.

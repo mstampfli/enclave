@@ -629,7 +629,10 @@ impl Relay {
                     }],
                     // Target offline: queue the Welcome for their next login, so a
                     // member added while away still joins the group.
-                    None => self.queue_for_offline(from, &to.0, welcome).into_iter().collect(),
+                    None => self
+                        .queue_for_offline(from, &to.0, welcome)
+                        .into_iter()
+                        .collect(),
                 }
             }
 
@@ -879,9 +882,7 @@ impl Relay {
                 live,
             } => self.handle_file_offer(from, offer_id, group, size, manifest, live),
 
-            ClientMsg::FileChunk { offer_id, data } => {
-                self.handle_file_chunk(from, offer_id, data)
-            }
+            ClientMsg::FileChunk { offer_id, data } => self.handle_file_chunk(from, offer_id, data),
 
             ClientMsg::FileComplete { offer_id } => self.handle_file_complete(from, offer_id),
 
@@ -930,7 +931,11 @@ impl Relay {
             None => return vec![],
         };
         if recipients.is_empty() {
-            return vec![reject(from, offer_id, "no one is in this conversation to receive it")];
+            return vec![reject(
+                from,
+                offer_id,
+                "no one is in this conversation to receive it",
+            )];
         }
 
         if live {
@@ -978,10 +983,15 @@ impl Relay {
             // Stored: admit to the on-disk store, then let the sender upload.
             let recip_names: Vec<String> = recipients.iter().map(|d| d.0.clone()).collect();
             let now = (self.now)();
-            match self
-                .files
-                .begin(offer_id, group, sender.0.clone(), recip_names, size, manifest, now)
-            {
+            match self.files.begin(
+                offer_id,
+                group,
+                sender.0.clone(),
+                recip_names,
+                size,
+                manifest,
+                now,
+            ) {
                 Ok(()) => vec![Outgoing {
                     to: from,
                     msg: ServerMsg::FileUploadReady { offer_id },
@@ -994,7 +1004,12 @@ impl Relay {
     /// One sealed chunk from the sender: appended to a stored upload, or relayed
     /// to the accepting recipients of a live offer. Only the offer's own sender
     /// may push chunks (ASVS V4).
-    fn handle_file_chunk(&mut self, from: ConnId, offer_id: [u8; 16], data: Sealed) -> Vec<Outgoing> {
+    fn handle_file_chunk(
+        &mut self,
+        from: ConnId,
+        offer_id: [u8; 16],
+        data: Sealed,
+    ) -> Vec<Outgoing> {
         let sender = self.device_for(from);
         if self.files.sender_of(&offer_id) == Some(sender.0.as_str()) {
             // Stored upload: buffer the chunk to disk.
@@ -1013,7 +1028,11 @@ impl Relay {
             .is_some_and(|o| o.sender == sender)
         {
             // Live stream: relay to everyone who accepted (and is still online).
-            let targets: Vec<DeviceId> = self.live_offers[&offer_id].accepted.iter().cloned().collect();
+            let targets: Vec<DeviceId> = self.live_offers[&offer_id]
+                .accepted
+                .iter()
+                .cloned()
+                .collect();
             targets
                 .into_iter()
                 .filter_map(|dev| self.device_conn.get(&dev).copied())
@@ -1040,7 +1059,8 @@ impl Relay {
             if self.files.finish(&offer_id).is_err() {
                 return vec![];
             }
-            let Some((group, _sender, size, manifest, recipients)) = self.files.offer_meta(&offer_id)
+            let Some((group, _sender, size, manifest, recipients)) =
+                self.files.offer_meta(&offer_id)
             else {
                 return vec![];
             };
@@ -1482,7 +1502,12 @@ impl Relay {
     /// -- i.e. real resource exhaustion. Below that the queue evicts the device's
     /// own oldest to make room, so an incoming message is never silently lost;
     /// at true exhaustion the sender is told rather than the message vanishing.
-    fn queue_for_offline(&mut self, sender: ConnId, device: &str, msg: ServerMsg) -> Option<Outgoing> {
+    fn queue_for_offline(
+        &mut self,
+        sender: ConnId,
+        device: &str,
+        msg: ServerMsg,
+    ) -> Option<Outgoing> {
         if self.queue.enqueue(device, msg) {
             None
         } else {

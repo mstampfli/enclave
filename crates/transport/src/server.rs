@@ -709,7 +709,11 @@ mod outbound_tests {
             .unwrap();
         // Control still flows: the two budgets are independent.
         out.try_send(&msg(1024));
-        assert_eq!(drain(&mut rx), 1, "control not starved by a full file budget");
+        assert_eq!(
+            drain(&mut rx),
+            1,
+            "control not starved by a full file budget"
+        );
     }
 
     #[tokio::test]

@@ -158,7 +158,11 @@ mod tests {
             &loaded.unacked[0].1,
             ClientMsg::Text { message, .. } if message.0 == vec![1, 2, 3]
         ));
-        assert_eq!(loaded.seen_ids, vec![[9u8; 16], [10u8; 16]], "dedup ids persisted");
+        assert_eq!(
+            loaded.seen_ids,
+            vec![[9u8; 16], [10u8; 16]],
+            "dedup ids persisted"
+        );
 
         // A wrong key yields a default (no leakage), including empty reliability state.
         let wrong = load(&path, b"the-wrong-export-key-entirely-here");

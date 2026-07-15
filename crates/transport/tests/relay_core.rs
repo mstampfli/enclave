@@ -745,7 +745,12 @@ fn two_member_group(r: &mut Relay) -> (u64, String, u64, String, GroupId) {
     let (a, ah) = register(r, "a", vec![1]);
     let (b, bh) = register(r, "b", vec![2]);
     let group = GroupId([42u8; 32]);
-    r.handle(a, ClientMsg::JoinGroup { group: group.clone() });
+    r.handle(
+        a,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    );
     r.handle(
         a,
         ClientMsg::Welcome {
@@ -788,15 +793,29 @@ fn a_stored_file_is_offered_not_pushed_and_delivered_only_on_accept() {
     );
 
     // Alice uploads a chunk and finishes. Bob is NOT sent the bytes.
-    let up = r.handle(a, ClientMsg::FileChunk { offer_id, data: Sealed(vec![1, 2, 3]) });
-    assert!(up.is_empty(), "an uploaded chunk is buffered, never fanned out");
+    let up = r.handle(
+        a,
+        ClientMsg::FileChunk {
+            offer_id,
+            data: Sealed(vec![1, 2, 3]),
+        },
+    );
+    assert!(
+        up.is_empty(),
+        "an uploaded chunk is buffered, never fanned out"
+    );
     let done = r.handle(a, ClientMsg::FileComplete { offer_id });
 
     // Bob (online) is *offered* the file, and only that -- no chunk.
     assert_eq!(done.len(), 1, "exactly one notification");
     assert_eq!(done[0].to, b);
     match &done[0].msg {
-        ServerMsg::FileOffered { manifest, live, from, .. } => {
+        ServerMsg::FileOffered {
+            manifest,
+            live,
+            from,
+            ..
+        } => {
             assert_eq!(manifest.0, vec![0xAA], "the sealed manifest reaches Bob");
             assert!(!live);
             assert_eq!(from.0, ah);
@@ -804,15 +823,18 @@ fn a_stored_file_is_offered_not_pushed_and_delivered_only_on_accept() {
         other => panic!("expected FileOffered, got {other:?}"),
     }
     assert!(
-        !done.iter().any(|o| matches!(o.msg, ServerMsg::FileChunk { .. })),
+        !done
+            .iter()
+            .any(|o| matches!(o.msg, ServerMsg::FileChunk { .. })),
         "no file bytes are auto-downloaded"
     );
 
     // Bob accepts: Alice is told, and a blob delivery to Bob is scheduled.
     let acc = r.handle(b, ClientMsg::FileAccept { offer_id });
     assert!(
-        acc.iter().any(|o| o.to == a
-            && matches!(&o.msg, ServerMsg::FileAccepted { by, .. } if by.0 == bh)),
+        acc.iter().any(
+            |o| o.to == a && matches!(&o.msg, ServerMsg::FileAccepted { by, .. } if by.0 == bh)
+        ),
         "sender notified of the accept"
     );
     let deliveries = r.take_blob_deliveries();
@@ -829,15 +851,28 @@ fn declining_a_stored_offer_notifies_the_sender() {
     let offer_id = [8u8; 16];
     r.handle(
         a,
-        ClientMsg::FileOffer { offer_id, group, size: 10, manifest: Sealed(vec![1]), live: false },
+        ClientMsg::FileOffer {
+            offer_id,
+            group,
+            size: 10,
+            manifest: Sealed(vec![1]),
+            live: false,
+        },
     );
-    r.handle(a, ClientMsg::FileChunk { offer_id, data: Sealed(vec![9]) });
+    r.handle(
+        a,
+        ClientMsg::FileChunk {
+            offer_id,
+            data: Sealed(vec![9]),
+        },
+    );
     r.handle(a, ClientMsg::FileComplete { offer_id });
 
     let out = r.handle(b, ClientMsg::FileDecline { offer_id });
     assert!(
-        out.iter().any(|o| o.to == a
-            && matches!(&o.msg, ServerMsg::FileDeclined { by, .. } if by.0 == bh)),
+        out.iter().any(
+            |o| o.to == a && matches!(&o.msg, ServerMsg::FileDeclined { by, .. } if by.0 == bh)
+        ),
         "sender told who declined"
     );
     // The offer is gone: a late accept delivers nothing.
@@ -854,9 +889,21 @@ fn a_stored_offer_to_an_offline_recipient_is_queued_until_login() {
     let offer_id = [9u8; 16];
     r.handle(
         a,
-        ClientMsg::FileOffer { offer_id, group, size: 10, manifest: Sealed(vec![0xCD]), live: false },
+        ClientMsg::FileOffer {
+            offer_id,
+            group,
+            size: 10,
+            manifest: Sealed(vec![0xCD]),
+            live: false,
+        },
     );
-    r.handle(a, ClientMsg::FileChunk { offer_id, data: Sealed(vec![1]) });
+    r.handle(
+        a,
+        ClientMsg::FileChunk {
+            offer_id,
+            data: Sealed(vec![1]),
+        },
+    );
     let done = r.handle(a, ClientMsg::FileComplete { offer_id });
     assert!(done.is_empty(), "nothing delivered while Bob is offline");
 
@@ -881,18 +928,34 @@ fn a_live_offer_streams_through_the_server_to_accepting_recipients() {
     // Live offer to an online recipient: Bob is offered it, nothing is stored.
     let out = r.handle(
         a,
-        ClientMsg::FileOffer { offer_id, group, size: 0, manifest: Sealed(vec![0xEE]), live: true },
+        ClientMsg::FileOffer {
+            offer_id,
+            group,
+            size: 0,
+            manifest: Sealed(vec![0xEE]),
+            live: true,
+        },
     );
     assert_eq!(out[0].to, b);
-    assert!(matches!(&out[0].msg, ServerMsg::FileOffered { live: true, .. }));
+    assert!(matches!(
+        &out[0].msg,
+        ServerMsg::FileOffered { live: true, .. }
+    ));
 
     // Bob accepts -> Alice is cued.
     let acc = r.handle(b, ClientMsg::FileAccept { offer_id });
-    assert!(acc.iter().any(|o| o.to == a
-        && matches!(&o.msg, ServerMsg::FileAccepted { by, .. } if by.0 == bh)));
+    assert!(acc
+        .iter()
+        .any(|o| o.to == a && matches!(&o.msg, ServerMsg::FileAccepted { by, .. } if by.0 == bh)));
 
     // Alice streams a chunk -> relayed to Bob (never buffered).
-    let chunk = r.handle(a, ClientMsg::FileChunk { offer_id, data: Sealed(vec![5, 6]) });
+    let chunk = r.handle(
+        a,
+        ClientMsg::FileChunk {
+            offer_id,
+            data: Sealed(vec![5, 6]),
+        },
+    );
     assert_eq!(chunk.len(), 1);
     assert_eq!(chunk[0].to, b);
     match &chunk[0].msg {
@@ -902,7 +965,10 @@ fn a_live_offer_streams_through_the_server_to_accepting_recipients() {
         }
         other => panic!("expected FileChunk, got {other:?}"),
     }
-    assert!(r.take_blob_deliveries().is_empty(), "live never touches the store");
+    assert!(
+        r.take_blob_deliveries().is_empty(),
+        "live never touches the store"
+    );
 
     // Completion is relayed too.
     let comp = r.handle(a, ClientMsg::FileComplete { offer_id });
@@ -917,7 +983,13 @@ fn a_live_offer_to_an_offline_recipient_is_rejected() {
     r.disconnect(b);
     let out = r.handle(
         a,
-        ClientMsg::FileOffer { offer_id: [11u8; 16], group, size: 0, manifest: Sealed(vec![1]), live: true },
+        ClientMsg::FileOffer {
+            offer_id: [11u8; 16],
+            group,
+            size: 0,
+            manifest: Sealed(vec![1]),
+            live: true,
+        },
     );
     assert!(
         matches!(&out[0].msg, ServerMsg::FileOfferRejected { .. }),
@@ -973,17 +1045,33 @@ fn cancelling_an_offer_withdraws_it_from_recipients() {
     let offer_id = [14u8; 16];
     r.handle(
         a,
-        ClientMsg::FileOffer { offer_id, group, size: 10, manifest: Sealed(vec![1]), live: false },
+        ClientMsg::FileOffer {
+            offer_id,
+            group,
+            size: 10,
+            manifest: Sealed(vec![1]),
+            live: false,
+        },
     );
-    r.handle(a, ClientMsg::FileChunk { offer_id, data: Sealed(vec![1]) });
+    r.handle(
+        a,
+        ClientMsg::FileChunk {
+            offer_id,
+            data: Sealed(vec![1]),
+        },
+    );
     r.handle(a, ClientMsg::FileComplete { offer_id });
 
     let out = r.handle(a, ClientMsg::FileCancel { offer_id });
     assert!(
-        out.iter().any(|o| o.to == b && matches!(o.msg, ServerMsg::FileDeclined { .. })),
+        out.iter()
+            .any(|o| o.to == b && matches!(o.msg, ServerMsg::FileDeclined { .. })),
         "recipient told the offer is withdrawn"
     );
-    assert!(r.handle(b, ClientMsg::FileAccept { offer_id }).is_empty(), "offer is gone");
+    assert!(
+        r.handle(b, ClientMsg::FileAccept { offer_id }).is_empty(),
+        "offer is gone"
+    );
 }
 
 #[test]
@@ -1011,10 +1099,22 @@ fn a_chunk_from_someone_who_is_not_the_sender_is_ignored() {
     let offer_id = [16u8; 16];
     r.handle(
         a,
-        ClientMsg::FileOffer { offer_id, group, size: 100, manifest: Sealed(vec![1]), live: false },
+        ClientMsg::FileOffer {
+            offer_id,
+            group,
+            size: 100,
+            manifest: Sealed(vec![1]),
+            live: false,
+        },
     );
     // Bob is not the sender: his chunk must not be appended or relayed.
-    let out = r.handle(b, ClientMsg::FileChunk { offer_id, data: Sealed(vec![9, 9]) });
+    let out = r.handle(
+        b,
+        ClientMsg::FileChunk {
+            offer_id,
+            data: Sealed(vec![9, 9]),
+        },
+    );
     assert!(out.is_empty());
 }
 
@@ -1081,17 +1181,33 @@ fn a_timed_out_live_recipient_is_dropped_and_the_sender_is_told() {
     let offer_id = [20u8; 16];
     r.handle(
         a,
-        ClientMsg::FileOffer { offer_id, group, size: 0, manifest: Sealed(vec![1]), live: true },
+        ClientMsg::FileOffer {
+            offer_id,
+            group,
+            size: 0,
+            manifest: Sealed(vec![1]),
+            live: true,
+        },
     );
     r.handle(b, ClientMsg::FileAccept { offer_id });
 
     let notify = r.drop_live_recipient(offer_id, b);
     assert!(
-        notify.iter().any(|o| o.to == a
-            && matches!(&o.msg, ServerMsg::FileDeclined { by, .. } if by.0 == bh)),
+        notify.iter().any(
+            |o| o.to == a && matches!(&o.msg, ServerMsg::FileDeclined { by, .. } if by.0 == bh)
+        ),
         "the sender is told the recipient did not receive it"
     );
     // A later chunk no longer routes to the dropped recipient.
-    let out = r.handle(a, ClientMsg::FileChunk { offer_id, data: Sealed(vec![9]) });
-    assert!(out.is_empty(), "the dropped recipient no longer receives chunks");
+    let out = r.handle(
+        a,
+        ClientMsg::FileChunk {
+            offer_id,
+            data: Sealed(vec![9]),
+        },
+    );
+    assert!(
+        out.is_empty(),
+        "the dropped recipient no longer receives chunks"
+    );
 }

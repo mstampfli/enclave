@@ -335,11 +335,16 @@ pub enum ServerMsg {
     },
     /// The server admitted a stored offer; the sender may begin uploading its
     /// chunks. (Sent only for non-live offers.)
-    FileUploadReady { offer_id: [u8; 16] },
+    FileUploadReady {
+        offer_id: [u8; 16],
+    },
     /// The server refused to store the offer (too large, store full, or low on
     /// disk). `reason` is a short human-readable explanation. The sender may
     /// retry the transfer live if the recipients are online.
-    FileOfferRejected { offer_id: [u8; 16], reason: String },
+    FileOfferRejected {
+        offer_id: [u8; 16],
+        reason: String,
+    },
     /// A file has been offered to you. Do NOT download it automatically: show
     /// the user (from the decrypted `manifest`) who sent what, and accept or
     /// decline. `live` means the sender is streaming now, so accept promptly.
@@ -353,9 +358,15 @@ pub enum ServerMsg {
     },
     /// A recipient accepted `offer_id`. For a live offer this is the sender's cue
     /// to start streaming chunks; for a stored offer it is informational.
-    FileAccepted { offer_id: [u8; 16], by: DeviceId },
+    FileAccepted {
+        offer_id: [u8; 16],
+        by: DeviceId,
+    },
     /// A recipient declined `offer_id` (or it expired for them).
-    FileDeclined { offer_id: [u8; 16], by: DeviceId },
+    FileDeclined {
+        offer_id: [u8; 16],
+        by: DeviceId,
+    },
     /// One sealed chunk of a file you accepted, from device `from`.
     FileChunk {
         offer_id: [u8; 16],
@@ -363,13 +374,18 @@ pub enum ServerMsg {
         data: Sealed,
     },
     /// Every chunk of `offer_id` from `from` has been delivered.
-    FileComplete { offer_id: [u8; 16], from: DeviceId },
+    FileComplete {
+        offer_id: [u8; 16],
+        from: DeviceId,
+    },
     /// Confirms the server durably accepted the [`ClientMsg::Reliable`] with this
     /// `seq`. The sender then drops it from its retransmit buffer. Until it
     /// arrives the sender keeps retransmitting, so a message that momentarily
     /// could not be accepted (e.g. the offline queue was at its global cap) is
     /// simply retried rather than reported failed.
-    Ack { seq: u64 },
+    Ack {
+        seq: u64,
+    },
     Error {
         detail: String,
     },

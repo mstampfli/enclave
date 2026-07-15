@@ -320,7 +320,10 @@ async fn large_message_and_file_transfer_between_two_clients() {
 async fn pump_until_offer(alice: &mut Client, bob: &mut Client) -> String {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
-        assert!(tokio::time::Instant::now() < deadline, "no file offer arrived");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no file offer arrived"
+        );
         alice.pump_uploads();
         tokio::select! {
             _ = tokio::time::timeout(Duration::from_millis(50), alice.next_event()) => {}
@@ -363,7 +366,6 @@ async fn recv_message(c: &mut Client) -> String {
     }
 }
 
-
 #[tokio::test]
 async fn a_reliable_message_survives_a_reconnect_exactly_once() {
     let handle = serve("127.0.0.1:0").await.unwrap();
@@ -394,7 +396,10 @@ async fn a_reliable_message_survives_a_reconnect_exactly_once() {
     alice.switch(&conv);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while alice.safety_number().is_none() {
-        assert!(tokio::time::Instant::now() < deadline, "DM never established");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "DM never established"
+        );
         tokio::select! {
             _ = tokio::time::timeout(Duration::from_millis(150), alice.next_event()) => {}
             _ = tokio::time::timeout(Duration::from_millis(150), bob.next_event()) => {}
@@ -403,7 +408,10 @@ async fn a_reliable_message_survives_a_reconnect_exactly_once() {
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while bob.conversations().is_empty() {
-        assert!(tokio::time::Instant::now() < deadline, "Bob never joined the DM");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Bob never joined the DM"
+        );
         let _ = tokio::time::timeout(Duration::from_millis(150), bob.next_event()).await;
     }
     let bc = bob.conversations().first().unwrap().id.clone();

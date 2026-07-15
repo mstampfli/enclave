@@ -46,9 +46,11 @@ pub fn downmix_i16_to_mono_into(interleaved: &[i16], channels: usize, out: &mut 
         out.extend_from_slice(interleaved);
         return;
     }
-    out.extend(interleaved.chunks(channels).map(|frame| {
-        (frame.iter().map(|&s| s as i32).sum::<i32>() / frame.len() as i32) as i16
-    }));
+    out.extend(
+        interleaved.chunks(channels).map(|frame| {
+            (frame.iter().map(|&s| s as i32).sum::<i32>() / frame.len() as i32) as i16
+        }),
+    );
 }
 
 /// Streaming linear resampler between two sample rates, mono. It is fed

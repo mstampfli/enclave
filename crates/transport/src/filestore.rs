@@ -54,7 +54,9 @@ pub const OFFER_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// sender lying about the size to slip past admission: a generous ~1.6% + 64KiB,
 /// far above real sealing overhead (<0.3%) yet nowhere near a quota bypass.
 fn seal_ceiling(plaintext: u64) -> u64 {
-    plaintext.saturating_add(plaintext / 64).saturating_add(64 * 1024)
+    plaintext
+        .saturating_add(plaintext / 64)
+        .saturating_add(64 * 1024)
 }
 
 /// Why an upload was refused. Returned to the sender so the UI can explain it.
@@ -139,7 +141,10 @@ impl FileStore {
     }
 
     /// A store with an injected free-disk query (for tests).
-    pub fn with_disk_probe(dir: impl Into<PathBuf>, available: impl Fn() -> u64 + Send + 'static) -> Self {
+    pub fn with_disk_probe(
+        dir: impl Into<PathBuf>,
+        available: impl Fn() -> u64 + Send + 'static,
+    ) -> Self {
         let dir = dir.into();
         let _ = std::fs::create_dir_all(&dir);
         Self {
@@ -229,7 +234,9 @@ impl FileStore {
             .open(&offer.blob)
             .map_err(|_| Rejected::Unavailable)?;
         let len = (chunk.len() as u32).to_le_bytes();
-        f.write_all(&len).and_then(|_| f.write_all(chunk)).map_err(|_| Rejected::Unavailable)?;
+        f.write_all(&len)
+            .and_then(|_| f.write_all(chunk))
+            .map_err(|_| Rejected::Unavailable)?;
         offer.written = new_written;
         Ok(())
     }
@@ -286,7 +293,10 @@ impl FileStore {
     /// during the stream stops a concurrent resolve from deleting the blob.
     pub fn begin_delivery(&mut self, id: &[u8; 16], recipient: &str) -> Option<(PathBuf, String)> {
         let offer = self.offers.get_mut(id)?;
-        if !offer.complete || !offer.pending.contains(recipient) || offer.delivering.contains(recipient) {
+        if !offer.complete
+            || !offer.pending.contains(recipient)
+            || offer.delivering.contains(recipient)
+        {
             return None;
         }
         offer.delivering.insert(recipient.to_string());
@@ -345,7 +355,9 @@ impl FileStore {
 
     /// The group of an offer, so a resolution can be announced to the sender.
     pub fn offer_group(&self, id: &[u8; 16]) -> Option<(GroupId, String)> {
-        self.offers.get(id).map(|o| (o.group.clone(), o.sender.clone()))
+        self.offers
+            .get(id)
+            .map(|o| (o.group.clone(), o.sender.clone()))
     }
 
     /// Delete every offer past its TTL, returning each expired offer's id and
@@ -440,8 +452,16 @@ mod tests {
     fn upload_then_read_replays_the_exact_chunks() {
         let (mut s, dir) = store(u64::MAX);
         let i = id(1);
-        s.begin(i, GroupId([0; 32]), "alice".into(), vec!["bob".into()], 30, Sealed(vec![9, 9]), SystemTime::UNIX_EPOCH)
-            .unwrap();
+        s.begin(
+            i,
+            GroupId([0; 32]),
+            "alice".into(),
+            vec!["bob".into()],
+            30,
+            Sealed(vec![9, 9]),
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
         s.append(&i, b"hello ").unwrap();
         s.append(&i, b"world").unwrap();
         s.finish(&i).unwrap();
@@ -477,12 +497,23 @@ mod tests {
                 break;
             }
             n += 1;
-            s.begin(id(n), GroupId([0; 32]), "a".into(), vec!["b".into()], PER_FILE_MAX, Sealed(vec![1]), SystemTime::UNIX_EPOCH)
-                .unwrap();
+            s.begin(
+                id(n),
+                GroupId([0; 32]),
+                "a".into(),
+                vec!["b".into()],
+                PER_FILE_MAX,
+                Sealed(vec![1]),
+                SystemTime::UNIX_EPOCH,
+            )
+            .unwrap();
         }
         assert!(n >= 1, "at least one offer fit");
         assert_eq!(s.would_admit(PER_FILE_MAX), Err(Rejected::StoreFull));
-        assert!(s.used_bytes() + PER_FILE_MAX > STORE_TOTAL_MAX, "genuinely at the cap");
+        assert!(
+            s.used_bytes() + PER_FILE_MAX > STORE_TOTAL_MAX,
+            "genuinely at the cap"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -492,17 +523,36 @@ mod tests {
         let i = id(1);
         // Declare 1000 bytes: the sealed write ceiling is ~66KiB (declared +
         // slack). Writing far past that is treated as lying about the size.
-        s.begin(i, GroupId([0; 32]), "a".into(), vec!["b".into()], 1000, Sealed(vec![1]), SystemTime::UNIX_EPOCH)
-            .unwrap();
+        s.begin(
+            i,
+            GroupId([0; 32]),
+            "a".into(),
+            vec!["b".into()],
+            1000,
+            Sealed(vec![1]),
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
         s.append(&i, b"ok").unwrap();
         let over = vec![0u8; 100 * 1024]; // 100KiB, past the ~66KiB ceiling
         assert_eq!(s.append(&i, &over), Err(Rejected::TooLarge));
         assert!(s.read_chunks(&i, "b").is_none(), "offer was dropped");
         // A legitimate sealing overhead (a few % over the declared size) is fine.
         let j = id(2);
-        s.begin(j, GroupId([0; 32]), "a".into(), vec!["b".into()], 1000, Sealed(vec![1]), SystemTime::UNIX_EPOCH)
-            .unwrap();
-        assert!(s.append(&j, &vec![0u8; 1000 + 40]).is_ok(), "sealing slack allowed");
+        s.begin(
+            j,
+            GroupId([0; 32]),
+            "a".into(),
+            vec!["b".into()],
+            1000,
+            Sealed(vec![1]),
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        assert!(
+            s.append(&j, &vec![0u8; 1000 + 40]).is_ok(),
+            "sealing slack allowed"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -510,8 +560,16 @@ mod tests {
     fn deletes_only_after_every_recipient_resolves() {
         let (mut s, dir) = store(u64::MAX);
         let i = id(1);
-        s.begin(i, GroupId([0; 32]), "a".into(), vec!["b".into(), "c".into()], 5, Sealed(vec![1]), SystemTime::UNIX_EPOCH)
-            .unwrap();
+        s.begin(
+            i,
+            GroupId([0; 32]),
+            "a".into(),
+            vec!["b".into(), "c".into()],
+            5,
+            Sealed(vec![1]),
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
         s.append(&i, b"data!").unwrap();
         s.finish(&i).unwrap();
         assert_eq!(s.resolve(&i, "b"), Resolution::Recorded, "c still pending");
@@ -527,9 +585,21 @@ mod tests {
         let (mut s, dir) = store(u64::MAX);
         let i = id(1);
         let t0 = SystemTime::UNIX_EPOCH;
-        s.begin(i, GroupId([0; 32]), "a".into(), vec!["b".into()], 5, Sealed(vec![1]), t0).unwrap();
+        s.begin(
+            i,
+            GroupId([0; 32]),
+            "a".into(),
+            vec!["b".into()],
+            5,
+            Sealed(vec![1]),
+            t0,
+        )
+        .unwrap();
         s.finish(&i).unwrap();
-        assert!(s.sweep(t0 + Duration::from_secs(60)).is_empty(), "not yet expired");
+        assert!(
+            s.sweep(t0 + Duration::from_secs(60)).is_empty(),
+            "not yet expired"
+        );
         let expired = s.sweep(t0 + OFFER_TTL + Duration::from_secs(1));
         assert_eq!(expired, vec![(i, "a".to_string())], "swept after TTL");
         assert!(s.read_chunks(&i, "b").is_none());
@@ -540,8 +610,16 @@ mod tests {
     fn a_non_recipient_cannot_read() {
         let (mut s, dir) = store(u64::MAX);
         let i = id(1);
-        s.begin(i, GroupId([0; 32]), "a".into(), vec!["b".into()], 3, Sealed(vec![1]), SystemTime::UNIX_EPOCH)
-            .unwrap();
+        s.begin(
+            i,
+            GroupId([0; 32]),
+            "a".into(),
+            vec!["b".into()],
+            3,
+            Sealed(vec![1]),
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
         s.append(&i, b"xyz").unwrap();
         s.finish(&i).unwrap();
         assert!(s.read_chunks(&i, "eve").is_none(), "non-recipient refused");

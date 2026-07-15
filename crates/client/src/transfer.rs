@@ -557,11 +557,8 @@ mod tests {
     }
 
     fn sink_at(tag: &str, total: u32, cap: u64) -> (FileSink, PathBuf) {
-        let path = std::env::temp_dir().join(format!(
-            "enclave-sink-{}-{}.bin",
-            std::process::id(),
-            tag
-        ));
+        let path =
+            std::env::temp_dir().join(format!("enclave-sink-{}-{}.bin", std::process::id(), tag));
         let _ = std::fs::remove_file(&path);
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -593,9 +590,18 @@ mod tests {
         let a = vec![1u8; CHUNK_BYTES];
         let b = vec![2u8; CHUNK_BYTES];
         let c = vec![3u8; 100];
-        assert!(!sink.write_part(&file_part(1, 0, 3, a.clone())).unwrap(), "not done");
-        assert!(!sink.write_part(&file_part(1, 1, 3, b.clone())).unwrap(), "not done");
-        assert!(sink.write_part(&file_part(1, 2, 3, c.clone())).unwrap(), "last part completes");
+        assert!(
+            !sink.write_part(&file_part(1, 0, 3, a.clone())).unwrap(),
+            "not done"
+        );
+        assert!(
+            !sink.write_part(&file_part(1, 1, 3, b.clone())).unwrap(),
+            "not done"
+        );
+        assert!(
+            sink.write_part(&file_part(1, 2, 3, c.clone())).unwrap(),
+            "last part completes"
+        );
         sink.finish().unwrap();
         let got = std::fs::read(&path).unwrap();
         let mut want = a;
