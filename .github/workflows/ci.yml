@@ -48,7 +48,14 @@ jobs:
         # the server has no libcrux dep). No upstream fix exists yet -- the fix is
         # exact-pinned out via openmls_rust_crypto -> hpke-rs -> libcrux-aead
         # 0.0.7. See THREAT_MODEL.md. Every OTHER advisory still breaks the build.
-        run: cargo audit --ignore RUSTSEC-2026-0124
+        #
+        # RUSTSEC-2026-0194/0195 (quick-xml parsing DoS) are waived: quick-xml is
+        # only a build-time dependency of the wayland-scanner proc-macro, which
+        # parses trusted vendored protocol XML during compilation and ships in no
+        # binary. wayland-scanner 0.31.10 (latest) still pins quick-xml 0.39, so
+        # no upgrade path exists yet. See THREAT_MODEL.md; drop these ignores when
+        # wayland-scanner releases against quick-xml >= 0.41.
+        run: cargo audit --ignore RUSTSEC-2026-0124 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
 
   secret-scan:
     name: Secret scan

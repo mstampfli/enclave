@@ -140,6 +140,16 @@ Target level L2 (private communications). Chapters touched and status:
   latest and exact-pin `libcrux-aead 0.0.7`. Waived in CI with this
   justification; re-checked on every build.
 
+- **RUSTSEC-2026-0194 / RUSTSEC-2026-0195** -- `quick-xml` < 0.41 (parsing DoS on
+  malicious XML: quadratic duplicate-attribute check and a related parser flaw).
+  **Not exploitable in Enclave:** quick-xml appears only as a dependency of the
+  `wayland-scanner` proc-macro (via ashpd/rfd), which runs at BUILD time and
+  parses only the trusted Wayland protocol XML vendored inside those crates.
+  It is not compiled into any shipped binary, and no attacker-supplied XML can
+  ever reach it. No upstream fix exists: `wayland-scanner` 0.31.10 is the latest
+  release and pins quick-xml 0.39. Waived in CI with this justification; drop
+  the ignores when wayland-scanner releases against quick-xml >= 0.41.
+
 ## Account authentication (STRIDE + ASVS L2) -- zero-knowledge via OPAQUE
 
 Target level **L2**. Scope: account create / login / logout, credential storage,
