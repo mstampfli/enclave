@@ -93,30 +93,41 @@ cargo run -p enclave-media --example mic_loopback         # hear yourself via Op
 
 ## Sending files and large messages
 
-The paperclip in the composer opens a native file picker. A file is never
-pushed to anyone: it is **offered**. The recipient sees a prompt with the name
-and size (decrypted from a sealed manifest, so the server never learns them)
-and chooses **Download** or **Decline** -- nothing touches their disk until
-they accept. On accept the file streams straight to disk in their
-`enclave-downloads/` directory (under the keystore) under a sanitized name,
-never buffered whole in memory.
+The paperclip in the composer opens a menu -- **Send a file** or **Live share** --
+then a native file picker. A file is never pushed to anyone: it is **offered**.
+The recipient sees a prompt with the name and size (decrypted from a sealed
+manifest, so the server never learns them) and chooses **Download** or
+**Decline** -- nothing touches their disk until they accept. On accept the file
+streams straight to disk in their `enclave-downloads/` directory (under the
+keystore) under a sanitized name, never buffered whole in memory.
 
-Two delivery modes are chosen automatically by size:
+The offer stays in the chat as a labelled row whatever happens to it -- nothing
+is ever silently removed:
 
-- **Stored** (up to 250 MB): the server buffers the encrypted file on disk so
-  it reaches a recipient who is currently offline. It is deleted the moment
-  every recipient has accepted or declined, or after 24 hours. The server
-  enforces a per-file (250 MB) and whole-store (2 GB) quota and refuses new
-  files when free disk would drop below 4 GB -- a peer cannot fill the server.
-- **Live** (larger, or when the store is full): the file streams in real time
-  to whoever accepts within about 90 seconds, and is never stored. This needs
-  the recipient online.
+- **Cancel** a download in progress and it is marked *aborted* but kept, with
+  **Download again**: cancelling stops the transfer promptly (even a multi-GB
+  one) without giving the file up.
+- **Decline** is final -- the row stays, marked declined.
+- If the sender **stops sharing** (a button on their own sent file) or goes
+  offline, the recipient's row is marked *no longer available*, still in the chat.
 
-A text message larger than one frame is split and reassembled the same way.
-Transfers show a progress bar while in flight. A received file is inert until
-you click **Open**, which hands it to the OS default application; Enclave never
-opens or executes it automatically. See THREAT_MODEL.md for the full
-file-sharing threat model.
+Two delivery modes:
+
+- **Stored** (Send a file, up to 250 MB): the server buffers the encrypted file
+  on disk so it reaches a recipient who is currently offline. It is deleted after
+  24 hours, or once the sender withdraws it. The server enforces a per-file
+  (250 MB) and whole-store (2 GB) quota and refuses new files when free disk would
+  drop below 4 GB -- a peer cannot fill the server.
+- **Live share** (explicit, or automatically when a file is too big to store):
+  the file streams in real time to whoever accepts within about 90 seconds, is
+  never stored, and has no size cap. This needs the recipient online.
+
+File bytes travel under a per-file content key, not the group message ratchet, so
+cancelling a transfer never disturbs the conversation. A text message larger than
+one frame is split and reassembled the same way. Transfers show a progress bar
+while in flight. A received file is inert until you click **Open**, which hands it
+to the OS default application; Enclave never opens or executes it automatically.
+See THREAT_MODEL.md for the full file-sharing threat model.
 
 ## Still to come
 

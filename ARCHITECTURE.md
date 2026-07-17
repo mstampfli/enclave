@@ -48,7 +48,9 @@ crypto  media  transport
 - `enclave-protocol` -- shared wire types. Every server-visible payload is
   `Sealed` (opaque) or routing metadata. Depends on nothing internal.
 - `enclave-crypto` -- identity keystore, MLS groups, media-key schedule, the
-  nonce-safe frame sealer/opener, safety numbers.
+  nonce-safe frame sealer/opener, safety numbers, the off-ratchet file-chunk
+  sealer (`seal_chunk`/`open_chunk`), and the self-update `rekey` that heals a
+  desynced group.
 - `enclave-media` -- the audio/video pipeline: Opus codec (`audio`), tested
   framing/format helpers (`frame`), cpal mic/speaker device I/O (`device`),
   H.264 encode (`video`), webcam capture (`camera`), and the per-platform
@@ -74,14 +76,17 @@ crypto  media  transport
   on the signaling hop and zero-knowledge account auth (OPAQUE, the `opaque`
   module) are implemented here. `msgqueue` is the bounded store-and-forward queue
   for offline members; `filestore` is the on-disk, quota-and-TTL-bounded store
-  for offered files awaiting a recipient's consent (see "File sharing" below).
+  for offered files awaiting a recipient's consent (see THREAT_MODEL.md,
+  "File sharing and large messages").
 - `enclave-client` -- lib + bin. The lib is the high-level `Client` controller
   (the app-logic API the UI drives); the bin is the self-contained WebView
-  window (see "UI" below) that bridges IPC to the controller. `transfer` chunks a
-  message or file too large for one 1 MiB frame into sealed parts; text is
-  reassembled in memory (bounded), while a consented file streams straight to
-  disk via `FileSink` (never buffered whole) under a sanitized name in a
-  downloads directory (see THREAT_MODEL.md).
+  window (see "UI" below) that bridges IPC to the controller. `transfer` splits a
+  message or file too large for one 1 MiB frame into chunks. Text and profiles
+  travel as MLS-sealed `Part`s reassembled in memory (bounded `Reassembler`); a
+  file's bulk bytes instead ride a **per-file content key** (`crypto::seal_chunk`,
+  never the MLS message ratchet -- see invariant 6) and stream straight to disk
+  via `FileSink` (never buffered whole) under a sanitized name in a downloads
+  directory (see THREAT_MODEL.md).
 - `enclave-server` -- signaling relay + SFU fan-out; holds no media keys.
 
 ## UI (self-contained window -- hard requirement)
@@ -131,7 +136,8 @@ window by default and only add the WASM/browser target when we choose to.
 4. A file is never delivered to a recipient without their explicit consent. An
    incoming file is only ever an offer (a sealed manifest); its bytes are
    requested only by an explicit accept, and a file smuggled over the text
-   channel is dropped rather than written.
+   channel is dropped rather than written. Consent is re-entrant: aborting a
+   download (`FileAbort`) keeps the offer, declining (`FileDecline`) gives it up.
 5. A chat message is not silently lost. Text and MLS handshakes are sent
    reliably (`ClientMsg::Reliable`): the server acks a message only once it has
    delivered it to online members and persisted it for offline ones, and the
@@ -144,7 +150,17 @@ window by default and only add the WASM/browser target when we choose to.
    (retrying past a threshold) warns the user rather than retrying forever
    silently. TCP handles bytes-to-socket; this handles message-to-recipient,
    which TCP does not.
-6. Docs update in the same commit as the change they describe.
+6. Bulk file data never rides the MLS message ratchet. A file's chunks are sealed
+   under a per-file content key (`crypto::seal_chunk`/`open_chunk`; the key
+   travels only inside the MLS-sealed manifest), so a file of any size costs
+   exactly one MLS message (the manifest) and a dropped chunk -- from a cancelled
+   or declined download -- never desyncs the group's ratchet. Enforced by the
+   chunk paths calling `seal_chunk`/`open_chunk`, never `encrypt_text`
+   (`client/src/lib.rs`), and proven end to end by
+   `client_flow::large_message_and_file_transfer_between_two_clients` (a
+   multi-chunk file) plus `mls_group::a_backlogged_receiver_skips_forward_to_the_latest_message`
+   (a conversation that fell behind still heals).
+7. Docs update in the same commit as the change they describe.
 
 ## Dependency plan (added per-phase, in the crate that first uses them)
 

@@ -21,7 +21,9 @@ compiled. **Text and files** are E2E-encrypted too: messages of any size are
 chunked and reassembled, and a file is never auto-downloaded -- it is *offered*,
 and the recipient consents before a byte reaches their disk (buffered on the
 server for offline delivery under a size/disk quota, or streamed live for a big
-one). **Chat messages are not silently lost:** text and MLS handshakes are
+one). A file's bytes travel under a per-file content key rather than the group
+message ratchet, so a cancelled transfer can be retried and never disturbs the
+conversation. **Chat messages are not silently lost:** text and MLS handshakes are
 acked, retransmitted until delivered, and deduped, with the retransmit buffer
 persisted across restarts. Friends, requests, presence, and named groups are in;
 the relay has deny-by-default access control, size-bounded panic-safe parsing,

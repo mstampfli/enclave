@@ -305,12 +305,19 @@ accept. Delivery then takes one of two modes:
   time to whoever accepts within ~90 s and are **never** stored; this needs the
   recipient online.
 
-Each chunk is one MLS-sealed `Part` (`crates/client/src/transfer.rs`), opaque to
-the server exactly like a text message. This design adds trust boundaries worth
-modeling: the **server** now buffers (transient, on-disk) sealed blobs and their
-sizes and enforces the store quota; the **receiving client** writes
-attacker-influenced bytes and an attacker-controlled *filename* to its disk, but
-only after the user consents.
+The manifest is one MLS-sealed message. The bulk **chunks are NOT MLS messages**:
+each is sealed under a per-file **content key** with ChaCha20-Poly1305
+(`crypto/src/blob.rs` `seal_chunk`/`open_chunk`), the key being a fresh 256-bit
+random value that travels only inside the sealed manifest (`FileManifest.content_key`).
+The server still sees only ciphertext. This decoupling is deliberate and load-bearing
+(see "Availability -- MLS ratchet integrity" below): putting thousands of file
+chunks through the group's message ratchet let a dropped chunk (a cancelled
+download) desync the ratchet and silently kill the whole conversation, and it made
+re-download impossible (MLS ciphertext is bound to one-time generations). This
+design adds trust boundaries worth modeling: the **server** now buffers (transient,
+on-disk) sealed blobs and their sizes and enforces the store quota; the **receiving
+client** writes attacker-influenced bytes and an attacker-controlled *filename* to
+its disk, but only after the user consents.
 
 Target level **L2**. Chapters touched: V1 (design), V4 (access control), V5
 (validation), V8 (data protection), V11 (business logic / anti-automation), V12
@@ -373,9 +380,33 @@ gated by explicit consent.
   path to the OS default handler (`open::that_detached`). The consent prompt shows
   the name and size before any download, so the user decides with the file's real
   name in view.
-- **Information disclosure -- content is E2E encrypted.** Every chunk and the
-  manifest are MLS-sealed and Ed25519-signed (V8); the server and non-members see
-  only ciphertext. A tampered chunk fails AEAD and is dropped.
+- **Information disclosure -- content is E2E encrypted.** The manifest is
+  MLS-sealed and Ed25519-signed; each chunk is sealed under the per-file content
+  key carried inside that manifest (V8), so the server and non-members see only
+  ciphertext. A tampered chunk fails AEAD and is dropped.
+- **Tampering / Spoofing -- forged, reordered, or replayed chunks.** A chunk's
+  AEAD binds `offer_id || index` as associated data, so a chunk cannot be moved to
+  a different position or offer without failing authentication, and the sink writes
+  strictly in order. The content key is shared by the group, but the **server
+  enforces that only the offer's own sender may push its chunks** (see Access
+  control below), so a different group member cannot inject chunks under someone
+  else's offer. A malicious server can at most reorder/drop (a denial of service
+  that aborts the download); it can never corrupt the file undetected. Proven by
+  `blob::tests::{a_chunk_will_not_open_at_the_wrong_index,
+  a_chunk_will_not_open_under_another_offer, a_tampered_chunk_is_rejected}`.
+- **Availability -- MLS ratchet integrity (the decoupling rationale).** Bulk file
+  data must not ride the group message ratchet: at 512 KiB/chunk a large transfer
+  advances the sender's generation by thousands, and a chunk dropped un-decrypted
+  (a cancelled/declined download hits the consent gate before decrypt) desyncs the
+  ratchet so far that openmls rejects every later message ("generation too far in
+  the future") -- silently killing the conversation. *Mitigation:* chunks use the
+  content key, never the ratchet, so a file of any size is exactly one MLS message
+  (the manifest) and dropping chunks is harmless. As recovery for a conversation
+  already desynced by the old design, the sender-ratchet `maximum_forward_distance`
+  is raised to a bounded 16384 (a receiver skips forward on the next message);
+  bounded because a crafted never-decrypting message forces at most that many key
+  derivations, and the message rate is capped. A per-offer content key is fresh, so
+  the index-based nonce never repeats.
 
 ### STRIDE at the server file store (the DoS surface)
 
@@ -422,10 +453,21 @@ surface, and every axis is bounded (`filestore.rs`, `relay.rs`).
   consent (live), so a high message rate here is safe.
 - **Access control (V4).** Only a routing member of the group may offer a file;
   only the offer's own sender may upload its chunks or cancel it; only a targeted
-  recipient may accept/decline; a stored blob is readable only by a pending
-  recipient. A live sender's disconnect tears down its offers and tells the
-  recipients. Proven by `relay_core::{a_non_member_cannot_offer_a_file_to_a_group,
+  recipient may accept/decline/abort; a stored blob is readable only by a pending
+  recipient. A recipient's `FileAbort` only affects its own delivery (the cancel
+  token and live-accepted set are keyed by that recipient's device), so it cannot
+  stop or affect another recipient's download. A live sender's disconnect tears
+  down its offers and tells the recipients. Proven by
+  `relay_core::{a_non_member_cannot_offer_a_file_to_a_group,
   a_chunk_from_someone_who_is_not_the_sender_is_ignored}`.
+- **Availability -- cancel must stop promptly and stay re-downloadable.** A
+  recipient cancelling a multi-gigabyte download must not keep draining the whole
+  file, and must be able to retry. *Mitigation:* `FileAbort` sets a per-delivery
+  cancel flag the off-lock streamer checks between chunks, so it stops within one
+  chunk and calls `abort_stored_delivery`, which leaves the recipient **pending**
+  (not resolved) so a later `FileAccept` re-streams from the start. Declining
+  (`FileDecline`) is the final path that gives the offer up. Proven by
+  `filestore::tests::an_aborted_delivery_stays_downloadable`.
 - **Information disclosure -- the server sees the file size.** Enforcing a 250 MB
   quota requires knowing the size, so a stored offer's plaintext size is visible
   to the server (unlike padded text messages). *Accepted, deliberate:* it is the
