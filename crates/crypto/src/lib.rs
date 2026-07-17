@@ -16,15 +16,22 @@
 
 use openmls::prelude::{Capabilities, Ciphersuite, CredentialType, ExtensionType};
 
+pub mod blob;
 pub mod error;
 pub mod group;
 pub mod identity;
 pub mod media;
+pub mod ring;
 
+pub use blob::{
+    blob_addr, open_ballot, open_blob, open_chunk, seal_ballot, seal_blob, seal_chunk, SealedBlob,
+    CHUNK_OVERHEAD,
+};
 pub use error::CryptoError;
 pub use group::{Group, MemberAdd, SafetyNumber, TextMessage};
 pub use identity::Identity;
 pub use media::{MediaOpener, MediaSealer, MediaSigner, MEDIA_SIG_CONTEXT};
+pub use ring::{ring_verify, RingKeypair, RingSig};
 
 /// The single ciphersuite Enclave uses: X25519 KEM, AES-128-GCM, SHA-256, and
 /// Ed25519 signatures. One fixed ciphersuite (not a negotiated set) keeps the

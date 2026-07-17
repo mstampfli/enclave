@@ -44,6 +44,9 @@ pub enum CryptoError {
     #[error("media frame seal/open failed: {0}")]
     Media(String),
 
+    #[error("content-addressed blob seal/open failed: {0}")]
+    Blob(String),
+
     #[error("serialization failed: {0}")]
     Serialize(String),
 }
