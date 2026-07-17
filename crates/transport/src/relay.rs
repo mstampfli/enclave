@@ -13,11 +13,14 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use enclave_protocol::{ClientMsg, DeviceId, Friend, GroupId, Presence, Sealed, ServerMsg, UserId};
 
 use crate::accounts::{AccountStore, AuthOutcome};
+use crate::avatarstore::AvatarStore;
 use crate::filestore::FileStore;
 use crate::friends::{FriendStore, RequestOutcome};
 use crate::groups::GroupStore;
@@ -65,6 +68,23 @@ pub struct BlobDelivery {
     /// The original sender device, for the chunk envelope.
     pub from: DeviceId,
     pub blob: PathBuf,
+    /// Set true to ask the off-lock streamer to stop early (the recipient aborted
+    /// the download). The streamer checks it between chunks and, when set, stops
+    /// and leaves the offer pending so the recipient can download it again.
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// One stored-upload chunk to flush to disk off the global lock. The size cap
+/// and byte accounting were already reserved under the lock; only the write
+/// itself is deferred, so a slow disk never stalls the relay.
+#[derive(Debug, Clone)]
+pub struct FileAppend {
+    /// The offer whose write this is (to drop the offer on a write error).
+    pub offer_id: [u8; 16],
+    /// The blob file to append to.
+    pub blob: PathBuf,
+    /// The chunk bytes to write (length-prefixed by `write_reserved`).
+    pub data: Vec<u8>,
 }
 
 /// A live (streamed, never stored) file offer in flight.
@@ -92,6 +112,11 @@ pub struct Relay {
     /// Group routing fan-out sets: which devices should receive group traffic.
     /// Persisted, so conversations survive a server restart.
     groups: GroupStore,
+    /// Buffered/routed poll ballots, keyed by poll id. In-memory: a server restart
+    /// mid-poll loses buffered ballots (a documented limitation; the content is
+    /// opaque either way). The server never reads a ballot -- it only withholds and
+    /// routes them per the poll's mode.
+    ballots: HashMap<[u8; 16], BufferedPoll>,
     /// Who is currently in the voice call of each group. Ephemeral (a call is a
     /// live session): not persisted, and cleared as participants leave/disconnect.
     active_calls: HashMap<GroupId, HashSet<DeviceId>>,
@@ -124,14 +149,42 @@ pub struct Relay {
     /// On-disk store for offered files awaiting the recipient's consent (stored
     /// path). Holds opaque sealed blobs; enforces the size/disk quota + TTL.
     files: FileStore,
+    /// Persistent, content-addressed store for encrypted profile avatars. Holds
+    /// opaque ciphertext; the address-equals-hash check bounds it against
+    /// poisoning and the per-user ring bounds its size.
+    avatars: AvatarStore,
     /// Live (streamed, never stored) file offers, keyed by offer id.
     live_offers: HashMap<[u8; 16], LiveOffer>,
     /// Stored-blob deliveries the async shell should stream off-lock. Drained
     /// after each `handle` via [`take_blob_deliveries`](Self::take_blob_deliveries).
     blob_deliveries: Vec<BlobDelivery>,
+    /// Cancel flags for in-flight stored deliveries, keyed by (offer, recipient).
+    /// A recipient's `FileAbort` sets its flag so the off-lock streamer stops
+    /// early; the flag is removed when the delivery finishes or aborts.
+    delivery_tokens: HashMap<([u8; 16], DeviceId), Arc<AtomicBool>>,
+    /// Stored-upload chunk writes the async shell should flush to disk OFF the
+    /// global lock (a slow disk write under the lock would stall every client).
+    /// Drained after each `handle` via [`take_file_appends`](Self::take_file_appends).
+    file_appends: Vec<FileAppend>,
     /// Injected wall clock, so file TTLs are testable. Defaults to the system
     /// clock; the async shell may leave it as is.
     now: Box<dyn Fn() -> SystemTime + Send>,
+}
+
+/// A poll whose ballots the server buffers/routes on the group's behalf, WITHOUT
+/// ever seeing their content (each ballot is opaque `Sealed` bytes). `mode`: 0 =
+/// release the whole set to the GROUP at close; 1 = route each ballot to the OWNER
+/// live (a private survey the owner watches); 2 = buffer and release to the OWNER
+/// at close. The owner is the device that opened the poll -- the only one that may
+/// close it early.
+struct BufferedPoll {
+    owner: DeviceId,
+    group: GroupId,
+    mode: u8,
+    /// Auto-release time; `None` = owner-triggered close only.
+    release_at: Option<SystemTime>,
+    /// Sealed ballots, deduped by submitter device (last write wins).
+    ballots: HashMap<DeviceId, Sealed>,
 }
 
 impl Default for Relay {
@@ -155,6 +208,7 @@ impl Relay {
             key_packages: HashMap::new(),
             identities: HashMap::new(),
             groups: GroupStore::default(),
+            ballots: HashMap::new(),
             active_calls: HashMap::new(),
             queue: MessageQueue::new(),
             udp_addrs: HashMap::new(),
@@ -169,8 +223,11 @@ impl Relay {
             pending_register: HashMap::new(),
             login_attempts: HashMap::new(),
             files: fresh_file_store(),
+            avatars: fresh_avatar_store(),
             live_offers: HashMap::new(),
             blob_deliveries: Vec::new(),
+            delivery_tokens: HashMap::new(),
+            file_appends: Vec::new(),
             now: Box::new(SystemTime::now),
         }
     }
@@ -204,6 +261,7 @@ impl Relay {
             friends,
             groups,
             queue,
+            avatars: AvatarStore::load(files_dir.join("avatars")),
             files: FileStore::new(files_dir),
             ..Self::new()
         }
@@ -569,9 +627,11 @@ impl Relay {
                     // Deny-by-default (ASVS V4): a self-join may only bootstrap a
                     // new (empty) group or re-affirm existing membership. Joining
                     // an existing group is done via a Welcome from a member.
-                    self.groups.join(group, device);
+                    self.groups.join(group.clone(), device);
                 }
-                vec![]
+                // Hand the (re)joining member the current membership so a returning
+                // client's count is correct even after changes it missed offline.
+                self.members_broadcast(&group)
             }
 
             ClientMsg::AffirmMember { group, member } => {
@@ -591,17 +651,33 @@ impl Relay {
             ClientMsg::LeaveGroup { group } => {
                 let device = self.device_for(from);
                 self.groups.remove(&group, &device);
-                // Also drop them from the group's live call, if any.
-                self.drop_from_calls(&device)
+                // Remaining members get the new authoritative membership (count
+                // updates for everyone online now, and on their next join if not).
+                let mut out = self.members_broadcast(&group);
+                // Also drop the leaver from the group's live call, if any.
+                out.extend(self.drop_from_calls(&device));
+                out
             }
 
             ClientMsg::RemoveMember { group, member } => {
                 // Only a current member may remove another from routing (ASVS V4).
                 let remover = self.device_for(from);
-                if self.is_member(&group, &remover) {
-                    self.groups.remove(&group, &member);
+                if !self.is_member(&group, &remover) {
+                    return vec![];
                 }
-                vec![]
+                self.groups.remove(&group, &member);
+                // Tell the removed member (if online) so they can mark the group
+                // read-only; the relayed removal commit may not reach them once
+                // de-routed, so this is the reliable signal. The rest get the new
+                // authoritative membership.
+                let mut out = self.members_broadcast(&group);
+                if let Some(&conn) = self.device_conn.get(&member) {
+                    out.push(Outgoing {
+                        to: conn,
+                        msg: ServerMsg::RemovedFromGroup { group },
+                    });
+                }
+                out
             }
 
             ClientMsg::Welcome {
@@ -617,23 +693,24 @@ impl Relay {
                 }
                 self.groups.add(&group, to.clone());
                 let welcome = ServerMsg::Welcome {
-                    group,
+                    group: group.clone(),
                     from: from_device,
                     name,
                     message,
                 };
+                // The whole group (including the new member) gets the updated
+                // membership so the count reflects the add immediately.
+                let mut out = self.members_broadcast(&group);
                 match self.device_conn.get(&to) {
-                    Some(&conn) => vec![Outgoing {
+                    Some(&conn) => out.push(Outgoing {
                         to: conn,
                         msg: welcome,
-                    }],
+                    }),
                     // Target offline: queue the Welcome for their next login, so a
                     // member added while away still joins the group.
-                    None => self
-                        .queue_for_offline(from, &to.0, welcome)
-                        .into_iter()
-                        .collect(),
+                    None => out.extend(self.queue_for_offline(from, &to.0, welcome)),
                 }
+                out
             }
 
             ClientMsg::Mls { group, message } => {
@@ -652,6 +729,81 @@ impl Relay {
                     from: from_device.clone(),
                     message: message.clone(),
                 })
+            }
+
+            // Register a buffered/routed poll. The sender becomes its owner; only a
+            // group member may open a poll for the group.
+            ClientMsg::BallotOpen {
+                poll,
+                group,
+                mode,
+                release_at,
+            } => {
+                let Some(owner) = self.conn_device.get(&from).cloned() else {
+                    return vec![];
+                };
+                if !self.is_member(&group, &owner) {
+                    return vec![];
+                }
+                self.ballots.insert(
+                    poll,
+                    BufferedPoll {
+                        owner,
+                        group,
+                        mode,
+                        release_at: release_at.map(|ms| UNIX_EPOCH + Duration::from_millis(ms)),
+                        ballots: HashMap::new(),
+                    },
+                );
+                vec![]
+            }
+
+            // A sealed ballot. Buffer it (deduped by submitter), or in owner-live
+            // mode forward it straight to the owner. Only group members may submit.
+            ClientMsg::BallotSubmit { poll, ballot } => {
+                let Some(dev) = self.conn_device.get(&from).cloned() else {
+                    return vec![];
+                };
+                let Some((group, owner, mode)) = self
+                    .ballots
+                    .get(&poll)
+                    .map(|bp| (bp.group.clone(), bp.owner.clone(), bp.mode))
+                else {
+                    return vec![]; // unknown or already-closed poll
+                };
+                if !self.is_member(&group, &dev) {
+                    return vec![];
+                }
+                if mode == 1 {
+                    let msg = ServerMsg::Ballots {
+                        group,
+                        poll,
+                        ballots: vec![(dev, ballot)],
+                    };
+                    return match self.device_conn.get(&owner).copied() {
+                        Some(conn) => vec![Outgoing { to: conn, msg }],
+                        None => {
+                            self.queue.enqueue(&owner.0, msg);
+                            vec![]
+                        }
+                    };
+                }
+                if let Some(bp) = self.ballots.get_mut(&poll) {
+                    bp.ballots.insert(dev, ballot);
+                }
+                vec![]
+            }
+
+            // The owner ends a buffered poll now: release its ballots per mode.
+            ClientMsg::BallotClose { poll } => {
+                let Some(dev) = self.conn_device.get(&from).cloned() else {
+                    return vec![];
+                };
+                match self.ballots.get(&poll) {
+                    Some(bp) if bp.owner == dev => {}
+                    _ => return vec![],
+                }
+                self.release_ballots(&poll)
             }
 
             ClientMsg::Media(frame) => {
@@ -882,7 +1034,13 @@ impl Relay {
                 live,
             } => self.handle_file_offer(from, offer_id, group, size, manifest, live),
 
-            ClientMsg::FileChunk { offer_id, data } => self.handle_file_chunk(from, offer_id, data),
+            ClientMsg::FileChunk {
+                offer_id,
+                index,
+                data,
+            } => self.handle_file_chunk(from, offer_id, index, data),
+
+            ClientMsg::FileAbort { offer_id } => self.handle_file_abort(from, offer_id),
 
             ClientMsg::FileComplete { offer_id } => self.handle_file_complete(from, offer_id),
 
@@ -891,6 +1049,31 @@ impl Relay {
             ClientMsg::FileDecline { offer_id } => self.handle_file_decline(from, offer_id),
 
             ClientMsg::FileCancel { offer_id } => self.handle_file_cancel(from, offer_id),
+
+            // Store an encrypted avatar blob for the uploader. Auth-gated above;
+            // the store verifies `addr == SHA-256(data)` so a client can only
+            // write its own content-addressed bytes (no overwriting another
+            // user's blob), caps the size, and rings the per-user history. The
+            // bytes are opaque ciphertext -- the key lives only in the sealed
+            // profile, so the server cannot read the image.
+            ClientMsg::PutAvatar { addr, data } => {
+                if let Some(owner) = self.conn_user.get(&from).map(|u| u.0.clone()) {
+                    self.avatars.put(&addr, &data, &owner);
+                }
+                vec![]
+            }
+
+            // Serve an avatar blob by its content address. The 256-bit address is
+            // a bearer capability learned only from a sealed profile, so any
+            // authenticated requester that presents it is authorized; the reply
+            // carries opaque ciphertext, useless without the key.
+            ClientMsg::FetchAvatar { addr } => {
+                let data = self.avatars.get(&addr);
+                vec![Outgoing {
+                    to: from,
+                    msg: ServerMsg::Avatar { addr, data },
+                }]
+            }
         }
     }
 
@@ -1008,13 +1191,23 @@ impl Relay {
         &mut self,
         from: ConnId,
         offer_id: [u8; 16],
+        index: u32,
         data: Sealed,
     ) -> Vec<Outgoing> {
         let sender = self.device_for(from);
         if self.files.sender_of(&offer_id) == Some(sender.0.as_str()) {
-            // Stored upload: buffer the chunk to disk.
-            match self.files.append(&offer_id, &data.0) {
-                Ok(()) => vec![],
+            // Stored upload: reserve the bytes under the lock (cap + accounting),
+            // then defer the DISK WRITE to the async shell off the lock, so a slow
+            // disk never stalls every other client.
+            match self.files.reserve_append(&offer_id, data.0.len()) {
+                Ok(blob) => {
+                    self.file_appends.push(FileAppend {
+                        offer_id,
+                        blob,
+                        data: data.0,
+                    });
+                    vec![]
+                }
                 // Overrun (declared less than uploaded): the offer was dropped.
                 Err(_) => vec![reject(
                     from,
@@ -1041,6 +1234,7 @@ impl Relay {
                     msg: ServerMsg::FileChunk {
                         offer_id,
                         from: sender.clone(),
+                        index,
                         data: data.clone(),
                     },
                 })
@@ -1113,12 +1307,18 @@ impl Relay {
         let recipient = self.device_for(from);
         // Stored: schedule the off-lock delivery if this recipient may have it.
         if let Some((blob, sender_name)) = self.files.begin_delivery(&offer_id, &recipient.0) {
+            // A fresh cancel flag for this delivery attempt; a later `FileAbort`
+            // from this recipient sets it to stop the stream early.
+            let cancel = Arc::new(AtomicBool::new(false));
+            self.delivery_tokens
+                .insert((offer_id, recipient.clone()), cancel.clone());
             self.blob_deliveries.push(BlobDelivery {
                 to: from,
                 recipient: recipient.clone(),
                 offer_id,
                 from: DeviceId(sender_name.clone()),
                 blob,
+                cancel,
             });
             // Tell the sender it was accepted (if online).
             return self.notify_sender(
@@ -1176,6 +1376,27 @@ impl Relay {
                     by: recipient,
                 },
             );
+        }
+        vec![]
+    }
+
+    /// A recipient aborts their in-progress download WITHOUT declining it. The
+    /// offer stays available (stored: the recipient remains pending; live: still
+    /// a candidate), so they can download it again while the sender keeps sharing.
+    /// Nothing is announced to the sender -- an abort is the recipient's private
+    /// pause, not a decline.
+    fn handle_file_abort(&mut self, from: ConnId, offer_id: [u8; 16]) -> Vec<Outgoing> {
+        let recipient = self.device_for(from);
+        // Stored: signal the in-flight streamer to stop early. It then calls
+        // `abort_stored_delivery`, which leaves the recipient pending (so a later
+        // `FileAccept` re-delivers). If no delivery is in flight, this is a no-op.
+        if let Some(token) = self.delivery_tokens.get(&(offer_id, recipient.clone())) {
+            token.store(true, Ordering::Relaxed);
+        }
+        // Live: stop relaying chunks to this recipient but keep them a candidate,
+        // so they can re-accept and rejoin the stream while it lasts.
+        if let Some(offer) = self.live_offers.get_mut(&offer_id) {
+            offer.accepted.remove(&recipient);
         }
         vec![]
     }
@@ -1294,15 +1515,42 @@ impl Relay {
         std::mem::take(&mut self.blob_deliveries)
     }
 
+    /// Drain the stored-upload chunk writes queued by the most recent `handle`,
+    /// for the async shell to flush to disk off the global lock.
+    pub fn take_file_appends(&mut self) -> Vec<FileAppend> {
+        std::mem::take(&mut self.file_appends)
+    }
+
+    /// Drop an offer whose off-lock disk write failed (I/O error), notifying the
+    /// uploading sender so its upload does not stall silently.
+    pub fn fail_file_append(&mut self, offer_id: [u8; 16]) -> Vec<Outgoing> {
+        let sender = self.files.sender_of(&offer_id).map(str::to_string);
+        let conn = sender.and_then(|s| self.device_conn.get(&DeviceId(s)).copied());
+        self.files.remove(&offer_id);
+        match conn {
+            Some(to) => vec![Outgoing {
+                to,
+                msg: ServerMsg::FileOfferRejected {
+                    offer_id,
+                    reason: "the server could not store the file".into(),
+                },
+            }],
+            None => vec![],
+        }
+    }
+
     /// A stored delivery streamed successfully: resolve the recipient (deleting
     /// the blob once every recipient has resolved).
     pub fn finish_stored_delivery(&mut self, offer_id: &[u8; 16], recipient: &DeviceId) {
+        self.delivery_tokens.remove(&(*offer_id, recipient.clone()));
         self.files.finish_delivery(offer_id, &recipient.0);
     }
 
-    /// A stored delivery failed midway (recipient dropped): free the in-flight
-    /// slot but leave the offer pending so it can be retried.
+    /// A stored delivery failed midway (recipient dropped) or was aborted by the
+    /// recipient: free the in-flight slot but leave the offer pending so it can be
+    /// retried.
     pub fn abort_stored_delivery(&mut self, offer_id: &[u8; 16], recipient: &DeviceId) {
+        self.delivery_tokens.remove(&(*offer_id, recipient.clone()));
         self.files.abort_delivery(offer_id, &recipient.0);
     }
 
@@ -1336,6 +1584,70 @@ impl Relay {
                     },
                 ));
             }
+        }
+        out
+    }
+
+    /// Release a buffered poll: hand its ballots to the right recipients and clear
+    /// it (one-shot). For mode 0 every group member receives the whole set; for
+    /// modes 1/2 only the owner does, and the other members receive an empty
+    /// `Ballots` so their client learns the poll closed. Online members get it
+    /// live, offline members via the persistent queue.
+    fn release_ballots(&mut self, poll_id: &[u8; 16]) -> Vec<Outgoing> {
+        let Some(bp) = self.ballots.remove(poll_id) else {
+            return vec![];
+        };
+        let members: Vec<DeviceId> = self
+            .groups
+            .members(&bp.group)
+            .map(|m| m.iter().cloned().collect())
+            .unwrap_or_default();
+        // Mode 3 is anonymous: strip the submitter attribution so peers receive the
+        // ballots with no idea who sent each (the ring signature inside each ballot
+        // still proves a member cast it).
+        let strip = bp.mode == 3;
+        let all: Vec<(DeviceId, Sealed)> = bp
+            .ballots
+            .into_iter()
+            .map(|(d, s)| (if strip { DeviceId(String::new()) } else { d }, s))
+            .collect();
+        let mut out = Vec::new();
+        for dev in members {
+            // Modes 0 and 3 release the whole set to every member; owner modes give
+            // it only to the owner (others get an empty set = closure signal).
+            let data = if bp.mode == 0 || bp.mode == 3 || dev == bp.owner {
+                all.clone()
+            } else {
+                Vec::new()
+            };
+            let msg = ServerMsg::Ballots {
+                group: bp.group.clone(),
+                poll: *poll_id,
+                ballots: data,
+            };
+            match self.device_conn.get(&dev).copied() {
+                Some(conn) => out.push(Outgoing { to: conn, msg }),
+                None => {
+                    self.queue.enqueue(&dev.0, msg);
+                }
+            }
+        }
+        out
+    }
+
+    /// Release every buffered poll whose deadline has passed (no one need be
+    /// online). Mirrors [`sweep_files`](Self::sweep_files); driven by the same tick.
+    pub fn sweep_ballots(&mut self) -> Vec<Outgoing> {
+        let now = (self.now)();
+        let due: Vec<[u8; 16]> = self
+            .ballots
+            .iter()
+            .filter(|(_, bp)| bp.release_at.is_some_and(|t| t <= now))
+            .map(|(id, _)| *id)
+            .collect();
+        let mut out = Vec::new();
+        for id in due {
+            out.extend(self.release_ballots(&id));
         }
         out
     }
@@ -1459,6 +1771,26 @@ impl Relay {
     /// Whether `device` is a routing member of `group`.
     fn is_member(&self, group: &GroupId, device: &DeviceId) -> bool {
         self.groups.is_member(group, device)
+    }
+
+    /// Send the group's current authoritative membership to every online member,
+    /// so their displayed member list/count reflects a join/leave/remove at once
+    /// (independent of the MLS leaf tree, which cannot drop an offline leaver).
+    fn members_broadcast(&self, group: &GroupId) -> Vec<Outgoing> {
+        let Some(set) = self.groups.members(group) else {
+            return vec![];
+        };
+        let members: Vec<String> = set.iter().map(|d| d.0.clone()).collect();
+        set.iter()
+            .filter_map(|dev| self.device_conn.get(dev).copied().map(|conn| (dev, conn)))
+            .map(|(_, conn)| Outgoing {
+                to: conn,
+                msg: ServerMsg::GroupMembers {
+                    group: group.clone(),
+                    members: members.clone(),
+                },
+            })
+            .collect()
     }
 
     /// Deliver `make(group)` to every online member of `group` except the
@@ -1602,6 +1934,17 @@ fn fresh_file_store() -> FileStore {
         N.fetch_add(1, Ordering::Relaxed)
     ));
     FileStore::new(dir)
+}
+
+fn fresh_avatar_store() -> AvatarStore {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "enclave-relay-avatars-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    AvatarStore::load(dir)
 }
 
 /// Build an auth-failure reply. Login failures use a single coarse message so

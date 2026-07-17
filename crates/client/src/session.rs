@@ -17,6 +17,8 @@ use enclave_protocol::ClientMsg;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::transfer::Profile;
+
 /// One persisted conversation: its routing id, MLS-internal id (to reload the
 /// group), kind, title, members, and scoped history.
 #[derive(Serialize, Deserialize, Clone)]
@@ -33,6 +35,57 @@ pub struct PersistConv {
     /// "trusted" mark across a membership change.
     #[serde(default)]
     pub verified: Option<String>,
+    /// Disappearing-messages duration (ms) for this conversation, if on.
+    #[serde(default)]
+    pub disappearing_ms: Option<u32>,
+    /// Lifecycle state: shown, archived (hidden from the list), or deleted
+    /// (group left, history kept for a future reconnect). Old sessions without
+    /// this field default to `Active`.
+    #[serde(default)]
+    pub visibility: crate::Visibility,
+    /// The local-only "Notes to self" scratchpad: no MLS group, one member (us),
+    /// nothing ever sent. Old sessions without this field default to `false`.
+    #[serde(default)]
+    pub local_only: bool,
+    /// Emoji reactions on this conversation's messages, keyed by message id (as
+    /// `(id, reactions)` pairs). Old sessions without this field default to empty.
+    #[serde(default)]
+    pub reactions: Vec<([u8; 16], Vec<crate::transfer::Reaction>)>,
+    /// Ids of messages that were edited (for the "edited" marker). Old sessions
+    /// without this field default to empty.
+    #[serde(default)]
+    pub edited: Vec<[u8; 16]>,
+    /// Polls in this conversation, keyed by the poll's message id. Old sessions
+    /// without this field default to empty.
+    #[serde(default)]
+    pub polls: Vec<([u8; 16], PersistPoll)>,
+    /// Ids of pinned messages. Old sessions without this field default to empty.
+    #[serde(default)]
+    pub pinned: Vec<[u8; 16]>,
+}
+
+/// A persisted poll: its definition, state, and per-member votes.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PersistPoll {
+    pub question: String,
+    pub options: Vec<String>,
+    pub multi: bool,
+    pub reveal: u8,
+    #[serde(default)]
+    pub closed: bool,
+    /// Absolute deadline (unix ms), or None for no time limit.
+    #[serde(default)]
+    pub closes_at: Option<u64>,
+    pub author: String,
+    /// Each voter's username paired with its chosen option indices.
+    pub votes: Vec<(String, Vec<u8>)>,
+    /// Content key for server-buffered ballots (reveal >= 2), or None.
+    #[serde(default)]
+    pub ballot_key: Option<[u8; 32]>,
+    #[serde(default)]
+    pub anonymous: bool,
+    #[serde(default)]
+    pub ring: Vec<[u8; 32]>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -44,6 +97,29 @@ pub struct PersistLine {
     /// without this field default to `None` (a text line).
     #[serde(default)]
     pub file: Option<PersistFile>,
+    /// A persisted system notice ("X declined foo"). Old sessions without this
+    /// field default to `false` (an ordinary message line).
+    #[serde(default)]
+    pub system: bool,
+    /// Stable message id (transfer/offer id). Old sessions default to all-zero
+    /// (a line that predates message ids: no reply/delete target).
+    #[serde(default)]
+    pub id: [u8; 16],
+    /// Creation time, unix milliseconds. Old sessions default to 0 (unknown).
+    #[serde(default)]
+    pub ts: u64,
+    /// Whether the message was deleted (shows a placeholder). Default false.
+    #[serde(default)]
+    pub deleted: bool,
+    /// The id of the message this replies to, if any. Default none.
+    #[serde(default)]
+    pub reply_to: Option<[u8; 16]>,
+    /// Duration in ms if this line is a voice message (its clip is the `file`).
+    #[serde(default)]
+    pub voice_ms: Option<u32>,
+    /// Amplitude envelope for a voice message's waveform (empty otherwise).
+    #[serde(default)]
+    pub waveform: Vec<u8>,
 }
 
 /// A file line, persisted so file history survives a restart. The bytes are
@@ -76,6 +152,25 @@ pub struct SessionData {
     /// -- a message resent after both peers restarted is still shown once.
     #[serde(default)]
     pub seen_ids: Vec<[u8; 16]>,
+    /// Our own end-to-end profile (display name, status, avatar reference, ...).
+    /// Persisted so it is broadcast unchanged after a restart. Old sessions
+    /// default to an empty profile.
+    #[serde(default)]
+    pub my_profile: Profile,
+    /// Cached profiles of people we share a group with, keyed by username, so
+    /// their names and avatars render immediately on restart without waiting for
+    /// a fresh broadcast. Old sessions default to empty.
+    #[serde(default)]
+    pub peer_profiles: Vec<(String, Profile)>,
+    /// Handles that removed us (they initiated the un-friend). Persisted so the
+    /// removal direction, and thus auto-reconnect eligibility, survives a restart.
+    #[serde(default)]
+    pub removed_me: Vec<String>,
+    /// Seed for our ring-signature voting keypair (anonymous polls). Persisted so
+    /// our voting public key is stable across sessions. Empty on old sessions; a
+    /// fresh one is generated on load.
+    #[serde(default)]
+    pub voting_seed: Vec<u8>,
 }
 
 /// Derive the 32-byte at-rest key from the OPAQUE export key (domain-separated).
@@ -147,6 +242,21 @@ mod tests {
                 },
             )],
             seen_ids: vec![[9u8; 16], [10u8; 16]],
+            my_profile: Profile {
+                display_name: "Me".into(),
+                version: 3,
+                ..Profile::default()
+            },
+            peer_profiles: vec![(
+                "bob".into(),
+                Profile {
+                    display_name: "Bob".into(),
+                    version: 1,
+                    ..Profile::default()
+                },
+            )],
+            removed_me: vec!["carol#0003".into()],
+            voting_seed: Vec::new(),
         };
         save(&path, key, &data);
 
@@ -163,11 +273,87 @@ mod tests {
             vec![[9u8; 16], [10u8; 16]],
             "dedup ids persisted"
         );
+        assert_eq!(
+            loaded.my_profile.display_name, "Me",
+            "own profile persisted"
+        );
+        assert_eq!(loaded.my_profile.version, 3);
+        assert_eq!(
+            loaded.peer_profiles.len(),
+            1,
+            "peer profile cache persisted"
+        );
+        assert_eq!(loaded.peer_profiles[0].0, "bob");
+        assert_eq!(loaded.peer_profiles[0].1.display_name, "Bob");
+        assert_eq!(
+            loaded.removed_me,
+            vec!["carol#0003"],
+            "removal direction persisted"
+        );
 
         // A wrong key yields a default (no leakage), including empty reliability state.
         let wrong = load(&path, b"the-wrong-export-key-entirely-here");
         assert!(wrong.unacked.is_empty());
         assert_eq!(wrong.next_seq, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn local_only_notes_conversation_survives_a_round_trip() {
+        let path = std::env::temp_dir().join(format!("enclave-notes-{}.enc", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let key = b"an-export-key-for-the-notes-test";
+
+        // A "Notes to self" scratchpad: no MLS group, one member (us), local_only.
+        let notes = PersistConv {
+            routing_id: [7u8; 32],
+            mls_group_id: Vec::new(),
+            is_dm: true,
+            title: "Notes to self".into(),
+            members: vec!["me".into()],
+            history: vec![PersistLine {
+                from: "me".into(),
+                text: "remember the milk".into(),
+                mine: true,
+                file: None,
+                system: false,
+                id: [0u8; 16],
+                ts: 0,
+                deleted: false,
+                reply_to: None,
+                voice_ms: None,
+                waveform: Vec::new(),
+            }],
+            verified: None,
+            disappearing_ms: None,
+            visibility: crate::Visibility::Active,
+            local_only: true,
+            reactions: Vec::new(),
+            edited: Vec::new(),
+            polls: Vec::new(),
+            pinned: Vec::new(),
+        };
+        let data = SessionData {
+            conversations: vec![notes],
+            ..Default::default()
+        };
+        save(&path, key, &data);
+
+        let loaded = load(&path, key);
+        assert_eq!(
+            loaded.conversations.len(),
+            1,
+            "the notes conversation persisted"
+        );
+        let c = &loaded.conversations[0];
+        assert!(c.local_only, "the local-only flag round-tripped");
+        assert!(
+            c.mls_group_id.is_empty(),
+            "no MLS group is stored for notes"
+        );
+        assert_eq!(c.members, vec!["me".to_string()], "just us");
+        assert_eq!(c.history.len(), 1, "the note text was kept");
+        assert_eq!(c.history[0].text, "remember the milk");
         let _ = std::fs::remove_file(&path);
     }
 }

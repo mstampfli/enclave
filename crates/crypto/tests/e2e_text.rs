@@ -14,7 +14,7 @@ fn two_member_group() -> (Identity, Group, Identity, Group) {
     let bob = Identity::generate("bob").expect("bob");
     let mut alice_group = Group::create(&alice).expect("create");
     let welcome = alice_group
-        .add_member(&alice, &bob.new_key_package().expect("bob kp"))
+        .add_member(&alice, &bob.new_key_package().expect("bob kp"), "bob")
         .expect("add bob")
         .welcome;
     let bob_group = Group::join(&bob, &welcome).expect("bob joins");

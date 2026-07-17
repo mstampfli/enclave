@@ -18,14 +18,14 @@ fn three_members_agree_then_rekey_on_leave() {
     // Alice creates, adds Bob (2 members: no other existing member to update).
     let mut alice_group = Group::create(&alice).unwrap();
     let add_bob = alice_group
-        .add_member(&alice, &bob.new_key_package().unwrap())
+        .add_member(&alice, &bob.new_key_package().unwrap(), "bob")
         .unwrap();
     let mut bob_group = Group::join(&bob, &add_bob.welcome).unwrap();
 
     // Alice adds Charlie (3 members): Bob, an existing member, applies the
     // commit to advance to the same epoch.
     let add_charlie = alice_group
-        .add_member(&alice, &charlie.new_key_package().unwrap())
+        .add_member(&alice, &charlie.new_key_package().unwrap(), "charlie")
         .unwrap();
     bob_group.apply_commit(&bob, &add_charlie.commit).unwrap();
     let mut charlie_group = Group::join(&charlie, &add_charlie.welcome).unwrap();

@@ -21,7 +21,7 @@ enclave-media = { version = "0.0.0", path = "../media" }
 enclave-transport = { path = "../transport" }
 thiserror.workspace = true
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
-wry = "0.55.1"
+wry = { version = "0.55.1", features = ["devtools"] }
 tao = "0.35.3"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

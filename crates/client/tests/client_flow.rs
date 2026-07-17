@@ -14,6 +14,31 @@ async fn next_event(client: &mut Client) -> Event {
         .expect("client disconnected")
 }
 
+/// Drain a client's events until `pred` holds (or give up after a few seconds).
+async fn pump_until<F: Fn(&Client) -> bool>(client: &mut Client, pred: F) {
+    for _ in 0..200 {
+        if pred(client) {
+            return;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(50), client.next_event()).await;
+    }
+    assert!(pred(client), "condition never became true");
+}
+
+/// Make `a` and `b` mutual friends (request + accept), pumping both to settle.
+async fn become_friends(a: &mut Client, b: &mut Client) {
+    let a_h = a.name().to_string();
+    let b_h = b.name().to_string();
+    a.send_friend_request(&b_h);
+    pump_until(b, |c| {
+        c.incoming_requests().iter().any(|f| f.username == a_h)
+    })
+    .await;
+    b.accept_friend(&a_h);
+    pump_until(a, |c| c.friends().iter().any(|f| f.username == b_h)).await;
+    pump_until(b, |c| c.friends().iter().any(|f| f.username == a_h)).await;
+}
+
 /// Connect and create an account (identity files go to a temp dir).
 async fn account(url: &str, name: &str) -> Client {
     let mut client = Client::connect(url).await.expect("connect");
@@ -101,7 +126,7 @@ async fn two_clients_chat_through_the_controller() {
     assert_eq!(alice.safety_number(), bob.safety_number());
 
     // Alice sends text; Bob receives it decrypted, authenticated as Alice's handle.
-    alice.send_text("hello bob").await.unwrap();
+    alice.send_text("hello bob", None).await.unwrap();
     loop {
         if let Event::Message { from, text, .. } = next_event(&mut bob).await {
             assert_eq!(from, alice_handle);
@@ -111,12 +136,775 @@ async fn two_clients_chat_through_the_controller() {
     }
 
     // And the reverse direction works too.
-    bob.send_text("hi alice").await.unwrap();
+    bob.send_text("hi alice", None).await.unwrap();
     loop {
         if let Event::Message { from, text, .. } = next_event(&mut alice).await {
             assert_eq!(from, bob_handle);
             assert_eq!(text, "hi alice");
             break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn reply_and_delete_for_everyone_propagate() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let bob_handle = bob.name().to_string();
+
+    alice
+        .create_group("hangout", std::slice::from_ref(&bob_handle))
+        .await
+        .unwrap();
+    loop {
+        if matches!(next_event(&mut bob).await, Event::ConversationsChanged) {
+            break;
+        }
+    }
+    bob.switch(&bob.conversations().first().unwrap().id.clone());
+
+    // Alice sends a message; Bob receives it and learns its id.
+    alice.send_text("the original", None).await.unwrap();
+    let orig_id = loop {
+        if let Event::Message { id, text, .. } = next_event(&mut bob).await {
+            if text == "the original" {
+                break id;
+            }
+        }
+    };
+
+    // Alice replies to it; Bob sees the reply carry the parent's id.
+    alice.send_text("a reply", Some(&orig_id)).await.unwrap();
+    loop {
+        if let Event::Message { text, reply_to, .. } = next_event(&mut bob).await {
+            if text == "a reply" {
+                assert_eq!(reply_to, orig_id, "the reply references the original");
+                break;
+            }
+        }
+    }
+
+    // Alice deletes the original for everyone; Bob's copy is tombstoned.
+    alice.delete_message(&alice.active_id().unwrap(), &orig_id, true);
+    loop {
+        if let Event::MessageDeleted { id, .. } = next_event(&mut bob).await {
+            assert_eq!(id, orig_id);
+            break;
+        }
+    }
+    // Bob's history keeps the line but marks it deleted (never removed).
+    let gid = bob.conversations().first().unwrap().id.clone();
+    let line = bob
+        .conversation_history(&gid)
+        .into_iter()
+        .find(|l| l.id == orig_id)
+        .expect("the line is still in history");
+    assert!(line.deleted, "the original is marked deleted, not removed");
+    assert!(line.text.is_empty(), "deleted content is cleared");
+}
+
+#[tokio::test]
+async fn reactions_propagate_and_toggle_between_two_clients() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let bob_handle = bob.name().to_string();
+    let alice_user = alice.name().to_string();
+    let bob_user = bob.name().to_string();
+
+    alice
+        .create_group("hangout", std::slice::from_ref(&bob_handle))
+        .await
+        .unwrap();
+    loop {
+        if matches!(next_event(&mut bob).await, Event::ConversationsChanged) {
+            break;
+        }
+    }
+    let bob_gid = bob.conversations().first().unwrap().id.clone();
+    bob.switch(&bob_gid);
+    let alice_gid = alice.active_id().unwrap();
+
+    // Alice sends a message; Bob receives it and learns its id.
+    alice.send_text("react to me", None).await.unwrap();
+    let mid = loop {
+        if let Event::Message { id, text, .. } = next_event(&mut bob).await {
+            if text == "react to me" {
+                break id;
+            }
+        }
+    };
+
+    // Bob reacts with a thumbs-up; Alice is notified and her history shows it,
+    // attributed to Bob (the authenticated sender), never a payload field.
+    bob.react(&bob_gid, &mid, "\u{1F44D}");
+    loop {
+        if let Event::ReactionsChanged { id, reactions, .. } = next_event(&mut alice).await {
+            if id == mid {
+                assert_eq!(reactions.len(), 1);
+                assert_eq!(reactions[0].emoji, "\u{1F44D}");
+                assert_eq!(reactions[0].users, vec![bob_user.clone()]);
+                break;
+            }
+        }
+    }
+
+    // Alice adds the SAME emoji: it now has two reactors.
+    alice.react(&alice_gid, &mid, "\u{1F44D}");
+    let line = alice
+        .conversation_history(&alice_gid)
+        .into_iter()
+        .find(|l| l.id == mid)
+        .unwrap();
+    assert_eq!(line.reactions.len(), 1, "still one emoji");
+    assert_eq!(line.reactions[0].users.len(), 2, "two reactors on it");
+    // Bob learns of Alice's reaction too.
+    loop {
+        if let Event::ReactionsChanged { id, reactions, .. } = next_event(&mut bob).await {
+            if id == mid && reactions.iter().any(|r| r.users.len() == 2) {
+                break;
+            }
+        }
+    }
+
+    // Bob toggles his reaction OFF (reacting again removes it): only Alice remains.
+    bob.react(&bob_gid, &mid, "\u{1F44D}");
+    loop {
+        if let Event::ReactionsChanged { id, reactions, .. } = next_event(&mut alice).await {
+            if id == mid {
+                assert_eq!(reactions.len(), 1);
+                assert_eq!(
+                    reactions[0].users,
+                    vec![alice_user.clone()],
+                    "only Alice's remains"
+                );
+                break;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn editing_a_message_propagates_and_only_the_author_can_edit() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let bob_handle = bob.name().to_string();
+
+    alice
+        .create_group("hangout", std::slice::from_ref(&bob_handle))
+        .await
+        .unwrap();
+    loop {
+        if matches!(next_event(&mut bob).await, Event::ConversationsChanged) {
+            break;
+        }
+    }
+    let bob_gid = bob.conversations().first().unwrap().id.clone();
+    bob.switch(&bob_gid);
+    let alice_gid = alice.active_id().unwrap();
+
+    // Alice sends a message; Bob receives it and learns its id.
+    alice.send_text("original", None).await.unwrap();
+    let mid = loop {
+        if let Event::Message { id, text, .. } = next_event(&mut bob).await {
+            if text == "original" {
+                break id;
+            }
+        }
+    };
+
+    // Bob cannot edit Alice's message (it is not his): refused locally, nothing sent.
+    assert!(
+        bob.edit_message(&bob_gid, &mid, "hacked").is_none(),
+        "a member cannot edit another member's message"
+    );
+
+    // Alice edits her own message; Bob receives the edit and his copy updates.
+    assert_eq!(
+        alice
+            .edit_message(&alice_gid, &mid, "edited text")
+            .as_deref(),
+        Some("edited text")
+    );
+    loop {
+        if let Event::MessageEdited { id, text, .. } = next_event(&mut bob).await {
+            if id == mid {
+                assert_eq!(text, "edited text");
+                break;
+            }
+        }
+    }
+    // Bob's history shows the new text, flagged edited; the line is not duplicated.
+    let line = bob
+        .conversation_history(&bob_gid)
+        .into_iter()
+        .find(|l| l.id == mid)
+        .expect("the edited line is still there");
+    assert_eq!(line.text, "edited text", "text was replaced in place");
+    assert!(line.edited, "marked as edited");
+    // Alice's own copy is edited and flagged too.
+    let aline = alice
+        .conversation_history(&alice_gid)
+        .into_iter()
+        .find(|l| l.id == mid)
+        .unwrap();
+    assert_eq!(aline.text, "edited text");
+    assert!(aline.edited);
+}
+
+#[tokio::test]
+async fn local_search_scopes_to_a_conversation_or_spans_all() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let _bob = account(&url, "bob").await; // the invitee (its key package is on the server)
+    let bob_handle = _bob.name().to_string();
+
+    // Two conversations, each with distinct messages, all recorded in Alice's
+    // local history the moment she sends them.
+    alice
+        .create_group("recipes", std::slice::from_ref(&bob_handle))
+        .await
+        .unwrap();
+    let g1 = alice.active_id().unwrap();
+    alice
+        .send_text("apple pie is the best", None)
+        .await
+        .unwrap();
+    alice.send_text("also cherry pie", None).await.unwrap();
+
+    alice
+        .create_group("plans", std::slice::from_ref(&bob_handle))
+        .await
+        .unwrap();
+    let g2 = alice.active_id().unwrap();
+    alice.send_text("meet on tuesday", None).await.unwrap();
+
+    // Global search: "pie" hits both recipe messages and nothing from the other.
+    let hits = alice.search_messages("pie", None);
+    assert_eq!(
+        hits.len(),
+        2,
+        "both pie messages found across all conversations"
+    );
+    assert!(
+        hits.iter().all(|h| h.conv == g1),
+        "both are in the recipes group"
+    );
+
+    // Case-insensitive: "TUESDAY" finds the plans message.
+    let hits = alice.search_messages("TUESDAY", None);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].conv, g2);
+
+    // Scoped to g1: a g2 term finds nothing; a g1 term still finds both.
+    assert!(alice.search_messages("tuesday", Some(&g1)).is_empty());
+    assert_eq!(alice.search_messages("pie", Some(&g1)).len(), 2);
+
+    // An empty query yields nothing.
+    assert!(alice.search_messages("   ", None).is_empty());
+}
+
+#[tokio::test]
+async fn polls_propagate_votes_tally_and_close() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let bob_handle = bob.name().to_string();
+
+    alice
+        .create_group("team", std::slice::from_ref(&bob_handle))
+        .await
+        .unwrap();
+    loop {
+        if matches!(next_event(&mut bob).await, Event::ConversationsChanged) {
+            break;
+        }
+    }
+    let bob_gid = bob.conversations().first().unwrap().id.clone();
+    bob.switch(&bob_gid);
+    let alice_gid = alice.active_id().unwrap();
+
+    // Alice posts a single-choice poll (results always visible).
+    let opts = vec!["Red".to_string(), "Green".to_string(), "Blue".to_string()];
+    let (pid, _ts, view) = alice
+        .create_poll("Favourite colour?", &opts, false, 0, 0, false)
+        .unwrap();
+    assert_eq!(view.options.len(), 3);
+    assert!(view.is_author, "the creator may close it");
+    assert_eq!(view.closes_at, 0, "no time limit");
+
+    // Bob receives the poll.
+    loop {
+        if let Event::PollPosted { id, poll, .. } = next_event(&mut bob).await {
+            if id == pid {
+                assert_eq!(poll.question, "Favourite colour?");
+                assert_eq!(poll.total, 0);
+                break;
+            }
+        }
+    }
+
+    // Bob votes Green (index 1); Alice sees the tally update.
+    bob.vote_poll(&bob_gid, &pid, vec![1]);
+    loop {
+        if let Event::PollUpdated { id, poll, .. } = next_event(&mut alice).await {
+            if id == pid {
+                assert_eq!(poll.counts, vec![0, 1, 0]);
+                assert_eq!(poll.total, 1);
+                break;
+            }
+        }
+    }
+
+    // Alice votes Green too; both see two votes on Green, and the voter
+    // breakdown lists both of them under Green.
+    let v = alice.vote_poll(&alice_gid, &pid, vec![1]).unwrap();
+    assert_eq!(v.counts, vec![0, 2, 0]);
+    assert_eq!(v.mine, vec![1]);
+    assert_eq!(v.voters[1].len(), 2, "Green lists two voters");
+    assert!(v.voters[0].is_empty() && v.voters[2].is_empty());
+    loop {
+        if let Event::PollUpdated { id, poll, .. } = next_event(&mut bob).await {
+            if id == pid && poll.total == 2 {
+                assert_eq!(poll.counts, vec![0, 2, 0]);
+                break;
+            }
+        }
+    }
+
+    // Single-choice: Alice moves her vote to Blue; Green drops to 1, Blue is 1.
+    let v = alice.vote_poll(&alice_gid, &pid, vec![2]).unwrap();
+    assert_eq!(v.counts, vec![0, 1, 1], "the vote moved, it did not add");
+    assert_eq!(v.mine, vec![2]);
+
+    // Alice closes the poll; Bob is told, and can no longer vote.
+    alice.close_poll(&alice_gid, &pid).unwrap();
+    loop {
+        if let Event::PollUpdated { id, poll, .. } = next_event(&mut bob).await {
+            if id == pid && poll.closed {
+                break;
+            }
+        }
+    }
+    assert!(
+        bob.vote_poll(&bob_gid, &pid, vec![0]).is_none(),
+        "a closed poll rejects votes"
+    );
+}
+
+#[tokio::test]
+async fn a_timed_poll_auto_closes_after_its_deadline() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let _bob = account(&url, "bob").await; // the invitee
+    let bob_handle = _bob.name().to_string();
+    alice
+        .create_group("q", std::slice::from_ref(&bob_handle))
+        .await
+        .unwrap();
+    let gid = alice.active_id().unwrap();
+
+    // A poll with a 60 ms limit. Before the deadline, voting works.
+    let opts = vec!["A".to_string(), "B".to_string()];
+    let (pid, _ts, view) = alice
+        .create_poll("quick?", &opts, false, 0, 60, false)
+        .unwrap();
+    assert!(view.closes_at > 0, "the poll carries a deadline");
+    assert!(
+        alice.vote_poll(&gid, &pid, vec![0]).is_some(),
+        "votes count before the deadline"
+    );
+
+    // After the deadline it auto-closes: votes are rejected and the view is closed.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(
+        alice.vote_poll(&gid, &pid, vec![1]).is_none(),
+        "no votes after the deadline"
+    );
+    let line = alice
+        .conversation_history(&gid)
+        .into_iter()
+        .find(|l| l.id == pid)
+        .unwrap();
+    assert!(
+        line.poll.unwrap().closed,
+        "the poll auto-closed once the deadline passed"
+    );
+}
+
+#[tokio::test]
+async fn a_buffered_poll_hides_votes_until_the_server_releases_them() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let bob_handle = bob.name().to_string();
+
+    alice
+        .create_group("team", std::slice::from_ref(&bob_handle))
+        .await
+        .unwrap();
+    loop {
+        if matches!(next_event(&mut bob).await, Event::ConversationsChanged) {
+            break;
+        }
+    }
+    let bob_gid = bob.conversations().first().unwrap().id.clone();
+    bob.switch(&bob_gid);
+    let alice_gid = alice.active_id().unwrap();
+
+    // A server-buffered poll (reveal 2 = everyone, on close) that closes in 300 ms.
+    // Creating it registers the poll with the server (BallotOpen).
+    let opts = vec!["A".to_string(), "B".to_string()];
+    let (pid, _ts, _v) = alice
+        .create_poll("buffered?", &opts, false, 2, 300, false)
+        .unwrap();
+    loop {
+        if let Event::PollPosted { id, .. } = next_event(&mut bob).await {
+            if id == pid {
+                break;
+            }
+        }
+    }
+
+    // Both vote; each ballot is a sealed BallotSubmit the server BUFFERS (not
+    // relayed), so before release neither sees the other's vote.
+    bob.vote_poll(&bob_gid, &pid, vec![1]);
+    alice.vote_poll(&alice_gid, &pid, vec![0]);
+    for _ in 0..8 {
+        let _ = tokio::time::timeout(Duration::from_millis(20), alice.next_event()).await;
+    }
+    let before = alice
+        .conversation_history(&alice_gid)
+        .into_iter()
+        .find(|l| l.id == pid)
+        .unwrap()
+        .poll
+        .unwrap();
+    assert_eq!(
+        before.total, 1,
+        "before release, only our own vote is visible"
+    );
+    assert!(!before.closed, "not closed before the deadline");
+
+    // After the deadline the server sweep releases the ballots to the whole group,
+    // with no one required to be online at close.
+    let released = loop {
+        if let Event::PollUpdated { id, poll, .. } = next_event(&mut alice).await {
+            if id == pid && poll.closed {
+                break poll;
+            }
+        }
+    };
+    assert_eq!(released.total, 2, "both votes appear at release");
+    assert_eq!(released.counts, vec![1, 1], "one each");
+}
+
+#[tokio::test]
+async fn an_anonymous_poll_tallies_without_attributing_votes() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let alice_user = alice.name().to_string();
+    let bob_user = bob.name().to_string();
+
+    alice
+        .create_group("secret ballot", std::slice::from_ref(&bob_user))
+        .await
+        .unwrap();
+    loop {
+        if matches!(next_event(&mut bob).await, Event::ConversationsChanged) {
+            break;
+        }
+    }
+    let bob_gid = bob.conversations().first().unwrap().id.clone();
+    bob.switch(&bob_gid);
+    let alice_gid = alice.active_id().unwrap();
+
+    // Let profiles -- which carry each member's ring voting key -- exchange, so the
+    // creator can assemble a ring containing both members.
+    for _ in 0..40 {
+        let _ = tokio::time::timeout(Duration::from_millis(25), alice.next_event()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(25), bob.next_event()).await;
+    }
+
+    // An anonymous, everyone-on-close poll (reveal 2 + anonymous) closing in 300ms.
+    let opts = vec!["Yes".to_string(), "No".to_string()];
+    let (pid, _ts, view) = alice
+        .create_poll("Approve?", &opts, false, 2, 300, true)
+        .unwrap();
+    assert!(
+        view.anonymous,
+        "the ring assembled from both members' voting keys"
+    );
+    loop {
+        if let Event::PollPosted { id, poll, .. } = next_event(&mut bob).await {
+            if id == pid {
+                assert!(poll.anonymous, "the peer sees it is anonymous");
+                break;
+            }
+        }
+    }
+
+    // Both cast ring-signed ballots; the server buffers them and strips attribution.
+    bob.vote_poll(&bob_gid, &pid, vec![0]);
+    alice.vote_poll(&alice_gid, &pid, vec![1]);
+
+    // At release the tally appears -- and no vote is attributable to a real member.
+    let released = loop {
+        if let Event::PollUpdated { id, poll, .. } = next_event(&mut alice).await {
+            if id == pid && poll.closed {
+                break poll;
+            }
+        }
+    };
+    assert_eq!(released.total, 2, "both anonymous ballots counted");
+    assert_eq!(released.counts, vec![1, 1], "one Yes, one No");
+    let voters: Vec<String> = released.voters.iter().flatten().cloned().collect();
+    assert_eq!(voters.len(), 2, "two distinct anonymous voters");
+    assert!(
+        !voters.iter().any(|v| v == &alice_user || v == &bob_user),
+        "voters are opaque pseudonyms, never real usernames"
+    );
+}
+
+#[tokio::test]
+async fn pinning_a_message_is_shared_across_members() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let bob_handle = bob.name().to_string();
+
+    alice
+        .create_group("team", std::slice::from_ref(&bob_handle))
+        .await
+        .unwrap();
+    loop {
+        if matches!(next_event(&mut bob).await, Event::ConversationsChanged) {
+            break;
+        }
+    }
+    let bob_gid = bob.conversations().first().unwrap().id.clone();
+    bob.switch(&bob_gid);
+    let alice_gid = alice.active_id().unwrap();
+
+    alice.send_text("important", None).await.unwrap();
+    let mid = loop {
+        if let Event::Message { id, text, .. } = next_event(&mut bob).await {
+            if text == "important" {
+                break id;
+            }
+        }
+    };
+
+    // Alice pins it; Bob is told and his copy shows it pinned.
+    assert_eq!(alice.pin_message(&alice_gid, &mid, true), Some(true));
+    loop {
+        if let Event::PinsChanged { id, pinned, .. } = next_event(&mut bob).await {
+            if id == mid {
+                assert!(pinned);
+                break;
+            }
+        }
+    }
+    assert!(
+        bob.conversation_history(&bob_gid)
+            .into_iter()
+            .find(|l| l.id == mid)
+            .unwrap()
+            .pinned,
+        "pin is shared to the other member"
+    );
+
+    // Bob unpins it (pins are shared, so any member may); Alice sees it un-pin.
+    assert_eq!(bob.pin_message(&bob_gid, &mid, false), Some(false));
+    loop {
+        if let Event::PinsChanged { id, pinned, .. } = next_event(&mut alice).await {
+            if id == mid {
+                assert!(!pinned);
+                break;
+            }
+        }
+    }
+    assert!(
+        !alice
+            .conversation_history(&alice_gid)
+            .into_iter()
+            .find(|l| l.id == mid)
+            .unwrap()
+            .pinned,
+        "the un-pin propagated back"
+    );
+}
+
+#[tokio::test]
+async fn disappearing_setting_propagates_and_expires() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let bob_handle = bob.name().to_string();
+
+    alice
+        .create_group("hangout", std::slice::from_ref(&bob_handle))
+        .await
+        .unwrap();
+    loop {
+        if matches!(next_event(&mut bob).await, Event::ConversationsChanged) {
+            break;
+        }
+    }
+    let a_gid = alice.active_id().unwrap();
+    let b_gid = bob.conversations().first().unwrap().id.clone();
+    bob.switch(&b_gid);
+
+    // Alice enables disappearing messages; Bob is told and adopts the same setting.
+    alice.set_disappearing(&a_gid, 1); // 1 ms, so it expires immediately for the test
+    loop {
+        if let Event::DisappearingChanged { ms, .. } = next_event(&mut bob).await {
+            assert_eq!(ms, 1, "the setting propagated to the peer");
+            break;
+        }
+    }
+    assert_eq!(bob.disappearing_of(&b_gid), 1, "bob adopted the setting");
+
+    // Alice sends a message; both sides receive it, then the sweep removes it
+    // (its ts is already older than the 1 ms window).
+    alice.send_text("here then gone", None).await.unwrap();
+    loop {
+        if let Event::Message { text, .. } = next_event(&mut bob).await {
+            if text == "here then gone" {
+                break;
+            }
+        }
+    }
+    // A moment later the message is past its 1 ms lifetime on both devices.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let expired_a = alice.expire_messages();
+    let expired_b = bob.expire_messages();
+    assert!(
+        expired_a.iter().any(|(_, ids)| !ids.is_empty()),
+        "alice swept the message"
+    );
+    assert!(
+        expired_b.iter().any(|(_, ids)| !ids.is_empty()),
+        "bob swept the message"
+    );
+    assert!(
+        !alice
+            .conversation_history(&a_gid)
+            .iter()
+            .any(|l| l.text == "here then gone"),
+        "the message is fully gone from alice's history (no placeholder)"
+    );
+    assert!(
+        bob.conversation_history(&b_gid).is_empty()
+            || !bob
+                .conversation_history(&b_gid)
+                .iter()
+                .any(|l| l.text == "here then gone"),
+        "the message is fully gone from bob's history"
+    );
+}
+
+#[tokio::test]
+async fn a_dm_does_not_wait_for_the_peer_to_be_online() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let alice = account(&url, "alice").await;
+    let bob = account(&url, "bob").await;
+    let alice_h = alice.name().to_string();
+    let bob_h = bob.name().to_string();
+
+    // The LARGER handle is the side that used to be stuck "waiting for the peer".
+    // Have it open the DM while the peer has done nothing, and prove it works.
+    let (mut opener, mut peer, peer_h) = if alice_h > bob_h {
+        (alice, bob, bob_h)
+    } else {
+        (bob, alice, alice_h)
+    };
+
+    let conv = opener
+        .open_dm(&peer_h)
+        .await
+        .expect("open_dm succeeds immediately");
+    // It is established right away, not a pending placeholder.
+    assert!(
+        opener
+            .conversations()
+            .iter()
+            .any(|c| c.id == conv && !c.pending),
+        "the DM is established without waiting for the peer"
+    );
+    opener.switch(&conv);
+    opener
+        .send_text("hi, no waiting", None)
+        .await
+        .expect("can send at once");
+
+    // The peer, coming online now, receives the queued Welcome, joins, and reads it.
+    loop {
+        if let Event::Message { text, .. } = next_event(&mut peer).await {
+            if text == "hi, no waiting" {
+                break;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn both_opening_a_dm_converge_on_one_group() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let alice_h = alice.name().to_string();
+    let bob_h = bob.name().to_string();
+
+    // Both open the DM at once, so both create a group for the same DM id.
+    let ca = alice.open_dm(&bob_h).await.unwrap();
+    let cb = bob.open_dm(&alice_h).await.unwrap();
+    assert_eq!(ca, cb, "the DM id is deterministic for the pair");
+    alice.switch(&ca);
+    bob.switch(&cb);
+
+    // Drain both until quiet so the two Welcomes cross and the tie-break (smaller
+    // handle's group wins) resolves on both sides.
+    async fn drain(c: &mut Client) {
+        while tokio::time::timeout(Duration::from_millis(300), c.next_event())
+            .await
+            .is_ok()
+        {}
+    }
+    drain(&mut alice).await;
+    drain(&mut bob).await;
+
+    // Converged: messages flow both ways (they would not if the two sides kept
+    // different MLS groups).
+    alice.send_text("from alice", None).await.unwrap();
+    loop {
+        if let Event::Message { text, .. } = next_event(&mut bob).await {
+            if text == "from alice" {
+                break;
+            }
+        }
+    }
+    bob.send_text("from bob", None).await.unwrap();
+    loop {
+        if let Event::Message { text, .. } = next_event(&mut alice).await {
+            if text == "from bob" {
+                break;
+            }
         }
     }
 }
@@ -164,7 +952,7 @@ async fn conversations_and_history_survive_restart() {
     assert!(alice.is_verified(), "verified after confirming");
     let bob_gid = bob.conversations().first().unwrap().id.clone();
     bob.switch(&bob_gid);
-    alice.send_text("before restart").await.unwrap();
+    alice.send_text("before restart", None).await.unwrap();
     loop {
         if let Event::Message { text, .. } = next_event(&mut bob).await {
             if text == "before restart" {
@@ -191,7 +979,7 @@ async fn conversations_and_history_survive_restart() {
         alice2
             .conversation_history(&gid)
             .iter()
-            .any(|(_, t, mine, _)| t == "before restart" && *mine),
+            .any(|l| l.text == "before restart" && l.mine),
         "history restored after restart"
     );
 
@@ -210,7 +998,7 @@ async fn conversations_and_history_survive_restart() {
 
     // The MLS group is genuinely live: Alice can still send and Bob receives.
     alice2.switch(&gid);
-    alice2.send_text("after restart").await.unwrap();
+    alice2.send_text("after restart", None).await.unwrap();
     loop {
         if let Event::Message { text, .. } = next_event(&mut bob).await {
             if text == "after restart" {
@@ -282,7 +1070,7 @@ async fn large_message_and_file_transfer_between_two_clients() {
     // 1) A ~1.3 MiB message: larger than one frame, so it is chunked.
     let big: String = "The quick brown fox. ".repeat(65_536); // ~1.35 MiB
     assert!(big.len() > 1024 * 1024, "message must exceed one frame");
-    alice.send_text(&big).await.unwrap();
+    alice.send_text(&big, None).await.unwrap();
     let got = recv_message(&mut bob).await;
     assert_eq!(got, big, "the large message reassembled byte-for-byte");
 
@@ -420,7 +1208,10 @@ async fn a_reliable_message_survives_a_reconnect_exactly_once() {
     // Alice sends a message, then immediately reconnects (as if the socket
     // dropped before she knew it was acked). The unacked message is replayed on
     // reconnect; Bob must see it exactly once -- dedup absorbs any duplicate.
-    alice.send_text("survive the reconnect").await.unwrap();
+    alice
+        .send_text("survive the reconnect", None)
+        .await
+        .unwrap();
     alice.reconnect().await.unwrap();
 
     let mut count = 0;
@@ -438,5 +1229,731 @@ async fn a_reliable_message_survives_a_reconnect_exactly_once() {
         }
     }
     assert_eq!(count, 1, "delivered exactly once despite the reconnect");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Deleting a DM makes it disappear entirely (not to an Inactive list), but we
+/// stay a member and keep the history + group, so reopening the same peer reuses
+/// the group (no fork) and the scrollback is intact.
+#[tokio::test]
+async fn deleting_a_dm_retains_history_and_reopening_restores_it() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let bob_h = bob.name().to_string();
+    become_friends(&mut alice, &mut bob).await;
+
+    let conv = alice.open_dm(&bob_h).await.expect("open dm");
+    alice.switch(&conv);
+    alice.send_text("keep me", None).await.unwrap();
+    assert_eq!(alice.conversation_history(&conv).len(), 1);
+
+    // Delete: disappears from the list entirely, history retained.
+    alice.delete_conversation(&conv);
+    assert!(
+        !alice.conversations().iter().any(|c| c.id == conv),
+        "a deleted conversation disappears from the list"
+    );
+    assert!(
+        alice
+            .conversation_history(&conv)
+            .iter()
+            .any(|l| l.text == "keep me"),
+        "the sealed history is retained after delete"
+    );
+
+    // Re-open the same peer: same deterministic id, back to live, scrollback back.
+    let conv2 = alice.open_dm(&bob_h).await.expect("reopen dm");
+    assert_eq!(conv2, conv, "the DM id is deterministic for the pair");
+    assert!(
+        alice
+            .conversations()
+            .iter()
+            .find(|c| c.id == conv2)
+            .is_some_and(|c| !c.archived && !c.left),
+        "the reopened conversation is back in the live Chats list"
+    );
+    assert!(
+        alice
+            .conversation_history(&conv2)
+            .iter()
+            .any(|l| l.text == "keep me"),
+        "reopening restores the retained history"
+    );
+}
+
+/// When a member leaves a group, the remaining members' roster (and member
+/// count) drops the leaver: a designated remaining member commits the MLS
+/// removal, since openmls forbids self-removal.
+#[tokio::test]
+async fn leaving_a_group_updates_the_member_count_for_others() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let mut carol = account(&url, "carol").await;
+    let bob_h = bob.name().to_string();
+    let carol_h = carol.name().to_string();
+
+    alice
+        .create_group("trio", &[bob_h.clone(), carol_h.clone()])
+        .await
+        .unwrap();
+    let gid = alice.active_id().unwrap();
+    // Everyone settles at 3 members.
+    pump_until(&mut bob, |c| {
+        c.conversations()
+            .iter()
+            .find(|cc| cc.id == gid)
+            .is_some_and(|cc| cc.members.len() == 3)
+    })
+    .await;
+    pump_until(&mut carol, |c| {
+        c.conversations()
+            .iter()
+            .find(|cc| cc.id == gid)
+            .is_some_and(|cc| cc.members.len() == 3)
+    })
+    .await;
+    pump_until(&mut alice, |c| {
+        c.conversations()
+            .iter()
+            .find(|cc| cc.id == gid)
+            .is_some_and(|cc| cc.members.len() == 3)
+    })
+    .await;
+
+    // Carol leaves.
+    carol.leave_group(&gid);
+
+    // Alice and Bob converge to 2 members (the designated remover kicks Carol's leaf).
+    async fn count_becomes_two(c: &mut Client, gid: &str) {
+        pump_until(c, |cl| {
+            cl.conversations()
+                .iter()
+                .find(|cc| cc.id == gid)
+                .is_some_and(|cc| cc.members.len() == 2)
+        })
+        .await;
+    }
+    // Pump both concurrently-ish so whoever is the remover commits and both apply.
+    for _ in 0..40 {
+        let a_ok = alice
+            .conversations()
+            .iter()
+            .find(|cc| cc.id == gid)
+            .is_some_and(|cc| cc.members.len() == 2);
+        let b_ok = bob
+            .conversations()
+            .iter()
+            .find(|cc| cc.id == gid)
+            .is_some_and(|cc| cc.members.len() == 2);
+        if a_ok && b_ok {
+            break;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(50), alice.next_event()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(50), bob.next_event()).await;
+    }
+    count_becomes_two(&mut alice, &gid).await;
+    count_becomes_two(&mut bob, &gid).await;
+}
+
+/// Deleting a DM then reopening it must NOT fork the MLS group: because delete
+/// keeps membership, reopening reuses the same group, so messages still flow both
+/// ways. (Regression guard for the "can't message after remove/re-add" bug.)
+#[tokio::test]
+async fn deleting_and_reopening_a_dm_does_not_break_messaging() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let bob_h = bob.name().to_string();
+    become_friends(&mut alice, &mut bob).await;
+
+    let conv = alice.open_dm(&bob_h).await.unwrap();
+    alice.switch(&conv);
+    alice.send_text("first", None).await.unwrap();
+    pump_until(&mut bob, |c| {
+        !c.conversations().is_empty() && c.conversations().iter().any(|cc| !cc.pending)
+    })
+    .await;
+    let bob_conv = bob.conversations().first().unwrap().id.clone();
+    bob.switch(&bob_conv);
+    pump_until(&mut bob, |c| {
+        c.conversation_history(&bob_conv)
+            .iter()
+            .any(|l| l.text == "first")
+    })
+    .await;
+
+    // Alice deletes and reopens the DM.
+    alice.delete_conversation(&conv);
+    let conv2 = alice.open_dm(&bob_h).await.unwrap();
+    assert_eq!(conv2, conv);
+    alice.switch(&conv2);
+
+    // Messaging still works both ways (no fork).
+    alice.send_text("after reopen", None).await.unwrap();
+    pump_until(&mut bob, |c| {
+        c.conversation_history(&bob_conv)
+            .iter()
+            .any(|l| l.text == "after reopen")
+    })
+    .await;
+    bob.send_text("got it", None).await.unwrap();
+    pump_until(&mut alice, |c| {
+        c.conversation_history(&conv2)
+            .iter()
+            .any(|l| l.text == "got it")
+    })
+    .await;
+}
+
+/// Archiving hides a conversation to the Archived page without any data change;
+/// opening it again returns it to the live list with history intact.
+#[tokio::test]
+async fn archiving_hides_a_conversation_and_reopening_returns_it() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let bob_h = bob.name().to_string();
+    become_friends(&mut alice, &mut bob).await;
+
+    let conv = alice.open_dm(&bob_h).await.expect("open dm");
+    alice.switch(&conv);
+    alice.send_text("still here", None).await.unwrap();
+
+    alice.archive_conversation(&conv);
+    assert!(
+        alice
+            .conversations()
+            .iter()
+            .find(|c| c.id == conv)
+            .is_some_and(|c| c.archived),
+        "an archived conversation moves to the Archived page"
+    );
+    assert!(
+        alice
+            .conversation_history(&conv)
+            .iter()
+            .any(|l| l.text == "still here"),
+        "history is untouched while archived"
+    );
+
+    // Opening it again un-archives it.
+    let conv2 = alice.open_dm(&bob_h).await.expect("reopen dm");
+    assert_eq!(conv2, conv);
+    assert!(
+        alice
+            .conversations()
+            .iter()
+            .find(|c| c.id == conv2)
+            .is_some_and(|c| !c.archived && !c.left),
+        "reopening returns the conversation to the live Chats list"
+    );
+    assert!(
+        alice
+            .conversation_history(&conv2)
+            .iter()
+            .any(|l| l.text == "still here"),
+        "history is preserved across an archive round-trip"
+    );
+}
+
+/// Deleting an ARCHIVED conversation removes it (it disappears), not a no-op.
+#[tokio::test]
+async fn deleting_an_archived_conversation_removes_it() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let bob_h = bob.name().to_string();
+    become_friends(&mut alice, &mut bob).await;
+
+    let conv = alice.open_dm(&bob_h).await.unwrap();
+    alice.switch(&conv);
+    alice.send_text("hi", None).await.unwrap();
+    alice.archive_conversation(&conv);
+    assert!(
+        alice
+            .conversations()
+            .iter()
+            .find(|c| c.id == conv)
+            .is_some_and(|c| c.archived),
+        "archived first"
+    );
+    // Delete while archived.
+    alice.delete_conversation(&conv);
+    assert!(
+        !alice.conversations().iter().any(|c| c.id == conv),
+        "deleting an archived conversation makes it disappear"
+    );
+}
+
+/// Clearing wipes a conversation's messages but keeps the conversation and its
+/// channel, so it stays in the list and can still be used.
+#[tokio::test]
+async fn clearing_wipes_history_but_keeps_the_conversation() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let bob_h = bob.name().to_string();
+    become_friends(&mut alice, &mut bob).await;
+
+    let conv = alice.open_dm(&bob_h).await.expect("open dm");
+    alice.switch(&conv);
+    alice.send_text("one", None).await.unwrap();
+    alice.send_text("two", None).await.unwrap();
+    assert_eq!(alice.conversation_history(&conv).len(), 2);
+
+    alice.clear_history(&conv);
+    assert!(
+        alice
+            .conversations()
+            .iter()
+            .find(|c| c.id == conv)
+            .is_some_and(|c| !c.archived && !c.left),
+        "the conversation itself survives a clear and stays live"
+    );
+    assert!(
+        alice.conversation_history(&conv).is_empty(),
+        "clearing removes every message"
+    );
+
+    // Still usable afterward.
+    alice.switch(&conv);
+    alice.send_text("after clear", None).await.unwrap();
+    assert_eq!(alice.conversation_history(&conv).len(), 1);
+}
+
+/// A deleted DM (group left, history retained) must survive an app restart: the
+/// retained record persists with no MLS group, stays hidden from the list, and
+/// reopening the same peer restores its scrollback.
+#[tokio::test]
+async fn a_deleted_dm_survives_restart_and_restores_on_reopen() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let dir = std::env::temp_dir().join(format!("enclave-deldm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    async fn account_in(url: &str, dir: &std::path::Path, name: &str) -> Client {
+        let mut c = Client::connect(url).await.expect("connect");
+        c.set_keystore_dir(dir);
+        c.create_account(name, "", "test-password-1234")
+            .await
+            .expect("create");
+        c
+    }
+
+    let mut alice = account_in(&url, &dir, "alice").await;
+    let mut bob = account_in(&url, &dir, "bob").await;
+    let alice_user = alice.name().to_string();
+    let bob_h = bob.name().to_string();
+    become_friends(&mut alice, &mut bob).await;
+
+    let conv = alice.open_dm(&bob_h).await.unwrap();
+    alice.switch(&conv);
+    alice.send_text("remember this", None).await.unwrap();
+    alice.delete_conversation(&conv); // disappears, keeps membership + history
+    assert!(
+        !alice.conversations().iter().any(|c| c.id == conv),
+        "a deleted conversation disappears"
+    );
+
+    // Restart Alice on the same device.
+    drop(alice);
+    let mut alice2 = Client::connect(&url).await.unwrap();
+    alice2.set_keystore_dir(&dir);
+    alice2
+        .login(&alice_user, "test-password-1234")
+        .await
+        .unwrap();
+
+    assert!(
+        !alice2.conversations().iter().any(|c| c.id == conv),
+        "a deleted conversation stays hidden across a restart"
+    );
+    assert!(
+        alice2
+            .conversation_history(&conv)
+            .iter()
+            .any(|l| l.text == "remember this"),
+        "the deleted conversation's history survived the restart"
+    );
+
+    // The friendship is restored from the server, so the reopened DM is live.
+    pump_until(&mut alice2, |c| {
+        c.friends().iter().any(|f| f.username == bob_h)
+    })
+    .await;
+
+    // Reopening the same peer brings it back live with the scrollback.
+    let conv2 = alice2.open_dm(&bob_h).await.unwrap();
+    assert_eq!(conv2, conv);
+    assert!(
+        alice2
+            .conversations()
+            .iter()
+            .find(|c| c.id == conv2)
+            .is_some_and(|c| !c.archived && !c.left),
+        "reopening after a restart returns it to the live list"
+    );
+    assert!(
+        alice2
+            .conversation_history(&conv2)
+            .iter()
+            .any(|l| l.text == "remember this"),
+        "history restored after restart + reopen"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// When a friend removes us, the DM stays (readable) and they become a "past
+/// contact". If they later re-add us, we reconnect automatically (the counter-add
+/// case) without a prompt, and the conversation is sendable again.
+#[tokio::test]
+async fn a_removed_friend_becomes_a_past_contact_and_readd_auto_reconnects() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let alice_h = alice.name().to_string();
+    let bob_h = bob.name().to_string();
+
+    // Become friends.
+    alice.send_friend_request(&bob_h);
+    pump_until(&mut bob, |c| {
+        c.incoming_requests().iter().any(|f| f.username == alice_h)
+    })
+    .await;
+    bob.accept_friend(&alice_h);
+    pump_until(&mut alice, |c| {
+        c.friends().iter().any(|f| f.username == bob_h)
+    })
+    .await;
+
+    // Open the DM and leave some history.
+    let conv = alice.open_dm(&bob_h).await.unwrap();
+    alice.switch(&conv);
+    alice.send_text("hey bob", None).await.unwrap();
+
+    // Bob removes Alice.
+    bob.remove_friend(&alice_h);
+    pump_until(&mut alice, |c| {
+        !c.friends().iter().any(|f| f.username == bob_h)
+    })
+    .await;
+
+    // The DM persists, Bob is a past contact, and the DM is now read-only.
+    assert!(
+        alice.conversations().iter().any(|cc| cc.id == conv),
+        "the DM stays in the list after being removed"
+    );
+    assert!(
+        alice.past_contacts().iter().any(|f| f.username == bob_h),
+        "the ex-friend becomes a past contact"
+    );
+    assert!(
+        alice
+            .conversations()
+            .iter()
+            .find(|cc| cc.id == conv)
+            .is_some_and(|cc| cc.reconnect && cc.can_send && !cc.archived && !cc.left),
+        "the DM stays live and sendable (texting re-adds) but flags reconnect"
+    );
+    // The history is still readable.
+    assert!(
+        alice
+            .conversation_history(&conv)
+            .iter()
+            .any(|l| l.text == "hey bob"),
+        "history is still readable after being removed"
+    );
+
+    // Bob re-adds Alice: she auto-accepts (counter-add) and they are friends again.
+    bob.send_friend_request(&alice_h);
+    pump_until(&mut alice, |c| {
+        c.friends().iter().any(|f| f.username == bob_h)
+    })
+    .await;
+    assert!(
+        alice.past_contacts().is_empty(),
+        "reconnecting clears the past-contact status"
+    );
+    assert!(
+        alice
+            .conversations()
+            .iter()
+            .find(|cc| cc.id == conv)
+            .is_some_and(|cc| cc.can_send && !cc.reconnect),
+        "the DM is sendable and connected again after reconnect"
+    );
+}
+
+/// Being removed from a group makes it read-only (moves to Inactive) but keeps
+/// its history readable, rather than leaving a broken "live" conversation.
+#[tokio::test]
+async fn being_removed_from_a_group_makes_it_read_only_but_readable() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let bob_h = bob.name().to_string();
+
+    alice
+        .create_group("crew", std::slice::from_ref(&bob_h))
+        .await
+        .unwrap();
+    let gid = alice.active_id().unwrap();
+
+    // Bob joins the group and receives a message, so he has history.
+    pump_until(&mut bob, |c| {
+        c.conversations().iter().any(|cc| cc.id == gid)
+    })
+    .await;
+    alice.switch(&gid);
+    alice.send_text("welcome to the crew", None).await.unwrap();
+    pump_until(&mut bob, |c| {
+        c.conversation_history(&gid)
+            .iter()
+            .any(|l| l.text == "welcome to the crew")
+    })
+    .await;
+
+    // Alice removes Bob.
+    alice.remove_member(&gid, &bob_h).unwrap();
+
+    // Bob applies the remove commit, detects he is out, and the group becomes
+    // Left (read-only) while its history stays readable.
+    pump_until(&mut bob, |c| {
+        c.conversations()
+            .iter()
+            .find(|cc| cc.id == gid)
+            .is_some_and(|cc| cc.left)
+    })
+    .await;
+    assert!(
+        bob.conversations()
+            .iter()
+            .find(|cc| cc.id == gid)
+            .is_some_and(|cc| !cc.can_send),
+        "the removed group is read-only for bob"
+    );
+    assert!(
+        bob.conversation_history(&gid)
+            .iter()
+            .any(|l| l.text == "welcome to the crew"),
+        "bob can still read the group's history after being removed"
+    );
+}
+
+/// Rejoining a group you were removed from (a fresh Welcome for the same group)
+/// restores it: it goes live again and its retained history reappears.
+#[tokio::test]
+async fn rejoining_a_group_after_removal_restores_its_history() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let bob_h = bob.name().to_string();
+
+    alice
+        .create_group("crew", std::slice::from_ref(&bob_h))
+        .await
+        .unwrap();
+    let gid = alice.active_id().unwrap();
+    pump_until(&mut bob, |c| {
+        c.conversations().iter().any(|cc| cc.id == gid)
+    })
+    .await;
+    alice.switch(&gid);
+    alice.send_text("original crew chat", None).await.unwrap();
+    pump_until(&mut bob, |c| {
+        c.conversation_history(&gid)
+            .iter()
+            .any(|l| l.text == "original crew chat")
+    })
+    .await;
+
+    // Alice removes Bob; Bob's group goes read-only.
+    alice.remove_member(&gid, &bob_h).unwrap();
+    pump_until(&mut bob, |c| {
+        c.conversations()
+            .iter()
+            .find(|cc| cc.id == gid)
+            .is_some_and(|cc| cc.left)
+    })
+    .await;
+
+    // Alice re-invites Bob. His fresh Welcome restores the group to live, with the
+    // old history intact.
+    alice.switch(&gid);
+    alice.add_to_active_group(&bob_h).await.unwrap();
+    pump_until(&mut bob, |c| {
+        c.conversations()
+            .iter()
+            .find(|cc| cc.id == gid)
+            .is_some_and(|cc| !cc.left && !cc.archived)
+    })
+    .await;
+    assert!(
+        bob.conversation_history(&gid)
+            .iter()
+            .any(|l| l.text == "original crew chat"),
+        "the group's history is restored after rejoining"
+    );
+}
+
+/// The mirror of the above: when WE remove someone, they are NOT a past contact,
+/// so a re-add from them arrives as an ordinary request to accept, not a silent
+/// auto-reconnect. (Their DM still stays readable in the Inactive section.)
+#[tokio::test]
+async fn removing_someone_ourselves_does_not_auto_reconnect_on_their_readd() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let alice_h = alice.name().to_string();
+    let bob_h = bob.name().to_string();
+
+    alice.send_friend_request(&bob_h);
+    pump_until(&mut bob, |c| {
+        c.incoming_requests().iter().any(|f| f.username == alice_h)
+    })
+    .await;
+    bob.accept_friend(&alice_h);
+    pump_until(&mut alice, |c| {
+        c.friends().iter().any(|f| f.username == bob_h)
+    })
+    .await;
+
+    let conv = alice.open_dm(&bob_h).await.unwrap();
+    alice.switch(&conv);
+    alice.send_text("hi", None).await.unwrap();
+
+    // ALICE removes Bob (she initiated).
+    alice.remove_friend(&bob_h);
+    pump_until(&mut alice, |c| {
+        !c.friends().iter().any(|f| f.username == bob_h)
+    })
+    .await;
+    assert!(
+        alice.past_contacts().is_empty(),
+        "someone we removed is not a past contact"
+    );
+
+    // Bob re-adds Alice: it must surface as a normal request, not auto-accept.
+    bob.send_friend_request(&alice_h);
+    let mut saw_request = false;
+    for _ in 0..40 {
+        match tokio::time::timeout(Duration::from_millis(50), alice.next_event()).await {
+            Ok(Some(Event::FriendRequest { from })) if from == bob_h => {
+                saw_request = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_request,
+        "bob's re-add surfaced as a request to decide on"
+    );
+    assert!(
+        !alice.friends().iter().any(|f| f.username == bob_h),
+        "we are NOT auto-reconnected to someone we removed"
+    );
+}
+
+/// "Notes to self" is a private, on-device scratchpad: everything typed into it
+/// stays local (an online friend never hears a whisper of it) and survives a
+/// restart via the encrypted session, with no MLS group or routing reconstructed.
+#[tokio::test]
+async fn notes_to_self_stay_local_and_survive_restart() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+
+    let dir = std::env::temp_dir().join(format!("enclave-notes-it-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    async fn account_in(url: &str, dir: &std::path::Path, name: &str) -> Client {
+        let mut c = Client::connect(url).await.expect("connect");
+        c.set_keystore_dir(dir);
+        c.create_account(name, "", "test-password-1234")
+            .await
+            .expect("create");
+        c
+    }
+
+    let mut alice = account_in(&url, &dir, "alice").await;
+    let mut bob = account_in(&url, &dir, "bob").await;
+    let alice_user = alice.name().to_string();
+    // Bob is an online friend: the strongest observable check is that he still
+    // never receives anything from Alice's private notes.
+    become_friends(&mut alice, &mut bob).await;
+
+    // Alice writes two notes to herself.
+    let notes = alice.open_self_notes().unwrap();
+    assert!(
+        alice
+            .conversations()
+            .iter()
+            .any(|c| c.id == notes && c.self_notes),
+        "the notes conversation exists and is flagged local-only"
+    );
+    alice.send_text("remember the milk", None).await.unwrap();
+    alice.send_text("and the eggs", None).await.unwrap();
+    assert_eq!(
+        alice.conversation_history(&notes).len(),
+        2,
+        "both notes recorded in local history"
+    );
+
+    // Nothing was relayed: pump Bob's stream; he gains no conversation and hears
+    // no message. A local-only note never reaches the server, let alone a peer.
+    for _ in 0..40 {
+        let _ = tokio::time::timeout(Duration::from_millis(25), bob.next_event()).await;
+    }
+    assert!(
+        bob.conversations().is_empty(),
+        "the peer received nothing -- the notes never left the device"
+    );
+
+    // Restart Alice: the notes are restored from the encrypted local session.
+    drop(alice);
+    let mut alice2 = Client::connect(&url).await.unwrap();
+    alice2.set_keystore_dir(&dir);
+    alice2
+        .login(&alice_user, "test-password-1234")
+        .await
+        .unwrap();
+
+    let restored = alice2
+        .conversations()
+        .into_iter()
+        .find(|c| c.id == notes)
+        .expect("notes restored after restart");
+    assert!(restored.self_notes, "still local-only after reload");
+    let hist = alice2.conversation_history(&notes);
+    assert_eq!(hist.len(), 2, "both notes survived the restart");
+    assert_eq!(hist[0].text, "remember the milk");
+    assert_eq!(hist[1].text, "and the eggs");
+
+    // And it is still local after the restart: a further note reaches no peer.
+    alice2.switch(&notes);
+    alice2.send_text("third note", None).await.unwrap();
+    for _ in 0..40 {
+        let _ = tokio::time::timeout(Duration::from_millis(25), bob.next_event()).await;
+    }
+    assert!(
+        bob.conversations().is_empty(),
+        "still nothing relayed after the restart"
+    );
+    assert_eq!(alice2.conversation_history(&notes).len(), 3);
+
     let _ = std::fs::remove_dir_all(&dir);
 }

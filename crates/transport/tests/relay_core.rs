@@ -584,9 +584,18 @@ fn welcome_is_directed_and_adds_the_recipient_to_routing() {
             message: Sealed(vec![4, 2]),
         },
     );
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].to, b);
-    assert!(matches!(out[0].msg, ServerMsg::Welcome { .. }));
+    // The Welcome is directed to Bob only. (The handler also broadcasts the
+    // updated GroupMembers to the group, so the output is not only the Welcome.)
+    assert!(
+        out.iter()
+            .any(|o| o.to == b && matches!(o.msg, ServerMsg::Welcome { .. })),
+        "the Welcome is delivered to Bob"
+    );
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o.msg, ServerMsg::Welcome { .. }) && o.to == a),
+        "the Welcome is not sent to Alice"
+    );
 
     // Bob is now in the routing set, so a subsequent Text reaches him without
     // an explicit JoinGroup from Bob.
@@ -797,6 +806,7 @@ fn a_stored_file_is_offered_not_pushed_and_delivered_only_on_accept() {
         a,
         ClientMsg::FileChunk {
             offer_id,
+            index: 0,
             data: Sealed(vec![1, 2, 3]),
         },
     );
@@ -863,6 +873,7 @@ fn declining_a_stored_offer_notifies_the_sender() {
         a,
         ClientMsg::FileChunk {
             offer_id,
+            index: 0,
             data: Sealed(vec![9]),
         },
     );
@@ -901,6 +912,7 @@ fn a_stored_offer_to_an_offline_recipient_is_queued_until_login() {
         a,
         ClientMsg::FileChunk {
             offer_id,
+            index: 0,
             data: Sealed(vec![1]),
         },
     );
@@ -953,6 +965,7 @@ fn a_live_offer_streams_through_the_server_to_accepting_recipients() {
         a,
         ClientMsg::FileChunk {
             offer_id,
+            index: 0,
             data: Sealed(vec![5, 6]),
         },
     );
@@ -1057,6 +1070,7 @@ fn cancelling_an_offer_withdraws_it_from_recipients() {
         a,
         ClientMsg::FileChunk {
             offer_id,
+            index: 0,
             data: Sealed(vec![1]),
         },
     );
@@ -1112,6 +1126,7 @@ fn a_chunk_from_someone_who_is_not_the_sender_is_ignored() {
         b,
         ClientMsg::FileChunk {
             offer_id,
+            index: 0,
             data: Sealed(vec![9, 9]),
         },
     );
@@ -1203,6 +1218,7 @@ fn a_timed_out_live_recipient_is_dropped_and_the_sender_is_told() {
         a,
         ClientMsg::FileChunk {
             offer_id,
+            index: 0,
             data: Sealed(vec![9]),
         },
     );

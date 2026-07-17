@@ -18,7 +18,7 @@ fn one_key_package_joins_multiple_groups() {
     let mut groups = Vec::new();
     for _ in 0..3 {
         let mut alice_g = Group::create(&alice).unwrap();
-        let add = alice_g.add_member(&alice, &bob_kp).unwrap();
+        let add = alice_g.add_member(&alice, &bob_kp, "bob").unwrap();
         let bob_g = Group::join(&bob, &add.welcome).unwrap();
         groups.push((alice_g, bob_g));
     }

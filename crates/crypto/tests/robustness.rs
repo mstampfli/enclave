@@ -28,7 +28,7 @@ fn parsers_reject_garbage_without_panicking() {
 
     let mut alice_group = Group::create(&alice).unwrap();
     let add = alice_group
-        .add_member(&alice, &bob.new_key_package().unwrap())
+        .add_member(&alice, &bob.new_key_package().unwrap(), "bob")
         .unwrap();
     let mut bob_group = Group::join(&bob, &add.welcome).unwrap();
 
@@ -39,7 +39,7 @@ fn parsers_reject_garbage_without_panicking() {
 
         // Every untrusted-input entry point must error, never panic. Success is
         // simply that the test process reaches the end.
-        let _ = alice_group.add_member(&alice, &junk);
+        let _ = alice_group.add_member(&alice, &junk, "bob");
         let _ = Group::join(&bob, &junk);
         let _ = bob_group.decrypt_text(&bob, &junk);
         let _ = bob_group.apply_commit(&bob, &junk);

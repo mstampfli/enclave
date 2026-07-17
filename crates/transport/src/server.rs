@@ -242,6 +242,7 @@ impl Server {
         let local = listener.local_addr()?;
         let state = self.state.clone();
         spawn_file_sweeper(state.clone());
+        spawn_ballot_sweeper(state.clone());
         tokio::spawn(async move {
             while let Ok((stream, _peer)) = listener.accept().await {
                 tokio::spawn(handle_conn(stream, state.clone()));
@@ -330,6 +331,7 @@ impl Server {
         let local = listener.local_addr()?;
         let state = self.state.clone();
         spawn_file_sweeper(state.clone());
+        spawn_ballot_sweeper(state.clone());
         tokio::spawn(async move {
             while let Ok((stream, _peer)) = listener.accept().await {
                 let acceptor = acceptor.clone();
@@ -449,7 +451,7 @@ where
         // Route under the lock; resolve target queues; release before sending.
         // Also collect any stored-blob deliveries scheduled by this message, to
         // stream off-lock (a large blob read must never hold the global lock).
-        let (sends, deliveries) = {
+        let (sends, deliveries, appends) = {
             let mut s = state.lock().unwrap();
             let outgoing = s.relay.handle(conn, client_msg);
             let sends: Vec<(ConnId, Outbound, ServerMsg)> = outgoing
@@ -462,8 +464,29 @@ where
                 .into_iter()
                 .filter_map(|d| s.txs.get(&d.to).cloned().map(|out| (d, out)))
                 .collect();
-            (sends, deliveries)
+            let appends = s.relay.take_file_appends();
+            (sends, deliveries, appends)
         };
+        // Flush stored-upload chunks to disk OFF the lock (the size cap was
+        // reserved under it): a slow disk must never stall every other client.
+        // One connection processes its messages sequentially, so a single offer's
+        // appends stay ordered. On an I/O error, drop the offer and tell the sender.
+        for a in appends {
+            let blob = a.blob.clone();
+            let data = a.data;
+            let ok = matches!(
+                tokio::task::spawn_blocking(move || crate::filestore::write_reserved(&blob, &data))
+                    .await,
+                Ok(Ok(()))
+            );
+            if !ok {
+                let notify = {
+                    let mut s = state.lock().unwrap();
+                    s.relay.fail_file_append(a.offer_id)
+                };
+                dispatch_now(&state, notify);
+            }
+        }
         // Dispatch. A relayed live file chunk backpressures on the recipient's
         // file budget so a slow reader paces the sender instead of the chunk
         // being dropped; the wait is bounded by a timeout so a dead reader
@@ -584,7 +607,18 @@ async fn stream_blob(state: Arc<Mutex<ServerState>>, d: BlobDelivery, out: Outbo
 /// recipient). The blob format matches `filestore`'s writer: a `u32` LE length
 /// then that many bytes, per chunk.
 async fn stream_blob_chunks(f: &mut tokio::fs::File, d: &BlobDelivery, out: &Outbound) -> bool {
+    // Chunks are stored (and were uploaded) in strict order, so a chunk's index
+    // is its position in the blob. The recipient needs it to derive the chunk's
+    // nonce; the AEAD binds it, so a wrong index simply fails to open.
+    let mut index: u32 = 0;
     loop {
+        // The recipient aborted (FileAbort): stop early and leave the offer
+        // pending (returning false routes to `abort_stored_delivery`), so they
+        // can download it again. This is what makes cancelling a multi-gigabyte
+        // download stop promptly instead of draining the whole file.
+        if d.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
         let mut len_buf = [0u8; 4];
         match f.read_exact(&mut len_buf).await {
             Ok(_) => {}
@@ -604,8 +638,10 @@ async fn stream_blob_chunks(f: &mut tokio::fs::File, d: &BlobDelivery, out: &Out
         let msg = ServerMsg::FileChunk {
             offer_id: d.offer_id,
             from: d.from.clone(),
+            index,
             data: Sealed(buf),
         };
+        index = index.saturating_add(1);
         // Backpressure: awaits until the recipient's outbound has room.
         if out.send(&msg).await.is_err() {
             return false; // recipient disconnected
@@ -636,6 +672,28 @@ fn spawn_file_sweeper(state: Arc<Mutex<ServerState>>) {
             let sends: Vec<(Outbound, ServerMsg)> = {
                 let mut s = state.lock().unwrap();
                 let outgoing = s.relay.sweep_files();
+                outgoing
+                    .into_iter()
+                    .filter_map(|o| s.txs.get(&o.to).cloned().map(|out| (out, o.msg)))
+                    .collect()
+            };
+            for (out, msg) in sends {
+                out.try_send(&msg);
+            }
+        }
+    });
+}
+
+/// Release buffered poll ballots whose deadline has passed, so a timed poll closes
+/// with no one online. Mirrors [`spawn_file_sweeper`] on a short tick.
+fn spawn_ballot_sweeper(state: Arc<Mutex<ServerState>>) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            ticker.tick().await;
+            let sends: Vec<(Outbound, ServerMsg)> = {
+                let mut s = state.lock().unwrap();
+                let outgoing = s.relay.sweep_ballots();
                 outgoing
                     .into_iter()
                     .filter_map(|o| s.txs.get(&o.to).cloned().map(|out| (out, o.msg)))

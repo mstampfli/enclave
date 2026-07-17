@@ -16,6 +16,7 @@
 //! [`MediaFrame`]: enclave_protocol::MediaFrame
 
 pub mod accounts;
+pub mod avatarstore;
 pub mod client;
 pub mod error;
 pub mod filestore;

@@ -164,6 +164,26 @@ pub enum ClientMsg {
     Mls { group: GroupId, message: Sealed },
     /// An end-to-end-encrypted application message (text DM). Opaque.
     Text { group: GroupId, message: Sealed },
+    /// Register a buffered/routed poll with the server. The sender is recorded as
+    /// the poll's OWNER (the only device that may `BallotClose` it early). `mode`:
+    /// 0 = buffer for the GROUP, release to it at close; 1 = route each ballot to
+    /// the OWNER live (a private survey the owner watches); 2 = buffer for the
+    /// OWNER, release to the owner at close. `release_at` = auto-release time (unix
+    /// ms) or None for owner-triggered close only. Ballot contents are never seen.
+    BallotOpen {
+        poll: [u8; 16],
+        group: GroupId,
+        mode: u8,
+        release_at: Option<u64>,
+    },
+    /// Submit one sealed ballot for a poll opened with `BallotOpen`. The server
+    /// buffers it (deduped by submitter, last write wins) or, in owner-live mode,
+    /// forwards it to the owner immediately. The `ballot` is opaque ciphertext.
+    BallotSubmit { poll: [u8; 16], ballot: Sealed },
+    /// The owner ends a buffered poll now: the server releases the buffered ballots
+    /// (to the group or the owner, per the poll's mode). Honored only from the
+    /// device that opened the poll.
+    BallotClose { poll: [u8; 16] },
     /// A real-time encrypted media frame destined for the SFU to fan out.
     Media(MediaFrame),
     /// Coarse presence the user chooses to expose. Metadata, visible to server.
@@ -212,9 +232,17 @@ pub enum ClientMsg {
         manifest: Sealed,
         live: bool,
     },
-    /// One sealed chunk (a `transfer::Part`) of an offered file: appended to the
-    /// server's store while uploading, or relayed live to accepting recipients.
-    FileChunk { offer_id: [u8; 16], data: Sealed },
+    /// One sealed chunk of an offered file: appended to the server's store while
+    /// uploading, or relayed live to accepting recipients. `data` is the chunk
+    /// sealed under the offer's per-file content key (see `crypto::seal_chunk`) --
+    /// NOT an MLS message, so streaming or dropping chunks never disturbs the
+    /// group's message ratchet. `index` is the chunk's 0-based position, needed
+    /// (and authenticated) to derive its nonce; it is not secret.
+    FileChunk {
+        offer_id: [u8; 16],
+        index: u32,
+        data: Sealed,
+    },
     /// The sender has sent every chunk of `offer_id`.
     FileComplete { offer_id: [u8; 16] },
     /// Consent to receive an offered file. The server then delivers its chunks
@@ -222,8 +250,25 @@ pub enum ClientMsg {
     FileAccept { offer_id: [u8; 16] },
     /// Refuse an offered file. The server drops it once every recipient resolves.
     FileDecline { offer_id: [u8; 16] },
+    /// Abort our in-progress download of an offer WITHOUT declining it: the
+    /// server stops the in-flight stream but leaves the offer available, so we
+    /// can download it again later (until the sender withdraws it or goes
+    /// offline). Distinct from `FileDecline`, which gives the offer up entirely.
+    FileAbort { offer_id: [u8; 16] },
     /// Withdraw an offer we made (before or during upload/streaming).
     FileCancel { offer_id: [u8; 16] },
+
+    /// Upload an encrypted, content-addressed avatar blob. `addr` MUST equal the
+    /// SHA-256 of `data`; the server verifies this and rejects a mismatch, so an
+    /// address can only ever name its own content and one user can never
+    /// overwrite another's blob. The bytes are opaque ciphertext -- the server
+    /// cannot read the image. Sent inside [`Reliable`] so the upload survives a
+    /// drop before the profile that references it is broadcast.
+    PutAvatar { addr: [u8; 32], data: Vec<u8> },
+    /// Fetch an avatar blob by its content address (learned from a sealed
+    /// profile). The 256-bit address is an unguessable bearer capability, so
+    /// possession of it is the authorization. Replied to with [`ServerMsg::Avatar`].
+    FetchAvatar { addr: [u8; 32] },
 
     /// A message wrapped for at-least-once delivery. The server processes `msg`
     /// exactly as if it were sent bare, then replies [`ServerMsg::Ack`] with the
@@ -289,6 +334,15 @@ pub enum ServerMsg {
         from: DeviceId,
         message: Sealed,
     },
+    /// Buffered ballots released to this recipient (the whole group, or the poll's
+    /// owner, per its mode). Each entry is (submitter, sealed ballot), delivered at
+    /// the release moment. The submitter is the server's authenticated view of who
+    /// sent each ballot (attribution, not vote content -- the ballot is opaque).
+    Ballots {
+        group: GroupId,
+        poll: [u8; 16],
+        ballots: Vec<(DeviceId, Sealed)>,
+    },
     Media(MediaFrame),
     Presence {
         user: UserId,
@@ -305,6 +359,21 @@ pub enum ServerMsg {
     /// A handle removed you as a friend (or you removed them).
     FriendRemoved {
         handle: String,
+    },
+    /// You were removed from a group (a member removed you). Its history stays
+    /// readable on your device, but the conversation becomes read-only.
+    RemovedFromGroup {
+        group: GroupId,
+    },
+    /// The server's authoritative routing membership for `group` (usernames),
+    /// sent when it changes (join/leave/remove) and on (re)join. Clients use it
+    /// for the displayed member list/count -- which does not depend on the MLS
+    /// leaf tree, so it stays correct even when no member is online to commit a
+    /// crypto removal. The safety number (from the crypto tree) remains the
+    /// security anchor; this list is convenience.
+    GroupMembers {
+        group: GroupId,
+        members: Vec<String>,
     },
     /// The current friends + pending-requests snapshot for this session, each
     /// carrying the person's current display name.
@@ -367,16 +436,26 @@ pub enum ServerMsg {
         offer_id: [u8; 16],
         by: DeviceId,
     },
-    /// One sealed chunk of a file you accepted, from device `from`.
+    /// One sealed chunk of a file you accepted, from device `from`. `data` is
+    /// sealed under the offer's content key (from the manifest), not the group
+    /// ratchet; `index` is its authenticated 0-based position.
     FileChunk {
         offer_id: [u8; 16],
         from: DeviceId,
+        index: u32,
         data: Sealed,
     },
     /// Every chunk of `offer_id` from `from` has been delivered.
     FileComplete {
         offer_id: [u8; 16],
         from: DeviceId,
+    },
+    /// Reply to [`ClientMsg::FetchAvatar`]: the ciphertext stored under `addr`,
+    /// or `None` if the server has no such blob (never uploaded, or evicted).
+    /// The bytes are opaque; only a group member holds the key to decrypt them.
+    Avatar {
+        addr: [u8; 32],
+        data: Option<Vec<u8>>,
     },
     /// Confirms the server durably accepted the [`ClientMsg::Reliable`] with this
     /// `seq`. The sender then drops it from its retransmit buffer. Until it

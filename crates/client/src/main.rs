@@ -6,12 +6,48 @@
 //! The controller runs on its own thread with a Tokio runtime; the tao event
 //! loop owns the WebView on the main thread and shuttles events between them.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use enclave_client::{Client, Event};
+/// Shared index mapping a message id (hex) to the local path of the image file it
+/// carries, so the `enclave://localhost/media/<id>` route can serve a thumbnail
+/// for a file that is actually in our history -- never an arbitrary path.
+type SharedMedia = Arc<Mutex<HashMap<String, PathBuf>>>;
+
+/// Register the active conversation's file paths into the media index (accumulates
+/// across conversations; ids are unique). The route decides at serve time whether
+/// the bytes are an image, so registering every file is safe.
+fn reindex_media(c: &Client, index: &SharedMedia) {
+    let Some(id) = c.active_id() else { return };
+    if let Ok(mut m) = index.lock() {
+        for l in c.conversation_history(&id) {
+            if let Some(f) = &l.file {
+                m.insert(l.id.clone(), PathBuf::from(&f.path));
+            }
+        }
+    }
+}
+
+/// Sniff a common image type from the leading bytes, or `None` if it is not one
+/// we will serve. Keeps the media route to images only.
+fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+use enclave_client::{Client, Event, Reaction};
 use enclave_protocol::{Friend, Presence};
 use std::borrow::Cow;
 
@@ -51,10 +87,31 @@ enum UiCommand {
         password: String,
     },
     Logout,
-    /// Change our display name.
+    /// Change our display name (now end-to-end: sealed, server-blind).
     SetDisplayName {
         display: String,
     },
+    /// Set our custom status: a status emoji and free text (either may be empty).
+    SetCustomStatus {
+        emoji: String,
+        text: String,
+    },
+    /// Set our personal accent color ("#rrggbb", or "" for the app default).
+    SetAccent {
+        accent: String,
+    },
+    /// Set our short bio / about line.
+    SetBio {
+        bio: String,
+    },
+    /// Replace our avatar with a base64 image (already downscaled + re-encoded by
+    /// the UI). `mime` is the image type (e.g. "image/jpeg").
+    SetAvatar {
+        data: String,
+        mime: String,
+    },
+    /// Remove our avatar (back to initials).
+    ClearAvatar,
     /// Back up the encrypted session to a discoverable file.
     ExportSession,
     /// Import a session file (same account + password) from `path`.
@@ -106,6 +163,12 @@ enum UiCommand {
     OpenDm {
         handle: String,
     },
+    /// Open (creating on first use) the local-only "Notes to self" scratchpad.
+    OpenSelfNotes,
+    /// Ask for the groups we share with `handle` (to list on their profile).
+    RequestSharedGroups {
+        handle: String,
+    },
     /// Create a named group with the given member handles.
     CreateGroup {
         name: String,
@@ -115,8 +178,27 @@ enum UiCommand {
     AddToGroup {
         handle: String,
     },
-    /// Leave / delete a conversation (hex id).
-    LeaveConversation {
+    /// Delete a conversation (hex id): it disappears but stays a member, so it
+    /// reappears on a new message or when reopened. Keeps the group + history.
+    DeleteConversation {
+        conv: String,
+    },
+    /// Truly leave a group (hex id): stop receiving; history stays readable on
+    /// the Archived page. Rejoin only if re-invited.
+    LeaveGroup {
+        conv: String,
+    },
+    /// Hide a conversation (hex id) to the Archived page without any data change;
+    /// it returns on the next message or when reopened.
+    ArchiveConversation {
+        conv: String,
+    },
+    /// Return an archived conversation (hex id) to the live list.
+    UnarchiveConversation {
+        conv: String,
+    },
+    /// Wipe a conversation's (hex id) message history, keeping the channel.
+    ClearHistory {
         conv: String,
     },
     /// Remove a member (username) from a group (hex id).
@@ -130,26 +212,128 @@ enum UiCommand {
     },
     SendText {
         text: String,
+        /// Hex id of the message being replied to, or empty for a normal message.
+        #[serde(default)]
+        reply_to: String,
     },
-    /// Open a native file picker and send the chosen file to the active
-    /// conversation. The bytes never cross this bridge: the core reads and
-    /// chunks the file itself.
-    SendFile,
+    /// Delete a message. `everyone` (only for our own message) also withdraws it
+    /// for the other members; otherwise it is deleted just for us.
+    DeleteMessage {
+        conv: String,
+        id: String,
+        everyone: bool,
+    },
+    /// Toggle our emoji reaction on a message (add if absent, remove if present).
+    React {
+        conv: String,
+        id: String,
+        emoji: String,
+    },
+    /// Edit one of our own text messages, replacing its text.
+    EditMessage {
+        conv: String,
+        id: String,
+        text: String,
+    },
+    /// Search message history locally. `conv` scopes it to one conversation;
+    /// null/absent searches all of them. Replies with `SearchResults`.
+    SearchMessages {
+        query: String,
+        #[serde(default)]
+        conv: Option<String>,
+    },
+    /// Post a poll to the active conversation. `reveal` is 0 (always), 1 (after
+    /// you vote), or 2 (after the creator closes).
+    CreatePoll {
+        question: String,
+        options: Vec<String>,
+        multi: bool,
+        reveal: u8,
+        #[serde(default)]
+        duration_ms: u64,
+        #[serde(default)]
+        anonymous: bool,
+    },
+    /// Cast/change/retract our vote on a poll (`options` = chosen indices; empty
+    /// retracts). Single-choice polls keep at most one.
+    VotePoll {
+        conv: String,
+        id: String,
+        options: Vec<u8>,
+    },
+    /// Close a poll we created (no more votes; reveals results for reveal mode 2).
+    ClosePoll {
+        conv: String,
+        id: String,
+    },
+    /// Pin or unpin a message for the whole conversation (pins are shared).
+    PinMessage {
+        conv: String,
+        id: String,
+        pinned: bool,
+    },
+    /// Turn disappearing messages on (ms) or off (0) for a conversation.
+    SetDisappearing {
+        conv: String,
+        ms: u32,
+    },
+    /// Start recording a voice message for the active conversation.
+    StartVoice,
+    /// Stop recording and hold it for preview (does not send).
+    StopVoice,
+    /// Send the previewed (stopped) voice message.
+    SendVoice,
+    /// Discard the in-progress recording or the previewed voice message.
+    CancelVoice,
+    /// Play a received (or sent, or previewed) voice clip at `path`, starting
+    /// `offset_ms` into it (for resuming a paused message).
+    PlayVoice {
+        path: String,
+        #[serde(default)]
+        offset_ms: u32,
+    },
+    /// Stop/pause voice playback at once.
+    StopVoicePlayback,
+    /// Open a native multi-file picker; the chosen files are ATTACHED to the
+    /// composer (an `AttachFiles` event), not sent, so the user can add a message
+    /// and more files before sending.
+    PickFiles,
+    /// Attach specific paths (from native drag-and-drop) to the composer: the core
+    /// stats them and replies with `AttachFiles`. Bytes never cross this bridge.
+    AttachPaths {
+        paths: Vec<String>,
+    },
+    /// Offer one attached file (from the composer tray) to the active
+    /// conversation. `live` streams it in real time; otherwise it is stored.
+    SendFilePath {
+        path: String,
+        #[serde(default)]
+        live: bool,
+    },
     /// Open a received (or sent) file with the OS default application. `path`
     /// must be a path the core previously reported; the UI never invents one.
     OpenFile {
         path: String,
+    },
+    /// Open an http(s) link from a message in the default browser (explicit click).
+    OpenLink {
+        url: String,
     },
     /// Consent to download a file that was offered to us (`offer_id` from a
     /// FileOffered event). Nothing was downloaded until this.
     AcceptFile {
         offer_id: String,
     },
-    /// Refuse a file that was offered to us; the server drops it.
+    /// Refuse a file that was offered to us for good; declining is final.
     DeclineFile {
         offer_id: String,
     },
-    /// Withdraw a file we offered (sent by mistake).
+    /// Abort our in-progress download but keep the offer, so it can be downloaded
+    /// again (until the sender withdraws it or goes offline).
+    AbortFile {
+        offer_id: String,
+    },
+    /// Withdraw a file we offered: stop sharing it with the recipients.
     CancelFile {
         offer_id: String,
     },
@@ -175,12 +359,50 @@ enum UiCommand {
 #[derive(serde::Serialize, Clone)]
 struct Line {
     from: String,
+    /// The sender's username (stable), so the UI resolves the name + avatar.
+    user: String,
     text: String,
     mine: bool,
     /// Present when this line is a file. The UI shows a file row instead of a
     /// text bubble and can ask the core to open it.
     #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<FileLine>,
+    /// A persisted system notice ("X declined foo"): the UI renders it as the
+    /// small centered line, not a message bubble.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    system: bool,
+    /// Stable message id (hex), for reply / forward / delete / details.
+    id: String,
+    /// Creation time, unix milliseconds, for the timestamp.
+    ts: u64,
+    /// Whether the message was deleted (shows a placeholder).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    deleted: bool,
+    /// Hex id of the message this replies to, or empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    reply_to: String,
+    /// Voice-message duration in ms, or 0 if not a voice message.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    voice_ms: u32,
+    /// Amplitude envelope for a voice message's waveform (empty otherwise).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    waveform: Vec<u8>,
+    /// Emoji reactions on this line (omitted when there are none).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reactions: Vec<Reaction>,
+    /// Whether this message was edited after sending (shows an "edited" marker).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    edited: bool,
+    /// Present when this line is a poll (the UI renders a poll card).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    poll: Option<PollViewOut>,
+    /// Whether this message is pinned in the conversation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pinned: bool,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// A file attached to a message line, for the UI.
@@ -189,6 +411,58 @@ struct FileLine {
     name: String,
     size: u64,
     path: String,
+}
+
+/// A poll as sent to the UI: definition, tallies, my vote, and reveal state.
+#[derive(serde::Serialize, Clone)]
+struct PollViewOut {
+    question: String,
+    options: Vec<String>,
+    counts: Vec<u32>,
+    multi: bool,
+    reveal: u8,
+    closed: bool,
+    mine: Vec<u8>,
+    total: u32,
+    revealed: bool,
+    is_author: bool,
+    closes_at: u64,
+    voters: Vec<Vec<String>>,
+    anonymous: bool,
+}
+
+impl From<enclave_client::PollView> for PollViewOut {
+    fn from(p: enclave_client::PollView) -> PollViewOut {
+        PollViewOut {
+            question: p.question,
+            options: p.options,
+            counts: p.counts,
+            multi: p.multi,
+            reveal: p.reveal,
+            closed: p.closed,
+            mine: p.mine,
+            total: p.total,
+            revealed: p.revealed,
+            is_author: p.is_author,
+            closes_at: p.closes_at,
+            voters: p.voters,
+            anonymous: p.anonymous,
+        }
+    }
+}
+
+/// One message-search result, for the UI's results list.
+#[derive(serde::Serialize, Clone)]
+struct SearchHitOut {
+    conv: String,
+    conv_title: String,
+    self_notes: bool,
+    id: String,
+    ts: u64,
+    user: String,
+    display: String,
+    text: String,
+    mine: bool,
 }
 
 /// A shareable video source for the picker. `id` is an opaque token the UI
@@ -207,6 +481,49 @@ struct ConvSummary {
     is_dm: bool,
     pending: bool,
     members: Vec<String>,
+    /// Hidden to the Archived page (still a member).
+    archived: bool,
+    /// Left or removed from the group: read-only, on the Archived page.
+    left: bool,
+    /// Whether the composer is usable (false only for a left/removed group).
+    can_send: bool,
+    /// A DM whose peer unfriended us: sendable, but sending re-adds them.
+    reconnect: bool,
+    /// The local-only "Notes to self" scratchpad: rendered distinctly, and its
+    /// call/verify/members controls are hidden.
+    self_notes: bool,
+}
+
+/// A file the user attached to the composer (path + display name + size), before
+/// sending. The bytes stay on disk; only this metadata reaches the UI.
+#[derive(serde::Serialize, Clone)]
+struct AttachedFile {
+    path: String,
+    name: String,
+    size: u64,
+}
+
+/// Stat each path into an [`AttachedFile`] (skipping directories / unreadable
+/// paths), for the composer's attachment tray.
+fn stat_attachments(paths: &[String]) -> Vec<AttachedFile> {
+    paths
+        .iter()
+        .filter_map(|p| {
+            let meta = std::fs::metadata(p).ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let name = std::path::Path::new(p)
+                .file_name()?
+                .to_string_lossy()
+                .into_owned();
+            Some(AttachedFile {
+                path: p.clone(),
+                name,
+                size: meta.len(),
+            })
+        })
+        .collect()
 }
 
 /// Events the core sends to the UI (serialized straight into `onEnclaveEvent`).
@@ -231,22 +548,45 @@ enum UiEvent {
         /// out of band. Comes from the core, and survives a restart.
         verified: bool,
         history: Vec<Line>,
+        /// Disappearing-messages duration (ms) for this conversation, 0 if off.
+        #[serde(default)]
+        disappearing_ms: u32,
     },
     /// A single message arrived (or was sent) in conversation `conv`.
     Message {
         conv: String,
+        /// Hex message id + creation time (unix ms) for reply/forward/delete/details.
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        ts: u64,
+        /// Hex id of the message this replies to, or empty.
+        #[serde(default)]
+        reply_to: String,
         from: String,
+        #[serde(default)]
+        user: String,
         text: String,
         mine: bool,
     },
     /// A file arrived (or was sent) in `conv`: show a file row and offer Open.
     FileMessage {
         conv: String,
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        ts: u64,
         from: String,
+        #[serde(default)]
+        user: String,
         name: String,
         size: u64,
         path: String,
         mine: bool,
+        /// The offer's hex id for our OWN sent files, so the UI can offer a "Stop
+        /// sharing" control; empty for received files (nothing to withdraw).
+        #[serde(default)]
+        offer_id: String,
     },
     /// Progress of an in-flight transfer, so the UI can show a bar for a large
     /// message or file. `sent`/`total` are byte counts; `incoming` marks a
@@ -269,15 +609,130 @@ enum UiEvent {
         size: u64,
         live: bool,
     },
-    /// An offer we were shown is gone (withdrawn, expired, or now delivered):
-    /// the UI removes its prompt for `offer_id`.
+    /// An offer we were shown resolved into a delivered file: the UI removes the
+    /// pending prompt (the file itself now shows in chat).
     FileOfferClosed {
         conv: String,
         offer_id: String,
     },
+    /// An offer we were shown is no longer available (sender withdrew it or went
+    /// offline): the UI marks its message unavailable but keeps it in chat.
+    FileOfferUnavailable {
+        conv: String,
+        offer_id: String,
+    },
+    /// A file drag is over the window (`active` true) or has left/dropped
+    /// (`false`): the UI shows or hides a drop overlay.
+    DropTarget {
+        active: bool,
+    },
+    /// Files the user picked or dropped, to attach to the composer (not yet sent).
+    AttachFiles {
+        files: Vec<AttachedFile>,
+    },
     Presence {
         user: String,
         status: String,
+    },
+    /// A neutral status line shown inside a conversation (e.g. "X declined foo").
+    Notice {
+        conv: String,
+        text: String,
+    },
+    /// A message was deleted: the UI marks its line as a placeholder, kept in chat.
+    MessageDeleted {
+        conv: String,
+        id: String,
+    },
+    /// A message's emoji reactions changed: the UI replaces that line's chips.
+    ReactionsChanged {
+        conv: String,
+        id: String,
+        reactions: Vec<Reaction>,
+    },
+    /// A message was edited by its author: the UI updates the text + "edited" mark.
+    MessageEdited {
+        conv: String,
+        id: String,
+        text: String,
+    },
+    /// A poll was posted: the UI adds a poll card line.
+    PollPosted {
+        conv: String,
+        id: String,
+        ts: u64,
+        from: String,
+        user: String,
+        mine: bool,
+        poll: PollViewOut,
+    },
+    /// A poll's tallies or state changed: the UI refreshes that card.
+    PollUpdated {
+        conv: String,
+        id: String,
+        poll: PollViewOut,
+    },
+    /// A message was pinned or unpinned: the UI updates its indicator + pin bar.
+    PinsChanged {
+        conv: String,
+        id: String,
+        pinned: bool,
+    },
+    /// Local message-search results (newest first). `scoped` is true when the
+    /// search was limited to one conversation. `query` echoes the input.
+    SearchResults {
+        query: String,
+        scoped: bool,
+        hits: Vec<SearchHitOut>,
+    },
+    /// The disappearing-messages setting for `conv` changed (ms, 0=off).
+    DisappearingChanged {
+        conv: String,
+        ms: u32,
+    },
+    /// Messages whose disappearing timer elapsed were removed: the UI drops them.
+    MessagesExpired {
+        conv: String,
+        ids: Vec<String>,
+    },
+    /// A voice message arrived (or we sent one): the UI shows a small player.
+    VoiceMessage {
+        conv: String,
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        ts: u64,
+        from: String,
+        #[serde(default)]
+        user: String,
+        path: String,
+        duration_ms: u32,
+        #[serde(default)]
+        waveform: Vec<u8>,
+        mine: bool,
+    },
+    /// A recording was stopped and is ready to preview before sending: the UI
+    /// shows a preview player with Send / Discard.
+    VoicePreview {
+        path: String,
+        duration_ms: u32,
+        #[serde(default)]
+        waveform: Vec<u8>,
+    },
+    /// A user's end-to-end profile (our own or a peer's) for the UI to render:
+    /// name, custom status, accent, bio, and the avatar's content address (used
+    /// to build an `enclave://localhost/avatar/<hex>` image URL). `avatar` is
+    /// `None` for the initials fallback. Emitted for all known users on login and
+    /// whenever one changes or an avatar finishes decrypting.
+    Profile {
+        user: String,
+        display: String,
+        status_emoji: String,
+        status_text: String,
+        accent: String,
+        bio: String,
+        avatar: Option<String>,
+        me: bool,
     },
     /// Whether a voice call is currently active.
     CallState {
@@ -295,7 +750,7 @@ enum UiEvent {
         conv: String,
         from: String,
     },
-    /// The participants of `conv`'s call (display names); empty = call ended.
+    /// The participants of `conv`'s call (usernames); empty = call ended.
     CallParticipants {
         conv: String,
         participants: Vec<String>,
@@ -335,10 +790,17 @@ enum UiEvent {
         from: String,
     },
     /// The current friends + pending-requests snapshot (username + display).
+    /// People we no longer connect to but share history with live in the Chats
+    /// sidebar's "Inactive" section, not here.
     Friends {
         friends: Vec<Friend>,
         incoming: Vec<Friend>,
         outgoing: Vec<Friend>,
+    },
+    /// Groups we share with `handle` (hex id, title), for their profile card.
+    SharedGroups {
+        handle: String,
+        groups: Vec<(String, String)>,
     },
     Status {
         message: String,
@@ -357,10 +819,17 @@ fn main() -> wry::Result<()> {
     let window = WindowBuilder::new()
         .with_title("Enclave")
         .with_inner_size(tao::dpi::LogicalSize::new(1000.0, 680.0))
+        // Floor the window size so it can never be shrunk into an overlapping,
+        // overflowing mess; below the sidebar's collapse width the layout still
+        // stays clean via the drawer.
+        .with_min_inner_size(tao::dpi::LogicalSize::new(360.0, 480.0))
         .build(&event_loop)
         .expect("build window");
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+    // Clones for the native drag-drop handler (files dropped on the window).
+    let drag_cmd_tx = cmd_tx.clone();
+    let drag_proxy = proxy.clone();
 
     // Whether the window is focused, so the core only raises OS toasts when the
     // user is not already looking at Enclave.
@@ -380,18 +849,107 @@ fn main() -> wry::Result<()> {
     // WebView2 can only register custom protocols under an http(s) mapping.
     #[cfg(windows)]
     let builder = builder.with_https_scheme(true);
+    // Avatars are served from the local decrypted cache at
+    // enclave://localhost/avatar/<hex>; everything else serves the app HTML.
+    let avatar_dir = app_dir().join("avatars");
+    let media_index: SharedMedia = Arc::new(Mutex::new(HashMap::new()));
+    let media_for_handler = media_index.clone();
     let builder = builder
-        .with_custom_protocol("enclave".to_string(), |_id, _req| {
+        .with_custom_protocol("enclave".to_string(), move |_id, req| {
+            // Serve a thumbnail for an image file that is in our history: the path
+            // is looked up from the vetted media index by message id (hex only, so
+            // no path can be injected), and only image bytes are returned.
+            if let Some(hexid) = req.uri().path().strip_prefix("/media/") {
+                if hexid.len() <= 32 && hexid.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    let path = media_for_handler
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(hexid).cloned());
+                    if let Some(path) = path {
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            if let Some(mime) = image_mime(&bytes) {
+                                return wry::http::Response::builder()
+                                    .header("Content-Type", mime)
+                                    .header("Cache-Control", "no-store")
+                                    .body(Cow::Owned(bytes))
+                                    .unwrap();
+                            }
+                        }
+                    }
+                }
+                return wry::http::Response::builder()
+                    .status(404)
+                    .header("Cache-Control", "no-store")
+                    .body(Cow::Owned(Vec::new()))
+                    .unwrap();
+            }
+            if let Some(hexaddr) = req.uri().path().strip_prefix("/avatar/") {
+                // The path is a 64-char hex content address -- hex only, so no
+                // "..", slash, or absolute path can escape the cache directory.
+                if hexaddr.len() == 64 && hexaddr.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    if let Ok(bytes) = std::fs::read(avatar_dir.join(hexaddr)) {
+                        let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+                            "image/png"
+                        } else {
+                            "image/jpeg"
+                        };
+                        return wry::http::Response::builder()
+                            .header("Content-Type", mime)
+                            // Immutable: a content address never names other bytes.
+                            .header("Cache-Control", "max-age=31536000, immutable")
+                            .body(Cow::Owned(bytes))
+                            .unwrap();
+                    }
+                }
+                // Not cached yet (or bad address): 404, no caching, so a later
+                // request succeeds once the avatar decrypts. The UI shows initials.
+                return wry::http::Response::builder()
+                    .status(404)
+                    .header("Cache-Control", "no-store")
+                    .body(Cow::Owned(Vec::new()))
+                    .unwrap();
+            }
             wry::http::Response::builder()
                 .header("Content-Type", "text/html")
                 .body(Cow::Borrowed(UI_HTML.as_bytes()))
                 .unwrap()
         })
         .with_url("enclave://localhost/")
+        // Enable the Web Inspector so the DOM/CSS can be examined live (right-click
+        // -> Inspect Element on WebKitGTK).
+        .with_devtools(true)
         .with_ipc_handler(move |req: Request<String>| {
             if let Ok(cmd) = serde_json::from_str::<UiCommand>(req.body()) {
                 let _ = cmd_tx.send(cmd);
             }
+        })
+        // Handle dropped files ourselves so the WebView never navigates to them
+        // (the default "open the file in a new view" browser behavior the user
+        // never wants). Returning true blocks that default. wry hands us real
+        // filesystem paths, so a dropped file is offered like any other.
+        .with_drag_drop_handler(move |event: wry::DragDropEvent| {
+            match event {
+                wry::DragDropEvent::Enter { .. } | wry::DragDropEvent::Over { .. } => {
+                    emit(&drag_proxy, UiEvent::DropTarget { active: true });
+                }
+                wry::DragDropEvent::Leave => {
+                    emit(&drag_proxy, UiEvent::DropTarget { active: false });
+                }
+                wry::DragDropEvent::Drop { paths, .. } => {
+                    emit(&drag_proxy, UiEvent::DropTarget { active: false });
+                    // Attach the dropped files to the composer (the user adds a
+                    // message / picks live before sending), never auto-send.
+                    let strs: Vec<String> = paths
+                        .iter()
+                        .filter_map(|p| p.to_str().map(str::to_string))
+                        .collect();
+                    if !strs.is_empty() {
+                        let _ = drag_cmd_tx.send(UiCommand::AttachPaths { paths: strs });
+                    }
+                }
+                _ => {}
+            }
+            true // we handled it; block the OS/WebView default
         });
     // On Linux, tao windows are GTK windows and wry attaches to the GTK
     // widget tree (a raw Wayland/X11 handle is unsupported). The webview must
@@ -406,10 +964,16 @@ fn main() -> wry::Result<()> {
     #[cfg(not(target_os = "linux"))]
     let webview = builder.build(&window)?;
 
+    // Auto-open the Web Inspector when ENCLAVE_DEVTOOLS is set (WebKitGTK ignores
+    // the right-click/F12 path), so the DOM/CSS can be examined live.
+    if std::env::var_os("ENCLAVE_DEVTOOLS").is_some() {
+        webview.open_devtools();
+    }
+
     let core_focused = focused.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-        runtime.block_on(run_client(cmd_rx, proxy, core_focused));
+        runtime.block_on(run_client(cmd_rx, proxy, core_focused, media_index));
     });
 
     event_loop.run(move |event, _, control_flow| {
@@ -461,6 +1025,36 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Decode standard base64 (ignoring padding and any whitespace), for receiving
+/// an avatar image the WebView encoded. Returns `None` on an invalid character.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for &c in s.as_bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        acc = (acc << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Raise an OS desktop notification (toast) off the async loop.
 fn notify_os(title: String, body: String) {
     std::thread::spawn(move || {
@@ -496,8 +1090,64 @@ fn conv_summaries(c: &Client) -> Vec<ConvSummary> {
             is_dm: i.is_dm,
             pending: i.pending,
             members: i.members,
+            archived: i.archived,
+            left: i.left,
+            can_send: i.can_send,
+            reconnect: i.reconnect,
+            self_notes: i.self_notes,
         })
         .collect()
+}
+
+/// Offer a file at `path` to the active conversation (stored, or `live`), then
+/// tell the UI to show it as our own sent message. Shared by the file picker
+/// (`SendFile`/`SendFileLive`) and native drag-and-drop (`SendFilePath`).
+async fn offer_file_from(
+    c: &mut Client,
+    proxy: &EventLoopProxy<UiEvent>,
+    path: String,
+    live: bool,
+) {
+    let conv = c.active_id();
+    let from = c.display_name().to_string();
+    let user = c.name().to_string();
+    let result = if live {
+        c.send_file_live(&path).await
+    } else {
+        c.send_file(&path).await
+    };
+    match result {
+        Ok((file, offer_id)) => {
+            if let Some(conv) = conv {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                emit(
+                    proxy,
+                    UiEvent::FileMessage {
+                        conv,
+                        id: offer_id.clone(),
+                        ts,
+                        from,
+                        user,
+                        name: file.name,
+                        size: file.size,
+                        path: file.path,
+                        mine: true,
+                        offer_id,
+                    },
+                );
+            }
+        }
+        Err(e) => error_status(
+            proxy,
+            format!(
+                "Could not {}: {e}",
+                if live { "live share" } else { "send file" }
+            ),
+        ),
+    }
 }
 
 /// The active-conversation snapshot (id, title, safety number, scoped history).
@@ -514,27 +1164,41 @@ fn active_conversation_event(c: &Client) -> UiEvent {
             let history = c
                 .conversation_history(id)
                 .into_iter()
-                .map(|(from, text, mine, file)| Line {
-                    from,
-                    text,
-                    mine,
-                    file: file.map(|f| FileLine {
+                .map(|l| Line {
+                    from: l.display,
+                    user: l.user,
+                    text: l.text,
+                    mine: l.mine,
+                    file: l.file.map(|f| FileLine {
                         name: f.name,
                         size: f.size,
                         path: f.path,
                     }),
+                    system: l.system,
+                    id: l.id,
+                    ts: l.ts,
+                    deleted: l.deleted,
+                    reply_to: l.reply_to,
+                    voice_ms: l.voice_ms,
+                    waveform: l.waveform,
+                    reactions: l.reactions,
+                    edited: l.edited,
+                    poll: l.poll.map(PollViewOut::from),
+                    pinned: l.pinned,
                 })
                 .collect();
             (title, history)
         }
         None => (String::new(), Vec::new()),
     };
+    let disappearing_ms = conv.as_deref().map(|id| c.disappearing_of(id)).unwrap_or(0);
     UiEvent::ActiveConversation {
         conv,
         title,
         safety: c.safety_number(),
         verified: c.is_verified(),
         history,
+        disappearing_ms,
     }
 }
 
@@ -547,6 +1211,48 @@ fn emit_conversations(proxy: &EventLoopProxy<UiEvent>, c: &Client) {
         },
     );
     emit(proxy, active_conversation_event(c));
+}
+
+/// Turn a stored profile into the UI event, resolving the avatar reference to
+/// its hex content address only when the decrypted image is actually cached
+/// locally (so the UI shows a picture only when it can load one).
+fn profile_event(c: &Client, user: &str, profile: &enclave_client::Profile, me: bool) -> UiEvent {
+    let avatar = profile
+        .avatar
+        .as_ref()
+        .filter(|a| c.have_avatar(&a.addr))
+        .map(|a| hex::encode(a.addr));
+    UiEvent::Profile {
+        user: user.to_string(),
+        display: profile.display_name.clone(),
+        status_emoji: profile.status_emoji.clone(),
+        status_text: profile.status_text.clone(),
+        accent: profile.accent.clone(),
+        bio: profile.bio.clone(),
+        avatar,
+        me,
+    }
+}
+
+/// Emit one user's profile to the UI (peer or self).
+fn emit_profile(proxy: &EventLoopProxy<UiEvent>, c: &Client, user: &str) {
+    let me = !user.is_empty() && c.name() == user;
+    let profile = if me {
+        Some(c.my_profile().clone())
+    } else {
+        c.profile_of(user).cloned()
+    };
+    if let Some(p) = profile {
+        emit(proxy, profile_event(c, user, &p, me));
+    }
+}
+
+/// Seed the UI with every profile we know (our own + cached peers), on login.
+fn emit_all_profiles(proxy: &EventLoopProxy<UiEvent>, c: &Client) {
+    let me = c.name().to_string();
+    for (user, profile) in c.all_profiles() {
+        emit(proxy, profile_event(c, &user, &profile, user == me));
+    }
 }
 
 fn emit_audio_devices(proxy: &EventLoopProxy<UiEvent>, c: &Client) {
@@ -637,11 +1343,33 @@ async fn run_client(
     mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
     proxy: EventLoopProxy<UiEvent>,
     focused: Arc<AtomicBool>,
+    media_index: SharedMedia,
 ) {
     let mut client: Option<Client> = None;
+    let mut last_expire = std::time::Instant::now();
     loop {
+        let mut ran_command = false;
         while let Ok(cmd) = cmd_rx.try_recv() {
             handle_command(&mut client, &proxy, cmd).await;
+            ran_command = true;
+        }
+        // A command may have switched conversations or sent a file: keep the media
+        // index current so the Media tab can serve thumbnails for the open chat.
+        if ran_command {
+            if let Some(c) = client.as_ref() {
+                reindex_media(c, &media_index);
+            }
+        }
+
+        // Periodically sweep messages whose disappearing timer has elapsed
+        // (fully removed on this device, no signal to anyone).
+        if last_expire.elapsed() >= Duration::from_secs(5) {
+            last_expire = std::time::Instant::now();
+            if let Some(c) = client.as_mut() {
+                for (conv, ids) in c.expire_messages() {
+                    emit(&proxy, UiEvent::MessagesExpired { conv, ids });
+                }
+            }
         }
 
         // Push any in-progress file uploads forward, paced by the connection's
@@ -654,6 +1382,8 @@ async fn run_client(
             if let Some(Event::Error(message)) = c.pump_retransmits() {
                 error_status(&proxy, message);
             }
+            // Heal any DM found to be forked (peer on a different MLS group).
+            c.pump_reinvites().await;
         }
 
         // A share can end without a command: the user cancels the system
@@ -687,7 +1417,11 @@ async fn run_client(
             Ok(Some(event)) => match event {
                 Event::Message {
                     conv,
+                    id,
+                    ts,
+                    reply_to,
                     from,
+                    user,
                     text,
                     mine,
                 } => {
@@ -701,7 +1435,11 @@ async fn run_client(
                         &proxy,
                         UiEvent::Message {
                             conv,
+                            id,
+                            ts,
+                            reply_to,
                             from,
+                            user,
                             text,
                             mine,
                         },
@@ -752,21 +1490,50 @@ async fn run_client(
                                 outgoing: c.outgoing_requests().to_vec(),
                             },
                         );
+                        // A friendship change flips a DM's peer_friend (and thus
+                        // the composer's Reconnect state) and can add/remove a past
+                        // contact, so refresh the conversation summaries too.
+                        emit_conversations(&proxy, c);
                     }
                 }
-                Event::File { conv, from, file } => {
+                Event::ProfileChanged { user } => {
+                    if let Some(c) = client.as_ref() {
+                        emit_profile(&proxy, c, &user);
+                        // DM titles, the chat header, and message history resolve
+                        // names through `display_of` in the core, so re-emit them
+                        // to reflect a peer's rename immediately (not only on
+                        // re-entering the conversation).
+                        emit_conversations(&proxy, c);
+                    }
+                }
+                Event::File {
+                    conv,
+                    id,
+                    ts,
+                    from,
+                    user,
+                    file,
+                } => {
                     if !focused.load(Ordering::Relaxed) {
                         notify_os(from.clone(), format!("sent a file: {}", file.name));
+                    }
+                    // A received image becomes servable as a thumbnail.
+                    if let Ok(mut m) = media_index.lock() {
+                        m.insert(id.clone(), PathBuf::from(&file.path));
                     }
                     emit(
                         &proxy,
                         UiEvent::FileMessage {
                             conv,
+                            id,
+                            ts,
                             from,
+                            user,
                             name: file.name,
                             size: file.size,
                             path: file.path,
                             mine: false,
+                            offer_id: String::new(),
                         },
                     );
                 }
@@ -813,6 +1580,91 @@ async fn run_client(
                 }
                 Event::FileOfferClosed { conv, offer_id } => {
                     emit(&proxy, UiEvent::FileOfferClosed { conv, offer_id });
+                }
+                Event::FileOfferUnavailable { conv, offer_id } => {
+                    emit(&proxy, UiEvent::FileOfferUnavailable { conv, offer_id });
+                }
+                Event::Notice { conv, text } => emit(&proxy, UiEvent::Notice { conv, text }),
+                Event::MessageDeleted { conv, id } => {
+                    emit(&proxy, UiEvent::MessageDeleted { conv, id })
+                }
+                Event::ReactionsChanged {
+                    conv,
+                    id,
+                    reactions,
+                } => emit(
+                    &proxy,
+                    UiEvent::ReactionsChanged {
+                        conv,
+                        id,
+                        reactions,
+                    },
+                ),
+                Event::MessageEdited { conv, id, text } => {
+                    emit(&proxy, UiEvent::MessageEdited { conv, id, text })
+                }
+                Event::PollPosted {
+                    conv,
+                    id,
+                    ts,
+                    from,
+                    user,
+                    mine,
+                    poll,
+                } => emit(
+                    &proxy,
+                    UiEvent::PollPosted {
+                        conv,
+                        id,
+                        ts,
+                        from,
+                        user,
+                        mine,
+                        poll: poll.into(),
+                    },
+                ),
+                Event::PollUpdated { conv, id, poll } => emit(
+                    &proxy,
+                    UiEvent::PollUpdated {
+                        conv,
+                        id,
+                        poll: poll.into(),
+                    },
+                ),
+                Event::PinsChanged { conv, id, pinned } => {
+                    emit(&proxy, UiEvent::PinsChanged { conv, id, pinned })
+                }
+                Event::DisappearingChanged { conv, ms } => {
+                    emit(&proxy, UiEvent::DisappearingChanged { conv, ms })
+                }
+                Event::VoiceMessage {
+                    conv,
+                    id,
+                    ts,
+                    from,
+                    user,
+                    path,
+                    duration_ms,
+                    waveform,
+                    mine,
+                } => {
+                    if !mine && !focused.load(Ordering::Relaxed) {
+                        notify_os(from.clone(), "sent a voice message".into());
+                    }
+                    emit(
+                        &proxy,
+                        UiEvent::VoiceMessage {
+                            conv,
+                            id,
+                            ts,
+                            from,
+                            user,
+                            path,
+                            duration_ms,
+                            waveform,
+                            mine,
+                        },
+                    );
                 }
                 Event::Error(message) => error_status(&proxy, message),
             },
@@ -900,6 +1752,9 @@ async fn authenticate(
             // chats were gone. Push the restored list.
             if let Some(c) = client.as_ref() {
                 emit_conversations(proxy, c);
+                // Seed the UI with every profile we know (our own + cached
+                // peers), so names and avatars render before any fresh broadcast.
+                emit_all_profiles(proxy, c);
             }
         }
         Err(e) => error_status(proxy, e.to_string()),
@@ -946,6 +1801,42 @@ async fn handle_command(
             if let Some(c) = client.as_mut() {
                 c.set_display_name(&display);
                 emit_conversations(proxy, c);
+                emit_profile(proxy, c, &c.name().to_string());
+            }
+        }
+        UiCommand::SetCustomStatus { emoji, text } => {
+            if let Some(c) = client.as_mut() {
+                c.set_custom_status(&emoji, &text);
+                emit_profile(proxy, c, &c.name().to_string());
+            }
+        }
+        UiCommand::SetAccent { accent } => {
+            if let Some(c) = client.as_mut() {
+                c.set_accent(&accent);
+                emit_profile(proxy, c, &c.name().to_string());
+            }
+        }
+        UiCommand::SetBio { bio } => {
+            if let Some(c) = client.as_mut() {
+                c.set_bio(&bio);
+                emit_profile(proxy, c, &c.name().to_string());
+            }
+        }
+        UiCommand::SetAvatar { data, mime } => {
+            if let Some(c) = client.as_mut() {
+                match base64_decode(&data) {
+                    Some(bytes) => match c.set_avatar(&bytes, &mime) {
+                        Ok(()) => emit_profile(proxy, c, &c.name().to_string()),
+                        Err(e) => error_status(proxy, e.to_string()),
+                    },
+                    None => error_status(proxy, "avatar image could not be read".into()),
+                }
+            }
+        }
+        UiCommand::ClearAvatar => {
+            if let Some(c) = client.as_mut() {
+                c.clear_avatar();
+                emit_profile(proxy, c, &c.name().to_string());
             }
         }
         UiCommand::ExportSession => {
@@ -1098,6 +1989,25 @@ async fn handle_command(
                 }
             }
         }
+        UiCommand::OpenSelfNotes => {
+            if let Some(c) = client.as_mut() {
+                match c.open_self_notes() {
+                    Ok(_) => emit_conversations(proxy, c),
+                    Err(e) => error_status(proxy, format!("Could not open notes: {e}")),
+                }
+            }
+        }
+        UiCommand::RequestSharedGroups { handle } => {
+            if let Some(c) = client.as_ref() {
+                emit(
+                    proxy,
+                    UiEvent::SharedGroups {
+                        handle: handle.clone(),
+                        groups: c.shared_groups(&handle),
+                    },
+                );
+            }
+        }
         UiCommand::CreateGroup { name, members } => {
             if let Some(c) = client.as_mut() {
                 match c.create_group(&name, &members).await {
@@ -1114,10 +2024,34 @@ async fn handle_command(
                 }
             }
         }
-        UiCommand::LeaveConversation { conv } => {
+        UiCommand::DeleteConversation { conv } => {
             if let Some(c) = client.as_mut() {
-                c.leave_conversation(&conv);
+                c.delete_conversation(&conv);
                 emit_conversations(proxy, c);
+            }
+        }
+        UiCommand::LeaveGroup { conv } => {
+            if let Some(c) = client.as_mut() {
+                c.leave_group(&conv);
+                emit_conversations(proxy, c);
+            }
+        }
+        UiCommand::ArchiveConversation { conv } => {
+            if let Some(c) = client.as_mut() {
+                c.archive_conversation(&conv);
+                emit_conversations(proxy, c);
+            }
+        }
+        UiCommand::UnarchiveConversation { conv } => {
+            if let Some(c) = client.as_mut() {
+                c.unarchive_conversation(&conv);
+                emit_conversations(proxy, c);
+            }
+        }
+        UiCommand::ClearHistory { conv } => {
+            if let Some(c) = client.as_mut() {
+                c.clear_history(&conv);
+                emit(proxy, active_conversation_event(c));
             }
         }
         UiCommand::RemoveMember { conv, member } => {
@@ -1131,40 +2065,51 @@ async fn handle_command(
         UiCommand::SwitchConversation { conv } => {
             if let Some(c) = client.as_mut() {
                 c.switch(&conv);
-                emit(proxy, active_conversation_event(c));
+                // Switching can un-hide an archived/deleted conversation (moving it
+                // back to the live list), so refresh the summaries too.
+                emit_conversations(proxy, c);
             }
         }
-        UiCommand::SendFile => {
+        UiCommand::PickFiles => {
+            // The native picker blocks; run it off the async loop's thread. Chosen
+            // files are ATTACHED to the composer, not sent.
+            let chosen = tokio::task::spawn_blocking(|| {
+                rfd::FileDialog::new()
+                    .set_title("Attach files")
+                    .pick_files()
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(paths) = chosen {
+                let strs: Vec<String> = paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                emit(
+                    proxy,
+                    UiEvent::AttachFiles {
+                        files: stat_attachments(&strs),
+                    },
+                );
+            }
+        }
+        UiCommand::AttachPaths { paths } => {
+            emit(
+                proxy,
+                UiEvent::AttachFiles {
+                    files: stat_attachments(&paths),
+                },
+            );
+        }
+        UiCommand::SendFilePath { path, live } => {
+            // One attachment from the composer tray, offered on Send.
             if let Some(c) = client.as_mut() {
-                let conv = c.active_id();
-                let from = c.display_name().to_string();
-                // The native picker blocks; run it off the async loop's thread.
-                let chosen = tokio::task::spawn_blocking(|| {
-                    rfd::FileDialog::new().set_title("Send a file").pick_file()
-                })
-                .await
-                .ok()
-                .flatten();
-                let Some(path) = chosen else { return };
-                let path = path.to_string_lossy().into_owned();
-                match c.send_file(&path).await {
-                    Ok(file) => {
-                        if let Some(conv) = conv {
-                            emit(
-                                proxy,
-                                UiEvent::FileMessage {
-                                    conv,
-                                    from,
-                                    name: file.name,
-                                    size: file.size,
-                                    path: file.path,
-                                    mine: true,
-                                },
-                            );
-                        }
-                    }
-                    Err(e) => error_status(proxy, format!("Could not send file: {e}")),
+                if c.active_id().is_none() {
+                    error_status(proxy, "Open a conversation first.".into());
+                    return;
                 }
+                offer_file_from(c, proxy, path, live).await;
             }
         }
         UiCommand::OpenFile { path } => {
@@ -1175,6 +2120,17 @@ async fn handle_command(
                 let _ = open::that_detached(&path);
             })
             .await;
+        }
+        UiCommand::OpenLink { url } => {
+            // Open a link from a message in the default browser, only on an
+            // explicit click. We open just http(s) URLs so a message can't smuggle
+            // a "file:" or app-scheme link that does something surprising.
+            if url.starts_with("https://") || url.starts_with("http://") {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = open::that_detached(&url);
+                })
+                .await;
+            }
         }
         UiCommand::AcceptFile { offer_id } => {
             if let Some(c) = client.as_mut() {
@@ -1188,23 +2144,236 @@ async fn handle_command(
                 let _ = c.decline_file(&offer_id);
             }
         }
+        UiCommand::AbortFile { offer_id } => {
+            if let Some(c) = client.as_mut() {
+                let _ = c.abort_file(&offer_id);
+            }
+        }
+        UiCommand::DeleteMessage { conv, id, everyone } => {
+            if let Some(c) = client.as_mut() {
+                c.delete_message(&conv, &id, everyone);
+            }
+        }
+        UiCommand::React { conv, id, emoji } => {
+            if let Some(c) = client.as_mut() {
+                if let Some(reactions) = c.react(&conv, &id, &emoji) {
+                    emit(
+                        proxy,
+                        UiEvent::ReactionsChanged {
+                            conv,
+                            id,
+                            reactions,
+                        },
+                    );
+                }
+            }
+        }
+        UiCommand::EditMessage { conv, id, text } => {
+            if let Some(c) = client.as_mut() {
+                if let Some(text) = c.edit_message(&conv, &id, &text) {
+                    emit(proxy, UiEvent::MessageEdited { conv, id, text });
+                }
+            }
+        }
+        UiCommand::CreatePoll {
+            question,
+            options,
+            multi,
+            reveal,
+            duration_ms,
+            anonymous,
+        } => {
+            if let Some(c) = client.as_mut() {
+                let conv = c.active_id();
+                let from = c.display_name().to_string();
+                let user = c.name().to_string();
+                match c.create_poll(&question, &options, multi, reveal, duration_ms, anonymous) {
+                    Some((id, ts, poll)) => {
+                        if let Some(conv) = conv {
+                            emit(
+                                proxy,
+                                UiEvent::PollPosted {
+                                    conv,
+                                    id,
+                                    ts,
+                                    from,
+                                    user,
+                                    mine: true,
+                                    poll: poll.into(),
+                                },
+                            );
+                        }
+                    }
+                    None => error_status(
+                        proxy,
+                        "Could not create the poll (check the question and options).".into(),
+                    ),
+                }
+            }
+        }
+        UiCommand::VotePoll { conv, id, options } => {
+            if let Some(c) = client.as_mut() {
+                if let Some(poll) = c.vote_poll(&conv, &id, options) {
+                    emit(
+                        proxy,
+                        UiEvent::PollUpdated {
+                            conv,
+                            id,
+                            poll: poll.into(),
+                        },
+                    );
+                }
+            }
+        }
+        UiCommand::ClosePoll { conv, id } => {
+            if let Some(c) = client.as_mut() {
+                if let Some(poll) = c.close_poll(&conv, &id) {
+                    emit(
+                        proxy,
+                        UiEvent::PollUpdated {
+                            conv,
+                            id,
+                            poll: poll.into(),
+                        },
+                    );
+                }
+            }
+        }
+        UiCommand::PinMessage { conv, id, pinned } => {
+            if let Some(c) = client.as_mut() {
+                if let Some(pinned) = c.pin_message(&conv, &id, pinned) {
+                    emit(proxy, UiEvent::PinsChanged { conv, id, pinned });
+                }
+            }
+        }
+        UiCommand::SearchMessages { query, conv } => {
+            if let Some(c) = client.as_ref() {
+                let hits = c
+                    .search_messages(&query, conv.as_deref())
+                    .into_iter()
+                    .map(|h| SearchHitOut {
+                        conv: h.conv,
+                        conv_title: h.conv_title,
+                        self_notes: h.self_notes,
+                        id: h.id,
+                        ts: h.ts,
+                        user: h.user,
+                        display: h.display,
+                        text: h.text,
+                        mine: h.mine,
+                    })
+                    .collect();
+                emit(
+                    proxy,
+                    UiEvent::SearchResults {
+                        query,
+                        scoped: conv.is_some(),
+                        hits,
+                    },
+                );
+            }
+        }
+        UiCommand::SetDisappearing { conv, ms } => {
+            if let Some(c) = client.as_mut() {
+                c.set_disappearing(&conv, ms);
+            }
+        }
+        UiCommand::StartVoice => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.start_voice() {
+                    error_status(proxy, format!("Could not record: {e}"));
+                }
+            }
+        }
+        UiCommand::StopVoice => {
+            if let Some(c) = client.as_mut() {
+                match c.stop_voice() {
+                    Ok((path, duration_ms, waveform)) => {
+                        emit(
+                            proxy,
+                            UiEvent::VoicePreview {
+                                path,
+                                duration_ms,
+                                waveform,
+                            },
+                        );
+                    }
+                    Err(e) => error_status(proxy, format!("Recording failed: {e}")),
+                }
+            }
+        }
+        UiCommand::CancelVoice => {
+            if let Some(c) = client.as_mut() {
+                c.cancel_voice();
+            }
+        }
+        UiCommand::SendVoice => {
+            if let Some(c) = client.as_mut() {
+                let conv = c.active_id();
+                let from = c.display_name().to_string();
+                let user = c.name().to_string();
+                match c.send_voice().await {
+                    Ok((id, ts, duration_ms, waveform)) => {
+                        if let Some(conv) = conv {
+                            // Resolve our own clip path to hand back for playback.
+                            let path = c.voice_clip_path(&id);
+                            emit(
+                                proxy,
+                                UiEvent::VoiceMessage {
+                                    conv,
+                                    id,
+                                    ts,
+                                    from,
+                                    user,
+                                    path,
+                                    duration_ms,
+                                    waveform,
+                                    mine: true,
+                                },
+                            );
+                        }
+                    }
+                    Err(e) => error_status(proxy, format!("Could not send voice message: {e}")),
+                }
+            }
+        }
+        UiCommand::PlayVoice { path, offset_ms } => {
+            if let Some(c) = client.as_mut() {
+                c.play_voice(&path, offset_ms);
+            }
+        }
+        UiCommand::StopVoicePlayback => {
+            if let Some(c) = client.as_ref() {
+                c.stop_voice_playback();
+            }
+        }
         UiCommand::CancelFile { offer_id } => {
             if let Some(c) = client.as_mut() {
                 let _ = c.cancel_file(&offer_id);
             }
         }
-        UiCommand::SendText { text } => {
+        UiCommand::SendText { text, reply_to } => {
             if let Some(c) = client.as_mut() {
                 let conv = c.active_id();
                 let from = c.display_name().to_string();
-                match c.send_text(&text).await {
-                    Ok(()) => {
+                let user = c.name().to_string();
+                let reply = if reply_to.is_empty() {
+                    None
+                } else {
+                    Some(reply_to.as_str())
+                };
+                match c.send_text(&text, reply).await {
+                    Ok((id, ts)) => {
                         if let Some(conv) = conv {
                             emit(
                                 proxy,
                                 UiEvent::Message {
                                     conv,
+                                    id,
+                                    ts,
+                                    reply_to,
                                     from,
+                                    user,
                                     text,
                                     mine: true,
                                 },
@@ -1231,7 +2400,7 @@ async fn handle_command(
             }
         }
         UiCommand::RemoveFriend { handle } => {
-            if let Some(c) = client.as_ref() {
+            if let Some(c) = client.as_mut() {
                 c.remove_friend(&handle);
             }
         }

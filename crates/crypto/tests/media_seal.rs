@@ -201,7 +201,7 @@ fn integrates_with_group_media_root_secret() {
     let bob = Identity::generate("bob").unwrap();
     let mut alice_group = Group::create(&alice).unwrap();
     let welcome = alice_group
-        .add_member(&alice, &bob.new_key_package().unwrap())
+        .add_member(&alice, &bob.new_key_package().unwrap(), "bob")
         .unwrap()
         .welcome;
     let bob_group = Group::join(&bob, &welcome).unwrap();

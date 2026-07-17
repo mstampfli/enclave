@@ -16,7 +16,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, Stream};
+use cpal::{ErrorKind, SampleFormat, Stream};
 
 use crate::audio::SAMPLE_RATE_HZ;
 use crate::frame::{
@@ -35,7 +35,7 @@ fn codec_err(e: impl std::fmt::Display) -> MediaError {
 pub fn input_device_names() -> Vec<String> {
     let host = cpal::default_host();
     match host.input_devices() {
-        Ok(devs) => pickable_names(devs.filter_map(|d| device_name(&d))),
+        Ok(devs) => pickable_names(devs.filter(offerable).filter_map(|d| device_name(&d))),
         Err(_) => Vec::new(),
     }
 }
@@ -44,9 +44,45 @@ pub fn input_device_names() -> Vec<String> {
 pub fn output_device_names() -> Vec<String> {
     let host = cpal::default_host();
     match host.output_devices() {
-        Ok(devs) => pickable_names(devs.filter_map(|d| device_name(&d))),
+        Ok(devs) => pickable_names(devs.filter(offerable).filter_map(|d| device_name(&d))),
         Err(_) => Vec::new(),
     }
+}
+
+/// On a PipeWire/PulseAudio system, ALSA also exposes the raw hardware PCMs
+/// (`hw:`/`plughw:`/`front:`/`hdmi:`/`iec958:`/`dmix:` and every `CARD=`-specific
+/// node). The sound server holds that hardware exclusively, so opening a raw PCM
+/// directly collides with it -- and picking the same headset's hardware for BOTH
+/// capture and playback fails with "device busy". Only the server-routed virtual
+/// PCMs (`default`/`pipewire`/`pulse`/`jack`/`sysdefault`) can be shared and can
+/// serve input and output at once, so the picker offers only those; the physical
+/// device is chosen in the system's audio settings, which is how routing works on
+/// a modern Linux desktop.
+#[cfg(target_os = "linux")]
+fn is_shared_pcm(id: &str) -> bool {
+    if id.contains("CARD=") {
+        return false; // a specific hardware card, not the shared server node
+    }
+    let head = id.split(':').next().unwrap_or(id);
+    matches!(
+        head,
+        "default" | "pipewire" | "pulse" | "jack" | "sysdefault"
+    )
+}
+
+/// Whether to offer this device in the picker (and accept it by name). On Linux
+/// only the shareable server-routed PCMs are offered (see [`is_shared_pcm`]);
+/// other platforms enumerate real devices that do not have this exclusivity
+/// problem, so everything cpal reports is offered.
+#[cfg(target_os = "linux")]
+fn offerable(d: &cpal::Device) -> bool {
+    use cpal::traits::DeviceTrait;
+    d.id().map(|id| is_shared_pcm(id.id())).unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn offerable(_d: &cpal::Device) -> bool {
+    true
 }
 
 /// Devices are selected by name (first match), so a picker entry is only
@@ -69,11 +105,15 @@ fn device_name(device: &cpal::Device) -> Option<String> {
 }
 
 /// Resolve an input device by name, falling back to the host default when the
-/// name is `None` or no longer present (e.g. the device was unplugged).
+/// name is `None`, no longer present (e.g. the device was unplugged), or not
+/// offerable (a stale preference for a raw hardware PCM we no longer use; see
+/// [`offerable`]) -- so a saved raw-device choice can never reintroduce the
+/// same-headset "busy" conflict.
 fn resolve_input(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
     if let Some(want) = name {
         if let Ok(mut devs) = host.input_devices() {
-            if let Some(d) = devs.find(|d| device_name(d).as_deref() == Some(want)) {
+            if let Some(d) = devs.find(|d| offerable(d) && device_name(d).as_deref() == Some(want))
+            {
                 return Some(d);
             }
         }
@@ -81,11 +121,13 @@ fn resolve_input(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> 
     host.default_input_device()
 }
 
-/// Resolve an output device by name, falling back to the host default.
+/// Resolve an output device by name, falling back to the host default (see
+/// [`resolve_input`] for why non-offerable names fall back too).
 fn resolve_output(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
     if let Some(want) = name {
         if let Ok(mut devs) = host.output_devices() {
-            if let Some(d) = devs.find(|d| device_name(d).as_deref() == Some(want)) {
+            if let Some(d) = devs.find(|d| offerable(d) && device_name(d).as_deref() == Some(want))
+            {
                 return Some(d);
             }
         }
@@ -136,13 +178,44 @@ impl AudioCapture {
         let mut mono: Vec<f32> = Vec::new();
         let mut native: Vec<i16> = Vec::new();
         let mut resampled: Vec<i16> = Vec::new();
-        // xruns recover on their own; log the first, then stay quiet so a burst
-        // does not flood the console (which reads as a hard failure).
-        let mut warned = false;
-        let on_error = move |e| {
-            if !warned {
-                warned = true;
-                eprintln!("input stream error: {e} (recovering; further xruns silenced)");
+        // Several very different failures arrive here, and conflating them
+        // misleads. An xrun (buffer under/overrun) recovers on its own; a route
+        // change is auto-rerouted and the stream keeps running; but
+        // DeviceNotAvailable/StreamInvalidated mean the device went away
+        // (unplugged, or a PipeWire/Bluetooth profile switch) and cpal does NOT
+        // restart the stream -- capture is dead until the mic is re-selected.
+        // Report the first of each honestly, then stay quiet so a burst does not
+        // flood the console (which reads as a hard failure).
+        let mut warned_xrun = false;
+        let mut warned_changed = false;
+        let mut warned_gone = false;
+        let mut warned_other = false;
+        let on_error = move |e: cpal::Error| match e.kind() {
+            ErrorKind::Xrun => {
+                if !warned_xrun {
+                    warned_xrun = true;
+                    eprintln!("input stream xrun: buffer under/overrun (recovering; further xruns silenced)");
+                }
+            }
+            ErrorKind::DeviceChanged => {
+                if !warned_changed {
+                    warned_changed = true;
+                    eprintln!("input audio route changed; capture rerouted and continues");
+                }
+            }
+            ErrorKind::DeviceNotAvailable | ErrorKind::StreamInvalidated => {
+                if !warned_gone {
+                    warned_gone = true;
+                    eprintln!(
+                        "input device disconnected: capture stopped (re-select the mic to resume)"
+                    );
+                }
+            }
+            _ => {
+                if !warned_other {
+                    warned_other = true;
+                    eprintln!("input stream error: {e}");
+                }
             }
         };
 
@@ -284,6 +357,12 @@ impl AudioPlayback {
     /// Enqueue decoded 48 kHz mono samples for playback.
     pub fn push(&self, mono48k: &[i16]) {
         self.inner.feed(mono48k);
+    }
+
+    /// Drop any audio still queued for playback (stops the current clip at once).
+    /// Used to pause/restart a voice message without letting clips pile up.
+    pub fn clear(&self) {
+        self.inner.queue.lock().unwrap().clear();
     }
 
     /// A `Send` handle to this device's playback feed, so a decode task on

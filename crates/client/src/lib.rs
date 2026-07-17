@@ -9,12 +9,12 @@
 //! Single-task and caller-driven: there is no background task, so the non-`Send`
 //! MLS group never crosses a thread boundary.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::transfer::{FileManifest, FileSink, Part, Reassembler, TransferMeta};
+use crate::transfer::{FileManifest, FileSink, Reassembler, TransferMeta};
 use enclave_crypto::{Group, Identity};
 use enclave_protocol::{ClientMsg, DeviceId, Friend, GroupId, Presence, Sealed, ServerMsg, UserId};
 use enclave_transport::accounts::MIN_PASSWORD_LEN;
@@ -56,10 +56,36 @@ const UNDELIVERED_WARN_AFTER: Duration = Duration::from_secs(30);
 /// dropped; this just bounds how far the backlog grows silently.
 const MAX_UNACKED_BEFORE_WARN: usize = 256;
 
+/// Minimum spacing between self-update rekeys used to heal a desynced
+/// conversation (see [`Client::heal_group`]). A burst of undecryptable messages
+/// triggers at most one rekey per window, which is ample for the peer to apply
+/// the commit and the epoch to advance before we would consider another.
+const HEAL_COOLDOWN: Duration = Duration::from_secs(15);
+
+/// Whether an MLS decrypt error is the sender-ratchet "too far in the future"
+/// desync -- the one healing a conversation can fix (as opposed to tampering, a
+/// stray frame, or a mid-join skew, which a rekey would not help). Matched on the
+/// openmls message text, the only signal the wrapped error exposes.
+fn is_ratchet_desync(err: &enclave_crypto::CryptoError) -> bool {
+    err.to_string().contains("too far in the future")
+}
+
+/// Whether an MLS decrypt error is a group-id MISMATCH -- the two peers of a DM
+/// ended up on different MLS groups for the same conversation (a fork). Healed by
+/// the smaller handle re-establishing the peer into its canonical group.
+fn is_group_fork(err: &enclave_crypto::CryptoError) -> bool {
+    err.to_string().contains("group ID differs")
+}
+
+/// Minimum spacing between DM re-establishments used to heal a forked DM, so a
+/// burst of undecryptable messages triggers at most one re-invite per window.
+const REINVITE_COOLDOWN: Duration = Duration::from_secs(15);
+
 /// Why a screen share ended on its own (see [`Client::reap_ended_share`]):
 /// `Cancelled` is the user changing their mind at the system picker, `Failed`
 /// is a real error worth showing loudly.
 pub use enclave_media::EndedReason as ShareEnded;
+pub use transfer::{AvatarRef, Profile, Reaction};
 
 /// Errors surfaced to the UI.
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +106,8 @@ pub enum ClientError {
     Disconnected,
     #[error("audio: {0}")]
     Audio(String),
+    #[error("profile: {0}")]
+    Profile(String),
 }
 
 /// A file that arrived (or was sent) in a conversation. The bytes live on
@@ -96,18 +124,31 @@ pub struct FileRef {
 /// Something the UI should react to.
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// A text message arrived in conversation `conv` (hex group id).
+    /// A text message arrived in conversation `conv` (hex group id). `from` is
+    /// the sender's current display name (for notifications); `user` is their
+    /// stable username, so the UI resolves the name/avatar from it at render.
     Message {
         conv: String,
+        /// Hex message id shared with the peer (reply/forward/delete/details).
+        id: String,
+        /// Creation time, unix milliseconds.
+        ts: u64,
+        /// Hex id of the message this replies to, or empty.
+        reply_to: String,
         from: String,
+        user: String,
         text: String,
         mine: bool,
     },
-    /// A file finished arriving in conversation `conv`, from display name
-    /// `from`, and was written to `file.path`.
+    /// A file finished arriving in conversation `conv`, from `from` (display
+    /// name) / `user` (username), and was written to `file.path`.
     File {
         conv: String,
+        /// Hex offer id (the file's message id) and creation time.
+        id: String,
+        ts: u64,
         from: String,
+        user: String,
         file: FileRef,
     },
     /// Someone offered a file in conversation `conv`. It is NOT downloaded: the
@@ -123,9 +164,14 @@ pub enum Event {
         size: u64,
         live: bool,
     },
-    /// An offer we were shown is gone (the sender withdrew it, it expired, or a
-    /// transfer resolved): the UI removes its prompt/row for `offer_id`.
+    /// An offer we were shown resolved into a delivered file (or a transfer we
+    /// completed): the UI removes the pending prompt, the file itself now shows
+    /// in chat. Only for a clean resolution -- never for a withdrawal.
     FileOfferClosed { conv: String, offer_id: String },
+    /// An offer we were shown is no longer available: the sender withdrew it or
+    /// went offline. The UI marks the offer's message "no longer available" but
+    /// KEEPS it in chat (name, size, the whole file row) -- nothing is removed.
+    FileOfferUnavailable { conv: String, offer_id: String },
     /// Progress of an in-flight transfer we are sending or receiving, 0..=1.
     /// `label` names it (a filename, or "message"); `done` marks completion.
     TransferProgress {
@@ -148,23 +194,89 @@ pub enum Event {
     /// An incoming call started in conversation `conv`, initiated by `from`
     /// (display name). The UI rings.
     CallOffer { conv: String, from: String },
-    /// The participant list of conversation `conv`'s call changed (display
-    /// names). Empty means the call ended.
+    /// The participant list of conversation `conv`'s call changed (usernames;
+    /// the UI resolves display names). Empty means the call ended.
     CallParticipants {
         conv: String,
         participants: Vec<String>,
     },
     /// `from` (display name) declined our call in conversation `conv`.
     CallDeclined { conv: String, from: String },
-    /// An H.264 video frame from `from` (display name) to show in the UI.
-    /// `data` is the Annex-B bytes; the UI decodes it with WebCodecs. `camera`
-    /// routes it: a per-user webcam tile (`true`) or the full-screen share
-    /// viewer (`false`).
+    /// An H.264 video frame from `from` (username; the UI resolves the name and
+    /// keys the per-user canvas by it) to show in the UI. `data` is the Annex-B
+    /// bytes; the UI decodes it with WebCodecs. `camera` routes it: a per-user
+    /// webcam tile (`true`) or the full-screen share viewer (`false`).
     ScreenFrame {
         from: String,
         data: Vec<u8>,
         keyframe: bool,
         camera: bool,
+    },
+    /// A user's end-to-end profile (display name, status, accent, avatar)
+    /// changed or first arrived; the UI re-reads it via `profile_of`. `user` is
+    /// the username. Also fires when a requested avatar blob finishes decrypting,
+    /// so the tile can swap initials for the picture.
+    ProfileChanged { user: String },
+    /// A neutral status line shown INSIDE conversation `conv` (hex id) rather
+    /// than as a popup: e.g. a file was declined or delivered. It is not stored
+    /// in history; it is a transient in-chat note.
+    Notice { conv: String, text: String },
+    /// A message was deleted (by us, or by its author for everyone): the UI marks
+    /// the line as a "message deleted" placeholder, never removing it.
+    MessageDeleted { conv: String, id: String },
+    /// A message's emoji reactions changed (someone reacted or un-reacted). The
+    /// UI replaces that message's reaction chips with `reactions`.
+    ReactionsChanged {
+        conv: String,
+        id: String,
+        reactions: Vec<transfer::Reaction>,
+    },
+    /// A message was edited by its author: the UI replaces the line's text and
+    /// shows an "edited" marker.
+    MessageEdited {
+        conv: String,
+        id: String,
+        text: String,
+    },
+    /// A poll was posted (by a peer, or by us): the UI adds a poll card line.
+    PollPosted {
+        conv: String,
+        id: String,
+        ts: u64,
+        from: String,
+        user: String,
+        mine: bool,
+        poll: PollView,
+    },
+    /// A poll's state changed (a vote landed, or it was closed): the UI refreshes
+    /// that poll card in place.
+    PollUpdated {
+        conv: String,
+        id: String,
+        poll: PollView,
+    },
+    /// A message was pinned or unpinned (by anyone): the UI updates its indicator
+    /// and the conversation's pinned bar.
+    PinsChanged {
+        conv: String,
+        id: String,
+        pinned: bool,
+    },
+    /// The peer changed the disappearing-messages setting for `conv` (ms, 0=off).
+    /// The UI reflects it; the local sweep enforces it.
+    DisappearingChanged { conv: String, ms: u32 },
+    /// A voice message arrived (or we sent one): the UI shows a small player.
+    /// `path` is the local clip (played via `play_voice`), `duration_ms` its length.
+    VoiceMessage {
+        conv: String,
+        id: String,
+        ts: u64,
+        from: String,
+        user: String,
+        path: String,
+        duration_ms: u32,
+        waveform: Vec<u8>,
+        mine: bool,
     },
     /// A non-fatal error worth showing.
     Error(String),
@@ -177,6 +289,29 @@ pub enum ConvKind {
     Group,
 }
 
+/// Where a conversation sits in its lifecycle. History is retained in every
+/// state (encrypted at rest); the difference is visibility and membership. The
+/// MLS group (and thus routing/membership) is kept in every state EXCEPT `Left`.
+///
+/// - `Active`: shown in the Chats list, live in its MLS group.
+/// - `Archived`: hidden from the Chats list, shown on the Archived page. Still a
+///   member, still receiving; opening it (or a new message) returns it to Active.
+/// - `Deleted`: hidden everywhere (it "disappears"), but still a member so it
+///   reappears in Active the moment a message arrives, or when reopened (a DM by
+///   clicking the person, a group from "groups you share" on a friend). Because
+///   the group is kept, reopening reuses it (no fork) and the history is intact.
+/// - `Left`: truly left the group (or was removed): the MLS group is torn down
+///   and we are no longer a member. Read-only on the Archived page; rejoining is
+///   only possible if a member re-invites us (a fresh Welcome restores it).
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Visibility {
+    #[default]
+    Active,
+    Archived,
+    Deleted,
+    Left,
+}
+
 /// A conversation summary handed to the UI.
 #[derive(Clone)]
 pub struct ConversationInfo {
@@ -187,6 +322,190 @@ pub struct ConversationInfo {
     pub members: Vec<String>,
     /// A DM whose MLS group is not established yet (waiting on the peer).
     pub pending: bool,
+    /// Hidden to the Archived page (still a member). Not in the live Chats list.
+    pub archived: bool,
+    /// We left or were removed from this group: read-only, on the Archived page.
+    pub left: bool,
+    /// Whether we can send here. `false` only for `left` (read-only); a DM whose
+    /// peer unfriended us is still sendable -- sending reconnects (see `reconnect`).
+    pub can_send: bool,
+    /// A DM whose peer is no longer a friend: still sendable, but sending it
+    /// re-adds them (sends a reconnect request). The composer shows a hint.
+    pub reconnect: bool,
+    /// The local-only "Notes to self" scratchpad: just us, nothing leaves the
+    /// device. The UI renders it distinctly and hides call/verify/members.
+    pub self_notes: bool,
+}
+
+/// One line of a conversation's history, as handed to the UI.
+pub struct HistoryLine {
+    /// Hex message id, shared with the peer (for reply/forward/delete/details).
+    pub id: String,
+    /// Creation time, unix milliseconds.
+    pub ts: u64,
+    /// Sender username (stable identity) and its current display name.
+    pub user: String,
+    pub display: String,
+    pub text: String,
+    pub mine: bool,
+    pub file: Option<FileRef>,
+    pub system: bool,
+    pub deleted: bool,
+    /// Hex id of the message this replies to, or empty.
+    pub reply_to: String,
+    /// Voice-message duration in ms, or 0 if this line is not a voice message.
+    pub voice_ms: u32,
+    /// Amplitude envelope for a voice message's waveform (empty otherwise).
+    pub waveform: Vec<u8>,
+    /// Emoji reactions on this line (empty if none).
+    pub reactions: Vec<transfer::Reaction>,
+    /// Whether this message was edited after being sent (shows an "edited" mark).
+    pub edited: bool,
+    /// Present when this line is a poll: its question, options, tallies, and my
+    /// vote. The UI renders a poll card instead of a text bubble.
+    pub poll: Option<PollView>,
+    /// Whether this message is pinned in the conversation.
+    pub pinned: bool,
+}
+
+/// A stored poll: a conversation annotation keyed by the poll's message id. Votes
+/// map each member's username to its chosen option indices (last write wins).
+#[derive(Clone)]
+struct Poll {
+    question: String,
+    options: Vec<String>,
+    multi: bool,
+    /// 0 = tallies always shown, 1 = after you vote, 2 = after the creator closes.
+    reveal: u8,
+    closed: bool,
+    /// Absolute deadline (unix ms); once past, the poll counts as closed. `None`
+    /// means no time limit. Shared, so every member auto-closes at the same moment.
+    closes_at: Option<u64>,
+    /// Creator username (only they may close the poll).
+    author: String,
+    votes: HashMap<String, Vec<u8>>,
+    /// Content key for server-buffered ballots (reveal >= 2); `None` for immediate
+    /// polls. All members hold it (it rides in the MLS-sealed poll); the server
+    /// does not, so buffered ballots stay unreadable to it.
+    ballot_key: Option<[u8; 32]>,
+    /// Anonymous poll: ballots are ring-signed and tallied by key image, so no one
+    /// (server, owner, peers) can attribute a vote.
+    anonymous: bool,
+    /// The ring (members' voting public keys) for an anonymous poll.
+    ring: Vec<[u8; 32]>,
+}
+
+impl Poll {
+    /// The server-side routing mode for a buffered poll, or `None` for an immediate
+    /// (reveal 0/1) poll that votes over normal MLS. 0 = release to the group at
+    /// close, 1 = route to the owner live, 2 = buffer and release to the owner,
+    /// 3 = release to the group but with submitter attribution stripped (anonymous).
+    fn server_mode(&self) -> Option<u8> {
+        match self.reveal {
+            2 => Some(if self.anonymous { 3 } else { 0 }),
+            3 => Some(1),
+            4 => Some(2),
+            _ => None,
+        }
+    }
+}
+
+impl Poll {
+    /// Whether the poll is closed right now -- explicitly, or because its deadline
+    /// has passed.
+    fn is_closed(&self) -> bool {
+        self.closed || self.closes_at.is_some_and(|t| now_ms() >= t)
+    }
+}
+
+impl From<session::PersistPoll> for Poll {
+    fn from(p: session::PersistPoll) -> Poll {
+        Poll {
+            question: p.question,
+            options: p.options,
+            multi: p.multi,
+            reveal: p.reveal,
+            closed: p.closed,
+            closes_at: p.closes_at,
+            author: p.author,
+            votes: p.votes.into_iter().collect(),
+            ballot_key: p.ballot_key,
+            anonymous: p.anonymous,
+            ring: p.ring,
+        }
+    }
+}
+
+impl From<&Poll> for session::PersistPoll {
+    fn from(p: &Poll) -> session::PersistPoll {
+        session::PersistPoll {
+            question: p.question.clone(),
+            options: p.options.clone(),
+            multi: p.multi,
+            reveal: p.reveal,
+            closed: p.closed,
+            closes_at: p.closes_at,
+            author: p.author.clone(),
+            votes: p
+                .votes
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            ballot_key: p.ballot_key,
+            anonymous: p.anonymous,
+            ring: p.ring.clone(),
+        }
+    }
+}
+
+/// A poll as handed to the UI: its definition plus the current tallies, my own
+/// selection, and whether the tallies should be revealed yet.
+#[derive(Debug, Clone)]
+pub struct PollView {
+    pub question: String,
+    pub options: Vec<String>,
+    /// Votes per option (index-aligned with `options`).
+    pub counts: Vec<u32>,
+    pub multi: bool,
+    pub reveal: u8,
+    pub closed: bool,
+    /// My selected option indices.
+    pub mine: Vec<u8>,
+    /// Number of distinct voters.
+    pub total: u32,
+    /// Whether the UI should reveal the tallies now, per the reveal mode.
+    pub revealed: bool,
+    /// Whether we created the poll (so we may close it).
+    pub is_author: bool,
+    /// Absolute deadline (unix ms), or 0 for no time limit. The UI shows a live
+    /// countdown and treats the poll as closed once it passes.
+    pub closes_at: u64,
+    /// Voters for each option (index-aligned with `options`). For a normal poll
+    /// these are usernames; for an anonymous poll they are opaque pseudonyms (key
+    /// image hex) the UI renders as "Anonymous". Always present; shown only once
+    /// results are revealed.
+    pub voters: Vec<Vec<String>>,
+    /// An anonymous poll (ring-signed ballots; voters unattributable).
+    pub anonymous: bool,
+}
+
+/// One hit from a local message search, with enough context to render a result
+/// row and jump to the message.
+pub struct SearchHit {
+    /// Hex id of the conversation the match is in, and its resolved title.
+    pub conv: String,
+    pub conv_title: String,
+    /// Whether the containing conversation is the local-only "Notes to self".
+    pub self_notes: bool,
+    /// Hex id + timestamp of the matching message.
+    pub id: String,
+    pub ts: u64,
+    /// Sender username (stable) and current display name.
+    pub user: String,
+    pub display: String,
+    /// The matching line's text (for a file line, its name).
+    pub text: String,
+    pub mine: bool,
 }
 
 /// One live conversation and its scoped history.
@@ -207,16 +526,64 @@ struct Conversation {
     /// survive a restart (they complete within a session over reliable TCP).
     #[allow(dead_code)]
     reassembler: Reassembler,
+    /// If set, disappearing messages is on for this conversation: each line is
+    /// removed locally once `now - ts` exceeds this many ms. The setting is shared
+    /// with the peer; the per-message deletion is local (no read-state leaves).
+    disappearing_ms: Option<u32>,
+    /// Where this conversation sits in its lifecycle (list visibility + group
+    /// membership). See [`Visibility`]. Defaults to `Active`.
+    visibility: Visibility,
+    /// A private on-device scratchpad ("Notes to self"): it has no MLS group and
+    /// exactly one member (us), and NOTHING it holds ever reaches the network.
+    /// Every send path checks this and records locally instead of sealing to the
+    /// server, and the routing announces on login/reload skip it. History is still
+    /// encrypted at rest with the rest of the session, so it is private but local.
+    local_only: bool,
+    /// Emoji reactions on this conversation's messages, keyed by message id. An
+    /// annotation overlay (not part of a line's content) so a reaction can be
+    /// added or removed after the message was sent. Persisted with the history.
+    reactions: HashMap<[u8; 16], Vec<transfer::Reaction>>,
+    /// Ids of messages that have been edited, so the UI can show an "edited"
+    /// marker. The edited text itself lives in the line; this only flags it.
+    edited: HashSet<[u8; 16]>,
+    /// Polls in this conversation, keyed by the poll's message id. The line for a
+    /// poll is a normal history entry; this holds its options, votes, and state.
+    polls: HashMap<[u8; 16], Poll>,
+    /// Ids of messages pinned in this conversation. Pins are shared: any member
+    /// may pin or unpin, and every member sees the same set.
+    pinned: HashSet<[u8; 16]>,
 }
 
 #[derive(Clone)]
 struct ChatLine {
+    /// Stable id both peers share: the message's transfer id (or a file's offer
+    /// id). Lets the UI reply to / forward / delete / show details for the line.
+    id: [u8; 16],
+    /// When this line was created locally (unix milliseconds), for the timestamp.
+    ts: u64,
     from: String,
     /// For a text message, the text. For a file, a human label (the filename).
+    /// For a system line, the notice text ("X declined foo").
     text: String,
     mine: bool,
     /// Present when this line is a file rather than plain text.
     file: Option<FileRef>,
+    /// A system notice (e.g. "X declined foo") rather than a person's message:
+    /// rendered as a small centered line, and persisted so it stays in the chat
+    /// for good rather than vanishing on the next reload.
+    system: bool,
+    /// Set once this message has been deleted: the row stays but shows a
+    /// "message deleted" placeholder instead of its content. `deleted` for
+    /// everyone (a peer withdrew it) reads the same as deleted just for me.
+    deleted: bool,
+    /// The id of the message this one replies to, if any. The quoted preview is
+    /// resolved from the local copy of that message at render, never re-sent.
+    reply_to: Option<[u8; 16]>,
+    /// Set (to the duration in ms) when this line is a voice message; `file` then
+    /// holds the local path to the decoded-on-demand clip. The UI shows a player.
+    voice_ms: Option<u32>,
+    /// Amplitude envelope for a voice message's waveform (empty otherwise).
+    waveform: Vec<u8>,
 }
 
 /// A file we are offering, kept until it is uploaded/streamed or resolved. The
@@ -229,6 +596,10 @@ struct OutgoingFile {
     mime: String,
     size: u64,
     live: bool,
+    /// Per-file content key: every chunk is sealed under it (kept so a re-stream,
+    /// e.g. a second recipient accepting a live offer, reuses the same key the
+    /// manifest advertised).
+    content_key: [u8; 32],
     /// Set once we have begun sending chunks, so a second trigger (e.g. a second
     /// recipient accepting a live offer) does not restart the stream.
     started: bool,
@@ -248,11 +619,13 @@ struct Pending {
 /// has room, so a large (or live, arbitrary-size) file is streamed from disk and
 /// paced by the socket -- never sealed or buffered whole in memory.
 struct Upload {
+    offer_id: [u8; 16],
     group: GroupId,
     file: std::fs::File,
     /// Display name, for progress.
     name: String,
-    meta: TransferMeta,
+    /// The per-file content key each chunk is sealed under.
+    content_key: [u8; 32],
     /// Total chunks and the next one to send.
     total: u32,
     index: u32,
@@ -267,6 +640,9 @@ struct IncomingFile {
     from: String,
     name: String,
     size: u64,
+    /// The per-file content key from the sealed manifest: every chunk is opened
+    /// with it (see `crypto::open_chunk`), so bulk bytes never touch the ratchet.
+    content_key: [u8; 32],
     /// Set only once the user explicitly accepts. Chunks are written to disk
     /// only for an accepted offer, so a malicious server cannot bypass the
     /// consent gate by streaming an un-accepted file's bytes at us.
@@ -303,6 +679,10 @@ pub struct Client {
     friends: Vec<Friend>,
     incoming: Vec<Friend>,
     outgoing: Vec<Friend>,
+    /// Handles that removed US (they initiated the un-friend). Only these auto-
+    /// reconnect when they re-add us; a person WE removed does not. Cleared once
+    /// we are friends again. Persisted so the direction survives a restart.
+    removed_me: std::collections::BTreeSet<String>,
     /// username -> current display name, learned from friend snapshots.
     display_names: HashMap<String, String>,
     /// The server's UDP media address (derived from the signaling URL).
@@ -342,6 +722,56 @@ pub struct Client {
     /// Files offered to us, awaiting/undergoing consented download (see
     /// [`IncomingFile`]). An entry exists from the offer until it resolves.
     incoming_files: HashMap<[u8; 16], IncomingFile>,
+    /// Our own end-to-end profile: display name, status, accent, bio, avatar
+    /// reference. Sealed and broadcast to the groups we share; the server never
+    /// sees it. Persisted in the session.
+    my_profile: transfer::Profile,
+    /// Seed for our ring-signature voting keypair (anonymous polls). Stable per
+    /// account (persisted); our voting public key rides in `my_profile`.
+    voting_seed: [u8; 32],
+    /// Cached profiles of people we share a group with, keyed by username.
+    /// Persisted, so names and avatars render immediately on restart.
+    profiles: HashMap<String, transfer::Profile>,
+    /// Avatar decryption keys for blobs we have requested but not yet received
+    /// (content address -> one-time key from the sealed profile), so a
+    /// [`ServerMsg::Avatar`] reply can be authenticated and opened.
+    pending_avatars: HashMap<[u8; 32], [u8; 32]>,
+    /// When we last committed a self-update to heal a desynced conversation, per
+    /// group. Debounces the heal so a burst of undecryptable messages triggers at
+    /// most one rekey per cooldown (see [`Client::heal_group`]).
+    last_heal: HashMap<GroupId, Instant>,
+    /// An in-progress voice-message recording, if any (mic capture + the target
+    /// conversation). Present only between `start_voice` and `stop_voice`/
+    /// `cancel_voice`.
+    voice_rec: Option<VoiceRec>,
+    /// A stopped-but-not-yet-sent voice message, held so the user can preview it
+    /// before sending (see `stop_voice` / `send_voice` / `cancel_voice`).
+    voice_pending: Option<PendingVoice>,
+    /// A persistent speaker stream for playing voice messages, created on first
+    /// play and reused (a stable stream lifecycle, unlike a per-play detached one).
+    voice_playback: Option<enclave_media::AudioPlayback>,
+    /// DMs found to be forked (peer on a different MLS group), awaiting the
+    /// smaller handle to re-establish the peer. Drained by `pump_reinvites`.
+    pending_reinvites: HashSet<GroupId>,
+    /// When we last re-established each forked DM, to debounce (see REINVITE_COOLDOWN).
+    last_reinvite: HashMap<GroupId, Instant>,
+}
+
+/// A recorded-and-encoded voice message waiting for the user to send or discard.
+struct PendingVoice {
+    bytes: Vec<u8>,
+    duration_ms: u32,
+    waveform: Vec<u8>,
+    group: GroupId,
+}
+
+/// A voice message being recorded: the live mic capture (kept alive so the stream
+/// keeps running), the frame channel it feeds, when it began, and which
+/// conversation it is for.
+struct VoiceRec {
+    _capture: enclave_media::AudioCapture,
+    rx: std::sync::mpsc::Receiver<Vec<i16>>,
+    group: GroupId,
 }
 
 impl Client {
@@ -361,6 +791,7 @@ impl Client {
             friends: Vec::new(),
             incoming: Vec::new(),
             outgoing: Vec::new(),
+            removed_me: std::collections::BTreeSet::new(),
             display_names: HashMap::new(),
             media_addr: media_addr_from(server_url),
             call: None,
@@ -377,6 +808,20 @@ impl Client {
             unacked: BTreeMap::new(),
             seen: transfer::SeenSet::new(MAX_SEEN_IDS),
             delivery_warned: false,
+            my_profile: transfer::Profile::default(),
+            voting_seed: {
+                let mut s = [0u8; 32];
+                let _ = getrandom::getrandom(&mut s);
+                s
+            },
+            profiles: HashMap::new(),
+            last_heal: HashMap::new(),
+            voice_rec: None,
+            voice_pending: None,
+            voice_playback: None,
+            pending_reinvites: HashSet::new(),
+            last_reinvite: HashMap::new(),
+            pending_avatars: HashMap::new(),
         })
     }
 
@@ -448,12 +893,21 @@ impl Client {
             upload,
             identity_pub: identity.identity_key(),
             key_package,
-            display: display.to_string(),
+            // The display name is end-to-end now: the server gets an empty one
+            // (it defaults to the username) and never learns the chosen name.
+            display: String::new(),
         });
         let server_display = self.await_auth().await?;
         self.finish_login(identity, &handle, server_display);
         self.export_key = export_key;
         self.password = Zeroizing::new(password.to_string());
+        // Record the chosen display name in the end-to-end profile; it will be
+        // sealed and broadcast once the user shares a group.
+        if !display.trim().is_empty() {
+            self.display = display.to_string();
+            self.my_profile.display_name = display.to_string();
+        }
+        self.save_session();
         Ok(())
     }
 
@@ -511,6 +965,9 @@ impl Client {
         self.incoming_files.clear();
         self.unacked.clear();
         self.seen.clear();
+        self.my_profile = transfer::Profile::default();
+        self.profiles.clear();
+        self.pending_avatars.clear();
     }
 
     fn finish_login(&mut self, identity: Identity, username: &str, display: String) {
@@ -620,11 +1077,20 @@ impl Client {
         &self.display
     }
 
-    /// The display name for a username (falls back to the username).
+    /// The display name for a username, preferring the end-to-end profile the
+    /// user set (server-blind), then the legacy server-distributed name, then the
+    /// username itself. Our own name comes from our own profile.
     pub fn display_of(&self, username: &str) -> String {
-        self.display_names
-            .get(username)
-            .cloned()
+        let from_profile = if Some(username) == self.username.as_deref() {
+            (!self.my_profile.display_name.is_empty()).then(|| self.my_profile.display_name.clone())
+        } else {
+            self.profiles
+                .get(username)
+                .map(|p| p.display_name.clone())
+                .filter(|d| !d.is_empty())
+        };
+        from_profile
+            .or_else(|| self.display_names.get(username).cloned())
             .unwrap_or_else(|| username.to_string())
     }
 
@@ -643,15 +1109,264 @@ impl Client {
         &self.outgoing
     }
 
-    /// Change our display name (cosmetic); friends are notified by the server.
+    /// People who removed us and have not been reconnected: they auto-reconnect
+    /// if they re-add us, and their DM stays readable. Sourced from `removed_me`
+    /// (the recorded removal direction), so a person we removed is not listed.
+    pub fn past_contacts(&self) -> Vec<Friend> {
+        self.removed_me
+            .iter()
+            .filter(|h| !self.is_friend(h))
+            .map(|h| Friend {
+                username: h.clone(),
+                display: self.display_of(h),
+            })
+            .collect()
+    }
+
+    /// Whether `handle` is currently an accepted friend.
+    fn is_friend(&self, handle: &str) -> bool {
+        self.friends.iter().any(|f| f.username == handle)
+    }
+
+    /// If `group_id` is a DM whose peer is no longer a friend, send them a
+    /// reconnect (friend) request. Called when messaging into such a DM so that
+    /// texting a removed person re-adds them.
+    fn reconnect_dm_peer_if_needed(&mut self, group_id: &GroupId) {
+        let me = self.username.clone().unwrap_or_default();
+        let peer = self.conversations.get(group_id).and_then(|c| {
+            (c.kind == ConvKind::Dm)
+                .then(|| c.members.iter().find(|m| **m != me).cloned())
+                .flatten()
+        });
+        if let Some(peer) = peer {
+            if !self.is_friend(&peer) {
+                self.send_friend_request(&peer);
+            }
+        }
+    }
+
+    /// Groups we currently share with `friend` (both members), across every
+    /// visibility EXCEPT Left (we can't restore a group we exited). Includes
+    /// Deleted ones, so a friend's profile can list them and clicking restores.
+    /// Returns (hex id, title) pairs.
+    pub fn shared_groups(&self, friend: &str) -> Vec<(String, String)> {
+        self.conversations
+            .iter()
+            .filter(|(_, c)| {
+                c.kind == ConvKind::Group
+                    && c.visibility != Visibility::Left
+                    && c.members.iter().any(|m| m == friend)
+            })
+            .map(|(id, c)| (hex_id(id), c.title.clone()))
+            .collect()
+    }
+
+    /// Change our display name. Unlike the legacy server-visible name, this now
+    /// lives in the end-to-end profile: it is sealed and broadcast to the groups
+    /// we share, so the server never learns it.
     pub fn set_display_name(&mut self, display: &str) {
         self.display = display.to_string();
-        if let Some(u) = self.username.clone() {
-            self.display_names.insert(u, display.to_string());
+        self.my_profile.display_name = display.to_string();
+        self.commit_profile();
+    }
+
+    /// Our own current profile, for the editor and self-card.
+    pub fn my_profile(&self) -> &transfer::Profile {
+        &self.my_profile
+    }
+
+    /// A peer's cached profile, if we have received one (we share a group).
+    pub fn profile_of(&self, username: &str) -> Option<&transfer::Profile> {
+        self.profiles.get(username)
+    }
+
+    /// Every profile we know: our own plus each cached peer, for the UI to seed
+    /// its render map on login.
+    pub fn all_profiles(&self) -> Vec<(String, transfer::Profile)> {
+        let mut out: Vec<(String, transfer::Profile)> = self
+            .profiles
+            .iter()
+            .map(|(u, p)| (u.clone(), p.clone()))
+            .collect();
+        if let Some(me) = &self.username {
+            out.push((me.clone(), self.my_profile.clone()));
         }
-        self.conn.send(ClientMsg::SetDisplayName {
-            display: display.to_string(),
+        out
+    }
+
+    /// Set the custom status (emoji + free text) at once; sealed + broadcast.
+    /// Distinct from `set_status`, which sets the coarse server-visible presence.
+    pub fn set_custom_status(&mut self, emoji: &str, text: &str) {
+        self.my_profile.status_emoji = emoji.to_string();
+        self.my_profile.status_text = text.to_string();
+        self.commit_profile();
+    }
+
+    /// Set the personal accent color ("#rrggbb", or "" for the app default).
+    pub fn set_accent(&mut self, accent: &str) {
+        self.my_profile.accent = accent.to_string();
+        self.commit_profile();
+    }
+
+    /// Set the short bio / about line.
+    pub fn set_bio(&mut self, bio: &str) {
+        self.my_profile.bio = bio.to_string();
+        self.commit_profile();
+    }
+
+    /// Replace our avatar with `image` (already downscaled + re-encoded by the
+    /// UI). The image is encrypted under a fresh key, uploaded to the server as
+    /// an opaque content-addressed blob, cached locally so we can show it too,
+    /// and referenced (address + key) in the sealed profile we then broadcast.
+    /// Rejects an oversized image so a caller can surface a clear error.
+    pub fn set_avatar(&mut self, image: &[u8], mime: &str) -> Result<(), ClientError> {
+        let sealed = enclave_crypto::seal_blob(image)?;
+        if sealed.ciphertext.len() > transfer::MAX_AVATAR_BYTES {
+            return Err(ClientError::Profile(
+                "avatar image is too large; pick a smaller one".into(),
+            ));
+        }
+        // Cache the plaintext locally (content-addressed) so our own tile shows
+        // it without a round-trip, and upload the ciphertext to the server.
+        self.cache_avatar(&sealed.addr, image);
+        self.send_reliable(ClientMsg::PutAvatar {
+            addr: sealed.addr,
+            data: sealed.ciphertext.clone(),
         });
+        self.my_profile.avatar = Some(transfer::AvatarRef {
+            addr: sealed.addr,
+            key: sealed.key,
+            mime: mime.to_string(),
+            size: sealed.ciphertext.len() as u32,
+        });
+        self.commit_profile();
+        Ok(())
+    }
+
+    /// Remove our avatar (back to initials); sealed + broadcast.
+    pub fn clear_avatar(&mut self) {
+        self.my_profile.avatar = None;
+        self.commit_profile();
+    }
+
+    /// Bump the profile version, persist, and broadcast the new profile to every
+    /// group we share. The monotonic version lets receivers apply last-writer-
+    /// wins and ignore a reordered or duplicated update.
+    fn commit_profile(&mut self) {
+        self.my_profile.version = self.my_profile.version.saturating_add(1);
+        self.save_session();
+        self.broadcast_profile();
+    }
+
+    /// Seal our current profile and send it into every established group. Cheap
+    /// (a few hundred bytes each): the avatar image is not inline, only its
+    /// content address + key. A pending DM (no group yet) is skipped; it gets our
+    /// profile when the group is established.
+    fn broadcast_profile(&mut self) {
+        if self.username.is_none() {
+            return;
+        }
+        // Always publish our voting public key so peers can build anonymous-poll
+        // rings (idempotent; the seed is stable per account).
+        self.my_profile.voting_key =
+            Some(enclave_crypto::RingKeypair::from_seed(&self.voting_seed).public);
+        let payload = self.my_profile.encode();
+        let groups: Vec<GroupId> = self
+            .conversations
+            .iter()
+            .filter(|(_, c)| c.group.is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for group in groups {
+            let _ = self.send_transfer(&group, TransferMeta::Profile, &payload);
+        }
+    }
+
+    /// Send our current profile into one specific group (used when a group is
+    /// established or a member joins, so the new co-member gets it promptly).
+    fn send_profile_to(&mut self, group: &GroupId) {
+        self.my_profile.voting_key =
+            Some(enclave_crypto::RingKeypair::from_seed(&self.voting_seed).public);
+        if self.username.is_none() {
+            return;
+        }
+        let payload = self.my_profile.encode();
+        let _ = self.send_transfer(group, TransferMeta::Profile, &payload);
+    }
+
+    /// The local content-addressed cache of decrypted avatar images. A file is
+    /// named by its hex address and is immutable (a new avatar gets a new
+    /// address), so a cached entry is never stale and never needs invalidation.
+    fn avatar_dir(&self) -> PathBuf {
+        self.keystore_dir.join("avatars")
+    }
+
+    fn avatar_path(&self, addr: &[u8; 32]) -> PathBuf {
+        self.avatar_dir().join(hex::encode(addr))
+    }
+
+    /// Whether the decrypted avatar for `addr` is already cached locally.
+    pub fn have_avatar(&self, addr: &[u8; 32]) -> bool {
+        self.avatar_path(addr).exists()
+    }
+
+    /// The local path of a cached avatar image, for the UI's `enclave://` handler.
+    pub fn avatar_file(&self, addr: &[u8; 32]) -> Option<PathBuf> {
+        let p = self.avatar_path(addr);
+        p.exists().then_some(p)
+    }
+
+    /// Write a decrypted avatar image into the content-addressed cache.
+    fn cache_avatar(&self, addr: &[u8; 32], image: &[u8]) {
+        let _ = std::fs::create_dir_all(self.avatar_dir());
+        let _ = std::fs::write(self.avatar_path(addr), image);
+    }
+
+    /// Apply a peer's sealed profile update. It is attributed to `username` --
+    /// the authenticated MLS sender -- never to any field inside the payload, so
+    /// a peer can only ever set its own profile. Applies last-writer-wins by
+    /// version, caches + persists, and fetches the avatar blob if it is new.
+    fn on_profile_update(&mut self, username: &str, data: &[u8]) -> Option<Event> {
+        let mut profile = transfer::Profile::decode(data)?;
+        // DoS guard: drop an avatar reference claiming to exceed the cap so its
+        // blob is never fetched -- a peer cannot make us download a huge image.
+        if profile
+            .avatar
+            .as_ref()
+            .is_some_and(|a| a.size as usize > transfer::MAX_AVATAR_BYTES)
+        {
+            profile.avatar = None;
+        }
+        // Last-writer-wins: keep only a strictly newer version (or the first
+        // one), so a reordered or duplicated broadcast never regresses state.
+        if let Some(existing) = self.profiles.get(username) {
+            if profile.version <= existing.version {
+                return None;
+            }
+        }
+        let avatar = profile.avatar.clone();
+        self.profiles.insert(username.to_string(), profile);
+        self.save_session();
+        // Fetch the avatar blob only if we do not already hold its decrypted
+        // image (content-addressed, so an unchanged avatar is a cache hit).
+        if let Some(av) = avatar {
+            if !self.have_avatar(&av.addr) {
+                self.pending_avatars.insert(av.addr, av.key);
+                self.conn.send(ClientMsg::FetchAvatar { addr: av.addr });
+            }
+        }
+        Some(Event::ProfileChanged {
+            user: username.to_string(),
+        })
+    }
+
+    /// The username whose cached profile points at avatar `addr` (to re-render
+    /// the right tile once the blob decrypts).
+    fn user_with_avatar(&self, addr: &[u8; 32]) -> Option<String> {
+        self.profiles
+            .iter()
+            .find(|(_, p)| p.avatar.as_ref().is_some_and(|a| &a.addr == addr))
+            .map(|(u, _)| u.clone())
     }
 
     /// Send a friend request to a unique username. If they had already requested
@@ -676,8 +1391,11 @@ impl Client {
         });
     }
 
-    /// Remove an existing friend.
-    pub fn remove_friend(&self, handle: &str) {
+    /// Remove an existing friend. WE initiated it, so `handle` is not marked as
+    /// "removed us": a later re-add from them is a normal request, not a silent
+    /// auto-reconnect. Their DM stays readable in the Inactive section.
+    pub fn remove_friend(&mut self, handle: &str) {
+        self.removed_me.remove(handle);
         self.conn.send(ClientMsg::FriendRemove {
             handle: handle.to_string(),
         });
@@ -695,52 +1413,64 @@ impl Client {
     pub async fn open_dm(&mut self, friend: &str) -> Result<String, ClientError> {
         let me = self.me()?;
         let dm_id = derive_dm_id(&me, friend);
-        if self.conversations.contains_key(&dm_id) {
+        // Already established? Just focus it, and bring it back to the Chats list
+        // if it was archived (opening it counts as activity).
+        if self
+            .conversations
+            .get(&dm_id)
+            .is_some_and(|c| c.group.is_some())
+        {
+            if self.touch_conversation(&dm_id) {
+                self.save_session();
+            }
             self.active = Some(dm_id.clone());
             return Ok(hex_id(&dm_id));
         }
-        if me.as_str() < friend {
-            // We create the group and invite them.
-            let identity = self.identity()?;
-            let group = Group::create(identity)?;
-            let mls_group_id = group.mls_group_id();
-            self.conn.send(ClientMsg::JoinGroup {
-                group: dm_id.clone(),
-            });
-            self.conversations.insert(
-                dm_id.clone(),
-                Conversation {
-                    group: Some(group),
-                    mls_group_id,
-                    kind: ConvKind::Dm,
-                    title: friend.to_string(),
-                    members: vec![me, friend.to_string()],
-                    history: Vec::new(),
-                    verified: None,
-                    reassembler: Reassembler::new(),
-                },
-            );
-            self.invite_peer(&dm_id, friend, "").await?;
-            self.save_session();
-        } else {
-            // They are the creator; ask them to open it, and show it as pending.
-            self.conn.send(ClientMsg::RequestDm {
-                to: friend.to_string(),
-            });
-            self.conversations.insert(
-                dm_id.clone(),
-                Conversation {
-                    group: None,
-                    mls_group_id: Vec::new(),
-                    kind: ConvKind::Dm,
-                    title: friend.to_string(),
-                    members: vec![me, friend.to_string()],
-                    history: Vec::new(),
-                    verified: None,
-                    reassembler: Reassembler::new(),
-                },
-            );
-        }
+        // Drop any stale pending placeholder from an older session before
+        // creating, but CARRY FORWARD its history and disappearing setting: a
+        // previously deleted DM (visibility Deleted, group None) keeps its sealed
+        // scrollback, so re-opening the same peer restores the old conversation.
+        let prior = self.conversations.remove(&dm_id);
+        let restored_history = prior
+            .as_ref()
+            .map(|c| c.history.clone())
+            .unwrap_or_default();
+        let restored_disappearing = prior.as_ref().and_then(|c| c.disappearing_ms);
+        // Create the MLS group NOW from the peer's published key package and queue
+        // the Welcome (delivered when they next log in) -- a DM never waits for the
+        // peer to be online. If BOTH sides open it at once, the two groups converge
+        // deterministically on the smaller handle's (see the Welcome handler).
+        let identity = self.identity()?;
+        let group = Group::create(identity)?;
+        let mls_group_id = group.mls_group_id();
+        self.conn.send(ClientMsg::JoinGroup {
+            group: dm_id.clone(),
+        });
+        self.conversations.insert(
+            dm_id.clone(),
+            Conversation {
+                group: Some(group),
+                mls_group_id,
+                kind: ConvKind::Dm,
+                title: friend.to_string(),
+                members: vec![me, friend.to_string()],
+                history: restored_history,
+                verified: None,
+                reassembler: Reassembler::new(),
+                disappearing_ms: restored_disappearing,
+                visibility: Visibility::Active,
+                local_only: false,
+                reactions: HashMap::new(),
+                edited: HashSet::new(),
+                polls: HashMap::new(),
+                pinned: HashSet::new(),
+            },
+        );
+        self.invite_peer(&dm_id, friend, "").await?;
+        // Hand the peer our profile as soon as the DM exists, so opening a
+        // conversation reveals each other's name/avatar right away.
+        self.send_profile_to(&dm_id);
+        self.save_session();
         self.active = Some(dm_id.clone());
         Ok(hex_id(&dm_id))
     }
@@ -771,14 +1501,64 @@ impl Client {
                 history: Vec::new(),
                 verified: None,
                 reassembler: Reassembler::new(),
+                disappearing_ms: None,
+                visibility: Visibility::Active,
+                local_only: false,
+                reactions: HashMap::new(),
+                edited: HashSet::new(),
+                polls: HashMap::new(),
+                pinned: HashSet::new(),
             },
         );
         for member in members {
             self.invite_peer(&group_id, member, name).await?;
         }
+        // Announce our profile to the new group's members.
+        self.send_profile_to(&group_id);
         self.save_session();
         self.active = Some(group_id.clone());
         Ok(hex_id(&group_id))
+    }
+
+    /// Open (creating on first use) the local-only "Notes to self" scratchpad and
+    /// focus it. It is a conversation with exactly one member (us) and NO MLS
+    /// group: nothing it holds is ever sealed or sent -- every send path records
+    /// locally instead (see the `local_only` guard in `send_text`/`offer_file`/
+    /// `send_voice`). Idempotent: there is exactly one per account, keyed by a
+    /// stable derived id, so calling this again just re-focuses the same notes.
+    pub fn open_self_notes(&mut self) -> Result<String, ClientError> {
+        let me = self.me()?;
+        let id = derive_self_id(&me);
+        // Restore visibility if it was archived/deleted; never touch the network.
+        if self.conversations.contains_key(&id) {
+            self.touch_conversation(&id);
+            self.active = Some(id.clone());
+            self.save_session();
+            return Ok(hex_id(&id));
+        }
+        self.conversations.insert(
+            id.clone(),
+            Conversation {
+                group: None,
+                mls_group_id: Vec::new(),
+                kind: ConvKind::Dm,
+                title: "Notes to self".to_string(),
+                members: vec![me],
+                history: Vec::new(),
+                verified: None,
+                reassembler: Reassembler::new(),
+                disappearing_ms: None,
+                visibility: Visibility::Active,
+                local_only: true,
+                reactions: HashMap::new(),
+                edited: HashSet::new(),
+                polls: HashMap::new(),
+                pinned: HashSet::new(),
+            },
+        );
+        self.active = Some(id.clone());
+        self.save_session();
+        Ok(hex_id(&id))
     }
 
     /// Add a friend to the active named group (no effect on a DM -- to grow a
@@ -796,6 +1576,8 @@ impl Client {
             conv.title.clone()
         };
         self.invite_peer(&group_id, friend, &name).await?;
+        // The new member needs our profile too.
+        self.send_profile_to(&group_id);
         self.save_session();
         Ok(())
     }
@@ -815,7 +1597,14 @@ impl Client {
             .get_mut(group_id)
             .ok_or(ClientError::NoGroup)?;
         let group = conv.group.as_mut().ok_or(ClientError::NoGroup)?;
-        let add = group.add_member(identity, &key_package)?;
+        // While fetching the key package we may have ADOPTED the peer's own group
+        // (a both-opened-at-once DM the tie-break resolved in their favor). If the
+        // peer is already a member, the DM is already established -- do not add
+        // them again (which would fail as a duplicate).
+        if group.member_keys().iter().any(|(name, _)| name == friend) {
+            return Ok(());
+        }
+        let add = group.add_member(identity, &key_package, friend)?;
         if !conv.members.iter().any(|m| m == friend) {
             conv.members.push(friend.to_string());
         }
@@ -832,23 +1621,139 @@ impl Client {
         Ok(())
     }
 
-    /// Leave / delete a conversation: stop receiving its traffic and drop it
-    /// locally. If a call is active in it, leave that first.
-    pub fn leave_conversation(&mut self, conv_hex: &str) {
+    /// Delete a conversation: it disappears from the Chats list (no Inactive
+    /// section) but we stay a member and keep the sealed history, so it reappears
+    /// in Active the moment a message arrives, or when reopened -- a DM by
+    /// clicking the person, a group from "groups you share" on a friend. The MLS
+    /// group is KEPT, so reopening reuses it (no fork). Use `clear_history` to
+    /// wipe the messages, or `leave_group` to truly exit a group.
+    pub fn delete_conversation(&mut self, conv_hex: &str) {
         let Some(group_id) = self.group_by_hex(conv_hex) else {
             return;
         };
+        let left = self
+            .conversations
+            .get(&group_id)
+            .is_some_and(|c| c.visibility == Visibility::Left);
+        if left {
+            // Already out of the group (no membership to keep): deleting removes it
+            // from view entirely.
+            self.conversations.remove(&group_id);
+        } else if let Some(c) = self.conversations.get_mut(&group_id) {
+            // Keep the group + membership so it can reappear; only hide it.
+            c.visibility = Visibility::Deleted;
+        }
+        if self.active.as_ref() == Some(&group_id) {
+            self.active = None;
+        }
+        self.save_session();
+    }
+
+    /// Truly leave a group: leave the MLS group (stop receiving) and delete its
+    /// provider state so a rejoin can recreate it, while keeping the history
+    /// readable on the Archived page. Rejoining is only possible if a member
+    /// re-invites us (a fresh Welcome restores it).
+    pub fn leave_group(&mut self, conv_hex: &str) {
+        let Some(group_id) = self.group_by_hex(conv_hex) else {
+            return;
+        };
+        // "Notes to self" has no group to leave and must never touch the network:
+        // there is nothing to leave. (The UI hides the option; this is a backstop.)
+        if self.is_local_only(&group_id) {
+            return;
+        }
         if self.call_group.as_ref() == Some(&group_id) {
             self.leave_call();
         }
         self.conn.send(ClientMsg::LeaveGroup {
             group: group_id.clone(),
         });
-        self.conversations.remove(&group_id);
+        let me = self.username.clone().unwrap_or_default();
+        let taken = self.conversations.get_mut(&group_id).and_then(|c| {
+            c.visibility = Visibility::Left;
+            // We are no longer in the group, so drop ourselves from our own copy of
+            // the roster (the server won't send us further membership updates).
+            c.members.retain(|m| m != &me);
+            c.group.take()
+        });
+        if let (Some(g), Some(identity)) = (taken, self.identity.as_ref()) {
+            let _ = g.delete(identity);
+        }
         if self.active.as_ref() == Some(&group_id) {
             self.active = None;
         }
         self.save_session();
+    }
+
+    /// Hide a conversation to the Archived page with no data change: it stays a
+    /// member and keeps receiving, and returns to Active when opened or on a new
+    /// message. A reversible declutter, distinct from delete (which disappears).
+    pub fn archive_conversation(&mut self, conv_hex: &str) {
+        let Some(group_id) = self.group_by_hex(conv_hex) else {
+            return;
+        };
+        if let Some(c) = self.conversations.get_mut(&group_id) {
+            if c.visibility == Visibility::Active {
+                c.visibility = Visibility::Archived;
+            }
+        }
+        if self.active.as_ref() == Some(&group_id) {
+            self.active = None;
+        }
+        self.save_session();
+    }
+
+    /// Return an Archived or Deleted conversation to the live Chats list without
+    /// opening it. A Left group cannot be un-archived (we are no longer a member).
+    pub fn unarchive_conversation(&mut self, conv_hex: &str) {
+        let Some(group_id) = self.group_by_hex(conv_hex) else {
+            return;
+        };
+        if let Some(c) = self.conversations.get_mut(&group_id) {
+            if c.visibility == Visibility::Archived || c.visibility == Visibility::Deleted {
+                c.visibility = Visibility::Active;
+            }
+        }
+        self.save_session();
+    }
+
+    /// Wipe a conversation's message history, keeping the conversation and its
+    /// MLS channel intact. The scrollback is gone locally; nothing is sent to
+    /// the peer (their copy is theirs to clear).
+    pub fn clear_history(&mut self, conv_hex: &str) {
+        let Some(group_id) = self.group_by_hex(conv_hex) else {
+            return;
+        };
+        if let Some(c) = self.conversations.get_mut(&group_id) {
+            c.history.clear();
+        }
+        self.save_session();
+    }
+
+    /// Return an Archived or Deleted conversation to Active because it saw
+    /// activity (a message sent or received, or it was opened). No-op for Active
+    /// or Left conversations (Left has no group and receives nothing). Returns
+    /// true if the visibility actually changed, so the caller can re-emit the
+    /// conversation list.
+    fn touch_conversation(&mut self, group_id: &GroupId) -> bool {
+        if let Some(c) = self.conversations.get_mut(group_id) {
+            if c.visibility == Visibility::Archived || c.visibility == Visibility::Deleted {
+                c.visibility = Visibility::Active;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Note that `group` saw new activity (a message received in it). If it was
+    /// Archived or Deleted, return it to Active and queue a conversation-list
+    /// refresh so it reappears in the Chats list. Called from the incoming-message
+    /// path; the send path un-hides via `open_dm`/`switch` when the conversation
+    /// is opened to type into it.
+    fn note_activity(&mut self, group_id: &GroupId) {
+        if self.touch_conversation(group_id) {
+            self.pending.push_back(Event::ConversationsChanged);
+        }
     }
 
     /// Remove a member from a group: MLS-rekey so they cannot read the new epoch,
@@ -885,7 +1790,721 @@ impl Client {
         Ok(())
     }
 
-    /// Focus a conversation by its hex id.
+    /// Where decoded-on-demand voice clips are cached (one file per message id).
+    fn voice_dir(&self) -> PathBuf {
+        self.keystore_dir.join("voice")
+    }
+
+    /// Begin recording a voice message for the active conversation. Refuses while
+    /// in a call (the mic is in use) or with no conversation open. The mic runs
+    /// until [`send_voice`](Self::send_voice) or [`cancel_voice`](Self::cancel_voice).
+    pub fn start_voice(&mut self) -> Result<(), ClientError> {
+        if self.call.is_some() {
+            return Err(ClientError::Audio(
+                "can't record a voice message during a call".into(),
+            ));
+        }
+        let group = self.active.clone().ok_or(ClientError::NoGroup)?;
+        let (capture, rx) =
+            enclave_media::AudioCapture::start().map_err(|e| ClientError::Audio(e.to_string()))?;
+        self.voice_rec = Some(VoiceRec {
+            _capture: capture,
+            rx,
+            group,
+        });
+        Ok(())
+    }
+
+    /// Discard an in-progress voice recording or a stopped-but-unsent preview.
+    pub fn cancel_voice(&mut self) {
+        self.voice_rec = None; // dropping the capture stops the mic stream
+        self.voice_pending = None;
+    }
+
+    /// Stop recording and encode the captured audio, holding it as a PENDING voice
+    /// message (not sent). Returns a local path to preview it and the duration, so
+    /// the user can listen before choosing to send (`send_voice`) or discard
+    /// (`cancel_voice`). Errors if nothing was captured or encoding fails.
+    pub fn stop_voice(&mut self) -> Result<(String, u32, Vec<u8>), ClientError> {
+        let rec = self
+            .voice_rec
+            .take()
+            .ok_or_else(|| ClientError::Audio("no voice recording in progress".into()))?;
+        // Draining the channel after the capture is dropped collects every frame
+        // the mic pushed (each is 20 ms of 48 kHz mono).
+        let mut pcm: Vec<i16> = Vec::new();
+        while let Ok(frame) = rec.rx.try_recv() {
+            pcm.extend_from_slice(&frame);
+        }
+        if pcm.is_empty() {
+            return Err(ClientError::Audio("the recording was empty".into()));
+        }
+        let frame_samples = enclave_media::audio::FRAME_SAMPLES;
+        let duration_ms = (pcm.len() as u64 * 1000 / 48_000) as u32;
+        let mut enc =
+            enclave_media::AudioEncoder::new().map_err(|e| ClientError::Audio(e.to_string()))?;
+        let mut packets = Vec::with_capacity(pcm.len() / frame_samples + 1);
+        for chunk in pcm.chunks(frame_samples) {
+            let mut frame = chunk.to_vec();
+            frame.resize(frame_samples, 0); // pad the final short frame with silence
+            packets.push(
+                enc.encode(&frame)
+                    .map_err(|e| ClientError::Audio(e.to_string()))?,
+            );
+        }
+        let waveform = transfer::waveform_bars(&pcm, 64);
+        let bytes = transfer::VoiceClip {
+            duration_ms,
+            packets,
+            waveform: waveform.clone(),
+        }
+        .encode();
+        // Write a preview file the user can play before sending.
+        let preview = self
+            .store_voice_at("__preview", &bytes)
+            .ok_or_else(|| ClientError::Audio("could not cache the recording".into()))?;
+        self.voice_pending = Some(PendingVoice {
+            bytes,
+            duration_ms,
+            waveform: waveform.clone(),
+            group: rec.group,
+        });
+        Ok((preview, duration_ms, waveform))
+    }
+
+    /// Send the pending (stopped) voice message and record it locally. Returns the
+    /// message id, timestamp, and duration (ms).
+    pub async fn send_voice(&mut self) -> Result<(String, u64, u32, Vec<u8>), ClientError> {
+        let pending = self
+            .voice_pending
+            .take()
+            .ok_or_else(|| ClientError::Audio("no voice message to send".into()))?;
+        let PendingVoice {
+            bytes,
+            duration_ms,
+            waveform,
+            group,
+        } = pending;
+        // "Notes to self" is local-only: cache the clip and record it with a
+        // fresh local id, but never seal or send it. Everything else is identical.
+        let id = if self.is_local_only(&group) {
+            new_transfer_id()
+        } else {
+            self.send_transfer(&group, TransferMeta::Voice, &bytes)?
+        };
+        let path = self.store_voice_at(&hex::encode(id), &bytes);
+        let ts = now_ms();
+        let me = self.me()?;
+        if let Some(conv) = self.conversations.get_mut(&group) {
+            conv.history.push(ChatLine {
+                id,
+                ts,
+                from: me,
+                text: String::new(),
+                mine: true,
+                file: path.clone().map(|p| FileRef {
+                    name: "Voice message".into(),
+                    size: bytes.len() as u64,
+                    path: p,
+                }),
+                system: false,
+                deleted: false,
+                reply_to: None,
+                voice_ms: Some(duration_ms),
+                waveform: waveform.clone(),
+            });
+        }
+        self.save_session();
+        Ok((hex::encode(id), ts, duration_ms, waveform))
+    }
+
+    /// Write a voice clip to the local cache under `name`, returning its path (or
+    /// `None` if the cache directory could not be written).
+    fn store_voice_at(&self, name: &str, bytes: &[u8]) -> Option<String> {
+        let dir = self.voice_dir();
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).ok()?;
+        Some(path.to_string_lossy().into_owned())
+    }
+
+    /// The local path of a cached voice clip by its hex message id (for the
+    /// sender to replay its own voice message).
+    pub fn voice_clip_path(&self, id_hex: &str) -> String {
+        self.voice_dir().join(id_hex).to_string_lossy().into_owned()
+    }
+
+    /// Play a cached voice clip through the selected speaker. Decodes inline (a
+    /// clip is small and fast) and feeds a PERSISTENT playback stream held by the
+    /// client (created on first play, reused after) -- a stable stream lifecycle
+    /// that plays reliably, unlike a per-play detached stream. Errors are logged.
+    pub fn play_voice(&mut self, path: &str, offset_ms: u32) {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("enclave: voice play: cannot read {path}: {e}");
+                return;
+            }
+        };
+        let Some(clip) = transfer::VoiceClip::decode(&bytes) else {
+            eprintln!("enclave: voice play: clip did not decode");
+            return;
+        };
+        let mut dec = match enclave_media::AudioDecoder::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("enclave: voice play: decoder: {e}");
+                return;
+            }
+        };
+        let mut pcm: Vec<i16> = Vec::new();
+        for pkt in &clip.packets {
+            match dec.decode(pkt) {
+                Ok(samples) => pcm.extend_from_slice(&samples),
+                Err(e) => eprintln!("enclave: voice play: a packet failed to decode: {e}"),
+            }
+        }
+        if pcm.is_empty() {
+            eprintln!(
+                "enclave: voice play: nothing decoded (0 of {} packets)",
+                clip.packets.len()
+            );
+            return;
+        }
+        if self.voice_playback.is_none() {
+            match enclave_media::AudioPlayback::start_on(self.output_device.as_deref()) {
+                Ok(p) => self.voice_playback = Some(p),
+                Err(e) => {
+                    eprintln!("enclave: voice play: could not open speaker: {e}");
+                    return;
+                }
+            }
+        }
+        eprintln!(
+            "enclave: voice play: {} samples ({} ms) -> speaker {:?}",
+            pcm.len(),
+            clip.duration_ms,
+            self.output_device.as_deref().unwrap_or("(default)")
+        );
+        // Resume from `offset_ms` into the clip (48 samples per ms at 48 kHz) so a
+        // paused message continues where it stopped instead of restarting.
+        let skip = (offset_ms as usize).saturating_mul(48).min(pcm.len());
+        if let Some(p) = &self.voice_playback {
+            // Replace anything still queued so a switch/resume never piles up.
+            p.clear();
+            p.push(&pcm[skip..]);
+        }
+    }
+
+    /// Stop voice playback at once (pause): drop whatever is still queued.
+    pub fn stop_voice_playback(&self) {
+        if let Some(p) = &self.voice_playback {
+            p.clear();
+        }
+    }
+
+    /// Delete a message. `everyone` (only meaningful for our own message) also
+    /// tells the other members to tombstone it. Locally the line is always kept
+    /// but marked deleted (a placeholder), never removed. Returns the group so the
+    /// caller can report the change.
+    pub fn delete_message(&mut self, conv: &str, id_hex: &str, everyone: bool) {
+        let Some(mid) = decode_offer_id(id_hex) else {
+            return;
+        };
+        let Some(group) = self
+            .conversations
+            .keys()
+            .find(|k| hex_id(k) == conv)
+            .cloned()
+        else {
+            return;
+        };
+        // Our own copy is FULLY removed (both for "just me" and "for everyone").
+        let mut is_mine = false;
+        if let Some(c) = self.conversations.get_mut(&group) {
+            if let Some(pos) = c.history.iter().position(|l| l.id == mid) {
+                is_mine = c.history[pos].mine;
+                c.history.remove(pos);
+            }
+        }
+        // Only the author may withdraw a message for everyone; the peer tombstones
+        // it (shows "message deleted") while our own copy is gone entirely.
+        if everyone && is_mine {
+            let _ = self.send_transfer(&group, TransferMeta::Delete, &mid);
+        }
+        self.save_session();
+    }
+
+    /// Toggle `user`'s `emoji` reaction on message `mid` within a conversation's
+    /// reaction map, and return the message's reactions after the change. Empty
+    /// emoji lists (and empty message entries) are pruned so the map only ever
+    /// holds live reactions. Shared by the send and receive paths so both mutate
+    /// the state identically.
+    fn apply_reaction(
+        reactions: &mut HashMap<[u8; 16], Vec<transfer::Reaction>>,
+        mid: [u8; 16],
+        user: &str,
+        emoji: &str,
+        add: bool,
+    ) -> Vec<transfer::Reaction> {
+        let list = reactions.entry(mid).or_default();
+        if let Some(r) = list.iter_mut().find(|r| r.emoji == emoji) {
+            r.users.retain(|u| u != user);
+            if add {
+                r.users.push(user.to_string());
+            }
+        } else if add {
+            list.push(transfer::Reaction {
+                emoji: emoji.to_string(),
+                users: vec![user.to_string()],
+            });
+        }
+        list.retain(|r| !r.users.is_empty());
+        let result = list.clone();
+        if list.is_empty() {
+            reactions.remove(&mid);
+        }
+        result
+    }
+
+    /// Toggle OUR emoji reaction on a message: if we already reacted with `emoji`
+    /// we remove it, otherwise we add it. The change is applied locally and, for a
+    /// networked conversation, sealed to the group as a [`TransferMeta::React`]
+    /// control (never for local-only notes). Returns the message's reactions after
+    /// the change so the caller can update the UI immediately.
+    pub fn react(
+        &mut self,
+        conv: &str,
+        id_hex: &str,
+        emoji: &str,
+    ) -> Option<Vec<transfer::Reaction>> {
+        let mid = decode_offer_id(id_hex)?;
+        let emoji = emoji.trim();
+        if emoji.is_empty() || emoji.len() > transfer::MAX_REACTION_BYTES {
+            return None;
+        }
+        let group = self
+            .conversations
+            .keys()
+            .find(|k| hex_id(k) == conv)
+            .cloned()?;
+        let me = self.me().ok()?;
+        // Toggle: if I already hold this emoji on this message, remove it.
+        let add = !self
+            .conversations
+            .get(&group)
+            .and_then(|c| c.reactions.get(&mid))
+            .is_some_and(|list| {
+                list.iter()
+                    .any(|r| r.emoji == emoji && r.users.iter().any(|u| u == &me))
+            });
+        let reactions = {
+            let c = self.conversations.get_mut(&group)?;
+            Self::apply_reaction(&mut c.reactions, mid, &me, emoji, add)
+        };
+        if !self.is_local_only(&group) {
+            let body = transfer::ReactBody {
+                target: mid,
+                emoji: emoji.to_string(),
+                add,
+            };
+            let _ = self.send_transfer(&group, TransferMeta::React, &body.encode());
+        }
+        self.save_session();
+        Some(reactions)
+    }
+
+    /// Edit one of OUR OWN messages: replace its text locally, flag it edited, and
+    /// (for a networked conversation) seal a [`TransferMeta::Edit`] control so the
+    /// other members update their copy. Only a text line we authored can be edited
+    /// -- a file/voice line, a deleted line, or someone else's message is refused.
+    /// Returns the new text on success so the caller can refresh the UI.
+    pub fn edit_message(&mut self, conv: &str, id_hex: &str, text: &str) -> Option<String> {
+        let mid = decode_offer_id(id_hex)?;
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let group = self
+            .conversations
+            .keys()
+            .find(|k| hex_id(k) == conv)
+            .cloned()?;
+        {
+            let c = self.conversations.get_mut(&group)?;
+            let line = c.history.iter_mut().find(|l| l.id == mid)?;
+            // Only our own, still-live, text messages are editable.
+            if !line.mine || line.deleted || line.file.is_some() || line.voice_ms.is_some() {
+                return None;
+            }
+            line.text = text.to_string();
+            c.edited.insert(mid);
+        }
+        if !self.is_local_only(&group) {
+            let body = transfer::EditBody {
+                target: mid,
+                text: text.to_string(),
+            };
+            let _ = self.send_transfer(&group, TransferMeta::Edit, &body.encode());
+        }
+        self.save_session();
+        Some(text.to_string())
+    }
+
+    /// Post a poll to the active conversation: a message line the members can vote
+    /// on. `reveal` is 0 (always show tallies), 1 (after you vote), or 2 (after the
+    /// creator closes). Returns the poll's message id (hex) + timestamp, and the
+    /// poll view for our own optimistic render. Refuses a malformed poll.
+    pub fn create_poll(
+        &mut self,
+        question: &str,
+        options: &[String],
+        multi: bool,
+        reveal: u8,
+        duration_ms: u64,
+        anonymous: bool,
+    ) -> Option<(String, u64, PollView)> {
+        let group = self.active.clone()?;
+        let me = self.me().ok()?;
+        let opts: Vec<String> = options
+            .iter()
+            .map(|o| o.trim().to_string())
+            .filter(|o| !o.is_empty())
+            .collect();
+        let closes_at = if duration_ms > 0 {
+            Some(now_ms() + duration_ms)
+        } else {
+            None
+        };
+        // reveal >= 2 is a server-buffered poll: mint a shared ballot key so votes
+        // seal off the MLS ratchet (the server holds ciphertext it can't read).
+        let buffered = reveal >= 2 && !self.is_local_only(&group);
+        let ballot_key = if buffered {
+            let mut k = [0u8; 32];
+            getrandom::getrandom(&mut k).ok()?;
+            Some(k)
+        } else {
+            None
+        };
+        // Anonymous polls (only meaningful for "everyone, on close"): assemble the
+        // ring from the members' voting keys, including our own. A member with no
+        // published voting key is left out of the ring (they can't vote anonymously).
+        let anonymous = anonymous && reveal == 2 && buffered;
+        let ring: Vec<[u8; 32]> = if anonymous {
+            let my_key = enclave_crypto::RingKeypair::from_seed(&self.voting_seed).public;
+            let members = self
+                .conversations
+                .get(&group)
+                .map(|c| c.members.clone())
+                .unwrap_or_default();
+            let mut r = vec![my_key];
+            for m in &members {
+                if *m == me {
+                    continue;
+                }
+                if let Some(k) = self.profiles.get(m).and_then(|p| p.voting_key) {
+                    r.push(k);
+                }
+            }
+            r
+        } else {
+            Vec::new()
+        };
+        // Anonymity needs at least a 2-member ring to hide anyone.
+        let anonymous = anonymous && ring.len() >= 2;
+        let body = transfer::PollBody {
+            question: question.trim().to_string(),
+            options: opts,
+            multi,
+            reveal,
+            closes_at,
+            ballot_key,
+            anonymous,
+            ring: if anonymous { ring.clone() } else { Vec::new() },
+        };
+        if !body.valid() {
+            return None;
+        }
+        let id = if self.is_local_only(&group) {
+            new_transfer_id()
+        } else {
+            self.send_transfer(&group, TransferMeta::Poll, &body.encode())
+                .ok()?
+        };
+        let ts = now_ms();
+        let poll = Poll {
+            question: body.question.clone(),
+            options: body.options.clone(),
+            multi,
+            reveal,
+            closed: false,
+            closes_at,
+            author: me.clone(),
+            votes: HashMap::new(),
+            ballot_key,
+            anonymous,
+            ring: body.ring.clone(),
+        };
+        // Register the buffered poll with the server so it withholds/routes ballots
+        // and knows we (the sender) are the owner who may close it early.
+        if let Some(mode) = poll.server_mode() {
+            self.send_reliable(ClientMsg::BallotOpen {
+                poll: id,
+                group: group.clone(),
+                mode,
+                release_at: closes_at,
+            });
+        }
+        let view = Self::build_poll_view(&poll, &me);
+        if let Some(c) = self.conversations.get_mut(&group) {
+            c.polls.insert(id, poll);
+            c.history.push(ChatLine {
+                id,
+                ts,
+                from: me,
+                text: body.question,
+                mine: true,
+                file: None,
+                system: false,
+                deleted: false,
+                reply_to: None,
+                voice_ms: None,
+                waveform: Vec::new(),
+            });
+        }
+        self.save_session();
+        Some((hex::encode(id), ts, view))
+    }
+
+    /// Cast (or change, or with an empty selection retract) OUR vote on a poll.
+    /// Single-choice polls keep at most one option; invalid indices are dropped.
+    /// Seals a [`TransferMeta::Vote`] to the group (unless local-only). Returns the
+    /// updated poll view.
+    pub fn vote_poll(&mut self, conv: &str, poll_id: &str, options: Vec<u8>) -> Option<PollView> {
+        let mid = decode_offer_id(poll_id)?;
+        let group = self
+            .conversations
+            .keys()
+            .find(|k| hex_id(k) == conv)
+            .cloned()?;
+        let me = self.me().ok()?;
+        let (sel, ballot_key, anonymous, ring) = {
+            let c = self.conversations.get_mut(&group)?;
+            let poll = c.polls.get_mut(&mid)?;
+            if poll.is_closed() {
+                return None; // a closed (or expired) poll accepts no more votes
+            }
+            let mut sel: Vec<u8> = options
+                .into_iter()
+                .filter(|&i| (i as usize) < poll.options.len())
+                .collect();
+            sel.sort_unstable();
+            sel.dedup();
+            if !poll.multi {
+                sel.truncate(1);
+            }
+            // A non-anonymous poll applies our vote now, keyed by our username. An
+            // anonymous poll keys by our key image instead (set below, after we
+            // sign), so nothing here would attribute the vote to us.
+            if !poll.anonymous {
+                if sel.is_empty() {
+                    poll.votes.remove(&me);
+                } else {
+                    poll.votes.insert(me.clone(), sel.clone());
+                }
+            }
+            (sel, poll.ballot_key, poll.anonymous, poll.ring.clone())
+        };
+        if !self.is_local_only(&group) {
+            let body = transfer::VoteBody {
+                target: mid,
+                options: sel.clone(),
+            };
+            match ballot_key {
+                // Anonymous poll: seal the choice, ring-sign it (proving a member
+                // cast it, without saying which), and submit. Our own vote is keyed
+                // locally by our key image -- the same pseudonym others will see.
+                Some(key) if anonymous => {
+                    if let Ok(sealed) = enclave_crypto::seal_ballot(&key, &mid, &body.encode()) {
+                        let kp = enclave_crypto::RingKeypair::from_seed(&self.voting_seed);
+                        if let Ok(sig) = kp.sign(&sealed, &mid, &ring) {
+                            let tag = hex::encode(sig.key_image);
+                            if let Some(p) = self
+                                .conversations
+                                .get_mut(&group)
+                                .and_then(|c| c.polls.get_mut(&mid))
+                            {
+                                if sel.is_empty() {
+                                    p.votes.remove(&tag);
+                                } else {
+                                    p.votes.insert(tag, sel.clone());
+                                }
+                            }
+                            let ballot = transfer::AnonBallot {
+                                sealed_choice: sealed,
+                                sig,
+                            };
+                            self.send_reliable(ClientMsg::BallotSubmit {
+                                poll: mid,
+                                ballot: Sealed(ballot.encode()),
+                            });
+                        }
+                    }
+                }
+                // Server-buffered (non-anonymous) poll: seal off the ratchet and
+                // submit a BallotSubmit the server withholds/routes (never Text).
+                Some(key) => {
+                    if let Ok(sealed) = enclave_crypto::seal_ballot(&key, &mid, &body.encode()) {
+                        self.send_reliable(ClientMsg::BallotSubmit {
+                            poll: mid,
+                            ballot: Sealed(sealed),
+                        });
+                    }
+                }
+                // Immediate poll (reveal 0/1): vote over normal MLS as before.
+                None => {
+                    let _ = self.send_transfer(&group, TransferMeta::Vote, &body.encode());
+                }
+            }
+        }
+        self.save_session();
+        let poll = self.conversations.get(&group)?.polls.get(&mid)?;
+        Some(Self::build_poll_view(poll, &me))
+    }
+
+    /// Close a poll we created: no more votes, and (for reveal mode 2) the tallies
+    /// become visible. Only the creator may close. Returns the updated view.
+    pub fn close_poll(&mut self, conv: &str, poll_id: &str) -> Option<PollView> {
+        let mid = decode_offer_id(poll_id)?;
+        let group = self
+            .conversations
+            .keys()
+            .find(|k| hex_id(k) == conv)
+            .cloned()?;
+        let me = self.me().ok()?;
+        let mode = {
+            let c = self.conversations.get_mut(&group)?;
+            let poll = c.polls.get_mut(&mid)?;
+            if poll.author != me {
+                return None; // only the creator closes their poll
+            }
+            poll.closed = true;
+            poll.server_mode()
+        };
+        if !self.is_local_only(&group) {
+            match mode {
+                // Buffered poll: ask the server to release its ballots now. The
+                // released Ballots delivery closes it (and delivers the tally) for
+                // everyone -- no MLS close control needed.
+                Some(_) => self.send_reliable(ClientMsg::BallotClose { poll: mid }),
+                // Immediate poll: seal the close control to the group as before.
+                None => {
+                    let _ = self.send_transfer(&group, TransferMeta::PollClose, &mid);
+                }
+            }
+        }
+        self.save_session();
+        let poll = self.conversations.get(&group)?.polls.get(&mid)?;
+        Some(Self::build_poll_view(poll, &me))
+    }
+
+    /// Pin or unpin a message for the whole conversation (pins are shared). Applies
+    /// locally and seals a [`TransferMeta::Pin`] so every member updates. Returns
+    /// the new pinned state.
+    pub fn pin_message(&mut self, conv: &str, id_hex: &str, pinned: bool) -> Option<bool> {
+        let mid = decode_offer_id(id_hex)?;
+        let group = self
+            .conversations
+            .keys()
+            .find(|k| hex_id(k) == conv)
+            .cloned()?;
+        {
+            let c = self.conversations.get_mut(&group)?;
+            // The message must exist in this conversation to be pinned.
+            if !c.history.iter().any(|l| l.id == mid) {
+                return None;
+            }
+            if pinned {
+                c.pinned.insert(mid);
+            } else {
+                c.pinned.remove(&mid);
+            }
+        }
+        if !self.is_local_only(&group) {
+            let body = transfer::PinBody {
+                target: mid,
+                pinned,
+            };
+            let _ = self.send_transfer(&group, TransferMeta::Pin, &body.encode());
+        }
+        self.save_session();
+        Some(pinned)
+    }
+
+    /// Turn disappearing messages on (a duration in ms) or off (0) for a
+    /// conversation, and tell the peer so both sides run the same local timer.
+    /// Only the on/off + duration is shared; deletion is local, so no read-state
+    /// or per-message timing ever leaves either device.
+    pub fn set_disappearing(&mut self, conv: &str, ms: u32) {
+        let Some(group) = self
+            .conversations
+            .keys()
+            .find(|k| hex_id(k) == conv)
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(c) = self.conversations.get_mut(&group) {
+            c.disappearing_ms = if ms == 0 { None } else { Some(ms) };
+        }
+        // "Notes to self" applies the timer purely locally; nothing is shared,
+        // because there is no peer and nothing may cross the network.
+        if !self.is_local_only(&group) {
+            let _ = self.send_transfer(&group, TransferMeta::Disappear, &ms.to_le_bytes());
+        }
+        self.save_session();
+    }
+
+    /// The disappearing-messages duration (ms) for a conversation, 0 if off.
+    pub fn disappearing_of(&self, conv: &str) -> u32 {
+        self.conversations
+            .iter()
+            .find(|(k, _)| hex_id(k) == conv)
+            .and_then(|(_, c)| c.disappearing_ms)
+            .unwrap_or(0)
+    }
+
+    /// Remove messages whose disappearing timer has elapsed (fully, no
+    /// placeholder). Returns the removed message ids per conversation (hex), so
+    /// the UI can drop them. Called periodically by the app loop.
+    pub fn expire_messages(&mut self) -> Vec<(String, Vec<String>)> {
+        let now = now_ms();
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for (gid, c) in self.conversations.iter_mut() {
+            let Some(ms) = c.disappearing_ms else {
+                continue;
+            };
+            let mut removed = Vec::new();
+            c.history.retain(|l| {
+                if now.saturating_sub(l.ts) > ms as u64 {
+                    removed.push(hex::encode(l.id));
+                    false
+                } else {
+                    true
+                }
+            });
+            if !removed.is_empty() {
+                out.push((hex_id(gid), removed));
+            }
+        }
+        if !out.is_empty() {
+            self.save_session();
+        }
+        out
+    }
+
+    /// Focus a conversation by its hex id. Opening an archived conversation
+    /// counts as activity and returns it to the Chats list.
     pub fn switch(&mut self, conv: &str) {
         if let Some(id) = self
             .conversations
@@ -893,6 +2512,9 @@ impl Client {
             .find(|k| hex_id(k) == conv)
             .cloned()
         {
+            if self.touch_conversation(&id) {
+                self.save_session();
+            }
             self.active = Some(id);
         }
     }
@@ -901,20 +2523,70 @@ impl Client {
     /// that fits in one sealed frame is a single part; a larger one is split
     /// into chunks (see [`crate::transfer`]) that the peer reassembles. Records
     /// the message in local history.
-    pub async fn send_text(&mut self, text: &str) -> Result<(), ClientError> {
+    pub async fn send_text(
+        &mut self,
+        text: &str,
+        reply_to: Option<&str>,
+    ) -> Result<(String, u64), ClientError> {
         let group_id = self.active.clone().ok_or(ClientError::NoGroup)?;
         let me = self.me()?;
-        self.send_transfer(&group_id, TransferMeta::Text, text.as_bytes())?;
+        let reply_to = reply_to.and_then(decode_offer_id);
+        // "Notes to self" is local-only: record the line and stop. Nothing is
+        // sealed or sent -- no `send_transfer`, no reconnect, no network at all.
+        if self.is_local_only(&group_id) {
+            let id = new_transfer_id();
+            let ts = now_ms();
+            if let Some(conv) = self.conversations.get_mut(&group_id) {
+                conv.history.push(ChatLine {
+                    id,
+                    ts,
+                    from: me,
+                    text: text.to_string(),
+                    mine: true,
+                    file: None,
+                    system: false,
+                    deleted: false,
+                    reply_to,
+                    voice_ms: None,
+                    waveform: Vec::new(),
+                });
+            }
+            self.save_session();
+            return Ok((hex::encode(id), ts));
+        }
+        // Messaging a DM whose peer unfriended us re-adds them (a reconnect).
+        self.reconnect_dm_peer_if_needed(&group_id);
+        let body = transfer::TextBody {
+            text: text.to_string(),
+            reply_to,
+        };
+        let id = self.send_transfer(&group_id, TransferMeta::Text, &body.encode())?;
+        let ts = now_ms();
         if let Some(conv) = self.conversations.get_mut(&group_id) {
             conv.history.push(ChatLine {
+                id,
+                ts,
                 from: me,
                 text: text.to_string(),
                 mine: true,
                 file: None,
+                system: false,
+                deleted: false,
+                reply_to,
+                voice_ms: None,
+                waveform: Vec::new(),
             });
         }
         self.save_session();
-        Ok(())
+        Ok((hex::encode(id), ts))
+    }
+
+    /// Whether `group_id` is the local-only "Notes to self" scratchpad -- the
+    /// single check every send path consults before it would touch the network.
+    fn is_local_only(&self, group_id: &GroupId) -> bool {
+        self.conversations
+            .get(group_id)
+            .is_some_and(|c| c.local_only)
     }
 
     /// Offer a file to the active conversation. The file is NOT sent yet: a
@@ -925,7 +2597,27 @@ impl Client {
     /// online). The bytes are read and sealed only when the server says to
     /// upload/stream, never up front, so the whole file is never held in memory.
     /// Returns the [`FileRef`] for the sender's own history.
-    pub async fn send_file(&mut self, path: &str) -> Result<FileRef, ClientError> {
+    /// Offer a file the normal way: buffered on the server for offline delivery
+    /// if small enough, otherwise streamed live. Capped at [`MAX_RECEIVE_BYTES`].
+    /// Offer a file. Returns the file descriptor and the offer's hex id, so the
+    /// UI can label the sender's own message with a "Stop sharing" control.
+    pub async fn send_file(&mut self, path: &str) -> Result<(FileRef, String), ClientError> {
+        self.offer_file(path, false).await
+    }
+
+    /// Explicitly LIVE-share a file: a real-time stream, never stored, with NO
+    /// size limit. Both parties must be online; the bytes go straight to the
+    /// recipient's disk (never buffered whole in RAM), and the recipient consents
+    /// to the declared size, so there is no ceiling to enforce.
+    pub async fn send_file_live(&mut self, path: &str) -> Result<(FileRef, String), ClientError> {
+        self.offer_file(path, true).await
+    }
+
+    async fn offer_file(
+        &mut self,
+        path: &str,
+        force_live: bool,
+    ) -> Result<(FileRef, String), ClientError> {
         let group_id = self.active.clone().ok_or(ClientError::NoGroup)?;
         let me = self.me()?;
         let p = std::path::Path::new(path);
@@ -937,29 +2629,69 @@ impl Client {
         let meta_fs = std::fs::metadata(p)
             .map_err(|e| ClientError::Audio(format!("cannot read {name}: {e}")))?;
         let size = meta_fs.len();
-        // Enforce the hard ceiling up front: a recipient will not accept more
-        // than this (their streaming sink caps at it), so refuse to even offer a
-        // larger file, with a clear message, rather than failing mid-transfer.
-        if size > transfer::MAX_RECEIVE_BYTES {
+        // "Notes to self" is local-only: attach the file as a local reference
+        // (name/size/path) and stop. Nothing is sealed, offered, or uploaded --
+        // the bytes stay where they are on disk and "Open" opens them in place.
+        // No size ceiling applies since nothing crosses the network.
+        if self.is_local_only(&group_id) {
+            let file_ref = FileRef {
+                name: name.clone(),
+                size,
+                path: path.to_string(),
+            };
+            let id = new_transfer_id();
+            if let Some(conv) = self.conversations.get_mut(&group_id) {
+                conv.history.push(ChatLine {
+                    id,
+                    ts: now_ms(),
+                    from: me,
+                    text: name,
+                    mine: true,
+                    file: Some(file_ref.clone()),
+                    system: false,
+                    deleted: false,
+                    reply_to: None,
+                    voice_ms: None,
+                    waveform: Vec::new(),
+                });
+            }
+            self.save_session();
+            return Ok((file_ref, hex::encode(id)));
+        }
+        // The normal path enforces the hard ceiling (a stored recipient's sink
+        // caps at it). Explicit live sharing has no cap: it streams to disk and
+        // the recipient consents to the declared size.
+        if !force_live && size > transfer::MAX_RECEIVE_BYTES {
             let gb = transfer::MAX_RECEIVE_BYTES / (1024 * 1024 * 1024);
             return Err(ClientError::Audio(format!(
-                "{name} is too large to send ({size_gb:.1} GB); the limit is {gb} GB",
+                "{name} is too large to send normally ({size_gb:.1} GB, limit {gb} GB); use Live share instead",
                 size_gb = size as f64 / (1024.0 * 1024.0 * 1024.0),
             )));
         }
         let mime = mime_from_name(&name);
-        let live = size > STORE_FILE_MAX;
+        let live = force_live || size > STORE_FILE_MAX;
 
-        // Seal the manifest so recipients learn the name/size without the bytes.
+        // Fresh per-file content key: every chunk is sealed under it (off the MLS
+        // ratchet), and it travels only inside the sealed manifest below.
+        let mut content_key = [0u8; 32];
+        getrandom::getrandom(&mut content_key)
+            .map_err(|e| ClientError::Audio(format!("rng: {e}")))?;
+
+        // Seal the manifest so recipients learn the name/size (and the content
+        // key) without the bytes.
         let manifest = FileManifest {
             name: name.clone(),
             mime: mime.clone(),
             size,
+            content_key,
         };
         let sealed_manifest = self.seal(&group_id, &manifest.encode())?;
 
         let offer_id = new_transfer_id();
-        self.conn.send(ClientMsg::FileOffer {
+        // Reliable so a dropped offer is retransmitted, not silently lost (the
+        // server dedups by the unique offer id). Without this a connection blip
+        // meant the file "just never arrived" with no error.
+        self.send_reliable(ClientMsg::FileOffer {
             offer_id,
             group: group_id.clone(),
             // The server only needs the size to enforce its store quota; a live
@@ -977,6 +2709,7 @@ impl Client {
                 mime,
                 size,
                 live,
+                content_key,
                 started: false,
             },
         );
@@ -988,14 +2721,21 @@ impl Client {
         };
         if let Some(conv) = self.conversations.get_mut(&group_id) {
             conv.history.push(ChatLine {
+                id: offer_id,
+                ts: now_ms(),
                 from: me,
                 text: name,
                 mine: true,
                 file: Some(file_ref.clone()),
+                system: false,
+                deleted: false,
+                reply_to: None,
+                voice_ms: None,
+                waveform: Vec::new(),
             });
         }
         self.save_session();
-        Ok(file_ref)
+        Ok((file_ref, hex::encode(offer_id)))
     }
 
     /// Consent to receive an offered file: tell the server, which then delivers
@@ -1010,7 +2750,9 @@ impl Client {
         Ok(())
     }
 
-    /// Refuse an offered file: tell the server (which drops it) and forget it.
+    /// Refuse an offered file for good: tell the server (which gives the offer up
+    /// for us) and forget it. The UI keeps the message, marked declined; declining
+    /// is final, so there is no re-download afterwards (that is what abort is for).
     pub fn decline_file(&mut self, offer_id: &str) -> Result<(), ClientError> {
         let id = decode_offer_id(offer_id).ok_or(ClientError::NoGroup)?;
         if let Some(inc) = self.incoming_files.remove(&id) {
@@ -1020,6 +2762,184 @@ impl Client {
             self.conn.send(ClientMsg::FileDecline { offer_id: id });
         }
         Ok(())
+    }
+
+    /// Abort an in-progress download WITHOUT giving the offer up: stop writing,
+    /// discard the partial file, and tell the server to stop streaming -- but keep
+    /// the offer so the user can download it again. The offer stays available
+    /// until the sender withdraws it or goes offline. Idempotent: aborting an
+    /// unknown or already-aborted offer is a no-op.
+    pub fn abort_file(&mut self, offer_id: &str) -> Result<(), ClientError> {
+        let id = decode_offer_id(offer_id).ok_or(ClientError::NoGroup)?;
+        if let Some(inc) = self.incoming_files.get_mut(&id) {
+            inc.accepted = false;
+            if let Some(sink) = inc.sink.take() {
+                sink.abort();
+            }
+            // Tell the server to stop the in-flight stream and leave the offer
+            // pending; a later `accept_file` re-downloads it from the start.
+            self.conn.send(ClientMsg::FileAbort { offer_id: id });
+        }
+        Ok(())
+    }
+
+    /// Heal a conversation whose application-message ratchet has desynced -- a
+    /// receiver so far behind the sender's generation that openmls rejects new
+    /// messages ("too far in the future"). We commit a self-update (rekey), which
+    /// starts a fresh epoch and resets every member's message ratchet to 0, so
+    /// both sides talk again. The rekey commit rides the SEPARATE handshake
+    /// ratchet (undisturbed by the application-message desync), so the peer can
+    /// apply it even while ordinary messages are undecryptable. Debounced per
+    /// group so a burst of undecryptable messages triggers at most one rekey per
+    /// cooldown -- ample time for the peer to apply it and the epoch to advance.
+    ///
+    /// For a one-directional desync (the common case: one side sent a large file
+    /// under the old design) only the stuck receiver ever reaches this, so exactly
+    /// one member commits and there is no competing commit. (A simultaneous
+    /// both-directions desync could race two commits; that resolves to recreating
+    /// the conversation, the same fallback as before, and cannot happen from new
+    /// transfers now that file bytes are off the ratchet.)
+    fn heal_group(&mut self, group: &GroupId) {
+        let now = Instant::now();
+        if let Some(&t) = self.last_heal.get(group) {
+            if now.duration_since(t) < HEAL_COOLDOWN {
+                return; // a rekey is already in flight for this group
+            }
+        }
+        let commit = {
+            let Some(identity) = self.identity.as_ref() else {
+                return;
+            };
+            let Some(conv) = self.conversations.get_mut(group) else {
+                return;
+            };
+            let Some(g) = conv.group.as_mut() else { return };
+            match g.rekey(identity) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("enclave: could not heal a desynced conversation: {e}");
+                    return;
+                }
+            }
+        };
+        self.last_heal.insert(group.clone(), now);
+        // Reliable: the heal must reach the peer even across a reconnect, or the
+        // conversation stays broken.
+        self.send_reliable(ClientMsg::Mls {
+            group: group.clone(),
+            message: Sealed(commit),
+        });
+        self.save_session();
+        eprintln!("enclave: healing a desynced conversation (rekey)");
+    }
+
+    /// Note a forked DM (the peer is on a different MLS group) so it gets healed.
+    /// Only the SMALLER handle queues a re-establish, deterministically, so the
+    /// two sides never both rebuild (which would fork again). The larger handle
+    /// waits for the smaller's fresh Welcome.
+    fn queue_dm_reinvite(&mut self, group: &GroupId) {
+        let me = self.username.clone().unwrap_or_default();
+        let Some(conv) = self.conversations.get(group) else {
+            return;
+        };
+        if !matches!(conv.kind, ConvKind::Dm) {
+            return;
+        }
+        // The peer is taken from the AUTHENTICATED MLS membership, never from
+        // server-provided metadata, so a malicious server cannot steer who we act
+        // on. Only the smaller handle acts (deterministic; no double-rebuild).
+        let Some(g) = conv.group.as_ref() else { return };
+        let members: Vec<String> = g.member_keys().into_iter().map(|(n, _)| n).collect();
+        match members.iter().find(|n| **n != me) {
+            Some(peer) => {
+                // EITHER side re-establishes (so it works whichever client is
+                // online / on the new build). Both re-establishing still converges:
+                // each sends the other a fresh Welcome, and the Welcome tie-break
+                // makes the smaller handle's group win. Debounced in pump_reinvites.
+                eprintln!("enclave: DM fork detected; me={me} peer={peer} members={members:?}");
+                self.pending_reinvites.insert(group.clone());
+            }
+            None => eprintln!("enclave: DM fork but no peer in my group members={members:?}"),
+        }
+    }
+
+    /// Re-establish any forked DMs (drained + debounced). Driven by the app loop.
+    pub async fn pump_reinvites(&mut self) {
+        let groups: Vec<GroupId> = self.pending_reinvites.drain().collect();
+        let now = Instant::now();
+        for g in groups {
+            if self
+                .last_reinvite
+                .get(&g)
+                .is_some_and(|t| now.duration_since(*t) < REINVITE_COOLDOWN)
+            {
+                continue;
+            }
+            self.last_reinvite.insert(g.clone(), now);
+            match self.reestablish_dm_peer(&g).await {
+                Ok(Some(peer)) => eprintln!("enclave: re-establishing a forked DM with {peer}"),
+                Ok(None) => {}
+                Err(e) => eprintln!("enclave: could not re-establish a forked DM: {e}"),
+            }
+        }
+    }
+
+    /// Remove the peer (rekeying off any stale state) then re-add them, so they
+    /// receive a fresh Welcome and converge onto our canonical DM group. The peer
+    /// is read from the AUTHENTICATED MLS membership -- never from server metadata
+    /// -- and re-added with an identity-bound `add_member`, so a malicious server
+    /// can neither steer who we re-add nor substitute a ghost. Returns the peer
+    /// re-established, or `None` if there was nothing to do.
+    async fn reestablish_dm_peer(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Option<String>, ClientError> {
+        let me = self.username.clone().unwrap_or_default();
+        // The peer is the OTHER member of the AUTHENTICATED MLS group -- read from
+        // `member_keys` (never server metadata). We do NOT remove it yet.
+        let Some((peer, peer_key)) = self
+            .conversations
+            .get(group_id)
+            .and_then(|c| c.group.as_ref())
+            .and_then(|g| g.member_keys().into_iter().find(|(n, _)| *n != me))
+        else {
+            return Ok(None); // no peer to re-establish
+        };
+        // Fetch and IDENTITY-CHECK the key package BEFORE any change, so a
+        // substituted (valid-but-wrong-identity) package fails closed without
+        // corrupting the group (no orphaned "just me" state).
+        let key_package = self.fetch_key_package(&peer).await?;
+        let add = {
+            let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
+            let got = Group::key_package_identity(identity, &key_package)?;
+            if got != peer {
+                return Err(ClientError::Crypto(
+                    enclave_crypto::CryptoError::KeyPackageInvalid(format!(
+                        "re-establish: key package identity {got:?} is not the peer {peer:?}"
+                    )),
+                ));
+            }
+            let conv = self
+                .conversations
+                .get_mut(group_id)
+                .ok_or(ClientError::NoGroup)?;
+            let group = conv.group.as_mut().ok_or(ClientError::NoGroup)?;
+            // Now safe: remove the stale member, then re-add the validated one.
+            let _ = group.remove_member(identity, &peer_key)?;
+            group.add_member(identity, &key_package, &peer)?
+        };
+        self.send_reliable(ClientMsg::Welcome {
+            to: DeviceId(peer.clone()),
+            group: group_id.clone(),
+            name: String::new(),
+            message: Sealed(add.welcome),
+        });
+        self.send_reliable(ClientMsg::Mls {
+            group: group_id.clone(),
+            message: Sealed(add.commit),
+        });
+        self.save_session();
+        Ok(Some(peer))
     }
 
     /// Withdraw a file we offered (e.g. sent by mistake): tell the server, which
@@ -1037,15 +2957,15 @@ impl Client {
     /// bytes are streamed later by [`pump_uploads`], paced by the connection.
     /// Marks the offer started so a repeated trigger does not re-stream it.
     fn start_upload(&mut self, offer_id: [u8; 16]) {
-        let (group, path, name, mime, size) = match self.outgoing_files.get_mut(&offer_id) {
+        let (group, path, name, size, content_key) = match self.outgoing_files.get_mut(&offer_id) {
             Some(o) if !o.started => {
                 o.started = true;
                 (
                     o.group.clone(),
                     o.path.clone(),
                     o.name.clone(),
-                    o.mime.clone(),
                     o.size,
+                    o.content_key,
                 )
             }
             _ => return, // unknown or already streaming
@@ -1062,12 +2982,10 @@ impl Client {
         self.uploads.insert(
             offer_id,
             Upload {
+                offer_id,
                 group,
                 file,
-                meta: TransferMeta::File {
-                    name: name.clone(),
-                    mime,
-                },
+                content_key,
                 name,
                 total,
                 index: 0,
@@ -1099,9 +3017,9 @@ impl Client {
                         match read_full(&mut up.file, &mut buf) {
                             Ok(n) => Some((
                                 up.index,
-                                up.total,
+                                up.offer_id,
                                 up.group.clone(),
-                                up.meta.clone(),
+                                up.content_key,
                                 buf[..n].to_vec(),
                                 n,
                             )),
@@ -1123,28 +3041,28 @@ impl Client {
                         self.uploads.remove(&id);
                         break;
                     }
-                    Some((index, total, group, meta, data, n)) => {
-                        let part = Part {
-                            id,
-                            index,
-                            total,
-                            meta,
-                            data,
-                        };
-                        let sealed = match self.seal(&group, &part.encode()) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                self.pending
-                                    .push_back(Event::Error(format!("sealing a file chunk: {e}")));
-                                self.uploads.remove(&id);
-                                break;
-                            }
-                        };
+                    Some((index, offer_id, group, content_key, data, n)) => {
+                        // Seal the raw chunk under the per-file content key (not
+                        // the MLS ratchet), binding its position, so streaming or
+                        // dropping it never disturbs the group's message keys.
+                        let sealed =
+                            match enclave_crypto::seal_chunk(&content_key, &offer_id, index, &data)
+                            {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    self.pending.push_back(Event::Error(format!(
+                                        "sealing a file chunk: {e}"
+                                    )));
+                                    self.uploads.remove(&id);
+                                    break;
+                                }
+                            };
                         // Capacity was checked at the loop head and we are the
                         // only file producer, so a send fails only if the
                         // connection dropped -- abandon the doomed upload then.
                         if !self.conn.try_send_file(ClientMsg::FileChunk {
                             offer_id: id,
+                            index,
                             data: Sealed(sealed),
                         }) {
                             self.uploads.remove(&id);
@@ -1173,17 +3091,19 @@ impl Client {
     }
 
     /// Split `data` into parts and send each one sealed to `group_id`.
+    /// Split, seal, and send a transfer; returns its id so the caller can label
+    /// the message in local history with the same id both peers will see.
     fn send_transfer(
         &mut self,
         group_id: &GroupId,
         meta: TransferMeta,
         data: &[u8],
-    ) -> Result<(), ClientError> {
+    ) -> Result<[u8; 16], ClientError> {
         let id = new_transfer_id();
         for part in transfer::split(id, meta, data) {
             self.seal_and_send(group_id, &part)?;
         }
-        Ok(())
+        Ok(id)
     }
 
     /// Seal one serialized part with the group key and hand it to the relay as a
@@ -1318,14 +3238,39 @@ impl Client {
         manifest: Sealed,
         live: bool,
     ) -> Option<Event> {
-        // Decrypt the manifest with the group key.
-        let plaintext = {
+        // Decrypt the manifest with the group key. A silently-dropped offer is
+        // the "file never popped up, no idea why" symptom, so each failure is
+        // logged rather than swallowed by `?`.
+        let decrypted = {
             let identity = self.identity.as_ref()?;
-            let conv = self.conversations.get_mut(&group)?;
-            let g = conv.group.as_mut()?;
-            g.decrypt_text(identity, &manifest.0).ok()?.plaintext
+            let Some(conv) = self.conversations.get_mut(&group) else {
+                eprintln!("enclave: file offer for a conversation we don't have; dropped");
+                return None;
+            };
+            let Some(g) = conv.group.as_mut() else {
+                eprintln!("enclave: file offer for a not-yet-established group; dropped");
+                return None;
+            };
+            g.decrypt_text(identity, &manifest.0)
         };
-        let m = FileManifest::decode(&plaintext)?;
+        let plaintext = match decrypted {
+            Ok(tm) => tm.plaintext,
+            Err(e) => {
+                eprintln!("enclave: file offer manifest failed to decrypt: {e}; dropped");
+                // A desynced ratchet (a legacy conversation from before file bytes
+                // were moved off it) drops offers too; heal it so the retry lands.
+                if is_ratchet_desync(&e) {
+                    self.heal_group(&group);
+                } else if is_group_fork(&e) {
+                    self.queue_dm_reinvite(&group);
+                }
+                return None;
+            }
+        };
+        let Some(m) = FileManifest::decode(&plaintext) else {
+            eprintln!("enclave: file offer manifest was malformed; dropped");
+            return None;
+        };
         let safe = safe_file_name(&m.name);
         let from_display = self.display_of(&from.0);
         self.incoming_files.insert(
@@ -1335,10 +3280,13 @@ impl Client {
                 from: from.0.clone(),
                 name: safe.clone(),
                 size: m.size,
+                content_key: m.content_key,
                 accepted: false,
                 sink: None,
             },
         );
+        // An incoming file is activity too: bring an archived conversation back.
+        self.note_activity(&group);
         Some(Event::FileOffered {
             conv: hex_id(&group),
             offer_id: hex::encode(offer_id),
@@ -1363,6 +3311,8 @@ impl Client {
                         name: o.name.clone(),
                         mime: o.mime.clone(),
                         size: o.size,
+                        // Reuse the same key the chunks are sealed under.
+                        content_key: o.content_key,
                     },
                 )
             };
@@ -1395,20 +3345,42 @@ impl Client {
         // (a group peer may still accept a live one); just report the outcome.
         if let Some(o) = self.outgoing_files.get(&offer_id) {
             let name = o.name.clone();
-            let who = if by.0.is_empty() {
-                "no reply".to_string()
+            let group = o.group.clone();
+            let conv = hex_id(&group);
+            let text = if by.0.is_empty() {
+                format!("{name} was not delivered (no reply)")
             } else {
-                format!("declined by {}", self.display_of(&by.0))
+                format!("{} declined {name}", self.display_of(&by.0))
             };
-            return Some(Event::Error(format!("{name} was not delivered ({who})")));
+            // Persist it as a system line so it stays in the chat for good (it is
+            // rendered as the same small centered notice); the event just shows it
+            // immediately if the conversation is already open.
+            if let Some(conv_state) = self.conversations.get_mut(&group) {
+                conv_state.history.push(ChatLine {
+                    id: new_transfer_id(),
+                    ts: now_ms(),
+                    from: String::new(),
+                    text: text.clone(),
+                    mine: false,
+                    file: None,
+                    system: true,
+                    deleted: false,
+                    reply_to: None,
+                    voice_ms: None,
+                    waveform: Vec::new(),
+                });
+            }
+            self.save_session();
+            return Some(Event::Notice { conv, text });
         }
-        // An offer shown to us: the sender withdrew it or it expired. Remove the
-        // prompt and drop any partial download.
+        // An offer shown to us: the sender withdrew it or went offline. Drop any
+        // partial download and forget the offer (it cannot be re-downloaded), but
+        // KEEP its message in chat -- mark it "no longer available", never remove.
         if let Some(inc) = self.incoming_files.remove(&offer_id) {
             if let Some(sink) = inc.sink {
                 sink.abort();
             }
-            return Some(Event::FileOfferClosed {
+            return Some(Event::FileOfferUnavailable {
                 conv: hex_id(&inc.group),
                 offer_id: hex::encode(offer_id),
             });
@@ -1419,26 +3391,19 @@ impl Client {
     /// A chunk of a file we accepted: decrypt it, create the streaming disk sink
     /// on the first chunk (sized from the offered manifest), write the part, and
     /// finalize when the last one lands. The whole file is never held in memory.
-    fn handle_file_chunk(&mut self, offer_id: [u8; 16], data: Sealed) -> Option<Event> {
+    fn handle_file_chunk(&mut self, offer_id: [u8; 16], index: u32, data: Sealed) -> Option<Event> {
         // Consent gate (defense in depth): write chunks only for an offer the
         // user explicitly accepted. A malicious server that streams an
         // un-accepted file's bytes at us gets them dropped, never written.
-        let group = match self.incoming_files.get(&offer_id) {
-            Some(inc) if inc.accepted => inc.group.clone(),
+        let (group, content_key) = match self.incoming_files.get(&offer_id) {
+            Some(inc) if inc.accepted => (inc.group.clone(), inc.content_key),
             _ => return None,
         };
-        // Decrypt the sealed part.
-        let part = {
-            let identity = self.identity.as_ref()?;
-            let conv = self.conversations.get_mut(&group)?;
-            let g = conv.group.as_mut()?;
-            let tm = g.decrypt_text(identity, &data.0).ok()?;
-            Part::decode(&tm.plaintext)?
-        };
-        // A file chunk must carry file metadata; ignore anything else.
-        if !matches!(part.meta, TransferMeta::File { .. }) {
-            return None;
-        }
+        // Open the chunk under the offer's content key. This never touches the
+        // MLS ratchet, so a chunk we drop (a cancelled or replayed download) can
+        // never desync the conversation. A tampered/misindexed chunk fails the
+        // AEAD and is dropped.
+        let chunk = enclave_crypto::open_chunk(&content_key, &offer_id, index, &data.0).ok()?;
         let dir = self.downloads_dir();
 
         // Create the sink lazily on the first chunk, reserving a safe unique
@@ -1468,13 +3433,14 @@ impl Client {
             }
         }
 
-        // Write the part.
+        // Write the chunk at its authenticated position.
         let (size, write) = {
             let inc = self.incoming_files.get_mut(&offer_id)?;
             let sink = inc.sink.as_mut()?;
             (
                 inc.size,
-                sink.write_part(&part).map(|done| (done, sink.bytes())),
+                sink.write_chunk(index, &chunk)
+                    .map(|done| (done, sink.bytes())),
             )
         };
         let (done, sent) = match write {
@@ -1520,12 +3486,20 @@ impl Client {
             path: sink.path().to_string_lossy().into_owned(),
         };
         let from_display = self.display_of(&inc.from);
+        let ts = now_ms();
         if let Some(conv) = self.conversations.get_mut(&group) {
             conv.history.push(ChatLine {
+                id: offer_id,
+                ts,
                 from: inc.from.clone(),
                 text: file.name.clone(),
                 mine: false,
                 file: Some(file.clone()),
+                system: false,
+                deleted: false,
+                reply_to: None,
+                voice_ms: None,
+                waveform: Vec::new(),
             });
         }
         self.save_session();
@@ -1536,7 +3510,10 @@ impl Client {
         });
         Some(Event::File {
             conv: hex_id(&group),
+            id: hex::encode(offer_id),
+            ts,
             from: from_display,
+            user: inc.from.clone(),
             file,
         })
     }
@@ -1568,10 +3545,30 @@ impl Client {
     /// peer's current display name.
     pub fn conversations(&self) -> Vec<ConversationInfo> {
         let me = self.username.clone().unwrap_or_default();
+        // Deleted conversations disappear entirely (they reappear on a new message
+        // or when reopened). Everything else is returned; the UI shows Active in
+        // the live list and Archived/Left on the Archived page.
         self.conversations
             .iter()
+            .filter(|(_, c)| c.visibility != Visibility::Deleted)
             .map(|(id, c)| {
-                let title = match c.kind {
+                // "Notes to self" has no peer: it is just us. Report it as its own
+                // kind, always sendable, never pending/reconnecting.
+                if c.local_only {
+                    return ConversationInfo {
+                        id: hex_id(id),
+                        title: c.title.clone(),
+                        is_dm: true,
+                        members: c.members.clone(),
+                        pending: false,
+                        archived: c.visibility == Visibility::Archived,
+                        left: false,
+                        can_send: true,
+                        reconnect: false,
+                        self_notes: true,
+                    };
+                }
+                let (title, peer_is_friend) = match c.kind {
                     ConvKind::Dm => {
                         let peer = c
                             .members
@@ -1579,16 +3576,25 @@ impl Client {
                             .find(|m| **m != me)
                             .cloned()
                             .unwrap_or_else(|| c.title.clone());
-                        self.display_of(&peer)
+                        (self.display_of(&peer), self.is_friend(&peer))
                     }
-                    ConvKind::Group => c.title.clone(),
+                    ConvKind::Group => (c.title.clone(), true),
                 };
+                let is_dm = c.kind == ConvKind::Dm;
+                let left = c.visibility == Visibility::Left;
                 ConversationInfo {
                     id: hex_id(id),
                     title,
-                    is_dm: c.kind == ConvKind::Dm,
+                    is_dm,
                     members: c.members.clone(),
-                    pending: c.group.is_none(),
+                    pending: c.group.is_none() && !left,
+                    archived: c.visibility == Visibility::Archived,
+                    left,
+                    // Left groups are read-only; everything else is sendable.
+                    can_send: !left,
+                    // A DM whose peer unfriended us: sending re-adds them.
+                    reconnect: is_dm && !peer_is_friend && !left,
+                    self_notes: false,
                 }
             })
             .collect()
@@ -1600,24 +3606,142 @@ impl Client {
     }
 
     /// The scoped history (from, text, mine) of a conversation by hex id.
-    pub fn conversation_history(&self, conv: &str) -> Vec<(String, String, bool, Option<FileRef>)> {
+    /// History as `(username, display_name, text, mine, file)` per line. The
+    /// username is the stable identity (for the avatar); the display name is
+    /// resolved live so a rename shows on reload.
+    /// Build the UI-facing view of a stored poll for viewer `me`: tallies, my
+    /// selection, and whether results should be revealed yet per the reveal mode.
+    fn build_poll_view(poll: &Poll, me: &str) -> PollView {
+        let mut counts = vec![0u32; poll.options.len()];
+        let mut voters = vec![Vec::new(); poll.options.len()];
+        for (user, sel) in &poll.votes {
+            for &i in sel {
+                if let Some(c) = counts.get_mut(i as usize) {
+                    *c += 1;
+                }
+                if let Some(v) = voters.get_mut(i as usize) {
+                    v.push(user.clone());
+                }
+            }
+        }
+        let mine = poll.votes.get(me).cloned().unwrap_or_default();
+        let eff_closed = poll.is_closed();
+        let am_owner = poll.author == me;
+        let revealed = match poll.reveal {
+            1 => poll.votes.contains_key(me), // after you vote
+            2 => eff_closed,                  // everyone, after it closes
+            3 => am_owner,                    // owner-only, live
+            4 => am_owner && eff_closed,      // owner-only, after it closes
+            _ => true,                        // always
+        };
+        PollView {
+            question: poll.question.clone(),
+            options: poll.options.clone(),
+            counts,
+            multi: poll.multi,
+            reveal: poll.reveal,
+            closed: eff_closed,
+            mine,
+            total: poll.votes.len() as u32,
+            revealed,
+            is_author: poll.author == me,
+            closes_at: poll.closes_at.unwrap_or(0),
+            voters,
+            anonymous: poll.anonymous,
+        }
+    }
+
+    pub fn conversation_history(&self, conv: &str) -> Vec<HistoryLine> {
+        let me = self.username.clone().unwrap_or_default();
         self.conversations
             .iter()
             .find(|(id, _)| hex_id(id) == conv)
             .map(|(_, c)| {
                 c.history
                     .iter()
-                    .map(|l| {
-                        (
-                            self.display_of(&l.from),
-                            l.text.clone(),
-                            l.mine,
-                            l.file.clone(),
-                        )
+                    .map(|l| HistoryLine {
+                        id: hex::encode(l.id),
+                        ts: l.ts,
+                        user: l.from.clone(),
+                        display: self.display_of(&l.from),
+                        text: l.text.clone(),
+                        mine: l.mine,
+                        file: l.file.clone(),
+                        system: l.system,
+                        deleted: l.deleted,
+                        reply_to: l.reply_to.map(hex::encode).unwrap_or_default(),
+                        voice_ms: l.voice_ms.unwrap_or(0),
+                        waveform: l.waveform.clone(),
+                        reactions: c.reactions.get(&l.id).cloned().unwrap_or_default(),
+                        edited: c.edited.contains(&l.id),
+                        poll: c.polls.get(&l.id).map(|p| Self::build_poll_view(p, &me)),
+                        pinned: c.pinned.contains(&l.id),
                     })
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Local full-text search over decrypted message history. `conv = Some(hex)`
+    /// scopes it to one conversation; `None` searches all of them. Matching is a
+    /// case-insensitive substring over each line's text (a file line's text is its
+    /// name), skipping deleted and system lines. Results are newest-first and
+    /// capped. The server never sees this: history is decrypted, in memory, here.
+    pub fn search_messages(&self, query: &str, conv: Option<&str>) -> Vec<SearchHit> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let me = self.username.clone().unwrap_or_default();
+        let mut hits = Vec::new();
+        for (id, c) in &self.conversations {
+            // Deleted (hidden) conversations are excluded; everything else is
+            // searchable, including archived and left ones.
+            if c.visibility == Visibility::Deleted {
+                continue;
+            }
+            let hex = hex_id(id);
+            if let Some(only) = conv {
+                if hex != only {
+                    continue;
+                }
+            }
+            let title = if c.local_only {
+                c.title.clone()
+            } else if c.kind == ConvKind::Dm {
+                let peer = c
+                    .members
+                    .iter()
+                    .find(|m| **m != me)
+                    .cloned()
+                    .unwrap_or_else(|| c.title.clone());
+                self.display_of(&peer)
+            } else {
+                c.title.clone()
+            };
+            for l in &c.history {
+                if l.deleted || l.system || l.text.is_empty() {
+                    continue;
+                }
+                if !l.text.to_lowercase().contains(&q) {
+                    continue;
+                }
+                hits.push(SearchHit {
+                    conv: hex.clone(),
+                    conv_title: title.clone(),
+                    self_notes: c.local_only,
+                    id: hex::encode(l.id),
+                    ts: l.ts,
+                    user: l.from.clone(),
+                    display: self.display_of(&l.from),
+                    text: l.text.clone(),
+                    mine: l.mine,
+                });
+            }
+        }
+        hits.sort_by(|a, b| b.ts.cmp(&a.ts));
+        hits.truncate(300);
+        hits
     }
 
     /// Whether the user has confirmed the active conversation's *current* safety
@@ -1957,7 +4081,13 @@ impl Client {
         let conversations = self
             .conversations
             .iter()
-            .filter(|(_, c)| c.group.is_some())
+            // Persist conversations with a live group, plus Left ones (group torn
+            // down, but their history is retained and readable on the Archived
+            // page) and the local-only "Notes to self" scratchpad (never had a
+            // group, but its notes must survive a restart). A still-pending DM
+            // placeholder (group None, Active) is transient and re-created on the
+            // next open, so it is not persisted.
+            .filter(|(_, c)| c.group.is_some() || c.visibility == Visibility::Left || c.local_only)
             .map(|(routing, c)| session::PersistConv {
                 routing_id: routing.0,
                 mls_group_id: c.mls_group_id.clone(),
@@ -1965,6 +4095,13 @@ impl Client {
                 title: c.title.clone(),
                 members: c.members.clone(),
                 verified: c.verified.clone(),
+                disappearing_ms: c.disappearing_ms,
+                visibility: c.visibility,
+                local_only: c.local_only,
+                reactions: c.reactions.iter().map(|(k, v)| (*k, v.clone())).collect(),
+                edited: c.edited.iter().copied().collect(),
+                polls: c.polls.iter().map(|(k, v)| (*k, v.into())).collect(),
+                pinned: c.pinned.iter().copied().collect(),
                 history: c
                     .history
                     .iter()
@@ -1977,6 +4114,13 @@ impl Client {
                             size: f.size,
                             path: f.path.clone(),
                         }),
+                        system: l.system,
+                        id: l.id,
+                        ts: l.ts,
+                        deleted: l.deleted,
+                        reply_to: l.reply_to,
+                        voice_ms: l.voice_ms,
+                        waveform: l.waveform.clone(),
                     })
                     .collect(),
             })
@@ -1993,6 +4137,14 @@ impl Client {
                 .map(|(seq, p)| (*seq, p.msg.clone()))
                 .collect(),
             seen_ids: self.seen.snapshot(),
+            my_profile: self.my_profile.clone(),
+            peer_profiles: self
+                .profiles
+                .iter()
+                .map(|(u, p)| (u.clone(), p.clone()))
+                .collect(),
+            removed_me: self.removed_me.iter().cloned().collect(),
+            voting_seed: self.voting_seed.to_vec(),
         };
         session::save(&self.session_path(), &self.export_key, &data);
     }
@@ -2020,6 +4172,23 @@ impl Client {
             });
         }
         self.seen.restore(data.seen_ids);
+        // Restore our own profile and the cached peer profiles so names/avatars
+        // render immediately, before any fresh broadcast arrives.
+        self.my_profile = data.my_profile;
+        // Restore (or keep the freshly-minted) voting seed, and publish its public
+        // key in our profile so peers can build anonymous-poll rings.
+        if data.voting_seed.len() == 32 {
+            self.voting_seed.copy_from_slice(&data.voting_seed);
+        }
+        self.my_profile.voting_key =
+            Some(enclave_crypto::RingKeypair::from_seed(&self.voting_seed).public);
+        if !self.display.is_empty() && self.my_profile.display_name.is_empty() {
+            // Migrate a pre-profile session's server-side display name into the
+            // profile once, so upgrading users keep their name.
+            self.my_profile.display_name = self.display.clone();
+        }
+        self.profiles = data.peer_profiles.into_iter().collect();
+        self.removed_me = data.removed_me.into_iter().collect();
         if data.conversations.is_empty() {
             return;
         }
@@ -2029,13 +4198,24 @@ impl Client {
         identity.restore_storage(data.mls);
         let mut loaded: Vec<(GroupId, Conversation)> = Vec::new();
         for pc in data.conversations {
-            let Ok(group) = Group::load(identity, &pc.mls_group_id) else {
-                continue; // group state missing/corrupt; skip it
+            // A Left conversation has no MLS group to reload, only the retained
+            // history; the local-only "Notes to self" scratchpad never had one.
+            // All others (incl. Deleted, which stays a member) must reload their
+            // group or be skipped (missing/corrupt state).
+            let group = if pc.visibility == Visibility::Left || pc.local_only {
+                None
+            } else {
+                match Group::load(identity, &pc.mls_group_id) {
+                    Ok(g) => Some(g),
+                    Err(_) => continue,
+                }
             };
             let history = pc
                 .history
                 .into_iter()
                 .map(|l| ChatLine {
+                    id: l.id,
+                    ts: l.ts,
                     from: l.from,
                     text: l.text,
                     mine: l.mine,
@@ -2044,12 +4224,17 @@ impl Client {
                         size: f.size,
                         path: f.path,
                     }),
+                    system: l.system,
+                    deleted: l.deleted,
+                    reply_to: l.reply_to,
+                    voice_ms: l.voice_ms,
+                    waveform: l.waveform,
                 })
                 .collect();
             loaded.push((
                 GroupId(pc.routing_id),
                 Conversation {
-                    group: Some(group),
+                    group,
                     mls_group_id: pc.mls_group_id,
                     kind: if pc.is_dm {
                         ConvKind::Dm
@@ -2061,10 +4246,27 @@ impl Client {
                     verified: pc.verified,
                     reassembler: Reassembler::new(),
                     history,
+                    disappearing_ms: pc.disappearing_ms,
+                    visibility: pc.visibility,
+                    local_only: pc.local_only,
+                    reactions: pc.reactions.into_iter().collect(),
+                    edited: pc.edited.into_iter().collect(),
+                    polls: pc.polls.into_iter().map(|(id, p)| (id, p.into())).collect(),
+                    pinned: pc.pinned.into_iter().collect(),
                 },
             ));
         }
         for (gid, conv) in loaded {
+            // A Left conversation is no longer in its group: do not re-announce
+            // routing for it (that would rejoin). Just keep the retained history.
+            // (Deleted stays a member, so it DOES re-announce and keeps receiving,
+            // which is how it reappears on a new message.) The local-only "Notes
+            // to self" scratchpad has no group and MUST never touch the network,
+            // so it is inserted without any routing announce.
+            if conv.visibility == Visibility::Left || conv.local_only {
+                self.conversations.insert(gid, conv);
+                continue;
+            }
             // Re-announce our own routing membership so the server fans traffic
             // to us (bootstraps or re-affirms).
             self.conn.send(ClientMsg::JoinGroup { group: gid.clone() });
@@ -2131,22 +4333,23 @@ impl Client {
             match src {
                 Src::Screen(sf) => {
                     return Some(Event::ScreenFrame {
-                        from: self.display_of(&sf.from),
+                        // The username (stable identity); the UI resolves the
+                        // display name and avatar from it, and keys per-user
+                        // canvases by it, so a rename never orphans a tile.
+                        from: sf.from,
                         data: sf.h264,
                         keyframe: sf.keyframe,
                         camera: sf.camera,
                     });
                 }
                 Src::Msg(msg) => {
-                    // A DM nudge needs an async follow-up (create the group +
-                    // invite), which the sync `handle` cannot do -- service it
-                    // here without stealing focus from the active conversation.
-                    if let ServerMsg::DmRequested { from } = &msg {
-                        let from = from.clone();
-                        let prev = self.active.clone();
-                        let _ = self.open_dm(&from).await;
-                        self.active = prev;
-                        return Some(Event::ConversationsChanged);
+                    // `DmRequested` is obsolete: DMs are now created directly by
+                    // whoever opens one (see `open_dm`). We deliberately do NOT
+                    // auto-create a group on this server-delivered nudge -- doing so
+                    // would let a malicious server drive unbounded group creation +
+                    // key-package fetches on our client. Ignore it.
+                    if matches!(msg, ServerMsg::DmRequested { .. }) {
+                        return None;
                     }
                     if let Some(event) = self.handle(msg) {
                         return Some(event);
@@ -2193,21 +4396,56 @@ impl Client {
                 name,
                 message,
             } => {
+                let group_key = group.clone();
+                let is_dm = name.is_empty();
+                // Both sides of a DM may have created a group (if both opened it).
+                // Converge on the one created by the smaller handle: if I already
+                // have an established group here and my handle is smaller than the
+                // inviter's, keep mine and ignore their Welcome -- they will adopt
+                // mine when my Welcome reaches them.
+                let have_group = self
+                    .conversations
+                    .get(&group)
+                    .is_some_and(|c| c.group.is_some());
+                if is_dm {
+                    let me = self.username.clone().unwrap_or_default();
+                    eprintln!(
+                        "enclave: DM Welcome from {}; i_have_a_group={have_group} i_am_smaller={}",
+                        from.0,
+                        me.as_str() < from.0.as_str()
+                    );
+                    if have_group && me.as_str() < from.0.as_str() {
+                        eprintln!(
+                            "enclave: keeping my group, ignoring their Welcome (mine is canonical)"
+                        );
+                        return None;
+                    }
+                }
                 let identity = self.identity.as_ref()?;
                 let joined = match Group::join(identity, &message.0) {
                     Ok(j) => j,
-                    Err(e) => return Some(Event::Error(format!("join failed: {e}"))),
+                    Err(e) => {
+                        eprintln!("enclave: DM Welcome join failed: {e}");
+                        return Some(Event::Error(format!("join failed: {e}")));
+                    }
                 };
+                if is_dm {
+                    eprintln!("enclave: adopted the peer's DM group (converged)");
+                }
                 let mls_group_id = joined.mls_group_id();
                 self.conn.send(ClientMsg::JoinGroup {
                     group: group.clone(),
                 });
-                let is_dm = name.is_empty();
                 match self.conversations.get_mut(&group) {
-                    // Populate a pending DM (or re-affirm) by adopting the group.
+                    // Adopt the group (replacing our own if we had made one, which
+                    // only happens on a both-opened-at-once DM the tie-break above
+                    // resolved in the inviter's favor). If this conversation had
+                    // been deleted/left, re-attaching its group RESTORES it: the
+                    // retained history is still here, so mark it Active again.
                     Some(conv) => {
                         conv.group = Some(joined);
                         conv.mls_group_id = mls_group_id;
+                        conv.visibility = Visibility::Active;
                     }
                     None => {
                         let me = self.username.clone().unwrap_or_default();
@@ -2223,26 +4461,135 @@ impl Client {
                                 history: Vec::new(),
                                 verified: None,
                                 reassembler: Reassembler::new(),
+                                disappearing_ms: None,
+                                visibility: Visibility::Active,
+                                local_only: false,
+                                reactions: HashMap::new(),
+                                edited: HashSet::new(),
+                                polls: HashMap::new(),
+                                pinned: HashSet::new(),
                             },
                         );
                     }
                 }
+                // We just adopted this group, so any queued re-establish for it is
+                // moot (we have converged); drop it to avoid needless churn.
+                self.pending_reinvites.remove(&group_key);
+                self.last_reinvite.remove(&group_key);
                 self.save_session();
+                // Give the members who just added us our profile (and, for a DM,
+                // complete the mutual exchange the creator started).
+                self.send_profile_to(&group_key);
                 Some(Event::ConversationsChanged)
+            }
+            ServerMsg::Ballots {
+                group,
+                poll,
+                ballots,
+            } => {
+                // The server released a buffered poll (a deadline passed, or its
+                // owner closed it). Open each ballot with the poll's shared key,
+                // apply the votes -- attributed to the server's authenticated
+                // submitter (device == username) -- and mark the poll closed here.
+                let me = self.username.clone().unwrap_or_default();
+                let view = {
+                    let conv = self.conversations.get_mut(&group)?;
+                    let p = conv.polls.get_mut(&poll)?;
+                    let key = match p.ballot_key {
+                        Some(k) => k,
+                        None => return None, // not a buffered poll we know
+                    };
+                    p.closed = true;
+                    for (dev, sealed) in ballots {
+                        // For an anonymous poll the ballot is a ring-signed AnonBallot:
+                        // verify the signature against the ring, then key the vote by
+                        // the (unlinkable-to-identity) key image. Otherwise the ballot
+                        // is the plain sealed choice, keyed by its submitter.
+                        let (choice_bytes, voter_key) = if p.anonymous {
+                            let Some(ab) = transfer::AnonBallot::decode(&sealed.0) else {
+                                continue;
+                            };
+                            if !enclave_crypto::ring_verify(
+                                &ab.sealed_choice,
+                                &poll,
+                                &p.ring,
+                                &ab.sig,
+                            ) {
+                                continue; // a forged or non-member ballot: reject
+                            }
+                            (ab.sealed_choice, hex::encode(ab.sig.key_image))
+                        } else {
+                            (sealed.0.clone(), dev.0.clone())
+                        };
+                        let Ok(pt) = enclave_crypto::open_ballot(&key, &poll, &choice_bytes) else {
+                            continue;
+                        };
+                        let Some(vb) = transfer::VoteBody::decode(&pt) else {
+                            continue;
+                        };
+                        let mut sel: Vec<u8> = vb
+                            .options
+                            .into_iter()
+                            .filter(|&i| (i as usize) < p.options.len())
+                            .collect();
+                        sel.sort_unstable();
+                        sel.dedup();
+                        if !p.multi {
+                            sel.truncate(1);
+                        }
+                        if sel.is_empty() {
+                            p.votes.remove(&voter_key);
+                        } else {
+                            p.votes.insert(voter_key, sel);
+                        }
+                    }
+                    Self::build_poll_view(p, &me)
+                };
+                self.save_session();
+                return Some(Event::PollUpdated {
+                    conv: hex_id(&group),
+                    id: hex::encode(poll),
+                    poll: view,
+                });
             }
             ServerMsg::Text { group, message, .. } => {
                 // Decrypt one sealed part and hand it to this conversation's
                 // reassembler, all inside a tight borrow of `conv` so the rest
                 // of the handler can touch `self` freely. A message/file becomes
                 // visible only once its last part arrives.
-                let (username, part_summary, complete) = {
+                // Decrypt under a short borrow, so a heal (which needs &mut self)
+                // can run after it if the ratchet desynced.
+                let decrypted = {
                     let identity = self.identity.as_ref()?;
                     let conv = self.conversations.get_mut(&group)?;
                     let g = conv.group.as_mut()?;
-                    let tm = match g.decrypt_text(identity, &message.0) {
-                        Ok(tm) => tm,
-                        Err(e) => return Some(Event::Error(format!("decrypt failed: {e}"))),
-                    };
+                    g.decrypt_text(identity, &message.0)
+                };
+                let tm = match decrypted {
+                    Ok(tm) => tm,
+                    // A message we cannot open (a transient MLS epoch skew
+                    // during a rekey, an out-of-order handshake, a stray frame
+                    // for a group we are mid-joining) is dropped, not shown:
+                    // it is not user-actionable, and profile broadcasts made
+                    // these common. Reliable delivery + last-writer-wins mean
+                    // anything that matters is re-sent. Log once for triage.
+                    Err(e) => {
+                        eprintln!("enclave: dropped an undecryptable message: {e}");
+                        // If the ratchet has desynced (a legacy conversation whose
+                        // file chunks rode the ratchet), heal it with a rekey so
+                        // the conversation comes back to life.
+                        if is_ratchet_desync(&e) {
+                            self.heal_group(&group);
+                        } else if is_group_fork(&e) {
+                            // The DM forked (peer on a different MLS group): the
+                            // smaller handle re-establishes it.
+                            self.queue_dm_reinvite(&group);
+                        }
+                        return None;
+                    }
+                };
+                let (username, part_summary, complete) = {
+                    let conv = self.conversations.get_mut(&group)?;
                     let username = String::from_utf8_lossy(&tm.sender).into_owned();
                     // A member sent a sealed blob that is not a valid part:
                     // authenticated but malformed, drop it quietly.
@@ -2287,6 +4634,278 @@ impl Client {
                     return None;
                 };
 
+                // A profile update rides the same sealed channel: apply it,
+                // attributed to the authenticated sender, and stop (it is not a
+                // chat line). Its own version dedups it, so it skips the text
+                // seen-set below.
+                if matches!(done.meta, TransferMeta::Profile) {
+                    return self.on_profile_update(&username, &done.data);
+                }
+                // A "delete for everyone" control: tombstone the referenced line,
+                // but ONLY if its author is this sealed message's authenticated
+                // sender -- a member can never delete another member's message.
+                if matches!(done.meta, TransferMeta::Delete) {
+                    let mut target = [0u8; 16];
+                    if done.data.len() == 16 {
+                        target.copy_from_slice(&done.data);
+                        if let Some(conv) = self.conversations.get_mut(&group) {
+                            if let Some(l) = conv
+                                .history
+                                .iter_mut()
+                                .find(|l| l.id == target && l.from == username)
+                            {
+                                l.deleted = true;
+                                l.text.clear();
+                                l.file = None;
+                                self.save_session();
+                                return Some(Event::MessageDeleted {
+                                    conv: hex_id(&group),
+                                    id: hex::encode(target),
+                                });
+                            }
+                        }
+                    }
+                    return None;
+                }
+                // An emoji-reaction toggle. The reactor is the authenticated
+                // sender (never a payload field), so a member can only ever add or
+                // remove ITS OWN reaction. Applies to any message in the group.
+                if matches!(done.meta, TransferMeta::React) {
+                    let body = transfer::ReactBody::decode(&done.data)?;
+                    if body.emoji.is_empty() || body.emoji.len() > transfer::MAX_REACTION_BYTES {
+                        return None;
+                    }
+                    let reactions = {
+                        let conv = self.conversations.get_mut(&group)?;
+                        Self::apply_reaction(
+                            &mut conv.reactions,
+                            body.target,
+                            &username,
+                            &body.emoji,
+                            body.add,
+                        )
+                    };
+                    self.save_session();
+                    return Some(Event::ReactionsChanged {
+                        conv: hex_id(&group),
+                        id: hex::encode(body.target),
+                        reactions,
+                    });
+                }
+                // An "edit this message" control: replace the target's text, but
+                // ONLY if its author is this sealed message's authenticated sender
+                // -- a member can never edit another member's message.
+                if matches!(done.meta, TransferMeta::Edit) {
+                    let body = transfer::EditBody::decode(&done.data)?;
+                    if let Some(conv) = self.conversations.get_mut(&group) {
+                        if let Some(l) = conv
+                            .history
+                            .iter_mut()
+                            .find(|l| l.id == body.target && l.from == username && !l.deleted)
+                        {
+                            l.text = body.text.clone();
+                            conv.edited.insert(body.target);
+                            self.save_session();
+                            return Some(Event::MessageEdited {
+                                conv: hex_id(&group),
+                                id: hex::encode(body.target),
+                                text: body.text,
+                            });
+                        }
+                    }
+                    return None;
+                }
+                // A poll was posted: add its line and hand the UI a poll card.
+                if matches!(done.meta, TransferMeta::Poll) {
+                    if !self.seen.insert(done.id) {
+                        return None; // a resent duplicate; show it once
+                    }
+                    let body = transfer::PollBody::decode(&done.data)?;
+                    if !body.valid() {
+                        return None;
+                    }
+                    let me = self.username.clone().unwrap_or_default();
+                    let ts = now_ms();
+                    let poll = Poll {
+                        question: body.question.clone(),
+                        options: body.options.clone(),
+                        multi: body.multi,
+                        reveal: body.reveal,
+                        closed: false,
+                        closes_at: body.closes_at,
+                        author: username.clone(),
+                        votes: HashMap::new(),
+                        ballot_key: body.ballot_key,
+                        anonymous: body.anonymous,
+                        ring: body.ring.clone(),
+                    };
+                    let view = Self::build_poll_view(&poll, &me);
+                    if let Some(conv) = self.conversations.get_mut(&group) {
+                        conv.polls.insert(done.id, poll);
+                        conv.history.push(ChatLine {
+                            id: done.id,
+                            ts,
+                            from: username.clone(),
+                            text: body.question,
+                            mine: false,
+                            file: None,
+                            system: false,
+                            deleted: false,
+                            reply_to: None,
+                            voice_ms: None,
+                            waveform: Vec::new(),
+                        });
+                    }
+                    self.save_session();
+                    self.note_activity(&group);
+                    return Some(Event::PollPosted {
+                        conv: hex_id(&group),
+                        id: hex::encode(done.id),
+                        ts,
+                        from: from_display,
+                        user: username,
+                        mine: false,
+                        poll: view,
+                    });
+                }
+                // A vote on a poll: record the sender's choice (their own, always),
+                // then hand the UI the refreshed tallies.
+                if matches!(done.meta, TransferMeta::Vote) {
+                    let body = transfer::VoteBody::decode(&done.data)?;
+                    let me = self.username.clone().unwrap_or_default();
+                    let view = {
+                        let conv = self.conversations.get_mut(&group)?;
+                        let poll = conv.polls.get_mut(&body.target)?;
+                        if poll.is_closed() {
+                            return None; // ignore votes after close/expiry
+                        }
+                        let mut sel: Vec<u8> = body
+                            .options
+                            .into_iter()
+                            .filter(|&i| (i as usize) < poll.options.len())
+                            .collect();
+                        sel.sort_unstable();
+                        sel.dedup();
+                        if !poll.multi {
+                            sel.truncate(1);
+                        }
+                        if sel.is_empty() {
+                            poll.votes.remove(&username);
+                        } else {
+                            poll.votes.insert(username.clone(), sel);
+                        }
+                        Self::build_poll_view(poll, &me)
+                    };
+                    self.save_session();
+                    return Some(Event::PollUpdated {
+                        conv: hex_id(&group),
+                        id: hex::encode(body.target),
+                        poll: view,
+                    });
+                }
+                // A "close poll" control: honored only if the poll's author is this
+                // sealed message's authenticated sender.
+                if matches!(done.meta, TransferMeta::PollClose) {
+                    if done.data.len() != 16 {
+                        return None;
+                    }
+                    let mut target = [0u8; 16];
+                    target.copy_from_slice(&done.data);
+                    let me = self.username.clone().unwrap_or_default();
+                    let view = {
+                        let conv = self.conversations.get_mut(&group)?;
+                        let poll = conv.polls.get_mut(&target)?;
+                        if poll.author != username {
+                            return None;
+                        }
+                        poll.closed = true;
+                        Self::build_poll_view(poll, &me)
+                    };
+                    self.save_session();
+                    return Some(Event::PollUpdated {
+                        conv: hex_id(&group),
+                        id: hex::encode(target),
+                        poll: view,
+                    });
+                }
+                // A pin/unpin control: shared, so any member's toggle applies.
+                if matches!(done.meta, TransferMeta::Pin) {
+                    let body = transfer::PinBody::decode(&done.data)?;
+                    if let Some(conv) = self.conversations.get_mut(&group) {
+                        // Only pin a message we actually have.
+                        if conv.history.iter().any(|l| l.id == body.target) {
+                            if body.pinned {
+                                conv.pinned.insert(body.target);
+                            } else {
+                                conv.pinned.remove(&body.target);
+                            }
+                            self.save_session();
+                            return Some(Event::PinsChanged {
+                                conv: hex_id(&group),
+                                id: hex::encode(body.target),
+                                pinned: body.pinned,
+                            });
+                        }
+                    }
+                    return None;
+                }
+                // The peer changed the disappearing-messages setting: adopt it.
+                if matches!(done.meta, TransferMeta::Disappear) {
+                    let ms = if done.data.len() == 4 {
+                        u32::from_le_bytes([done.data[0], done.data[1], done.data[2], done.data[3]])
+                    } else {
+                        0
+                    };
+                    if let Some(conv) = self.conversations.get_mut(&group) {
+                        conv.disappearing_ms = if ms == 0 { None } else { Some(ms) };
+                    }
+                    self.save_session();
+                    return Some(Event::DisappearingChanged {
+                        conv: hex_id(&group),
+                        ms,
+                    });
+                }
+                // A voice message: cache the clip and hand the UI a player.
+                if matches!(done.meta, TransferMeta::Voice) {
+                    if !self.seen.insert(done.id) {
+                        return None; // a resent duplicate; show it once
+                    }
+                    let clip = transfer::VoiceClip::decode(&done.data)?;
+                    let path = self.store_voice_at(&hex::encode(done.id), &done.data)?;
+                    let ts = now_ms();
+                    if let Some(conv) = self.conversations.get_mut(&group) {
+                        conv.history.push(ChatLine {
+                            id: done.id,
+                            ts,
+                            from: username.clone(),
+                            text: String::new(),
+                            mine: false,
+                            file: Some(FileRef {
+                                name: "Voice message".into(),
+                                size: done.data.len() as u64,
+                                path: path.clone(),
+                            }),
+                            system: false,
+                            deleted: false,
+                            reply_to: None,
+                            voice_ms: Some(clip.duration_ms),
+                            waveform: clip.waveform.clone(),
+                        });
+                    }
+                    self.save_session();
+                    self.note_activity(&group);
+                    return Some(Event::VoiceMessage {
+                        conv: hex_id(&group),
+                        id: hex::encode(done.id),
+                        ts,
+                        from: from_display,
+                        user: username,
+                        path,
+                        duration_ms: clip.duration_ms,
+                        waveform: clip.waveform.clone(),
+                        mine: false,
+                    });
+                }
                 // Only Text transfers reach here (File-meta parts were dropped
                 // above); reject anything else defensively rather than treat it
                 // as text.
@@ -2298,19 +4917,37 @@ impl Client {
                 if !self.seen.insert(done.id) {
                     return None;
                 }
-                let text = String::from_utf8_lossy(&done.data).into_owned();
+                // Decode the structured body (text + optional reply target). Fall
+                // back to treating the raw bytes as text for resilience.
+                let (text, reply_to) = match transfer::TextBody::decode(&done.data) {
+                    Some(b) => (b.text, b.reply_to),
+                    None => (String::from_utf8_lossy(&done.data).into_owned(), None),
+                };
+                let ts = now_ms();
                 if let Some(conv) = self.conversations.get_mut(&group) {
                     conv.history.push(ChatLine {
-                        from: username,
+                        id: done.id,
+                        ts,
+                        from: username.clone(),
                         text: text.clone(),
                         mine: false,
                         file: None,
+                        system: false,
+                        deleted: false,
+                        reply_to,
+                        voice_ms: None,
+                        waveform: Vec::new(),
                     });
                 }
                 self.save_session();
+                self.note_activity(&group);
                 Some(Event::Message {
                     conv: hex_id(&group),
+                    id: hex::encode(done.id),
+                    ts,
+                    reply_to: reply_to.map(hex::encode).unwrap_or_default(),
                     from: from_display,
+                    user: username,
                     text,
                     mine: false,
                 })
@@ -2348,8 +4985,9 @@ impl Client {
             ServerMsg::FileChunk {
                 offer_id,
                 from: _,
+                index,
                 data,
-            } => self.handle_file_chunk(offer_id, data),
+            } => self.handle_file_chunk(offer_id, index, data),
             ServerMsg::FileComplete { offer_id, .. } => self.handle_file_complete(offer_id),
             ServerMsg::Ack { seq } => {
                 // The server durably accepted this reliable message: stop tracking
@@ -2357,17 +4995,65 @@ impl Client {
                 self.unacked.remove(&seq);
                 None
             }
+            ServerMsg::Avatar { addr, data } => {
+                // The reply to one of our FetchAvatar requests. Use the key we
+                // stashed when asking, verify the returned bytes hash to `addr`
+                // (open_blob does this) and decrypt them, then cache the image and
+                // re-render whoever it belongs to. Failures are logged (not
+                // toasted) and the tile keeps its initials; a later profile
+                // update re-triggers the fetch.
+                let key = self.pending_avatars.remove(&addr)?;
+                let Some(bytes) = data else {
+                    eprintln!("enclave: avatar {} not found on server", hex::encode(addr));
+                    return None;
+                };
+                match enclave_crypto::open_blob(&bytes, &addr, &key) {
+                    Ok(image) => {
+                        self.cache_avatar(&addr, &image);
+                        self.user_with_avatar(&addr)
+                            .map(|user| Event::ProfileChanged { user })
+                    }
+                    Err(e) => {
+                        eprintln!("enclave: avatar {} failed to open: {e}", hex::encode(addr));
+                        None
+                    }
+                }
+            }
             ServerMsg::Mls { group, message, .. } => {
                 let identity = self.identity.as_ref()?;
-                let conv = self.conversations.get_mut(&group)?;
-                let g = conv.group.as_mut()?;
-                match g.apply_commit(identity, &message.0) {
-                    Ok(()) => {
-                        self.save_session();
-                        Some(Event::ConversationsChanged)
+                let me = self.username.clone().unwrap_or_default();
+                // Apply the commit; if it removed us, take the now-dead group out to
+                // delete its state (so a rejoin can recreate it) and mark it Left.
+                // The displayed roster is driven by the server's GroupMembers, not
+                // this leaf tree, so we do not sync members here.
+                let removed_group: Option<Group> = {
+                    let conv = self.conversations.get_mut(&group)?;
+                    let apply = {
+                        let g = conv.group.as_mut()?;
+                        g.apply_commit(identity, &message.0)
+                            .map(|()| g.is_member(&me))
+                    };
+                    match apply {
+                        Ok(true) => None,
+                        Ok(false) => {
+                            conv.visibility = Visibility::Left;
+                            conv.group.take()
+                        }
+                        Err(_) => return None,
                     }
-                    Err(_) => None,
+                };
+                let removed = removed_group.is_some();
+                if let Some(g) = removed_group {
+                    let _ = g.delete(identity);
                 }
+                self.save_session();
+                if !removed {
+                    // Membership changed: re-announce our profile to the group so a
+                    // member who just joined receives it (the version dedups it for
+                    // members who already had it).
+                    self.send_profile_to(&group);
+                }
+                Some(Event::ConversationsChanged)
             }
             ServerMsg::Presence { user, status } => Some(Event::Presence {
                 user: user.0,
@@ -2385,14 +5071,64 @@ impl Client {
                 self.friends = friends;
                 self.incoming = incoming;
                 self.outgoing = outgoing;
+                // Anyone we are friends with again is no longer "removed us".
+                let friend_names: Vec<String> =
+                    self.friends.iter().map(|f| f.username.clone()).collect();
+                self.removed_me.retain(|h| !friend_names.contains(h));
                 Some(Event::FriendsChanged)
             }
-            ServerMsg::FriendRequestReceived { from } => Some(Event::FriendRequest { from }),
+            ServerMsg::FriendRequestReceived { from } => {
+                // Auto-reconnect ONLY when they removed us: a re-add from someone
+                // who dropped us reconnects silently (the counter-add case) and
+                // restores the DM. A re-add from someone WE removed is surfaced as
+                // a normal request to accept or decline.
+                if self.removed_me.contains(&from) {
+                    self.accept_friend(&from);
+                    return Some(Event::FriendsChanged);
+                }
+                Some(Event::FriendRequest { from })
+            }
+            ServerMsg::FriendRemoved { handle } => {
+                // They removed us: remember the direction so a later re-add from
+                // them auto-reconnects. The conversation and its history stay; only
+                // sending pauses until reconnected.
+                self.removed_me.insert(handle);
+                Some(Event::FriendsChanged)
+            }
+            ServerMsg::GroupMembers { group, members } => {
+                // The server's authoritative routing membership for a GROUP. It is
+                // the source of truth for the displayed member list/count (a leaver
+                // can't be removed from the MLS leaf tree while offline, but the
+                // server always knows). DMs keep their fixed [me, peer] roster.
+                if let Some(conv) = self.conversations.get_mut(&group) {
+                    if conv.kind == ConvKind::Group {
+                        conv.members = members;
+                        self.save_session();
+                        return Some(Event::ConversationsChanged);
+                    }
+                }
+                None
+            }
+            ServerMsg::RemovedFromGroup { group } => {
+                // A member removed us from this group. Keep the history readable
+                // but tear down the dead channel (deleting the MLS state so a
+                // future rejoin can recreate it) and mark it Left (read-only).
+                let taken = self.conversations.get_mut(&group).and_then(|c| {
+                    c.visibility = Visibility::Left;
+                    c.group.take()
+                });
+                if taken.is_some() {
+                    if let (Some(g), Some(identity)) = (taken, self.identity.as_ref()) {
+                        let _ = g.delete(identity);
+                    }
+                    self.save_session();
+                    return Some(Event::ConversationsChanged);
+                }
+                None
+            }
             // The authoritative list follows in a Friends snapshot; surface the
             // change so the UI refreshes.
-            ServerMsg::FriendAccepted { .. } | ServerMsg::FriendRemoved { .. } => {
-                Some(Event::FriendsChanged)
-            }
+            ServerMsg::FriendAccepted { .. } => Some(Event::FriendsChanged),
             ServerMsg::CallOffer { group, from } => Some(Event::CallOffer {
                 conv: hex_id(&group),
                 from: self.display_of(&from),
@@ -2402,7 +5138,10 @@ impl Client {
                 participants,
             } => Some(Event::CallParticipants {
                 conv: hex_id(&group),
-                participants: participants.iter().map(|p| self.display_of(p)).collect(),
+                // Usernames (stable identity); the UI resolves display names for
+                // the nameplates and matches our own entry by username, so a
+                // rename can never drop us out of the participant tiles.
+                participants,
             }),
             ServerMsg::CallDeclined { group, from } => Some(Event::CallDeclined {
                 conv: hex_id(&group),
@@ -2430,6 +5169,20 @@ fn derive_dm_id(a: &str, b: &str) -> GroupId {
     GroupId(id)
 }
 
+/// The stable routing id of our own "Notes to self" scratchpad. Derived from our
+/// username under a distinct domain so there is exactly one per account and it
+/// can never collide with a DM id (`enclave-dm`) or a random group id. Nothing is
+/// ever routed to it -- the id only keys the local conversation map.
+fn derive_self_id(me: &str) -> GroupId {
+    let mut h = Sha256::new();
+    h.update(b"enclave-self\0");
+    h.update(me.as_bytes());
+    let digest = h.finalize();
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&digest);
+    GroupId(id)
+}
+
 /// A fresh random routing id for a named group.
 fn random_group_id() -> GroupId {
     let mut id = [0u8; 32];
@@ -2451,6 +5204,15 @@ fn new_transfer_id() -> [u8; 16] {
     let mut id = [0u8; 16];
     let _ = getrandom::getrandom(&mut id);
     id
+}
+
+/// Wall-clock now in unix milliseconds, for message timestamps. Zero if the
+/// clock is before the epoch (unreachable in practice).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Read up to `buf.len()` bytes, retrying short reads so a full chunk is

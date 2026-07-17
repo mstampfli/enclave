@@ -361,13 +361,23 @@ impl Call {
     fn spawn_screen(&mut self, capture: enclave_media::ScreenCapture) {
         let sealer = self.sealer.clone();
         let frame_tx = self.frame_tx.clone();
+        // Loop our own screen back locally (tagged with our name, as a non-camera
+        // frame) so we get a self-preview of what we are sharing, the same way
+        // the camera loops its frames back. Peers still receive the sent frames.
+        let preview_tx = self.local_frame_tx.clone();
+        let me = self.me.clone();
         let status = capture.status_handle();
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
         let thread = std::thread::spawn(move || {
-            video_encode_loop(&s, MediaKind::Screen, &sealer, &frame_tx, None, || {
-                capture.latest().map(|cf| (cf.bgra, cf.width, cf.height))
-            });
+            video_encode_loop(
+                &s,
+                MediaKind::Screen,
+                &sealer,
+                &frame_tx,
+                Some((preview_tx, me)),
+                || capture.latest().map(|cf| (cf.bgra, cf.width, cf.height)),
+            );
         });
         self.screen = Some(VideoSender {
             stop,
@@ -514,8 +524,9 @@ fn mix_into(mix: &MixRing, frame: &mut [i16], muted: bool) -> bool {
 
 /// The shared video send loop for both screen share and camera. Pulls BGRA
 /// frames from `next_frame`, crops to even dimensions, H.264-encodes with a
-/// periodic keyframe, seals with `kind`, and sends. If `preview` is set (camera
-/// only), each encoded frame is also looped back locally for a self-preview.
+/// periodic keyframe, seals with `kind`, and sends. If `preview` is set (both
+/// camera and screen use it), each encoded frame is also looped back locally,
+/// tagged with our own name, for a self-preview the sender can watch.
 /// Paced to ~30 fps: a source whose read already blocks for the frame interval
 /// (a camera) incurs no extra sleep; an instant source (screen) is throttled.
 fn video_encode_loop<F>(
@@ -533,7 +544,10 @@ fn video_encode_loop<F>(
 
     let mut encoder = match H264Encoder::new(6_000_000, 30.0) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("enclave: video encoder init failed ({kind:?}): {e}");
+            return;
+        }
     };
     let target = Duration::from_millis(33); // ~30 fps
     let mut n: u64 = 0;
@@ -557,8 +571,9 @@ fn video_encode_loop<F>(
                 let force_key = n.is_multiple_of(60); // keyframe every ~2 s and at start
                 if let Ok((h264, key)) = encoder.encode(&tight, w, h, force_key) {
                     if !h264.is_empty() {
-                        // Camera self-preview: show our own frames locally
-                        // without transmitting them back to ourselves.
+                        // Self-preview: show our own frames locally without
+                        // transmitting them back to ourselves. Set for both
+                        // camera tiles and screen share (see `preview`).
                         if let Some((preview_tx, me)) = &preview {
                             let _ = preview_tx.send(ScreenFrameOut {
                                 from: me.clone(),

@@ -1441,6 +1441,7 @@ version = "0.0.0"
 dependencies = [
  "argon2",
  "chacha20poly1305 0.11.0",
+ "curve25519-dalek",
  "ed25519-dalek",
  "enclave-protocol",
  "getrandom 0.2.17",
@@ -1450,6 +1451,7 @@ dependencies = [
  "openmls_basic_credential",
  "openmls_rust_crypto",
  "openmls_traits",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.18",

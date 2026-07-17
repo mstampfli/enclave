@@ -215,30 +215,34 @@ impl FileStore {
     /// Append one sealed chunk to an in-progress upload. Rejects (and drops the
     /// whole offer) if the sealed total exceeds the declared size plus sealing
     /// slack, so a sender cannot under-declare to slip past admission.
+    ///
+    /// This does the disk write inline; production uses [`reserve_append`] +
+    /// [`write_reserved`] to keep the write off the global relay lock (a slow
+    /// disk write under the lock would stall every client). Kept for tests.
+    #[cfg(test)]
     pub fn append(&mut self, id: &[u8; 16], chunk: &[u8]) -> Result<(), Rejected> {
+        let path = self.reserve_append(id, chunk.len())?;
+        write_reserved(&path, chunk).map_err(|_| Rejected::Unavailable)
+    }
+
+    /// Reserve space for a chunk under the lock: check the size cap and account
+    /// the bytes, returning the blob path to write to. The actual disk write is
+    /// done off the lock by [`write_reserved`], so a slow disk never stalls the
+    /// relay. On overrun the offer is dropped (the sender under-declared).
+    pub fn reserve_append(&mut self, id: &[u8; 16], len: usize) -> Result<PathBuf, Rejected> {
         let Some(offer) = self.offers.get_mut(id) else {
             return Err(Rejected::Unavailable);
         };
         if offer.complete {
             return Err(Rejected::Unavailable);
         }
-        let new_written = offer.written.saturating_add(chunk.len() as u64);
+        let new_written = offer.written.saturating_add(len as u64);
         if new_written > offer.write_cap {
-            // Overrun: the sender lied about the size. Drop the whole offer.
             self.remove(id);
             return Err(Rejected::TooLarge);
         }
-        // Length-prefix each chunk so the exact sealed boundaries replay on read.
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&offer.blob)
-            .map_err(|_| Rejected::Unavailable)?;
-        let len = (chunk.len() as u32).to_le_bytes();
-        f.write_all(&len)
-            .and_then(|_| f.write_all(chunk))
-            .map_err(|_| Rejected::Unavailable)?;
         offer.written = new_written;
-        Ok(())
+        Ok(offer.blob.clone())
     }
 
     /// Finish an upload: make the offer deliverable. The declared size is the
@@ -392,6 +396,18 @@ impl FileStore {
 
 fn hex(id: &[u8; 16]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Append a length-prefixed chunk to a blob file, run OFF the global relay lock.
+/// The per-offer file is written by one connection processing messages
+/// sequentially, so appends stay in order without holding the store lock, and a
+/// slow disk write never stalls every other client. Uses the same framing
+/// [`BlobReader`] reads back.
+pub fn write_reserved(path: &std::path::Path, chunk: &[u8]) -> std::io::Result<()> {
+    let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
+    let len = (chunk.len() as u32).to_le_bytes();
+    f.write_all(&len)?;
+    f.write_all(chunk)
 }
 
 /// Streams a stored blob's length-prefixed sealed chunks back one at a time, so
@@ -577,6 +593,42 @@ mod tests {
         assert_eq!(s.resolve(&i, "c"), Resolution::Deleted, "last recipient");
         assert!(s.read_chunks(&i, "c").is_none(), "blob gone");
         assert_eq!(s.used_bytes(), 0, "quota reclaimed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_aborted_delivery_stays_downloadable() {
+        // A recipient who aborts mid-download (abort_delivery, not resolve) must
+        // remain able to download the file again: the offer is not consumed.
+        let (mut s, dir) = store(u64::MAX);
+        let i = id(1);
+        s.begin(
+            i,
+            GroupId([0; 32]),
+            "a".into(),
+            vec!["b".into()],
+            5,
+            Sealed(vec![1]),
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        s.append(&i, b"data!").unwrap();
+        s.finish(&i).unwrap();
+        // First attempt begins, then aborts (recipient cancelled).
+        let (_blob, _sender) = s.begin_delivery(&i, "b").expect("first delivery begins");
+        s.abort_delivery(&i, "b");
+        // The offer survives and a second delivery to the same recipient begins.
+        assert!(
+            s.begin_delivery(&i, "b").is_some(),
+            "re-download after abort works"
+        );
+        // A genuine completion still resolves and reclaims the blob.
+        assert_eq!(
+            s.finish_delivery(&i, "b"),
+            Resolution::Deleted,
+            "last recipient done"
+        );
+        assert_eq!(s.used_bytes(), 0, "quota reclaimed after real completion");
         let _ = std::fs::remove_dir_all(dir);
     }
 
