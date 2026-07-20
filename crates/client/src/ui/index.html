@@ -186,7 +186,7 @@ input[type="checkbox"], select { cursor: pointer; }
 .msg-group.mine .msg-reactions { justify-content: flex-end; }
 .reaction { display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px; height: 22px;
   font-size: 12.5px; color: var(--ink); background: var(--bg); border: 1px solid var(--border);
-  border-radius: 999px; cursor: pointer; }
+  border-radius: var(--radius); cursor: pointer; }
 .reaction:hover { border-color: var(--border-strong); }
 .reaction.mine { background: var(--accent-bg); border-color: var(--accent-ink); color: var(--accent-ink); }
 .reaction .re-emoji { font-size: 13.5px; line-height: 1; }
@@ -969,7 +969,7 @@ input[type="checkbox"], select { cursor: pointer; }
 .search-modal { width: min(560px, calc(100vw - 48px)); }
 .search-scope { display: flex; align-items: center; gap: 4px; margin: 2px 0 8px; }
 .search-scope .scope-tab { font-size: 12.5px; color: var(--muted); background: none;
-  border: 1px solid var(--border); border-radius: 999px; padding: 4px 12px; cursor: pointer; }
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 4px 12px; cursor: pointer; }
 .search-scope .scope-tab:hover:not([disabled]) { color: var(--ink); border-color: var(--border-strong); }
 .search-scope .scope-tab.active { color: var(--accent-ink); border-color: var(--accent-ink); background: var(--accent-bg); }
 .search-scope .scope-tab[disabled] { opacity: 0.4; cursor: default; }
