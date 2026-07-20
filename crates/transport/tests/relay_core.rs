@@ -1227,3 +1227,228 @@ fn a_timed_out_live_recipient_is_dropped_and_the_sender_is_told() {
         "the dropped recipient no longer receives chunks"
     );
 }
+
+// --- Poll (ballot buffer) quotas: a member must not be able to spam the relay
+// out of memory, nor stamp on another member's poll. ---
+
+// Open a group containing `a` and `b`, returning it.
+fn poll_group(r: &mut Relay, a: u64, bh: &str, tag: u8) -> GroupId {
+    let group = GroupId([tag; 32]);
+    r.handle(
+        a,
+        ClientMsg::JoinGroup {
+            group: group.clone(),
+        },
+    );
+    r.handle(
+        a,
+        ClientMsg::Welcome {
+            to: DeviceId(bh.to_string()),
+            name: String::new(),
+            group: group.clone(),
+            message: Sealed(vec![]),
+        },
+    );
+    group
+}
+
+fn error_detail(out: &[Outgoing]) -> Option<String> {
+    out.iter().find_map(|o| match &o.msg {
+        ServerMsg::Error { detail } => Some(detail.clone()),
+        _ => None,
+    })
+}
+
+#[test]
+fn reopening_a_poll_id_is_refused_and_cannot_discard_cast_ballots() {
+    let mut r = Relay::new();
+    let (a, _ah) = register(&mut r, "a", vec![1]);
+    let (b, bh) = register(&mut r, "b", vec![2]);
+    let group = poll_group(&mut r, a, &bh, 21);
+    let poll = [1u8; 16];
+
+    r.handle(
+        a,
+        ClientMsg::BallotOpen {
+            poll,
+            group: group.clone(),
+            mode: 2,
+            release_at: None,
+        },
+    );
+    r.handle(
+        b,
+        ClientMsg::BallotSubmit {
+            poll,
+            ballot: Sealed(vec![9; 76]),
+        },
+    );
+
+    // Bob re-opens Alice's poll id: refused, and Bob's cast ballot survives.
+    let out = r.handle(
+        b,
+        ClientMsg::BallotOpen {
+            poll,
+            group: group.clone(),
+            mode: 2,
+            release_at: None,
+        },
+    );
+    assert_eq!(
+        error_detail(&out).as_deref(),
+        Some("that poll is already open"),
+        "a re-used poll id is refused with a clear reason"
+    );
+
+    // The owner closes: the ballot cast before the re-open attempt is still there.
+    let out = r.handle(a, ClientMsg::BallotClose { poll });
+    let released: usize = out
+        .iter()
+        .filter_map(|o| match &o.msg {
+            ServerMsg::Ballots { ballots, .. } => Some(ballots.len()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        released, 1,
+        "the ballot was not wiped by the re-open attempt"
+    );
+}
+
+#[test]
+fn one_device_cannot_open_unbounded_polls() {
+    let mut r = Relay::new();
+    let (a, _ah) = register(&mut r, "a", vec![1]);
+    let (_b, bh) = register(&mut r, "b", vec![2]);
+    let group = poll_group(&mut r, a, &bh, 22);
+
+    // Fill the per-device quota; every one of these is accepted.
+    let mut opened = 0;
+    for n in 0..64u16 {
+        let mut poll = [0u8; 16];
+        poll[..2].copy_from_slice(&n.to_le_bytes());
+        let out = r.handle(
+            a,
+            ClientMsg::BallotOpen {
+                poll,
+                group: group.clone(),
+                mode: 2,
+                release_at: None,
+            },
+        );
+        match error_detail(&out) {
+            None => opened += 1,
+            Some(detail) => {
+                assert!(
+                    detail.contains("too many open polls"),
+                    "refusal explains the quota, got: {detail}"
+                );
+                assert!(opened > 0, "some polls were accepted before the cap");
+                return; // the cap bit, with a clean error
+            }
+        }
+    }
+    panic!("the per-device poll quota never applied: opened {opened} polls unchecked");
+}
+
+#[test]
+fn an_oversized_ballot_is_refused() {
+    let mut r = Relay::new();
+    let (a, _ah) = register(&mut r, "a", vec![1]);
+    let (b, bh) = register(&mut r, "b", vec![2]);
+    let group = poll_group(&mut r, a, &bh, 23);
+    let poll = [3u8; 16];
+    r.handle(
+        a,
+        ClientMsg::BallotOpen {
+            poll,
+            group: group.clone(),
+            mode: 2,
+            release_at: None,
+        },
+    );
+
+    // A real ballot is ~76 bytes; this is a memory-parking attempt.
+    let out = r.handle(
+        b,
+        ClientMsg::BallotSubmit {
+            poll,
+            ballot: Sealed(vec![0; 64 * 1024]),
+        },
+    );
+    assert_eq!(
+        error_detail(&out).as_deref(),
+        Some("that ballot is too large to accept"),
+        "an oversized ballot is refused with a clear reason"
+    );
+
+    // A normal-sized ballot on the same poll is still accepted.
+    let out = r.handle(
+        b,
+        ClientMsg::BallotSubmit {
+            poll,
+            ballot: Sealed(vec![1; 76]),
+        },
+    );
+    assert!(error_detail(&out).is_none(), "a real ballot still works");
+}
+
+#[test]
+fn an_abandoned_poll_is_reclaimed_and_frees_its_quota() {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime};
+
+    let mut r = Relay::new();
+    let clock = Arc::new(Mutex::new(SystemTime::now()));
+    let c = Arc::clone(&clock);
+    r.set_clock(move || *c.lock().unwrap());
+
+    let (a, _ah) = register(&mut r, "a", vec![1]);
+    let (_b, bh) = register(&mut r, "b", vec![2]);
+    let group = poll_group(&mut r, a, &bh, 24);
+    let poll = [4u8; 16];
+
+    // A poll with no deadline: only its owner could ever close it.
+    r.handle(
+        a,
+        ClientMsg::BallotOpen {
+            poll,
+            group: group.clone(),
+            mode: 2,
+            release_at: None,
+        },
+    );
+    // Nothing is due yet, so the sweep leaves it alone.
+    r.sweep_ballots();
+    let out = r.handle(
+        a,
+        ClientMsg::BallotOpen {
+            poll,
+            group: group.clone(),
+            mode: 2,
+            release_at: None,
+        },
+    );
+    assert!(
+        error_detail(&out).is_some(),
+        "the poll is still open before the TTL"
+    );
+
+    // Long after it was abandoned, the relay reclaims it.
+    *clock.lock().unwrap() += Duration::from_secs(31 * 24 * 60 * 60);
+    r.sweep_ballots();
+    let out = r.handle(
+        a,
+        ClientMsg::BallotOpen {
+            poll,
+            group,
+            mode: 2,
+            release_at: None,
+        },
+    );
+    assert!(
+        error_detail(&out).is_none(),
+        "the abandoned poll was reclaimed, so its id and quota are free again"
+    );
+}

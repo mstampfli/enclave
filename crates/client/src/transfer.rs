@@ -80,10 +80,11 @@ pub enum TransferMeta {
     /// options + single/multi + reveal mode). Sent inline like text (small), so it
     /// becomes a message line the recipients can vote on.
     Poll,
-    /// A vote on a poll. The part's `data` is a bincode [`VoteBody`] (the poll's
-    /// message id + the chosen option indices; empty = vote retracted). The voter
-    /// is the sealed message's *authenticated sender*, so a member can only ever
-    /// set its OWN vote (one vote-set per member, last write wins).
+    /// A vote on a poll. The part's `data` is a fixed-width [`VoteBody`] (the
+    /// poll's message id + a selection bitmask; all-zero = vote retracted), the
+    /// same constant size whatever it says. The voter is the sealed message's
+    /// *authenticated sender*, so a member can only ever set its OWN vote (one
+    /// vote-set per member, last write wins).
     Vote,
     /// A "close this poll" control. The part's `data` is the 16-byte poll message
     /// id. Honored only if the poll's author equals the authenticated sender, so
@@ -175,6 +176,11 @@ pub struct VoteBody {
     pub options: Vec<u8>,
 }
 
+/// The fixed on-the-wire size of an encoded [`VoteBody`]: a 16-byte poll id
+/// plus a 256-bit selection bitmask. Every ballot is exactly this long, so a
+/// ballot's size can never hint at what it contains. See [`VoteBody::encode`].
+pub const VOTE_BODY_BYTES: usize = 16 + 32;
+
 /// An anonymous poll ballot: the sealed choice plus a linkable ring signature
 /// proving a ring member cast it, without revealing which. The signature's key
 /// image is the ballot's pseudonymous voter id (a re-vote by the same member
@@ -195,11 +201,47 @@ impl AnonBallot {
 }
 
 impl VoteBody {
+    /// Encode to a **fixed-width** body: the poll id followed by a 256-bit
+    /// selection bitmask (bit `i` set = option `i` chosen).
+    ///
+    /// The constant size is a security property, not an implementation detail.
+    /// Ballots on the buffered/anonymous path are sealed with a stream cipher
+    /// and handed straight to the untrusted relay, so ciphertext length equals
+    /// plaintext length plus a constant. A variable-length body (a list of
+    /// chosen indices) would let the relay read *how many* options a voter
+    /// picked directly off the wire without holding any key -- and on a poll
+    /// where someone picks every option, or on a single-choice poll where the
+    /// only distinction is "voted" vs "retracted", that count identifies the
+    /// ballot outright. A fixed mask makes every ballot the same size whatever
+    /// it says, and hides the poll's option count as well.
+    ///
+    /// The mask is also *canonical*: it dedups and orders the selections, so
+    /// the ordering of indices cannot smuggle a signal either.
     pub fn encode(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_default()
+        let mut out = vec![0u8; VOTE_BODY_BYTES];
+        out[..16].copy_from_slice(&self.target);
+        for &i in &self.options {
+            // `i` is a u8, so every representable option index fits the mask.
+            out[16 + (i as usize) / 8] |= 1u8 << (i % 8);
+        }
+        out
     }
+
+    /// Decode a fixed-width body, returning the selected indices in ascending
+    /// order. Any body that is not exactly [`VOTE_BODY_BYTES`] is rejected.
     pub fn decode(bytes: &[u8]) -> Option<VoteBody> {
-        bincode::deserialize(bytes).ok()
+        if bytes.len() != VOTE_BODY_BYTES {
+            return None;
+        }
+        let mut target = [0u8; 16];
+        target.copy_from_slice(&bytes[..16]);
+        let mut options = Vec::new();
+        for i in 0..=u8::MAX {
+            if bytes[16 + (i as usize) / 8] & (1u8 << (i % 8)) != 0 {
+                options.push(i);
+            }
+        }
+        Some(VoteBody { target, options })
     }
 }
 
@@ -1058,5 +1100,129 @@ mod tests {
         assert!(s.insert(seen_id(0)), "evicted id is no longer remembered");
         // A still-remembered recent id is still a duplicate.
         assert!(!s.insert(seen_id(3)));
+    }
+
+    /// The ballot-secrecy property: a sealed ballot's *length* must not depend
+    /// on what was voted for. The relay holds no ballot key, so length is the
+    /// only channel it could read a choice from -- if the encoding were a list
+    /// of chosen indices, "picked 1" and "picked 4" would differ on the wire.
+    #[test]
+    fn a_sealed_ballot_is_the_same_size_whatever_it_says() {
+        let target = [7u8; 16];
+        let key = [42u8; 32];
+        let choices: Vec<Vec<u8>> = vec![
+            vec![],                // retracted / abstained
+            vec![0],               // a single low option
+            vec![255],             // a single high option
+            vec![0, 1, 2, 3],      // several
+            (0..=255u8).collect(), // every option at once
+        ];
+
+        let mut plaintext_sizes = Vec::new();
+        let mut sealed_sizes = Vec::new();
+        for options in &choices {
+            let body = VoteBody {
+                target,
+                options: options.clone(),
+            };
+            let pt = body.encode();
+            let sealed = enclave_crypto::seal_ballot(&key, &target, &pt).expect("seal");
+            plaintext_sizes.push(pt.len());
+            sealed_sizes.push(sealed.len());
+        }
+
+        assert!(
+            plaintext_sizes.iter().all(|&n| n == VOTE_BODY_BYTES),
+            "every ballot body is the fixed width: {plaintext_sizes:?}"
+        );
+        assert_eq!(
+            sealed_sizes
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1,
+            "every sealed ballot is one identical size, so the relay learns \
+             nothing from it: {sealed_sizes:?}"
+        );
+    }
+
+    #[test]
+    fn a_ballot_round_trips_and_canonicalizes_its_selection() {
+        let target = [3u8; 16];
+        // Deliberately out of order and with a duplicate: the bitmask must
+        // canonicalize, so index ordering cannot carry a covert signal.
+        let body = VoteBody {
+            target,
+            options: vec![9, 2, 9, 0],
+        };
+        let back = VoteBody::decode(&body.encode()).expect("decode");
+        assert_eq!(back.target, target);
+        assert_eq!(back.options, vec![0, 2, 9], "sorted and deduped");
+
+        // Empty (a retraction) round-trips as empty, not as "missing".
+        let empty = VoteBody {
+            target,
+            options: vec![],
+        };
+        let back = VoteBody::decode(&empty.encode()).expect("decode");
+        assert!(back.options.is_empty());
+
+        // The full range survives, so no option index is unrepresentable.
+        let all = VoteBody {
+            target,
+            options: (0..=255u8).collect(),
+        };
+        let back = VoteBody::decode(&all.encode()).expect("decode");
+        assert_eq!(back.options.len(), 256);
+    }
+
+    #[test]
+    fn a_wrong_sized_ballot_body_is_rejected() {
+        assert!(VoteBody::decode(&[]).is_none());
+        assert!(VoteBody::decode(&[0u8; VOTE_BODY_BYTES - 1]).is_none());
+        assert!(VoteBody::decode(&[0u8; VOTE_BODY_BYTES + 1]).is_none());
+        assert!(VoteBody::decode(&[0u8; VOTE_BODY_BYTES]).is_some());
+    }
+
+    /// What the relay actually stores for an anonymous poll is the whole
+    /// [`AnonBallot`] (sealed choice + ring signature), so that -- not just the
+    /// inner ciphertext -- is what must be size-invariant. The signature's size
+    /// tracks the ring, which is fixed when the poll is created and identical
+    /// for every voter, so the complete wire object is one constant size no
+    /// matter who votes or what they pick.
+    #[test]
+    fn the_anonymous_ballot_the_relay_stores_is_size_invariant() {
+        let poll = [5u8; 16];
+        let key = [9u8; 32];
+        let members: Vec<enclave_crypto::RingKeypair> = (0..3u8)
+            .map(|n| enclave_crypto::RingKeypair::from_seed(&[n; 32]))
+            .collect();
+        let ring: Vec<[u8; 32]> = members.iter().map(|m| m.public).collect();
+
+        let mut sizes = std::collections::HashSet::new();
+        // Different voters casting different choices, including an abstention
+        // and a pick-everything ballot.
+        for (voter, options) in [
+            (0usize, vec![]),
+            (1usize, vec![0u8]),
+            (2usize, vec![0u8, 1, 2, 3]),
+        ] {
+            let body = VoteBody {
+                target: poll,
+                options,
+            };
+            let sealed = enclave_crypto::seal_ballot(&key, &poll, &body.encode()).expect("seal");
+            let sig = members[voter].sign(&sealed, &poll, &ring).expect("sign");
+            let ballot = AnonBallot {
+                sealed_choice: sealed,
+                sig,
+            };
+            sizes.insert(ballot.encode().len());
+        }
+        assert_eq!(
+            sizes.len(),
+            1,
+            "every anonymous ballot on the wire is one identical size: {sizes:?}"
+        );
     }
 }

@@ -177,12 +177,31 @@ pub struct Relay {
 /// live (a private survey the owner watches); 2 = buffer and release to the OWNER
 /// at close. The owner is the device that opened the poll -- the only one that may
 /// close it early.
+/// Quotas on buffered polls. An open poll costs the relay memory until it is
+/// released, so their number is bounded per owner AND globally, and a ballot is
+/// bounded in size. These are far above real use: a poll is a handful of bytes
+/// of bookkeeping, and a real ballot is a fixed-width sealed body (plus a ring
+/// signature on an anonymous poll, which grows only with the group's size), so
+/// the caps bite only on abuse.
+const MAX_OPEN_POLLS_PER_DEVICE: usize = 16;
+const MAX_OPEN_POLLS_TOTAL: usize = 1024;
+/// Generous ceiling for one sealed ballot: a plain ballot is ~76 bytes, and an
+/// anonymous one adds ~32 bytes per ring member, so this still admits a ring of
+/// several hundred while refusing a blob sent to exhaust memory.
+const MAX_BALLOT_BYTES: usize = 16 * 1024;
+/// How long an un-closed poll may sit before the relay reclaims it. Without
+/// this, a poll opened with no deadline and never closed would hold its owner's
+/// quota (and the relay's memory) forever.
+const POLL_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 struct BufferedPoll {
     owner: DeviceId,
     group: GroupId,
     mode: u8,
     /// Auto-release time; `None` = owner-triggered close only.
     release_at: Option<SystemTime>,
+    /// When the poll was opened, so an abandoned one can be reclaimed (POLL_TTL).
+    opened_at: SystemTime,
     /// Sealed ballots, deduped by submitter device (last write wins).
     ballots: HashMap<DeviceId, Sealed>,
 }
@@ -745,6 +764,29 @@ impl Relay {
                 if !self.is_member(&group, &owner) {
                     return vec![];
                 }
+                // Deny-by-default on a re-used poll id (ASVS V4, object level):
+                // re-opening an id would otherwise let ANY member reset another
+                // member's poll and discard the ballots already cast in it.
+                if self.ballots.contains_key(&poll) {
+                    return poll_refused(from, "that poll is already open");
+                }
+                if self.ballots.len() >= MAX_OPEN_POLLS_TOTAL {
+                    return poll_refused(
+                        from,
+                        "the server has too many open polls right now; try again later",
+                    );
+                }
+                // Counted from the one authoritative map rather than a side
+                // counter that could drift out of step with releases, expiries
+                // and reclaims. Bounded by MAX_OPEN_POLLS_TOTAL and only run
+                // when a poll is opened, which is rare.
+                let mine = self.ballots.values().filter(|bp| bp.owner == owner).count();
+                if mine >= MAX_OPEN_POLLS_PER_DEVICE {
+                    return poll_refused(
+                        from,
+                        "you already have too many open polls; close one before starting another",
+                    );
+                }
                 self.ballots.insert(
                     poll,
                     BufferedPoll {
@@ -752,6 +794,7 @@ impl Relay {
                         group,
                         mode,
                         release_at: release_at.map(|ms| UNIX_EPOCH + Duration::from_millis(ms)),
+                        opened_at: (self.now)(),
                         ballots: HashMap::new(),
                     },
                 );
@@ -773,6 +816,11 @@ impl Relay {
                 };
                 if !self.is_member(&group, &dev) {
                     return vec![];
+                }
+                // A real ballot is tiny and fixed-width; anything far larger is
+                // an attempt to park memory on the relay, not a vote.
+                if ballot.0.len() > MAX_BALLOT_BYTES {
+                    return poll_refused(from, "that ballot is too large to accept");
                 }
                 if mode == 1 {
                     let msg = ServerMsg::Ballots {
@@ -1649,6 +1697,12 @@ impl Relay {
         for id in due {
             out.extend(self.release_ballots(&id));
         }
+        // Reclaim polls nobody ever closed. Dropped rather than released: the
+        // owner chose "close when I say", and publishing a month-old tally they
+        // never asked for would be a worse surprise than letting it lapse. The
+        // poll still exists in each client's own history.
+        self.ballots
+            .retain(|_, bp| now.duration_since(bp.opened_at).unwrap_or_default() < POLL_TTL);
         out
     }
 
@@ -1910,6 +1964,18 @@ pub fn spillable(msg: &ServerMsg) -> bool {
             | ServerMsg::Welcome { .. }
             | ServerMsg::FileOffered { .. }
     )
+}
+
+/// Refuse a poll operation, telling the sender why in words their client can
+/// show. Poll controls are not on the reliable-delivery path, so a refusal is
+/// reported once rather than retried silently.
+fn poll_refused(to: ConnId, detail: &str) -> Vec<Outgoing> {
+    vec![Outgoing {
+        to,
+        msg: ServerMsg::Error {
+            detail: detail.to_string(),
+        },
+    }]
 }
 
 /// Build a `FileOfferRejected` reply to the sender.

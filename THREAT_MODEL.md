@@ -269,6 +269,20 @@ addressed at the wire:
   hiding those means constant-bitrate padding, a much more expensive tradeoff
   left for later.
 
+- **Ballot size.** A vote on a buffered or anonymous poll does not travel as an
+  MLS message, so it does not inherit the padding above: it is sealed with a
+  stream cipher (`crypto::seal_ballot`) and handed straight to the relay, where
+  ciphertext length is plaintext length plus a constant. A ballot is therefore
+  encoded at a **fixed width** -- the poll id plus a 256-bit selection bitmask
+  (`transfer::VOTE_BODY_BYTES`), never a variable list of chosen indices -- so
+  every ballot is the same size whatever it says. Without this the relay could
+  read the *number* of options a voter picked straight off the wire while
+  holding no key at all; on a pick-everything ballot, or on a single-choice poll
+  where the only distinction is "voted" vs "retracted", that count identifies
+  the vote outright. The mask is also canonical, so index ordering cannot carry
+  a signal either. Proven by `a_sealed_ballot_is_the_same_size_whatever_it_says`
+  and `the_anonymous_ballot_the_relay_stores_is_size_invariant`.
+
 - **Recipient set.** The relay routes a group's traffic to exactly that group's
   members (`Relay` fan-out sets), so it learns the social graph of who talks to
   whom. The obvious hardening -- broadcast every message to *every* account and
@@ -288,6 +302,67 @@ addressed at the wire:
   (a mixnet, or sealed-sender with per-message tokens the server cannot link to
   an account), which is a separate design, not a routing tweak. Recorded here as
   a known, accepted limitation of the SFU model.
+
+## Polls and ballots (STRIDE + ASVS L2)
+
+A poll is an ordinary sealed message; how its votes travel depends on the reveal
+mode its creator picked:
+
+- **Immediate modes** (tally always visible, or visible once you vote) send each
+  vote as a normal MLS-sealed control, padded like any other message.
+- **Buffered modes** (tally only after close, owner-only, or anonymous) cannot
+  use the message ratchet: a ballot must still open after an epoch change, and
+  the whole point is that nobody -- the creator included -- sees a tally early.
+  Ballots are instead sealed under a per-poll **content key**, minted by the
+  creator and distributed only inside the MLS-sealed poll body, then held by the
+  relay and released at the deadline or on an authenticated close by the owner.
+
+**What the relay holds.** Sealed ballots it cannot open (it never sees the
+content key), each a fixed-width body under a random nonce. It enforces release
+timing and membership, nothing else.
+
+**What the relay learns.** That a given connection submitted a ballot, and when.
+It does **not** learn what the ballot says: the choice is AEAD-sealed under a key
+it does not hold, and the ciphertext is a constant size, so no part of the
+selection is recoverable from the wire (see "Metadata the server sees").
+
+**Anonymous polls.** Ballots carry a linkable ring signature (LSAG,
+`crypto::ring`) over the ring of members' voting keys, so a verifier learns only
+that *some* ring member cast it. The signature's key image is a stable pseudonym
+per (voter, poll), which lets a re-vote replace the earlier one without ever
+naming the voter, and stops one member stuffing the ballot box. On release the
+relay strips the submitting device id.
+
+**Denial of service.** A buffered poll costs the relay memory until it is
+released, so the ballot buffer is bounded on every axis: at most
+`MAX_OPEN_POLLS_PER_DEVICE` open polls per owner, `MAX_OPEN_POLLS_TOTAL` across
+the whole server, a `MAX_BALLOT_BYTES` ceiling on any single sealed ballot (a
+real one is ~76 bytes), and a `POLL_TTL` after which a poll nobody ever closed is
+reclaimed, so an abandoned one cannot hold memory -- or its owner's quota --
+forever. Ballots are keyed by submitting device, so re-voting replaces rather
+than accumulates, and only a group member may open a poll or submit to one.
+Every refusal returns a `ServerMsg::Error` the client displays, so a user is told
+why rather than seeing a vote vanish. Re-using an already-open poll id is refused
+outright: otherwise any member could reset another member's poll and discard the
+ballots already cast in it. Proven by `relay_core::one_device_cannot_open_unbounded_polls`,
+`an_oversized_ballot_is_refused`, `an_abandoned_poll_is_reclaimed_and_frees_its_quota`
+and `reopening_a_poll_id_is_refused_and_cannot_discard_cast_ballots`.
+
+### Residual / accepted risks
+
+- **Anonymity is from peers, not from the relay operator.** The relay sees which
+  connection submitted a ballot, even though it cannot read it and strips the id
+  on release. An operator who logs connections can therefore link a ballot to an
+  account -- but still not to a *choice*. Hiding the submitter as well needs a
+  different transport (mixnet / sealed sender), not a poll change. On a
+  self-hosted server this is the accepted tradeoff.
+- **Unanimity leaks regardless of the crypto.** If every voter picks the same
+  option, the published tally tells everyone how each of them voted. No ballot
+  scheme prevents this; it is a property of publishing a tally over a small
+  group, and the same is true of any near-unanimous split.
+- **Owner-live mode is disclosed, not hidden.** In the mode where the creator may
+  see results before close, voters are shown that the creator can do so before
+  they vote.
 
 ## File sharing and large messages (STRIDE + ASVS L2)
 

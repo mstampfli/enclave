@@ -49,7 +49,9 @@ crypto  media  transport
   `Sealed` (opaque) or routing metadata. Depends on nothing internal.
 - `enclave-crypto` -- identity keystore, MLS groups, media-key schedule, the
   nonce-safe frame sealer/opener, safety numbers, the off-ratchet file-chunk
-  sealer (`seal_chunk`/`open_chunk`), and the self-update `rekey` that heals a
+  sealer (`seal_chunk`/`open_chunk`), the off-ratchet ballot sealer
+  (`seal_ballot`/`open_ballot`) and the linkable ring signatures (`ring`) that
+  make an anonymous poll unattributable, and the self-update `rekey` that heals a
   desynced group.
 - `enclave-media` -- the audio/video pipeline: Opus codec (`audio`), tested
   framing/format helpers (`frame`), cpal mic/speaker device I/O (`device`),
@@ -160,7 +162,18 @@ window by default and only add the WASM/browser target when we choose to.
    `client_flow::large_message_and_file_transfer_between_two_clients` (a
    multi-chunk file) plus `mls_group::a_backlogged_receiver_skips_forward_to_the_latest_message`
    (a conversation that fell behind still heals).
-7. Docs update in the same commit as the change they describe.
+7. A ballot never reveals its content through its shape. Votes on buffered and
+   anonymous polls are sealed off the ratchet under a per-poll content key
+   (`crypto::seal_ballot`) and encoded at a fixed width -- the poll id plus a
+   256-bit selection bitmask (`transfer::VOTE_BODY_BYTES`) -- so every ballot the
+   relay holds is the same size whatever it says, and the mask is canonical so
+   index ordering carries nothing either. A variable-length encoding (a list of
+   chosen indices) would let the untrusted relay count a voter's selections with
+   no key at all. Enforced by `VoteBody::encode`/`decode` being the only ballot
+   codec, and proven by
+   `transfer::tests::a_sealed_ballot_is_the_same_size_whatever_it_says` and
+   `the_anonymous_ballot_the_relay_stores_is_size_invariant`.
+8. Docs update in the same commit as the change they describe.
 
 ## Dependency plan (added per-phase, in the crate that first uses them)
 
