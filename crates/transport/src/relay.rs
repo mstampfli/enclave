@@ -200,6 +200,9 @@ struct BufferedPoll {
     mode: u8,
     /// Auto-release time; `None` = owner-triggered close only.
     release_at: Option<SystemTime>,
+    /// Strip submitter attribution on release (an anonymous poll). Independent of
+    /// `mode`, which decides only who receives the ballots and when.
+    anonymous: bool,
     /// When the poll was opened, so an abandoned one can be reclaimed (POLL_TTL).
     opened_at: SystemTime,
     /// Sealed ballots, deduped by submitter device (last write wins).
@@ -757,6 +760,7 @@ impl Relay {
                 group,
                 mode,
                 release_at,
+                anonymous,
             } => {
                 let Some(owner) = self.conn_device.get(&from).cloned() else {
                     return vec![];
@@ -794,6 +798,7 @@ impl Relay {
                         group,
                         mode,
                         release_at: release_at.map(|ms| UNIX_EPOCH + Duration::from_millis(ms)),
+                        anonymous,
                         opened_at: (self.now)(),
                         ballots: HashMap::new(),
                     },
@@ -1650,10 +1655,11 @@ impl Relay {
             .members(&bp.group)
             .map(|m| m.iter().cloned().collect())
             .unwrap_or_default();
-        // Mode 3 is anonymous: strip the submitter attribution so peers receive the
+        // An anonymous poll strips submitter attribution, so recipients get the
         // ballots with no idea who sent each (the ring signature inside each ballot
-        // still proves a member cast it).
-        let strip = bp.mode == 3;
+        // still proves a member cast it). This is independent of who receives
+        // them, so it applies equally to a group release and an owner-only one.
+        let strip = bp.anonymous;
         let all: Vec<(DeviceId, Sealed)> = bp
             .ballots
             .into_iter()
@@ -1661,9 +1667,9 @@ impl Relay {
             .collect();
         let mut out = Vec::new();
         for dev in members {
-            // Modes 0 and 3 release the whole set to every member; owner modes give
+            // Mode 0 releases the whole set to every member; the owner modes give
             // it only to the owner (others get an empty set = closure signal).
-            let data = if bp.mode == 0 || bp.mode == 3 || dev == bp.owner {
+            let data = if bp.mode == 0 || dev == bp.owner {
                 all.clone()
             } else {
                 Vec::new()

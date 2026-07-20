@@ -173,8 +173,16 @@ pub enum ClientMsg {
     BallotOpen {
         poll: [u8; 16],
         group: GroupId,
+        /// Who gets the ballots and when: 0 = the whole group once the poll
+        /// closes, 1 = the owner as each ballot arrives, 2 = the owner once the
+        /// poll closes.
         mode: u8,
         release_at: Option<u64>,
+        /// Strip the submitter's identity when releasing, so recipients get an
+        /// unattributed batch. Orthogonal to `mode` on purpose: anonymity is a
+        /// property of *how* ballots are released, not of *who* receives them,
+        /// and folding it into the mode number would multiply the modes.
+        anonymous: bool,
     },
     /// Submit one sealed ballot for a poll opened with `BallotOpen`. The server
     /// buffers it (deduped by submitter, last write wins) or, in owner-live mode,

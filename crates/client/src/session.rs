@@ -86,6 +86,10 @@ pub struct PersistPoll {
     pub anonymous: bool,
     #[serde(default)]
     pub ring: Vec<[u8; 32]>,
+    /// For an anonymous poll, the key-image pseudonym our own ballot is filed
+    /// under, so a restart still shows us our own choice.
+    #[serde(default)]
+    pub my_tag: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

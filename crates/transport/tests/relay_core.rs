@@ -1274,6 +1274,7 @@ fn reopening_a_poll_id_is_refused_and_cannot_discard_cast_ballots() {
             group: group.clone(),
             mode: 2,
             release_at: None,
+            anonymous: false,
         },
     );
     r.handle(
@@ -1292,6 +1293,7 @@ fn reopening_a_poll_id_is_refused_and_cannot_discard_cast_ballots() {
             group: group.clone(),
             mode: 2,
             release_at: None,
+            anonymous: false,
         },
     );
     assert_eq!(
@@ -1335,6 +1337,7 @@ fn one_device_cannot_open_unbounded_polls() {
                 group: group.clone(),
                 mode: 2,
                 release_at: None,
+                anonymous: false,
             },
         );
         match error_detail(&out) {
@@ -1366,6 +1369,7 @@ fn an_oversized_ballot_is_refused() {
             group: group.clone(),
             mode: 2,
             release_at: None,
+            anonymous: false,
         },
     );
 
@@ -1417,6 +1421,7 @@ fn an_abandoned_poll_is_reclaimed_and_frees_its_quota() {
             group: group.clone(),
             mode: 2,
             release_at: None,
+            anonymous: false,
         },
     );
     // Nothing is due yet, so the sweep leaves it alone.
@@ -1428,6 +1433,7 @@ fn an_abandoned_poll_is_reclaimed_and_frees_its_quota() {
             group: group.clone(),
             mode: 2,
             release_at: None,
+            anonymous: false,
         },
     );
     assert!(
@@ -1445,6 +1451,7 @@ fn an_abandoned_poll_is_reclaimed_and_frees_its_quota() {
             group,
             mode: 2,
             release_at: None,
+            anonymous: false,
         },
     );
     assert!(

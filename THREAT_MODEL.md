@@ -326,6 +326,16 @@ It does **not** learn what the ballot says: the choice is AEAD-sealed under a ke
 it does not hold, and the ciphertext is a constant size, so no part of the
 selection is recoverable from the wire (see "Metadata the server sees").
 
+**Anonymity is orthogonal to audience.** Who receives the ballots (the group, or
+the creator alone) and whether they are attributed are separate flags on
+`BallotOpen`, not points on one scale, so "only the creator sees the tally, and
+even they cannot tell who voted for what" is expressible. It is offered only for
+the two modes that release ballots as a single batch when the poll closes. The
+live modes hand each ballot on as it arrives, so its arrival time would identify
+the voter in a small group however the ballot is signed: batching does as much
+work here as the ring signature, and a "live anonymous" poll would not keep the
+promise on its label.
+
 **Anonymous polls.** Ballots carry a linkable ring signature (LSAG,
 `crypto::ring`) over the ring of members' voting keys, so a verifier learns only
 that *some* ring member cast it. The signature's key image is a stable pseudonym

@@ -1675,8 +1675,9 @@ label.member-row:hover { background: var(--raised); }
       <input type="checkbox" id="poll-anon"> Anonymous &mdash; hide who voted for what
     </label>
     <div class="poll-note" id="poll-anon-why" hidden>
-      Needs &ldquo;Everyone, after it closes&rdquo;: ballots are only hidden while the
-      server holds them.
+      Needs a mode that reveals on close (&ldquo;Everyone, after it closes&rdquo; or
+      &ldquo;Only me, sealed until it closes&rdquo;). The live modes release each ballot
+      as it arrives, so its timing would give the voter away.
     </div>
     <div class="poll-actions">
       <button type="button" data-close class="pa-cancel">Cancel</button>
@@ -3300,7 +3301,13 @@ function pollCard(m) {
   // Timing + reveal are recomputed here (not trusted from the snapshot) so a
   // timed poll auto-closes and reveals the moment its deadline passes.
   const effClosed = !!(p.closed || (p.closes_at && Date.now() >= p.closes_at));
-  const revealed = p.reveal === 0 || (p.reveal === 1 && (p.mine || []).length > 0) || (p.reveal === 2 && effClosed);
+  // Must mirror build_poll_view in the client exactly, including the owner-only
+  // modes: omitting those left a creator unable to ever see their own results.
+  const revealed = p.reveal === 0
+    || (p.reveal === 1 && (p.mine || []).length > 0)
+    || (p.reveal === 2 && effClosed)
+    || (p.reveal === 3 && p.is_author)
+    || (p.reveal === 4 && p.is_author && effClosed);
   const card = document.createElement("div");
   card.className = "poll-card";
   card.dataset.poll = m.id;
@@ -3380,7 +3387,13 @@ function pollCard(m) {
 }
 // A small transparency line: who can see this poll's results, and when.
 function pollAccessNote(p) {
-  if (p.anonymous) return "Anonymous — no one can see who voted for what.";
+  // An anonymous poll still has an audience, so say BOTH things: who gets to see
+  // the tally, and that nobody (including them) can attribute a ballot.
+  if (p.anonymous) {
+    return p.reveal === 4
+      ? "Anonymous. Only the creator sees results, once it closes, and even they cannot tell who voted for what."
+      : "Anonymous. Results appear when the poll closes, and no one can see who voted for what.";
+  }
   switch (p.reveal) {
     case 1: return "Results appear after you vote.";
     case 2: return "Results are hidden until the poll closes.";
@@ -3742,7 +3755,11 @@ $("poll-add-opt").addEventListener("click", () => {
 });
 // Anonymous polls only make sense for "everyone, after it closes" (reveal 2).
 function updatePollAnonAvailability() {
-  const on = $("poll-reveal").value === "2";
+  // Only the two batch-release modes can honestly be anonymous: the group on
+  // close, or the creator alone on close. The live modes hand each ballot over
+  // as it arrives, so its timing would give the voter away.
+  const v = $("poll-reveal").value;
+  const on = v === "2" || v === "4";
   $("poll-anon").disabled = !on;
   if (!on) $("poll-anon").checked = false;
   $("poll-anon-wrap").style.opacity = on ? "" : "0.45";

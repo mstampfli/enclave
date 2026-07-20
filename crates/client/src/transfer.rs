@@ -125,8 +125,9 @@ pub struct PollBody {
     pub options: Vec<String>,
     /// Whether a voter may select more than one option.
     pub multi: bool,
-    /// When tallies are shown: 0 = always, 1 = after you vote, 2 = after the
-    /// creator closes the poll.
+    /// When tallies are shown, and to whom: 0 = always, 1 = after you vote,
+    /// 2 = after the creator closes the poll, 3 = only the creator, live,
+    /// 4 = only the creator, and only once the poll closes.
     pub reveal: u8,
     /// Absolute deadline (unix ms) after which the poll auto-closes, or `None` for
     /// no time limit. Every peer stores the same value, so all agree when it ends.
@@ -164,7 +165,7 @@ impl PollBody {
                 .options
                 .iter()
                 .all(|o| !o.trim().is_empty() && o.len() <= MAX_POLL_TEXT)
-            && self.reveal <= 2
+            && self.reveal <= 4
     }
 }
 

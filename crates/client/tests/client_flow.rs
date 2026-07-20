@@ -669,11 +669,103 @@ async fn an_anonymous_poll_tallies_without_attributing_votes() {
     };
     assert_eq!(released.total, 2, "both anonymous ballots counted");
     assert_eq!(released.counts, vec![1, 1], "one Yes, one No");
+    // No per-option voter breakdown is produced at all: not real names, and not
+    // pseudonyms either, since listing which pseudonym picked what would still
+    // show a voting pattern the poll promised not to reveal.
     let voters: Vec<String> = released.voters.iter().flatten().cloned().collect();
-    assert_eq!(voters.len(), 2, "two distinct anonymous voters");
+    assert!(
+        voters.is_empty(),
+        "an anonymous poll yields no voter breakdown, got {voters:?}"
+    );
     assert!(
         !voters.iter().any(|v| v == &alice_user || v == &bob_user),
-        "voters are opaque pseudonyms, never real usernames"
+        "and certainly never a real username"
+    );
+}
+
+/// Anonymity and audience are independent: an "only me, sealed until it closes"
+/// poll can also be anonymous, so the creator learns the tally but still cannot
+/// tell who cast which ballot, and non-owners learn nothing at all.
+#[tokio::test]
+async fn an_owner_only_poll_can_also_be_anonymous() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let alice_user = alice.name().to_string();
+    let bob_user = bob.name().to_string();
+
+    alice
+        .create_group("sealed ballot", std::slice::from_ref(&bob_user))
+        .await
+        .unwrap();
+    loop {
+        if matches!(next_event(&mut bob).await, Event::ConversationsChanged) {
+            break;
+        }
+    }
+    let bob_gid = bob.conversations().first().unwrap().id.clone();
+    bob.switch(&bob_gid);
+    let alice_gid = alice.active_id().unwrap();
+
+    // Let the profiles (and their ring voting keys) exchange.
+    for _ in 0..40 {
+        let _ = tokio::time::timeout(Duration::from_millis(25), alice.next_event()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(25), bob.next_event()).await;
+    }
+
+    // reveal 4 = only the creator, once it closes -- AND anonymous.
+    let opts = vec!["Yes".to_string(), "No".to_string()];
+    let (pid, _ts, view) = alice
+        .create_poll("Approve?", &opts, false, 4, 300, true)
+        .unwrap();
+    assert!(view.anonymous, "owner-only polls can be anonymous too");
+
+    loop {
+        if let Event::PollPosted { id, poll, .. } = next_event(&mut bob).await {
+            if id == pid {
+                assert!(poll.anonymous, "the peer is told it is anonymous");
+                break;
+            }
+        }
+    }
+
+    bob.vote_poll(&bob_gid, &pid, vec![0]);
+    alice.vote_poll(&alice_gid, &pid, vec![1]);
+
+    // The creator gets the tally when it closes, with no attribution.
+    let released = loop {
+        if let Event::PollUpdated { id, poll, .. } = next_event(&mut alice).await {
+            if id == pid && poll.closed {
+                break poll;
+            }
+        }
+    };
+    assert!(released.revealed, "the creator sees results once it closes");
+    assert_eq!(released.total, 2, "both ballots reached the creator");
+    assert_eq!(released.counts, vec![1, 1], "one Yes, one No");
+    let voters: Vec<String> = released.voters.iter().flatten().cloned().collect();
+    assert!(
+        voters.is_empty(),
+        "not even the creator gets a voter breakdown, got {voters:?}"
+    );
+    assert!(
+        !voters.iter().any(|v| v == &alice_user || v == &bob_user),
+        "and never a real username"
+    );
+
+    // Bob is not the owner: he learns it closed, but never the tally.
+    for _ in 0..40 {
+        let _ = tokio::time::timeout(Duration::from_millis(25), bob.next_event()).await;
+    }
+    let bobs = bob
+        .conversation_history(&bob_gid)
+        .into_iter()
+        .find_map(|l| l.poll.filter(|_| l.id == pid))
+        .expect("bob still sees the poll");
+    assert!(
+        !bobs.revealed,
+        "a non-owner never has the results revealed to them"
     );
 }
 

@@ -393,6 +393,11 @@ struct Poll {
     anonymous: bool,
     /// The ring (members' voting public keys) for an anonymous poll.
     ring: Vec<[u8; 32]>,
+    /// For an anonymous poll, the pseudonym (key image) our OWN ballot is filed
+    /// under. Votes are keyed by key image rather than username there, so without
+    /// this we could not find our own vote to show back to us. It names only
+    /// ourselves, to ourselves, and is unlinkable to an identity by anyone else.
+    my_tag: Option<String>,
 }
 
 impl Poll {
@@ -400,11 +405,14 @@ impl Poll {
     /// (reveal 0/1) poll that votes over normal MLS. 0 = release to the group at
     /// close, 1 = route to the owner live, 2 = buffer and release to the owner,
     /// 3 = release to the group but with submitter attribution stripped (anonymous).
+    /// Who the server releases this poll's ballots to, and when. Anonymity is NOT
+    /// encoded here: it rides its own flag on `BallotOpen`, so "who sees the
+    /// ballots" and "are they attributed" stay independent.
     fn server_mode(&self) -> Option<u8> {
         match self.reveal {
-            2 => Some(if self.anonymous { 3 } else { 0 }),
-            3 => Some(1),
-            4 => Some(2),
+            2 => Some(0), // the whole group, once it closes
+            3 => Some(1), // the owner, as ballots arrive
+            4 => Some(2), // the owner, once it closes
             _ => None,
         }
     }
@@ -432,6 +440,7 @@ impl From<session::PersistPoll> for Poll {
             ballot_key: p.ballot_key,
             anonymous: p.anonymous,
             ring: p.ring,
+            my_tag: p.my_tag,
         }
     }
 }
@@ -454,6 +463,7 @@ impl From<&Poll> for session::PersistPoll {
             ballot_key: p.ballot_key,
             anonymous: p.anonymous,
             ring: p.ring.clone(),
+            my_tag: p.my_tag.clone(),
         }
     }
 }
@@ -2189,7 +2199,13 @@ impl Client {
         // Anonymous polls (only meaningful for "everyone, on close"): assemble the
         // ring from the members' voting keys, including our own. A member with no
         // published voting key is left out of the ring (they can't vote anonymously).
-        let anonymous = anonymous && reveal == 2 && buffered;
+        // Anonymity is offered only for the two modes that release ballots as a
+        // single batch when the poll closes: to the group (2) or to the creator
+        // alone (4). The live modes forward each ballot the moment it arrives, so
+        // its arrival time would identify the voter in a small group no matter
+        // how the ballot is signed -- batching does as much work here as the ring
+        // signature does, so a "live anonymous" poll would not keep its promise.
+        let anonymous = anonymous && (reveal == 2 || reveal == 4) && buffered;
         let ring: Vec<[u8; 32]> = if anonymous {
             let my_key = enclave_crypto::RingKeypair::from_seed(&self.voting_seed).public;
             let members = self
@@ -2254,6 +2270,7 @@ impl Client {
             ballot_key,
             anonymous,
             ring: body.ring.clone(),
+            my_tag: None,
         };
         // Register the buffered poll with the server so it withholds/routes ballots
         // and knows we (the sender) are the owner who may close it early.
@@ -2263,6 +2280,7 @@ impl Client {
                 group: group.clone(),
                 mode,
                 release_at: closes_at,
+                anonymous,
             });
         }
         let view = Self::build_poll_view(&poll, &me);
@@ -2344,6 +2362,9 @@ impl Client {
                                 .get_mut(&group)
                                 .and_then(|c| c.polls.get_mut(&mid))
                             {
+                                // Remember the pseudonym we filed under, so we can
+                                // still show the user their own choice back.
+                                p.my_tag = Some(tag.clone());
                                 if sel.is_empty() {
                                     p.votes.remove(&tag);
                                 } else {
@@ -3629,12 +3650,21 @@ impl Client {
                 if let Some(c) = counts.get_mut(i as usize) {
                     *c += 1;
                 }
+                // Never build a per-option voter list for an anonymous poll: those
+                // keys are key-image pseudonyms, and a breakdown of them is exactly
+                // what the poll promises not to produce. Counts still tally.
+                if poll.anonymous {
+                    continue;
+                }
                 if let Some(v) = voters.get_mut(i as usize) {
                     v.push(user.clone());
                 }
             }
         }
-        let mine = poll.votes.get(me).cloned().unwrap_or_default();
+        // An anonymous poll files our vote under our key image, not our name, so
+        // look it up by whichever key we actually stored it under.
+        let my_key = poll.my_tag.as_deref().unwrap_or(me);
+        let mine = poll.votes.get(my_key).cloned().unwrap_or_default();
         let eff_closed = poll.is_closed();
         let am_owner = poll.author == me;
         let revealed = match poll.reveal {
@@ -4748,6 +4778,7 @@ impl Client {
                         ballot_key: body.ballot_key,
                         anonymous: body.anonymous,
                         ring: body.ring.clone(),
+                        my_tag: None,
                     };
                     let view = Self::build_poll_view(&poll, &me);
                     if let Some(conv) = self.conversations.get_mut(&group) {
