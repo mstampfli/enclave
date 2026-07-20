@@ -590,6 +590,7 @@ input[type="checkbox"], select { cursor: pointer; }
 .conv-menu .cm-opt.active .cm-check { visibility: visible; }
 .conv-menu .cm-note { font-size: 11.5px; color: var(--muted); padding: 4px 9px 3px; line-height: 1.45; }
 .conv-menu .cm-sep { height: 1px; margin: 4px 6px; background: var(--border); }
+.conv-menu .cm-key { margin-left: auto; font-size: 11px; color: var(--faint); flex: none; }
 .header-actions > button {
   display: inline-flex; align-items: center; gap: 7px;
   padding: 5px 11px; border-radius: var(--radius); font-size: 13px; font-weight: 500;
@@ -1142,6 +1143,18 @@ label.member-row:hover { background: var(--raised); }
 
 /* sidebar + modal search */
 .side-search { padding: 8px 8px 0; }
+/* Message hits shown under the conversation list when the sidebar search has a
+   query, so global search never requires opening a chat first. */
+.side-hit { display: block; width: 100%; text-align: left; padding: 6px 9px;
+  background: none; border: none; border-radius: var(--radius); cursor: pointer; }
+.side-hit:hover { background: var(--raised); }
+.side-hit .sh-top { display: flex; align-items: baseline; gap: 6px; }
+.side-hit .sh-who { font-size: 12px; color: var(--muted); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.side-hit .sh-time { margin-left: auto; font-size: 11px; color: var(--faint); flex: none; }
+.side-hit .sh-text { font-size: 12.5px; color: var(--ink); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.side-msgs-empty { padding: 6px 9px; font-size: 12px; color: var(--faint); }
 .side-search input {
   width: 100%; padding: 7px 10px; border-radius: var(--radius);
   background: var(--bg); border: 1px solid var(--border); color: var(--ink);
@@ -1282,7 +1295,7 @@ label.member-row:hover { background: var(--raised); }
     </div>
 
     <div class="side-search">
-      <input id="side-search" placeholder="Search conversations" autocomplete="off" spellcheck="false">
+      <input id="side-search" placeholder="Search chats and messages" autocomplete="off" spellcheck="false">
     </div>
 
     <div class="side-scroll" id="pane-chats">
@@ -1307,6 +1320,10 @@ label.member-row:hover { background: var(--raised); }
           <span>Archived</span><span class="archived-count" id="archived-count"></span>
         </button>
         <div id="archived-list" hidden></div>
+      </div>
+      <div class="side-section" id="side-msgs" hidden>
+        <div class="head"><span>Messages</span></div>
+        <div id="side-msg-list"></div>
       </div>
     </div>
 
@@ -1366,12 +1383,6 @@ label.member-row:hover { background: var(--raised); }
         <div class="subtitle" id="room-subtitle"></div>
       </div>
       <div class="header-actions">
-        <button id="btn-search" hidden title="Search messages (Ctrl+F)" aria-label="Search messages">
-          <svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20.5 20.5 16.5 16.5"/></svg>
-        </button>
-        <button id="btn-info" hidden title="Shared media, files & links" aria-label="Shared content">
-          <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-        </button>
         <button id="btn-members" hidden>
           <svg class="icon" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
           <span id="member-count"></span>
@@ -1385,6 +1396,15 @@ label.member-row:hover { background: var(--raised); }
             <svg class="icon dots" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>
           </button>
           <div class="conv-menu" id="conv-menu" hidden role="menu">
+            <button type="button" class="cm-item" id="cm-search">
+              <svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20.5 20.5 16.5 16.5"/></svg>
+              Search this chat<span class="cm-key">Ctrl+F</span>
+            </button>
+            <button type="button" class="cm-item" id="cm-info">
+              <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+              Shared media &amp; files
+            </button>
+            <div class="cm-sep"></div>
             <div class="cm-head">Disappearing messages</div>
             <button type="button" class="cm-opt" data-ms="0">Off<svg class="cm-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></button>
             <button type="button" class="cm-opt" data-ms="1800000">After 30 minutes<svg class="cm-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></button>
@@ -2802,7 +2822,7 @@ function setTab(tab) {
   $("tab-people").classList.toggle("active", tab === "people");
   $("pane-chats").hidden = tab !== "chats";
   $("pane-people").hidden = tab !== "people";
-  $("side-search").placeholder = tab === "chats" ? "Search conversations" : "Search friends";
+  $("side-search").placeholder = tab === "chats" ? "Search chats and messages" : "Search friends";
 }
 $("tab-chats").addEventListener("click", () => setTab("chats"));
 $("tab-people").addEventListener("click", () => setTab("people"));
@@ -2813,11 +2833,62 @@ const matches = (...fields) => {
   if (!q) return true;
   return fields.some((f) => (f || "").toLowerCase().includes(q));
 };
+let sideMsgTimer = null;
 $("side-search").addEventListener("input", (e) => {
   sideQuery = e.target.value;
   renderConvoList();
   renderPeople();
+  // The same field also searches message bodies across every conversation, so
+  // global search never needs a chat to be open. Debounced like the modal's.
+  if (sideMsgTimer) clearTimeout(sideMsgTimer);
+  sideMsgTimer = setTimeout(runSideMessageSearch, 130);
 });
+
+// Global message search from the sidebar. Two characters minimum: one letter
+// matches nearly everything and just churns the list.
+function runSideMessageSearch() {
+  const q = sideQuery.trim();
+  if (q.length < 2) {
+    $("side-msgs").hidden = true;
+    $("side-msg-list").innerHTML = "";
+    return;
+  }
+  send({ type: "SearchMessages", query: q, conv: null });
+}
+
+function renderSideMessages(query, hits) {
+  const list = $("side-msg-list");
+  list.innerHTML = "";
+  $("side-msgs").hidden = false;
+  if (!hits.length) {
+    const none = document.createElement("div");
+    none.className = "side-msgs-empty";
+    none.textContent = "No messages match.";
+    list.appendChild(none);
+    return;
+  }
+  for (const h of hits.slice(0, 50)) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "side-hit";
+    const top = document.createElement("div");
+    top.className = "sh-top";
+    const who = document.createElement("span");
+    who.className = "sh-who";
+    const name = h.self_notes ? "Note to self" : (h.mine ? "You" : (h.display || h.user));
+    who.textContent = name + " \u00b7 " + h.conv_title;
+    const time = document.createElement("span");
+    time.className = "sh-time";
+    time.textContent = fmtDay(h.ts);
+    top.append(who, time);
+    const snip = document.createElement("div");
+    snip.className = "sh-text";
+    snip.appendChild(highlight(h.text, query));
+    row.append(top, snip);
+    row.addEventListener("click", () => jumpToMessage(h.conv, h.id));
+    list.appendChild(row);
+  }
+}
 
 function statusOf(u) { return presence[u] || "offline"; }
 function dmPeer(conv) {
@@ -3078,14 +3149,10 @@ function renderHeader() {
     $("room-title").textContent = "Enclave";
     sub.textContent = "Pick a conversation, or press Ctrl+K";
     $("header-seal").innerHTML = "";
-    $("btn-search").hidden = true;
-    $("btn-info").hidden = true;
     $("btn-members").hidden = true;
     $("btn-convmenu").hidden = true;
     return;
   }
-  $("btn-search").hidden = false;
-  $("btn-info").hidden = false;
   $("room-title").textContent = conv.title;
   // Notes to self: no peer, no seal, no verify -- a private on-device scratchpad.
   if (conv.self_notes) {
@@ -3621,7 +3688,7 @@ document.querySelectorAll("#modal-search .scope-tab").forEach((t) =>
     document.querySelectorAll("#modal-search .scope-tab").forEach((x) => x.classList.toggle("active", x === t));
     runSearch();
   }));
-$("btn-search").addEventListener("click", () => openSearch("chat"));
+$("cm-search").addEventListener("click", () => { $("conv-menu").hidden = true; openSearch("chat"); });
 
 // ---- shared-content panel: Media / Files / Links, derived from local history ----
 let infoTab = "media";
@@ -3717,7 +3784,7 @@ function renderInfoBody() {
   }
 }
 document.querySelectorAll("#modal-info .info-tab").forEach((t) => t.addEventListener("click", () => setInfoTab(t.dataset.tab)));
-$("btn-info").addEventListener("click", openInfoPanel);
+$("cm-info").addEventListener("click", () => { $("conv-menu").hidden = true; openInfoPanel(); });
 
 // ---- poll composer ----
 function openPollModal() {
@@ -5305,8 +5372,12 @@ window.onEnclaveEvent = (ev) => {
     }
     case "SearchResults": {
       // Ignore stale async results whose query no longer matches the input.
-      if (!$("modal-search").hidden && ev.query === $("search-input").value.trim()) {
-        renderSearchResults(ev.query, ev.hits || []);
+      if (!$("modal-search").hidden) {
+        if (ev.query === $("search-input").value.trim()) {
+          renderSearchResults(ev.query, ev.hits || []);
+        }
+      } else if (ev.query === $("side-search").value.trim()) {
+        renderSideMessages(ev.query, ev.hits || []);
       }
       break;
     }
