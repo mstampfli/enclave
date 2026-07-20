@@ -2075,3 +2075,38 @@ async fn an_anonymous_poll_works_immediately_with_nobody_reachable() {
         "and it is genuinely anonymous, not silently downgraded"
     );
 }
+
+/// Closing the open chat must stay closed. Becoming friends -- accepting a
+/// request, or having one auto-accepted -- refreshes the conversation list,
+/// which used to re-broadcast a stale active conversation and pull the UI back
+/// into the chat you had just left. Deselecting in the core keeps it closed.
+#[tokio::test]
+async fn a_closed_chat_is_not_reopened_by_a_friend_change() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    become_friends(&mut alice, &mut bob).await;
+    let bob_h = bob.name().to_string();
+
+    // Alice opens the DM: the core now has an active conversation.
+    alice.open_dm(&bob_h).await.unwrap();
+    assert!(alice.active_id().is_some(), "the DM is active while open");
+
+    // Alice presses the home button; the core deselects.
+    alice.deselect();
+    assert!(
+        alice.active_id().is_none(),
+        "closing the chat clears the active conversation"
+    );
+
+    // A third person becomes Alice's friend. The acceptance fires the same
+    // conversation-list refresh that used to re-open the closed chat.
+    let mut carol = account(&url, "carol").await;
+    become_friends(&mut alice, &mut carol).await;
+
+    assert!(
+        alice.active_id().is_none(),
+        "accepting a friend must not re-open the chat Alice closed"
+    );
+}

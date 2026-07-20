@@ -2900,6 +2900,10 @@ function closeChat() {
   activeConv = null;
   activeSafety = "";
   activeVerified = false;
+  // Tell the core to deselect too, so a later conversation-list refresh (e.g.
+  // after a friend is accepted) does not re-broadcast the old active chat and
+  // pull us back into it.
+  send({ type: "CloseConversation" });
   renderConvoList();
   renderHeader();
   renderChat();

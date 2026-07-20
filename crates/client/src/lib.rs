@@ -2546,6 +2546,14 @@ impl Client {
         }
     }
 
+    /// Clear the active conversation (the UI closed the open chat and went to the
+    /// home view). Keeps the core's notion of "what is open" in step with the UI,
+    /// so a later conversation-list refresh -- e.g. after a friend is accepted --
+    /// does not re-broadcast a stale active conversation and yank the UI back in.
+    pub fn deselect(&mut self) {
+        self.active = None;
+    }
+
     /// Encrypt and send a text message to the active conversation. A message
     /// that fits in one sealed frame is a single part; a larger one is split
     /// into chunks (see [`crate::transfer`]) that the peer reassembles. Records

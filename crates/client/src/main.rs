@@ -210,6 +210,9 @@ enum UiCommand {
     SwitchConversation {
         conv: String,
     },
+    /// The UI closed the open chat (back to the home view). Clears the core's
+    /// active conversation so a later refresh does not re-open it.
+    CloseConversation,
     SendText {
         text: String,
         /// Hex id of the message being replied to, or empty for a normal message.
@@ -2068,6 +2071,13 @@ async fn handle_command(
                 // Switching can un-hide an archived/deleted conversation (moving it
                 // back to the live list), so refresh the summaries too.
                 emit_conversations(proxy, c);
+            }
+        }
+        UiCommand::CloseConversation => {
+            if let Some(c) = client.as_mut() {
+                // Deselect only; the UI already moved itself to the home view, so
+                // there is nothing to emit back.
+                c.deselect();
             }
         }
         UiCommand::PickFiles => {
