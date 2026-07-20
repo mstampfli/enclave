@@ -2210,8 +2210,18 @@ impl Client {
         } else {
             Vec::new()
         };
-        // Anonymity needs at least a 2-member ring to hide anyone.
-        let anonymous = anonymous && ring.len() >= 2;
+        // Anonymity needs at least a 2-member ring: a ring of one hides nobody.
+        // Refuse rather than quietly hand back an attributed poll -- silently
+        // downgrading a privacy choice the user explicitly made is worse than
+        // failing, because they would never learn the votes were attributable.
+        if anonymous && ring.len() < 2 {
+            self.pending.push_back(Event::Error(
+                "This poll cannot be anonymous yet: no one else here has published a voting key. \
+                 They each need to come online once on a current version, then try again."
+                    .into(),
+            ));
+            return None;
+        }
         let body = transfer::PollBody {
             question: question.trim().to_string(),
             options: opts,

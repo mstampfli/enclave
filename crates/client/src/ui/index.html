@@ -1671,9 +1671,13 @@ label.member-row:hover { background: var(--raised); }
         <option value="604800000">1 week</option>
       </select>
     </div>
-    <label class="poll-check" id="poll-anon-wrap" title="Only available with 'Everyone, after it closes'">
+    <label class="poll-check" id="poll-anon-wrap">
       <input type="checkbox" id="poll-anon"> Anonymous &mdash; hide who voted for what
     </label>
+    <div class="poll-note" id="poll-anon-why" hidden>
+      Needs &ldquo;Everyone, after it closes&rdquo;: ballots are only hidden while the
+      server holds them.
+    </div>
     <div class="poll-actions">
       <button type="button" data-close class="pa-cancel">Cancel</button>
       <button type="button" id="poll-create" class="pa-create">Create poll</button>
@@ -3742,6 +3746,9 @@ function updatePollAnonAvailability() {
   $("poll-anon").disabled = !on;
   if (!on) $("poll-anon").checked = false;
   $("poll-anon-wrap").style.opacity = on ? "" : "0.45";
+  // Say WHY it is unavailable, in the open. A greyed-out control whose only
+  // explanation is a hover tooltip just reads as broken.
+  $("poll-anon-why").hidden = on;
 }
 $("poll-reveal").addEventListener("change", updatePollAnonAvailability);
 $("poll-create").addEventListener("click", () => {
