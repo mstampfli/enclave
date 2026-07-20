@@ -1123,6 +1123,8 @@ impl Client {
             .map(|h| Friend {
                 username: h.clone(),
                 display: self.display_of(h),
+                since: None,
+                member_since: None,
             })
             .collect()
     }

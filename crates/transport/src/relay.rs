@@ -548,10 +548,13 @@ impl Relay {
                     Ok(env) => env,
                     Err(_) => return auth_fail(from, handle, "registration failed"),
                 };
-                match self
-                    .accounts
-                    .create_account(&handle, envelope, identity_pub.clone(), display)
-                {
+                match self.accounts.create_account(
+                    &handle,
+                    envelope,
+                    identity_pub.clone(),
+                    display,
+                    self.now_secs(),
+                ) {
                     AuthOutcome::Created => {
                         let display = self.accounts.display(&handle);
                         let mut out = vec![Outgoing {
@@ -899,7 +902,7 @@ impl Relay {
                         },
                     }];
                 }
-                match self.friends.request(&me, &to) {
+                match self.friends.request(&me, &to, self.now_secs()) {
                     RequestOutcome::Sent => {
                         let mut out = vec![Outgoing {
                             to: from,
@@ -930,7 +933,7 @@ impl Relay {
                 let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
                     return vec![];
                 };
-                if self.friends.accept(&me, &requester) {
+                if self.friends.accept(&me, &requester, self.now_secs()) {
                     self.on_new_friendship(from, &me, &requester)
                 } else {
                     vec![Outgoing {
@@ -1804,20 +1807,33 @@ impl Relay {
     /// The friends + pending-requests snapshot for `handle`, each entry carrying
     /// the person's current display name.
     fn friends_snapshot(&self, handle: &str) -> ServerMsg {
-        let with_display = |names: Vec<String>| -> Vec<Friend> {
+        let to_friends = |names: Vec<String>| -> Vec<Friend> {
             names
                 .into_iter()
                 .map(|u| Friend {
                     display: self.accounts.display(&u),
+                    // The friend's account age, and (for accepted friends only)
+                    // when this friendship formed. `since` is None for pending
+                    // requests, since no friendship exists yet.
+                    member_since: self.accounts.created_at(&u),
+                    since: self.friends.friends_since(handle, &u),
                     username: u,
                 })
                 .collect()
         };
         ServerMsg::Friends {
-            friends: with_display(self.friends.friends_of(handle)),
-            incoming: with_display(self.friends.incoming(handle)),
-            outgoing: with_display(self.friends.outgoing(handle)),
+            friends: to_friends(self.friends.friends_of(handle)),
+            incoming: to_friends(self.friends.incoming(handle)),
+            outgoing: to_friends(self.friends.outgoing(handle)),
         }
+    }
+
+    /// The relay clock as unix seconds, for stamping account/friendship times.
+    fn now_secs(&self) -> u64 {
+        (self.now)()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
     /// The device currently on `conn`, or an empty id if unregistered.

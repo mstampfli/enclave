@@ -24,6 +24,10 @@ struct Account {
     /// Cosmetic display name; the username stays the unique login/add id.
     #[serde(default)]
     display: String,
+    /// Account creation time (unix seconds). `0` for accounts registered before
+    /// the server tracked it, which read back as "unknown".
+    #[serde(default)]
+    created: u64,
 }
 
 /// The result of a create-account attempt. Login is handled by the OPAQUE
@@ -73,6 +77,7 @@ impl AccountStore {
         envelope: Vec<u8>,
         identity_pub: Vec<u8>,
         display: String,
+        created: u64,
     ) -> AuthOutcome {
         if username.trim().is_empty() {
             return AuthOutcome::InvalidUsername;
@@ -91,10 +96,19 @@ impl AccountStore {
                 envelope,
                 identity_pub,
                 display,
+                created,
             },
         );
         self.save();
         AuthOutcome::Created
+    }
+
+    /// Account creation time (unix seconds), or `None` if it predates tracking.
+    pub fn created_at(&self, username: &str) -> Option<u64> {
+        self.accounts
+            .get(username)
+            .map(|a| a.created)
+            .filter(|&c| c > 0)
     }
 
     /// The display name for `username` (falls back to the username itself).
@@ -158,7 +172,13 @@ mod tests {
     fn create_stores_envelope_identity_and_display() {
         let mut store = AccountStore::new();
         assert_eq!(
-            store.create_account("alice", vec![1, 2, 3], vec![4, 5, 6], "Alice A".into()),
+            store.create_account(
+                "alice",
+                vec![1, 2, 3],
+                vec![4, 5, 6],
+                "Alice A".into(),
+                1_700_000_000
+            ),
             AuthOutcome::Created
         );
         assert!(store.contains("alice"));
@@ -166,7 +186,7 @@ mod tests {
         assert_eq!(store.identity_pub("alice"), Some(&[4, 5, 6][..]));
         assert_eq!(store.display("alice"), "Alice A");
         // An empty display defaults to the username.
-        store.create_account("bob", vec![], vec![], String::new());
+        store.create_account("bob", vec![], vec![], String::new(), 1_700_000_000);
         assert_eq!(store.display("bob"), "bob");
         // Changing it takes effect.
         assert!(store.set_display("bob", "Bobby"));
@@ -177,18 +197,29 @@ mod tests {
     }
 
     #[test]
+    fn records_and_reports_account_creation_time() {
+        let mut store = AccountStore::new();
+        store.create_account("eve#0001", vec![1], vec![], String::new(), 1_700_000_000);
+        assert_eq!(store.created_at("eve#0001"), Some(1_700_000_000));
+        assert_eq!(store.created_at("nobody#0000"), None);
+        // A legacy account (created == 0) reads back as unknown, not the epoch.
+        store.create_account("old#0002", vec![], vec![], String::new(), 0);
+        assert_eq!(store.created_at("old#0002"), None);
+    }
+
+    #[test]
     fn rejects_duplicate_and_empty() {
         let mut store = AccountStore::new();
         assert_eq!(
-            store.create_account("bob", vec![1], vec![], String::new()),
+            store.create_account("bob", vec![1], vec![], String::new(), 1_700_000_000),
             AuthOutcome::Created
         );
         assert_eq!(
-            store.create_account("bob", vec![2], vec![], String::new()),
+            store.create_account("bob", vec![2], vec![], String::new(), 1_700_000_000),
             AuthOutcome::UsernameTaken
         );
         assert_eq!(
-            store.create_account("  ", vec![3], vec![], String::new()),
+            store.create_account("  ", vec![3], vec![], String::new(), 1_700_000_000),
             AuthOutcome::InvalidUsername
         );
     }
@@ -202,7 +233,7 @@ mod tests {
         {
             let mut store = AccountStore::load(&path);
             assert_eq!(
-                store.create_account("dave", vec![9, 9], vec![7], "Dave".into()),
+                store.create_account("dave", vec![9, 9], vec![7], "Dave".into(), 1_700_000_000),
                 AuthOutcome::Created
             );
         }

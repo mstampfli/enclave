@@ -19,6 +19,10 @@ struct Relationships {
     incoming: BTreeSet<String>,
     /// Requests this handle has sent and that are not yet accepted.
     outgoing: BTreeSet<String>,
+    /// When each friendship was formed (friend handle -> unix seconds). Both
+    /// sides store the same value. Absent for friendships that predate tracking.
+    #[serde(default)]
+    friend_since: BTreeMap<String, u64>,
 }
 
 /// The result of sending a friend request.
@@ -63,7 +67,7 @@ impl FriendStore {
 
     /// Record a friend request `from` -> `to`. If `to` had already requested
     /// `from`, they become friends immediately (the Discord "both added" case).
-    pub fn request(&mut self, from: &str, to: &str) -> RequestOutcome {
+    pub fn request(&mut self, from: &str, to: &str, now: u64) -> RequestOutcome {
         if from == to {
             return RequestOutcome::Yourself;
         }
@@ -76,7 +80,7 @@ impl FriendStore {
             .get(from)
             .is_some_and(|r| r.incoming.contains(to))
         {
-            self.make_friends(from, to);
+            self.make_friends(from, to, now);
             self.save();
             return RequestOutcome::NowFriends;
         }
@@ -103,7 +107,7 @@ impl FriendStore {
 
     /// `who` accepts a pending request from `from`. Returns true if a pending
     /// request existed and they are now friends.
-    pub fn accept(&mut self, who: &str, from: &str) -> bool {
+    pub fn accept(&mut self, who: &str, from: &str, now: u64) -> bool {
         if !self
             .graph
             .get(who)
@@ -111,7 +115,7 @@ impl FriendStore {
         {
             return false;
         }
-        self.make_friends(who, from);
+        self.make_friends(who, from, now);
         self.save();
         true
     }
@@ -134,9 +138,11 @@ impl FriendStore {
     pub fn remove(&mut self, a: &str, b: &str) {
         if let Some(r) = self.graph.get_mut(a) {
             r.friends.remove(b);
+            r.friend_since.remove(b);
         }
         if let Some(r) = self.graph.get_mut(b) {
             r.friends.remove(a);
+            r.friend_since.remove(a);
         }
         self.save();
     }
@@ -166,17 +172,26 @@ impl FriendStore {
             .unwrap_or_default()
     }
 
-    fn make_friends(&mut self, a: &str, b: &str) {
+    fn make_friends(&mut self, a: &str, b: &str, now: u64) {
         {
             let ra = self.graph.entry(a.to_string()).or_default();
             ra.friends.insert(b.to_string());
+            ra.friend_since.insert(b.to_string(), now);
             ra.incoming.remove(b);
             ra.outgoing.remove(b);
         }
         let rb = self.graph.entry(b.to_string()).or_default();
         rb.friends.insert(a.to_string());
+        rb.friend_since.insert(a.to_string(), now);
         rb.incoming.remove(a);
         rb.outgoing.remove(a);
+    }
+
+    /// When `a` and `b` became friends (unix seconds), if recorded.
+    pub fn friends_since(&self, a: &str, b: &str) -> Option<u64> {
+        self.graph
+            .get(a)
+            .and_then(|r| r.friend_since.get(b).copied())
     }
 
     fn save(&self) {
@@ -196,12 +211,12 @@ mod tests {
     #[test]
     fn request_then_accept_makes_mutual_friends() {
         let mut s = FriendStore::new();
-        assert_eq!(s.request("a#0001", "b#0002"), RequestOutcome::Sent);
+        assert_eq!(s.request("a#0001", "b#0002", 1000), RequestOutcome::Sent);
         assert!(!s.are_friends("a#0001", "b#0002"));
         assert_eq!(s.incoming("b#0002"), vec!["a#0001"]);
         assert_eq!(s.outgoing("a#0001"), vec!["b#0002"]);
 
-        assert!(s.accept("b#0002", "a#0001"));
+        assert!(s.accept("b#0002", "a#0001", 1000));
         assert!(s.are_friends("a#0001", "b#0002"));
         assert!(s.are_friends("b#0002", "a#0001"));
         // The pending sets are cleared once accepted.
@@ -210,26 +225,48 @@ mod tests {
     }
 
     #[test]
+    fn records_when_a_friendship_formed() {
+        let mut s = FriendStore::new();
+        assert_eq!(s.friends_since("a#0001", "b#0002"), None);
+        s.request("a#0001", "b#0002", 1000);
+        // Still only a pending request: no friendship date yet.
+        assert_eq!(s.friends_since("a#0001", "b#0002"), None);
+        s.accept("b#0002", "a#0001", 4242);
+        // Recorded, and identical from both sides.
+        assert_eq!(s.friends_since("a#0001", "b#0002"), Some(4242));
+        assert_eq!(s.friends_since("b#0002", "a#0001"), Some(4242));
+        // Removing the friendship clears it.
+        s.remove("a#0001", "b#0002");
+        assert_eq!(s.friends_since("a#0001", "b#0002"), None);
+    }
+
+    #[test]
     fn mutual_requests_auto_accept() {
         let mut s = FriendStore::new();
-        assert_eq!(s.request("a#0001", "b#0002"), RequestOutcome::Sent);
+        assert_eq!(s.request("a#0001", "b#0002", 1000), RequestOutcome::Sent);
         // b requests a back -> immediately friends.
-        assert_eq!(s.request("b#0002", "a#0001"), RequestOutcome::NowFriends);
+        assert_eq!(
+            s.request("b#0002", "a#0001", 1000),
+            RequestOutcome::NowFriends
+        );
         assert!(s.are_friends("a#0001", "b#0002"));
     }
 
     #[test]
     fn duplicate_and_self_and_existing() {
         let mut s = FriendStore::new();
-        assert_eq!(s.request("a#0001", "a#0001"), RequestOutcome::Yourself);
-        assert_eq!(s.request("a#0001", "b#0002"), RequestOutcome::Sent);
         assert_eq!(
-            s.request("a#0001", "b#0002"),
+            s.request("a#0001", "a#0001", 1000),
+            RequestOutcome::Yourself
+        );
+        assert_eq!(s.request("a#0001", "b#0002", 1000), RequestOutcome::Sent);
+        assert_eq!(
+            s.request("a#0001", "b#0002", 1000),
             RequestOutcome::AlreadyPending
         );
-        s.accept("b#0002", "a#0001");
+        s.accept("b#0002", "a#0001", 1000);
         assert_eq!(
-            s.request("a#0001", "b#0002"),
+            s.request("a#0001", "b#0002", 1000),
             RequestOutcome::AlreadyFriends
         );
     }
@@ -237,14 +274,14 @@ mod tests {
     #[test]
     fn decline_and_remove() {
         let mut s = FriendStore::new();
-        s.request("a#0001", "b#0002");
+        s.request("a#0001", "b#0002", 1000);
         s.decline("b#0002", "a#0001");
         assert!(s.incoming("b#0002").is_empty());
         assert!(s.outgoing("a#0001").is_empty());
-        assert!(!s.accept("b#0002", "a#0001")); // nothing to accept now
+        assert!(!s.accept("b#0002", "a#0001", 1000)); // nothing to accept now
 
-        s.request("a#0001", "b#0002");
-        s.accept("b#0002", "a#0001");
+        s.request("a#0001", "b#0002", 1000);
+        s.accept("b#0002", "a#0001", 1000);
         s.remove("a#0001", "b#0002");
         assert!(!s.are_friends("a#0001", "b#0002"));
         assert!(!s.are_friends("b#0002", "a#0001"));
@@ -257,8 +294,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         {
             let mut s = FriendStore::load(&path);
-            s.request("a#0001", "b#0002");
-            s.accept("b#0002", "a#0001");
+            s.request("a#0001", "b#0002", 1000);
+            s.accept("b#0002", "a#0001", 1000);
         }
         let s = FriendStore::load(&path);
         assert!(s.are_friends("a#0001", "b#0002"));

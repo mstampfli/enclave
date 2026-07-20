@@ -326,6 +326,8 @@ input[type="checkbox"], select { cursor: pointer; }
   text-transform: uppercase; color: var(--faint); margin-bottom: 6px; }
 .pv-bio { font-size: 13.5px; color: var(--ink); line-height: 1.5;
   white-space: pre-wrap; overflow-wrap: break-word; }
+.pv-dates { display: flex; flex-wrap: wrap; gap: 12px 28px; }
+.pv-date-val { font-size: 13.5px; color: var(--ink); }
 .pv-group { display: block; width: 100%; text-align: left; padding: 7px 10px; font-size: 13.5px;
   color: var(--ink); background: var(--panel); border: 1px solid var(--border);
   border-radius: var(--radius); cursor: pointer; margin-bottom: 4px;
@@ -1950,6 +1952,16 @@ label.member-row:hover { background: var(--raised); }
           <div class="pv-section pv-groups" id="pv-groups" hidden>
             <div class="pv-sec-head">Groups you share</div>
             <div id="pv-groups-list"></div>
+          </div>
+          <div class="pv-dates" id="pv-dates" hidden>
+            <div class="pv-date" id="pv-member" hidden>
+              <div class="pv-sec-head">Member since</div>
+              <div class="pv-date-val" id="pv-member-val"></div>
+            </div>
+            <div class="pv-date" id="pv-friends" hidden>
+              <div class="pv-sec-head">Friends since</div>
+              <div class="pv-date-val" id="pv-friends-val"></div>
+            </div>
           </div>
         </div>
       </div>
@@ -4944,6 +4956,18 @@ function openProfile(username) {
   $("pv-status").textContent = st; $("pv-status").hidden = !st;
   $("pv-bio").textContent = p.bio || ""; $("pv-about").hidden = !p.bio;
 
+  // Dates come from the server via the friend record (member-since for anyone we
+  // have a record of; friends-since for accepted friends). Absent for accounts
+  // or friendships that predate the server tracking them, so the line just hides.
+  const rec = friends.find((f) => f.username === username)
+    || incoming.find((f) => f.username === username)
+    || outgoing.find((f) => f.username === username) || {};
+  $("pv-member-val").textContent = fmtProfileDate(rec.member_since);
+  $("pv-member").hidden = !rec.member_since;
+  $("pv-friends-val").textContent = fmtProfileDate(rec.since);
+  $("pv-friends").hidden = !rec.since;
+  $("pv-dates").hidden = !rec.member_since && !rec.since;
+
   $("pv-message").onclick = () => { closeModals(); send({ type: "OpenDm", handle: username }); };
   // Offer "Add friend" only to someone who is not already one.
   $("pv-add").hidden = isFriend;
@@ -4963,7 +4987,13 @@ function openProfile(username) {
 // The details card holds the optional sections; hide the whole card when none of
 // them has anything, so an empty box never shows.
 function updatePvCard() {
-  $("pv-details").hidden = $("pv-status").hidden && $("pv-about").hidden && $("pv-groups").hidden;
+  $("pv-details").hidden = $("pv-status").hidden && $("pv-about").hidden
+    && $("pv-groups").hidden && $("pv-dates").hidden;
+}
+// Unix seconds -> "3 Nov 2018"; empty for a missing/zero timestamp.
+function fmtProfileDate(secs) {
+  if (!secs) return "";
+  return new Date(secs * 1000).toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
 }
 let pvGroupsFor = null;
 function renderSharedGroups(handle, groups) {

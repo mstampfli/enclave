@@ -297,6 +297,15 @@ pub enum ClientMsg {
 pub struct Friend {
     pub username: String,
     pub display: String,
+    /// When this friendship was formed (unix seconds), if the server recorded it.
+    /// `None` for pending requests and for friendships that predate the server
+    /// tracking it. Server-authoritative, so both sides agree.
+    #[serde(default)]
+    pub since: Option<u64>,
+    /// When this person's account was created (unix seconds), if known. `None`
+    /// for accounts that predate the server tracking it.
+    #[serde(default)]
+    pub member_since: Option<u64>,
 }
 
 /// Server -> client messages.
