@@ -979,11 +979,7 @@ input[type="checkbox"], select { cursor: pointer; }
 /* Message search modal. */
 .search-modal { width: min(560px, calc(100vw - 48px)); }
 .search-scope { display: flex; align-items: center; gap: 4px; margin: 2px 0 8px; }
-.search-scope .scope-tab { font-size: 12.5px; color: var(--muted); background: none;
-  border: 1px solid var(--border); border-radius: var(--radius); padding: 4px 12px; cursor: pointer; }
-.search-scope .scope-tab:hover:not([disabled]) { color: var(--ink); border-color: var(--border-strong); }
-.search-scope .scope-tab.active { color: var(--accent-ink); border-color: var(--accent-ink); background: var(--accent-bg); }
-.search-scope .scope-tab[disabled] { opacity: 0.4; cursor: default; }
+.search-scope .search-scope-label { font-size: 12px; color: var(--muted); }
 .search-scope .search-count { margin-left: auto; font-size: 12px; color: var(--faint); }
 .search-list { display: flex; flex-direction: column; gap: 2px; max-height: 52vh;
   overflow-y: auto; scrollbar-gutter: stable; }
@@ -1662,10 +1658,9 @@ label.member-row:hover { background: var(--raised); }
       <h2>Search messages</h2>
       <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     </div>
-    <input id="search-input" class="fwd-search" placeholder="Search messages" autocomplete="off" spellcheck="false">
+    <input id="search-input" class="fwd-search" placeholder="Search this chat" autocomplete="off" spellcheck="false">
     <div class="search-scope">
-      <button type="button" class="scope-tab" data-scope="chat">This chat</button>
-      <button type="button" class="scope-tab active" data-scope="all">All chats</button>
+      <span class="search-scope-label">This chat</span>
       <span class="search-count" id="search-count"></span>
     </div>
     <div class="search-list" id="search-list"></div>
@@ -3670,13 +3665,12 @@ function scrollToMessage(mid) {
 
 // ---- message search (local, over decrypted history; the server can't search) ----
 let pendingJump = null;   // {conv, id}: a message to scroll to after switching
-let searchScope = "all";  // "all" | "chat"
 let searchTimer = null;
-function openSearch(scope) {
-  searchScope = (scope === "chat" && activeConv) ? "chat" : "all";
-  document.querySelector('#modal-search .scope-tab[data-scope="chat"]').disabled = !activeConv;
-  document.querySelectorAll("#modal-search .scope-tab").forEach((t) =>
-    t.classList.toggle("active", t.dataset.scope === searchScope));
+// The modal only ever searches the open conversation; global search lives in the
+// sidebar field. Callers guarantee a chat is open (the menu item and Ctrl+F both
+// gate on activeConv), so there is no scope to choose.
+function openSearch() {
+  if (!activeConv) return;
   $("modal-search").hidden = false;
   $("search-list").innerHTML = "";
   $("search-count").textContent = "";
@@ -3685,8 +3679,8 @@ function openSearch(scope) {
 }
 function runSearch() {
   const q = $("search-input").value.trim();
-  if (!q) { $("search-list").innerHTML = ""; $("search-count").textContent = ""; return; }
-  send({ type: "SearchMessages", query: q, conv: searchScope === "chat" ? activeConv : null });
+  if (!q || !activeConv) { $("search-list").innerHTML = ""; $("search-count").textContent = ""; return; }
+  send({ type: "SearchMessages", query: q, conv: activeConv });
 }
 function fmtDay(ms) {
   if (!ms) return "";
@@ -3720,7 +3714,7 @@ function renderSearchResults(query, hits) {
     const top = document.createElement("div"); top.className = "sh-top";
     const who = document.createElement("span"); who.className = "sh-who";
     const name = h.self_notes ? "Note to self" : (h.mine ? "You" : (h.display || h.user));
-    who.textContent = searchScope === "all" ? name + " · " + h.conv_title : name;
+    who.textContent = name;
     const time = document.createElement("span"); time.className = "sh-time"; time.textContent = fmtDay(h.ts);
     top.append(who, time);
     const snip = document.createElement("div"); snip.className = "sh-text";
@@ -3739,14 +3733,7 @@ $("search-input").addEventListener("input", () => {
   if (searchTimer) clearTimeout(searchTimer);
   searchTimer = setTimeout(runSearch, 130);
 });
-document.querySelectorAll("#modal-search .scope-tab").forEach((t) =>
-  t.addEventListener("click", () => {
-    if (t.disabled) return;
-    searchScope = t.dataset.scope;
-    document.querySelectorAll("#modal-search .scope-tab").forEach((x) => x.classList.toggle("active", x === t));
-    runSearch();
-  }));
-$("cm-search").addEventListener("click", () => { $("conv-menu").hidden = true; openSearch("chat"); });
+$("cm-search").addEventListener("click", () => { $("conv-menu").hidden = true; openSearch(); });
 
 // ---- shared-content panel: Media / Files / Links, derived from local history ----
 let infoTab = "media";
@@ -5240,7 +5227,11 @@ $("palette-hint").addEventListener("click", openPalette);
 $("palette-input").addEventListener("input", () => { paletteSel = 0; renderPalette(); });
 document.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") { e.preventDefault(); openSearch(activeConv ? "chat" : "all"); }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+    e.preventDefault();
+    if (activeConv) { openSearch(); }
+    else { setSidebar(true); const ss = $("side-search"); ss.focus(); ss.select(); }
+  }
   if (e.key === "Escape") { closeModals(); closeMsgMenu(); cancelReply(); $("presence-menu").hidden = true; $("emoji-pop").hidden = true; $("row-menu").hidden = true; $("conv-menu").hidden = true; setSidebar(false); }
   if (!$("palette-overlay").hidden) {
     const items = paletteItems($("palette-input").value);
