@@ -795,7 +795,10 @@ input[type="checkbox"], select { cursor: pointer; }
 .composer-box {
   flex: 1; display: flex; align-items: center; gap: 8px;
   background: var(--bg); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 3px 5px 3px 13px;
+  /* Symmetric: both edges now hold a 32px icon button (the "+" and send), so
+     they sit the same distance in. The old 13px left inset dated from when the
+     text input started at that edge with no button in front of it. */
+  border-radius: var(--radius); padding: 3px 5px;
   transition: border-color 130ms ease-out;
 }
 .composer-box:focus-within { border-color: var(--border-strong); }
