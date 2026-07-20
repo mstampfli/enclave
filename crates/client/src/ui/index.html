@@ -3391,8 +3391,8 @@ function pollAccessNote(p) {
   // the tally, and that nobody (including them) can attribute a ballot.
   if (p.anonymous) {
     return p.reveal === 4
-      ? "Anonymous. Only the creator sees results, once it closes, and even they cannot tell who voted for what."
-      : "Anonymous. Results appear when the poll closes, and no one can see who voted for what.";
+      ? "Anonymous. Only the creator sees the tally, once it closes, and not even they can tell who voted for what, then or ever after."
+      : "Anonymous. The tally appears when the poll closes, but who voted for what is never revealed, then or ever after.";
   }
   switch (p.reveal) {
     case 1: return "Results appear after you vote.";
