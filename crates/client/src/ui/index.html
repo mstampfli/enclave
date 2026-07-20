@@ -796,16 +796,22 @@ input[type="checkbox"], select { cursor: pointer; }
 .composer-box {
   flex: 1; display: flex; align-items: center; gap: 8px;
   background: var(--bg); border: 1px solid var(--border);
-  /* Uniform inset: every edge control is a 32px icon button, so each sits the
-     same 4px (3px padding + 1px border) from the box's top, bottom and its own
-     outer edge. The input is 32px too, so the row centres pixel-exactly and the
-     bar stays 40px tall. */
-  border-radius: var(--radius); padding: 3px;
+  /* Uniform inset: every edge control is a 32px icon button, and the input is
+     pinned to 32px too (below), so nothing in the row is taller than anything
+     else and align-items has no slack to distribute. Each control therefore sits
+     the same 7px (6px padding + 1px border) from the box's top, bottom and its
+     own outer edge. Letting the input set the height instead makes the vertical
+     gaps depend on the font's line-height, which is what previously left the
+     buttons 4px from the sides but 7.23px from top and bottom. */
+  border-radius: var(--radius); padding: 6px;
   transition: border-color 130ms ease-out;
 }
 .composer-box:focus-within { border-color: var(--border-strong); }
 .composer-box input { flex: 1; background: none; border: none; color: var(--ink);
-  font-size: 14.5px; padding: 8px 0; }
+  /* Fixed to the icon buttons' height rather than derived from padding + the
+     font's line-height, so the row's geometry does not shift with the font that
+     actually resolves from the --sans stack. An input centres its own text. */
+  font-size: 14.5px; padding: 0; height: 32px; }
 .composer-box input:focus { outline: none; }
 .composer-box input::placeholder { color: var(--faint); }
 .send-btn { width: 32px; height: 32px; display: grid; place-items: center;
