@@ -433,7 +433,16 @@ input[type="checkbox"], select { cursor: pointer; }
 .home-add-btn .icon { width: 18px; height: 18px; }
 /* The revealed add-friend field, styled exactly like the app's other search
    fields (and made clearable by makeClearable), so nothing looks bolted on. */
-.home-add-row { margin-bottom: 16px; }
+/* Field + "+" submit as one unit: align-items stretch makes the button exactly
+   the field's height, and both use --radius, so the button never reads as a
+   different (rounder) shape than the input beside it. */
+.home-add-row { margin-bottom: 16px; display: flex; gap: 6px; align-items: stretch; }
+.home-add-row .clearable { flex: 1; }
+.home-add-send { flex: none; width: 38px; display: grid; place-items: center;
+  border-radius: var(--radius); border: 1px solid var(--border);
+  background: var(--bg); color: var(--muted); }
+.home-add-send:hover { border-color: var(--border-strong); color: var(--ink); background: var(--raised); }
+.home-add-send .icon { width: 16px; height: 16px; }
 .home-add-row input { width: 100%; padding: 8px 11px; border-radius: var(--radius);
   background: var(--bg); border: 1px solid var(--border); color: var(--ink); font-size: 13.5px; }
 .home-add-row input:focus { outline: none; border-color: var(--border-strong); }
@@ -1530,7 +1539,10 @@ label.member-row:hover { background: var(--raised); }
             </button>
           </div>
           <div class="home-add-row" id="home-add-row" hidden>
-            <input id="friend" placeholder="Add by username, then press Enter" spellcheck="false" autocomplete="off">
+            <input id="friend" placeholder="Add by username" spellcheck="false" autocomplete="off">
+            <button class="home-add-send" id="add-friend" title="Send friend request" aria-label="Send friend request">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
           </div>
           <div class="side-section" id="sec-incoming" hidden>
             <div class="head"><span>Requests for you</span></div>
@@ -5030,6 +5042,7 @@ $("home-add-toggle").addEventListener("click", () => {
   row.hidden = !row.hidden;
   if (!row.hidden) setTimeout(() => $("friend").focus(), 0);
 });
+$("add-friend").addEventListener("click", submitAddFriend);
 // Reconnect with the read-only DM's peer: send a friend request and re-open the
 // DM. OpenDm restores a deleted conversation's history and re-establishes the
 // channel; for a still-live DM it just refocuses. Once the request is accepted
