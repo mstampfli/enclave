@@ -991,12 +991,15 @@ input[type="checkbox"], select { cursor: pointer; }
   padding: 8px 10px; background: none; border: none; border-radius: var(--radius); cursor: pointer; }
 .search-hit:hover { background: var(--raised); }
 .search-hit .sh-top { display: flex; align-items: baseline; gap: 8px; }
-.search-hit .sh-who { font-size: 12.5px; font-weight: 600; color: var(--ink-strong);
+.search-hit .sh-who { font-size: 13.5px; font-weight: 600; color: var(--ink-strong);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .search-hit .sh-time { margin-left: auto; flex: none; font-size: 11.5px; color: var(--faint); }
 .search-hit .sh-text { font-size: 13.5px; color: var(--muted); overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
-.search-hit mark { background: var(--accent-bg); color: var(--accent-ink); border-radius: 3px; padding: 0 1px; }
+/* Search-term highlight, for every result list. Enclave green, not the
+   browser default mark (yellow), which belongs to no palette here. */
+.search-hit mark, .side-hit mark { background: var(--accent-bg); color: var(--accent-ink);
+  border-radius: 3px; padding: 0 1px; font-weight: 600; }
 /* Shared-content panel (Media / Files / Links). */
 .info-modal { width: min(540px, calc(100vw - 48px)); }
 .info-tabs { display: flex; gap: 2px; margin: 2px 0 10px; border-bottom: 1px solid var(--border); }
@@ -1156,10 +1159,10 @@ label.member-row:hover { background: var(--raised); }
   background: none; border: none; border-radius: var(--radius); cursor: pointer; }
 .side-hit:hover { background: var(--raised); }
 .side-hit .sh-top { display: flex; align-items: baseline; gap: 6px; }
-.side-hit .sh-who { font-size: 12px; color: var(--muted); overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; }
-.side-hit .sh-time { margin-left: auto; font-size: 11px; color: var(--faint); flex: none; }
-.side-hit .sh-text { font-size: 12.5px; color: var(--ink); overflow: hidden;
+.side-hit .sh-who { font-size: 13px; font-weight: 600; color: var(--ink-strong);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.side-hit .sh-time { margin-left: auto; font-size: 11.5px; color: var(--faint); flex: none; }
+.side-hit .sh-text { font-size: 13px; color: var(--muted); overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
 .side-msgs-empty { padding: 6px 9px; font-size: 12px; color: var(--faint); }
 .side-search input {
