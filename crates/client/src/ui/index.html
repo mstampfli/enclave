@@ -409,18 +409,35 @@ input[type="checkbox"], select { cursor: pointer; }
   background: var(--bg); border: 1px solid var(--border); color: var(--ink); font-size: 12.5px; }
 .pm-note { font-size: 11.5px; color: var(--faint); padding: 0 9px 6px; }
 
-/* The header "back to your people" button, with a badge for pending requests
-   (the only people-side notification that needs surfacing while a chat is open). */
-.home-btn { position: relative; }
+/* The header "back to your people" button. Sized and coloured to match the
+   sidebar toggle beside it (muted, 30x30) rather than inheriting the brighter
+   default text colour. Carries a badge for pending requests -- the one
+   people-side notification worth surfacing while a chat is open. */
+.home-btn { position: relative; display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; flex: none; border-radius: var(--radius); color: var(--muted); }
+.home-btn:hover { background: var(--raised); color: var(--ink); }
+.home-btn .icon { width: 18px; height: 18px; }
 .home-badge { position: absolute; top: -3px; right: -3px; min-width: 15px; height: 15px;
   padding: 0 3px; display: grid; place-items: center; font-size: 10px; font-weight: 700;
   color: #fff; background: var(--danger); border-radius: 999px; }
 
 /* Home ("Your people") view: fills the room when no chat is open. */
 #home-view { max-width: 760px; margin: 0 auto; padding: 26px 24px 40px; }
-.home-head { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; flex-wrap: wrap; }
+.home-head { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .home-title { font-size: 19px; font-weight: 650; color: var(--ink-strong); }
-.home-add { margin-left: auto; padding: 0; max-width: 320px; flex: 1 1 220px; }
+/* Add-friend is gated behind this icon (a person with a +), so it is not a
+   permanent field competing for attention. Clicking it reveals the input below. */
+.home-add-btn { margin-left: auto; width: 30px; height: 30px; flex: none;
+  display: grid; place-items: center; border-radius: var(--radius); color: var(--muted); }
+.home-add-btn:hover { background: var(--raised); color: var(--ink); }
+.home-add-btn .icon { width: 18px; height: 18px; }
+/* The revealed add-friend field, styled exactly like the app's other search
+   fields (and made clearable by makeClearable), so nothing looks bolted on. */
+.home-add-row { margin-bottom: 16px; }
+.home-add-row input { width: 100%; padding: 8px 11px; border-radius: var(--radius);
+  background: var(--bg); border: 1px solid var(--border); color: var(--ink); font-size: 13.5px; }
+.home-add-row input:focus { outline: none; border-color: var(--border-strong); }
+.home-add-row input::placeholder { color: var(--faint); }
 #home-view .side-section { margin-bottom: 18px; }
 .home-friends .head { margin-bottom: 8px; }
 .friend-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
@@ -1393,8 +1410,8 @@ label.member-row:hover { background: var(--raised); }
       <button class="sidebar-toggle" id="sidebar-toggle" title="Show conversations" aria-label="Show conversations">
         <svg class="icon" viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
       </button>
-      <button class="icon-btn home-btn" id="btn-home" hidden title="Close chat (back to your people)" aria-label="Close chat">
-        <svg class="icon" viewBox="0 0 24 24"><path d="M3 11l9-8 9 8"/><path d="M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10"/></svg>
+      <button class="home-btn" id="btn-home" hidden title="Back to your people" aria-label="Back to your people">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
         <span class="home-badge" id="home-badge" hidden>0</span>
       </button>
       <button class="seal-btn" id="header-seal" title="Verify identity"></button>
@@ -1508,10 +1525,12 @@ label.member-row:hover { background: var(--raised); }
         <div class="home">
           <div class="home-head">
             <div class="home-title">Your people</div>
-            <div class="add-friend home-add">
-              <input id="friend" placeholder="Add a friend by username" spellcheck="false" autocomplete="off">
-              <button class="btn" id="add-friend" title="Send friend request" aria-label="Send friend request">Add</button>
-            </div>
+            <button class="home-add-btn" id="home-add-toggle" title="Add a friend" aria-label="Add a friend">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6M22 11h-6"/></svg>
+            </button>
+          </div>
+          <div class="home-add-row" id="home-add-row" hidden>
+            <input id="friend" placeholder="Add by username, then press Enter" spellcheck="false" autocomplete="off">
           </div>
           <div class="side-section" id="sec-incoming" hidden>
             <div class="head"><span>Requests for you</span></div>
@@ -2907,7 +2926,7 @@ function makeClearable(id) {
     input.focus();
   });
 }
-["side-search", "search-input", "forward-search", "members-search", "group-search"]
+["side-search", "search-input", "forward-search", "members-search", "group-search", "friend"]
   .forEach(makeClearable);
 
 let sideQuery = "";
@@ -3265,6 +3284,10 @@ function renderHeader() {
   $("home-badge").hidden = !reqs;
   if (!conv) {
     $("room-title").textContent = "Enclave";
+    // Clear any click handler left over from the last DM, or clicking "Enclave"
+    // would still open that peer's profile.
+    $("room-title").classList.remove("clickable");
+    $("room-title").onclick = null;
     sub.textContent = "Your people are here. Pick a conversation, or press Ctrl+K.";
     $("header-seal").innerHTML = "";
     $("btn-members").hidden = true;
@@ -4991,9 +5014,21 @@ function fillDevices(sel, names, current) {
 }
 
 // ---- friends ----
-$("add-friend").addEventListener("click", () => {
+function submitAddFriend() {
   const user = $("friend").value.trim();
-  if (user) { send({ type: "AddFriend", user }); $("friend").value = ""; toast("Friend request sent to " + user); }
+  if (!user) return;
+  send({ type: "AddFriend", user });
+  $("friend").value = "";
+  $("friend").dispatchEvent(new Event("input", { bubbles: true })); // hide the clear x
+  $("home-add-row").hidden = true;
+  toast("Friend request sent to " + user);
+}
+// The person+ icon reveals the add-friend field on demand rather than it being
+// always present. Toggling off leaves any half-typed name to resume later.
+$("home-add-toggle").addEventListener("click", () => {
+  const row = $("home-add-row");
+  row.hidden = !row.hidden;
+  if (!row.hidden) setTimeout(() => $("friend").focus(), 0);
 });
 // Reconnect with the read-only DM's peer: send a friend request and re-open the
 // DM. OpenDm restores a deleted conversation's history and re-establishes the
@@ -5008,7 +5043,10 @@ $("cl-reconnect").addEventListener("click", () => {
     toast("Reconnect request sent to " + conv.title);
   }
 });
-$("friend").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("add-friend").click(); } });
+$("friend").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); submitAddFriend(); }
+  else if (e.key === "Escape") { e.preventDefault(); $("home-add-row").hidden = true; }
+});
 
 // ---- composer ----
 // Files attached to the composer (picked or dropped), sent on the next Send with
