@@ -630,12 +630,9 @@ async fn an_anonymous_poll_tallies_without_attributing_votes() {
     bob.switch(&bob_gid);
     let alice_gid = alice.active_id().unwrap();
 
-    // Let profiles -- which carry each member's ring voting key -- exchange, so the
-    // creator can assemble a ring containing both members.
-    for _ in 0..40 {
-        let _ = tokio::time::timeout(Duration::from_millis(25), alice.next_event()).await;
-        let _ = tokio::time::timeout(Duration::from_millis(25), bob.next_event()).await;
-    }
+    // NOTE: no profile exchange and no waiting. The ring is built from the members'
+    // Ed25519 identity keys in local MLS group state, so it exists the moment the
+    // group does.
 
     // An anonymous, everyone-on-close poll (reveal 2 + anonymous) closing in 300ms.
     let opts = vec!["Yes".to_string(), "No".to_string()];
@@ -708,11 +705,9 @@ async fn an_owner_only_poll_can_also_be_anonymous() {
     bob.switch(&bob_gid);
     let alice_gid = alice.active_id().unwrap();
 
-    // Let the profiles (and their ring voting keys) exchange.
-    for _ in 0..40 {
-        let _ = tokio::time::timeout(Duration::from_millis(25), alice.next_event()).await;
-        let _ = tokio::time::timeout(Duration::from_millis(25), bob.next_event()).await;
-    }
+    // NOTE: no profile exchange and no waiting. The ring is built from the members'
+    // Ed25519 identity keys in local MLS group state, so it exists the moment the
+    // group does.
 
     // reveal 4 = only the creator, once it closes -- AND anonymous.
     let opts = vec!["Yes".to_string(), "No".to_string()];
@@ -2050,55 +2045,33 @@ async fn notes_to_self_stay_local_and_survive_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A privacy choice must never be silently downgraded. If no ring can be
-/// assembled (nobody else has published a voting key), creating an "anonymous"
-/// poll has to fail loudly -- handing back an attributable poll that the user
-/// believes is anonymous is the worst possible outcome.
+/// The requirement that matters most here: an anonymous poll must work the
+/// instant a conversation exists. No profile exchange, no key publication, no
+/// waiting, and nobody on the other end ever having to be reachable. The ring is
+/// every member's Ed25519 identity key, which arrives with membership itself and
+/// is already what the safety number verifies.
 #[tokio::test]
-async fn an_anonymous_poll_without_a_ring_is_refused_not_silently_attributed() {
+async fn an_anonymous_poll_works_immediately_with_nobody_reachable() {
     let handle = serve("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", handle.addr);
     let mut alice = account(&url, "alice").await;
     let bob = account(&url, "bob").await;
     let bob_user = bob.name().to_string();
 
-    // A real (server-backed) group, but deliberately WITHOUT pumping events, so
-    // Bob's profile -- which carries his ring voting key -- has not arrived yet.
-    // The ring Alice can assemble therefore contains only herself, which is
-    // exactly the state a fresh conversation is in.
     alice
-        .create_group("no ring yet", std::slice::from_ref(&bob_user))
+        .create_group("instant", std::slice::from_ref(&bob_user))
         .await
         .unwrap();
 
+    // Straight to an anonymous poll: nothing pumped, nothing exchanged, and Bob
+    // has done nothing at all. Under the previous design the ring came from
+    // broadcast profiles, so this could not be created until Bob had connected.
     let opts = vec!["Yes".to_string(), "No".to_string()];
-    let refused = alice.create_poll("Approve?", &opts, false, 2, 0, true);
+    let (_pid, _ts, view) = alice
+        .create_poll("Approve?", &opts, false, 2, 0, true)
+        .expect("an anonymous poll is creatable the moment the group exists");
     assert!(
-        refused.is_none(),
-        "an anonymous poll with a ring of one is refused, not quietly created"
-    );
-
-    // The user is told why, instead of being left with a poll they wrongly
-    // believe is anonymous.
-    let mut told = false;
-    for _ in 0..20 {
-        match tokio::time::timeout(Duration::from_millis(50), alice.next_event()).await {
-            Ok(Some(Event::Error(detail))) if detail.contains("cannot be anonymous") => {
-                told = true;
-                break;
-            }
-            Ok(_) => continue,
-            Err(_) => break,
-        }
-    }
-    assert!(told, "the refusal is explained to the user");
-
-    // The same poll without the anonymous flag is still perfectly creatable, so
-    // the refusal is scoped to the privacy claim it cannot honor.
-    assert!(
-        alice
-            .create_poll("Approve?", &opts, false, 2, 0, false)
-            .is_some(),
-        "a non-anonymous poll is unaffected"
+        view.anonymous,
+        "and it is genuinely anonymous, not silently downgraded"
     );
 }

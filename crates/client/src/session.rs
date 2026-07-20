@@ -170,11 +170,6 @@ pub struct SessionData {
     /// removal direction, and thus auto-reconnect eligibility, survives a restart.
     #[serde(default)]
     pub removed_me: Vec<String>,
-    /// Seed for our ring-signature voting keypair (anonymous polls). Persisted so
-    /// our voting public key is stable across sessions. Empty on old sessions; a
-    /// fresh one is generated on load.
-    #[serde(default)]
-    pub voting_seed: Vec<u8>,
 }
 
 /// Derive the 32-byte at-rest key from the OPAQUE export key (domain-separated).
@@ -260,7 +255,6 @@ mod tests {
                 },
             )],
             removed_me: vec!["carol#0003".into()],
-            voting_seed: Vec::new(),
         };
         save(&path, key, &data);
 

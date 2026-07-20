@@ -738,7 +738,6 @@ pub struct Client {
     my_profile: transfer::Profile,
     /// Seed for our ring-signature voting keypair (anonymous polls). Stable per
     /// account (persisted); our voting public key rides in `my_profile`.
-    voting_seed: [u8; 32],
     /// Cached profiles of people we share a group with, keyed by username.
     /// Persisted, so names and avatars render immediately on restart.
     profiles: HashMap<String, transfer::Profile>,
@@ -819,11 +818,6 @@ impl Client {
             seen: transfer::SeenSet::new(MAX_SEEN_IDS),
             delivery_warned: false,
             my_profile: transfer::Profile::default(),
-            voting_seed: {
-                let mut s = [0u8; 32];
-                let _ = getrandom::getrandom(&mut s);
-                s
-            },
             profiles: HashMap::new(),
             last_heal: HashMap::new(),
             voice_rec: None,
@@ -1276,10 +1270,6 @@ impl Client {
         if self.username.is_none() {
             return;
         }
-        // Always publish our voting public key so peers can build anonymous-poll
-        // rings (idempotent; the seed is stable per account).
-        self.my_profile.voting_key =
-            Some(enclave_crypto::RingKeypair::from_seed(&self.voting_seed).public);
         let payload = self.my_profile.encode();
         let groups: Vec<GroupId> = self
             .conversations
@@ -1295,8 +1285,6 @@ impl Client {
     /// Send our current profile into one specific group (used when a group is
     /// established or a member joins, so the new co-member gets it promptly).
     fn send_profile_to(&mut self, group: &GroupId) {
-        self.my_profile.voting_key =
-            Some(enclave_crypto::RingKeypair::from_seed(&self.voting_seed).public);
         if self.username.is_none() {
             return;
         }
@@ -2206,23 +2194,29 @@ impl Client {
         // how the ballot is signed -- batching does as much work here as the ring
         // signature does, so a "live anonymous" poll would not keep its promise.
         let anonymous = anonymous && (reveal == 2 || reveal == 4) && buffered;
+        // The ring is every member's Ed25519 identity key, read straight out of
+        // our own MLS group state. Those keys arrive with membership itself, are
+        // already what the safety number verifies, and are never fetched from the
+        // server -- so a ring exists for any group, offline, with nobody needing
+        // to have been reachable and nothing extra to publish.
         let ring: Vec<[u8; 32]> = if anonymous {
-            let my_key = enclave_crypto::RingKeypair::from_seed(&self.voting_seed).public;
-            let members = self
-                .conversations
+            self.conversations
                 .get(&group)
-                .map(|c| c.members.clone())
-                .unwrap_or_default();
-            let mut r = vec![my_key];
-            for m in &members {
-                if *m == me {
-                    continue;
-                }
-                if let Some(k) = self.profiles.get(m).and_then(|p| p.voting_key) {
-                    r.push(k);
-                }
-            }
-            r
+                .and_then(|c| c.group.as_ref())
+                .map(|g| {
+                    let mut keys: Vec<[u8; 32]> = g
+                        .member_keys()
+                        .into_iter()
+                        .filter_map(|(_, k)| <[u8; 32]>::try_from(k.as_slice()).ok())
+                        .collect();
+                    // A fixed order every verifier agrees on, derived from the keys
+                    // themselves rather than from roster order (which can differ
+                    // between members) or names (which would order by identity).
+                    keys.sort_unstable();
+                    keys.dedup();
+                    keys
+                })
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -2232,8 +2226,10 @@ impl Client {
         // failing, because they would never learn the votes were attributable.
         if anonymous && ring.len() < 2 {
             self.pending.push_back(Event::Error(
-                "This poll cannot be anonymous yet: no one else here has published a voting key. \
-                 They each need to come online once on a current version, then try again."
+                "This poll cannot be anonymous yet: a ring of one hides nobody, and no one \
+                 else here has a voting key cached yet. It arrives with their profile and is \
+                 stored permanently, so this is one-time per contact and never affects who \
+                 needs to be around when a poll closes."
                     .into(),
             ));
             return None;
@@ -2354,8 +2350,8 @@ impl Client {
                 // locally by our key image -- the same pseudonym others will see.
                 Some(key) if anonymous => {
                     if let Ok(sealed) = enclave_crypto::seal_ballot(&key, &mid, &body.encode()) {
-                        let kp = enclave_crypto::RingKeypair::from_seed(&self.voting_seed);
-                        if let Ok(sig) = kp.sign(&sealed, &mid, &ring) {
+                        let kp = self.identity.as_ref().and_then(|i| i.ring_keypair().ok());
+                        if let Some(sig) = kp.and_then(|k| k.sign(&sealed, &mid, &ring).ok()) {
                             let tag = hex::encode(sig.key_image);
                             if let Some(p) = self
                                 .conversations
@@ -4184,7 +4180,6 @@ impl Client {
                 .map(|(u, p)| (u.clone(), p.clone()))
                 .collect(),
             removed_me: self.removed_me.iter().cloned().collect(),
-            voting_seed: self.voting_seed.to_vec(),
         };
         session::save(&self.session_path(), &self.export_key, &data);
     }
@@ -4217,11 +4212,6 @@ impl Client {
         self.my_profile = data.my_profile;
         // Restore (or keep the freshly-minted) voting seed, and publish its public
         // key in our profile so peers can build anonymous-poll rings.
-        if data.voting_seed.len() == 32 {
-            self.voting_seed.copy_from_slice(&data.voting_seed);
-        }
-        self.my_profile.voting_key =
-            Some(enclave_crypto::RingKeypair::from_seed(&self.voting_seed).public);
         if !self.display.is_empty() && self.my_profile.display_name.is_empty() {
             // Migrate a pre-profile session's server-side display name into the
             // profile once, so upgrading users keep their name.

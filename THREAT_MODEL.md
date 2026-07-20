@@ -337,11 +337,28 @@ work here as the ring signature, and a "live anonymous" poll would not keep the
 promise on its label.
 
 **Anonymous polls.** Ballots carry a linkable ring signature (LSAG,
-`crypto::ring`) over the ring of members' voting keys, so a verifier learns only
+`crypto::ring`) over the ring of members' **Ed25519 identity keys**, so a verifier learns only
 that *some* ring member cast it. The signature's key image is a stable pseudonym
 per (voter, poll), which lets a re-vote replace the earlier one without ever
 naming the voter, and stops one member stuffing the ballot box. On release the
 relay strips the submitting device id.
+
+**The ring needs no key distribution.** A poll's ring is the members' existing
+MLS identity keys, read out of the creator's own local group state
+(`Group::member_keys`). Nothing is published, nothing is fetched from the server,
+and no member has to be reachable at any point for a ring to exist -- it is
+available the moment a conversation does. This is also why the ring is not worth
+attacking: those keys arrive with group membership itself and are already the keys
+the safety number verifies, so substituting one is exactly the attack the existing
+verification catches. Putting voting keys on the server instead would have handed
+the relay the ability to insert itself into a ring and stuff ballots, buying an
+availability win for a trust loss.
+
+Ed25519 has cofactor 8, so `crypto::ring` constrains every point to the
+prime-order subgroup: ring keys and key images must be torsion-free, and the
+hash-to-point result is cofactor-cleared. Without that, a crafted small-order key
+would make a key image malleable and let one member vote repeatedly without
+linking. Proven by `ring::tests::small_order_points_are_refused_everywhere`.
 
 **Denial of service.** A buffered poll costs the relay memory until it is
 released, so the ballot buffer is bounded on every axis: at most

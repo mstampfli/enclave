@@ -74,6 +74,42 @@ impl Identity {
         Ok(crate::MediaSigner::from_keypair(self.signer.clone()))
     }
 
+    /// This device's ring keypair for anonymous ballots. It **is** the long-term
+    /// Ed25519 identity key, so a poll's ring is assembled from MLS group state
+    /// alone: nothing to publish, nothing to fetch from the server, and nobody who
+    /// has to be reachable for a ring to exist. The public half is what peers
+    /// already hold via [`Group::member_keys`](crate::Group::member_keys) and what
+    /// the safety number already verifies.
+    pub fn ring_keypair(&self) -> Result<crate::RingKeypair, CryptoError> {
+        if self.signer.signature_scheme() != CIPHERSUITE.signature_algorithm() {
+            return Err(CryptoError::Identity("identity is not Ed25519".into()));
+        }
+        // openmls gates its raw `private()` accessor behind a test-only feature,
+        // but the keypair's serde form is stable public API -- it is exactly what
+        // `save`/`load` above round-trip to persist this key. Reading the seed back
+        // out that way needs no unstable feature and, crucially, works for
+        // identities that already exist. `ring_key_matches_the_identity_key` pins
+        // this: if the upstream shape ever changed, that test fails loudly rather
+        // than anything degrading quietly.
+        #[derive(serde::Deserialize)]
+        struct RawSigner {
+            private: Vec<u8>,
+        }
+        let mut json = serde_json::to_vec(&self.signer)
+            .map_err(|e| CryptoError::Identity(format!("serialize signer: {e}")))?;
+        let raw: RawSigner = serde_json::from_slice(&json)
+            .map_err(|e| CryptoError::Identity(format!("read signer: {e}")))?;
+        json.zeroize();
+        let mut seed: [u8; 32] = raw
+            .private
+            .get(..32)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| CryptoError::Identity("unexpected Ed25519 key length".into()))?;
+        let kp = crate::RingKeypair::from_ed25519_seed(&seed);
+        seed.zeroize();
+        Ok(kp)
+    }
+
     /// Snapshot this device's entire MLS storage (all group states and private
     /// keys) so a session can be persisted. It contains private key material and
     /// MUST be encrypted before it touches disk.
@@ -195,5 +231,32 @@ impl Identity {
             signer,
             credential,
         })
+    }
+}
+
+#[cfg(test)]
+mod ring_identity_tests {
+    use super::*;
+
+    /// The load-bearing property: a member's ring key IS their Ed25519 identity
+    /// key. That is what lets any member assemble a poll's ring from local MLS
+    /// group state alone, with nothing published and nobody needing to be
+    /// reachable. It also pins openmls's keypair serde shape, which we read the
+    /// seed through: if that ever changes, this fails rather than degrading.
+    #[test]
+    fn ring_key_matches_the_identity_key() {
+        let id = Identity::generate("alice").expect("generate");
+        let kp = id.ring_keypair().expect("ring keypair");
+        assert_eq!(
+            kp.public.to_vec(),
+            id.identity_key(),
+            "the ring public key is the identity key peers already hold and verify"
+        );
+        // Stable across calls, so a member always occupies the same ring slot.
+        let again = id.ring_keypair().expect("ring keypair");
+        assert_eq!(kp.public, again.public, "derivation is deterministic");
+        // A different identity yields a different ring key.
+        let other = Identity::generate("bob").expect("generate");
+        assert_ne!(kp.public, other.ring_keypair().unwrap().public);
     }
 }

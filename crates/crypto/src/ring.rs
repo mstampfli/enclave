@@ -1,5 +1,5 @@
-//! Linkable spontaneous anonymous group (LSAG) signatures over Ristretto255 --
-//! the primitive behind anonymous polls.
+//! Linkable spontaneous anonymous group (LSAG) signatures over the Ed25519
+//! group -- the primitive behind anonymous polls.
 //!
 //! A voter signs their ballot as *"one of the members of this ring cast this"*
 //! without revealing WHICH member (anonymity), while a deterministic **key image**
@@ -13,13 +13,38 @@
 //! every hash, and the whole ring is hashed in, so a signature is tied to its exact
 //! `(message, ring, scope)`.
 //!
+//! ## Why Ed25519 and not Ristretto
+//!
+//! The ring is built from the members' **existing MLS identity keys**, which are
+//! Ed25519, and which every member already holds locally in their group state.
+//! That is the entire point: a ring can be assembled offline, for any group, with
+//! no key distribution step and nobody needing to be reachable -- and those keys
+//! are already what the safety number verifies, so there is no new thing to trust
+//! or to check. A separate Ristretto voting key would have to travel somewhere
+//! first, which is exactly the requirement we are removing.
+//!
+//! Ed25519's group has cofactor 8, which Ristretto exists to abstract away, so the
+//! cofactor is handled explicitly and in one place here:
+//!
+//! - **Every ring key must be torsion-free.** A genuine Ed25519 public key is
+//!   `a*B` and therefore in the prime-order subgroup; anything else is rejected.
+//!   This is what stops a crafted small-order key from yielding a malleable key
+//!   image (which would let one member vote twice without linking).
+//! - **The hash-to-point result is cofactor-cleared**, so the key image `x*H(scope)`
+//!   is prime-order by construction.
+//! - **The key image is re-checked on verify**, so a hand-built signature cannot
+//!   smuggle a torsion component past us.
+//!
+//! With every point constrained to the prime-order subgroup, the algebra is the
+//! same as it would be over any prime-order group.
+//!
 //! PRIMITIVE: the single source of truth for anonymous ballots. Never hand-roll a
 //! ring signature elsewhere; reuse this. Vetted building blocks only (curve25519-
 //! dalek constant-time group ops, SHA-512); we assemble, we do not invent curves.
 
 use curve25519_dalek::{
-    constants::RISTRETTO_BASEPOINT_POINT as G,
-    ristretto::{CompressedRistretto, RistrettoPoint},
+    constants::ED25519_BASEPOINT_POINT as G,
+    edwards::{CompressedEdwardsY, EdwardsPoint},
     scalar::Scalar,
 };
 use serde::{Deserialize, Serialize};
@@ -27,9 +52,8 @@ use sha2::{Digest, Sha512};
 
 use crate::CryptoError;
 
-const KEY_DOMAIN: &[u8] = b"enclave-ring-key-v1";
-const H2P_DOMAIN: &[u8] = b"enclave-ring-h2p-v1";
-const HS_DOMAIN: &[u8] = b"enclave-ring-hs-v1";
+const H2P_DOMAIN: &[u8] = b"enclave-ring-h2p-v2";
+const HS_DOMAIN: &[u8] = b"enclave-ring-hs-v2";
 
 /// A linkable ring signature. `s` has one scalar per ring member; `key_image`
 /// links two signatures by the same signer under the same scope.
@@ -40,18 +64,29 @@ pub struct RingSig {
     pub key_image: [u8; 32],
 }
 
-/// A member's ring keypair. `public` (compressed point) is broadcast to the group;
-/// `secret` is kept on the device. Distinct from the identity/MLS keys.
+/// A member's ring keypair. `public` is the member's **Ed25519 identity key** --
+/// the very key their MLS credential and safety number are bound to -- so a ring
+/// is assembled from group state alone, with nothing to publish or fetch.
 pub struct RingKeypair {
     secret: Scalar,
     pub public: [u8; 32],
 }
 
 impl RingKeypair {
-    /// Derive the keypair deterministically from a persisted 32-byte seed, so the
-    /// same account always presents the same voting public key.
-    pub fn from_seed(seed: &[u8; 32]) -> RingKeypair {
-        let secret = scalar_from_hash(&[KEY_DOMAIN, seed]);
+    /// Derive from a 32-byte Ed25519 private seed (what `SignatureKeyPair` stores).
+    /// Applies the standard Ed25519 clamp, so `public` is byte-identical to the
+    /// identity's verifying key and the holder can sign for their own ring slot.
+    pub fn from_ed25519_seed(seed: &[u8; 32]) -> RingKeypair {
+        let h = Sha512::digest(seed);
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&h[..32]);
+        // Ed25519 clamping: clear the low 3 bits, clear the top bit, set bit 254.
+        s[0] &= 248;
+        s[31] &= 127;
+        s[31] |= 64;
+        // Reduce mod L. The clamped value may exceed the group order, and the
+        // reduced scalar is congruent, so it yields the same public point.
+        let secret = Scalar::from_bytes_mod_order(s);
         let public = (secret * G).compress().to_bytes();
         RingKeypair { secret, public }
     }
@@ -84,17 +119,34 @@ fn scalar_from_hash(parts: &[&[u8]]) -> Scalar {
     Scalar::from_bytes_mod_order_wide(&wide)
 }
 
-/// Deterministically map the linkability `scope` (the poll id) to a ristretto
-/// point, so a member's key image `x*H(scope)` is the same for every ballot they
-/// cast in that poll but unrelated to any other poll.
-fn hash_to_point(scope: &[u8]) -> RistrettoPoint {
-    let mut h = Sha512::new();
-    h.update(H2P_DOMAIN);
-    h.update(scope);
-    let d = h.finalize();
-    let mut wide = [0u8; 64];
-    wide.copy_from_slice(&d);
-    RistrettoPoint::from_uniform_bytes(&wide)
+/// Deterministically map the linkability `scope` (the poll id) to a prime-order
+/// Edwards point, so a member's key image `x*H(scope)` is the same for every
+/// ballot they cast in that poll but unrelated to any other poll.
+///
+/// Try-and-increment: hash, attempt to decompress, bump a counter on failure.
+/// The input is public (a poll id), so the variable iteration count leaks nothing.
+/// The result is cofactor-cleared, putting it in the prime-order subgroup.
+fn hash_to_point(scope: &[u8]) -> EdwardsPoint {
+    for counter in 0u16..=u16::MAX {
+        let mut h = Sha512::new();
+        h.update(H2P_DOMAIN);
+        h.update(scope);
+        h.update(counter.to_le_bytes());
+        let d = h.finalize();
+        let mut c = [0u8; 32];
+        c.copy_from_slice(&d[..32]);
+        if let Some(p) = CompressedEdwardsY(c).decompress() {
+            let p = p.mul_by_cofactor();
+            // Cofactor clearing can land on the identity; that point is useless
+            // as a key-image base (every key image would collapse to it).
+            if p != EdwardsPoint::default() {
+                return p;
+            }
+        }
+    }
+    // Unreachable in practice: ~50% of candidates decompress, so exhausting
+    // 65536 of them has probability ~2^-65536.
+    unreachable!("no hash-to-point candidate succeeded")
 }
 
 fn random_scalar() -> Result<Scalar, CryptoError> {
@@ -103,10 +155,12 @@ fn random_scalar() -> Result<Scalar, CryptoError> {
     Ok(Scalar::from_bytes_mod_order_wide(&b))
 }
 
-fn decompress(b: &[u8; 32]) -> Option<RistrettoPoint> {
-    CompressedRistretto::from_slice(b)
-        .ok()
-        .and_then(|c| c.decompress())
+/// Decompress a ring point, REJECTING anything outside the prime-order subgroup.
+/// Genuine Ed25519 public keys are `a*B` and always pass; a crafted key with a
+/// torsion component would make the key image malleable, so it never gets in.
+fn decompress(b: &[u8; 32]) -> Option<EdwardsPoint> {
+    let p = CompressedEdwardsY(*b).decompress()?;
+    (p.is_torsion_free() && p != EdwardsPoint::default()).then_some(p)
 }
 
 fn scalar_from_canonical(b: &[u8; 32]) -> Option<Scalar> {
@@ -119,8 +173,8 @@ fn challenge(
     msg: &[u8],
     ring_bytes: &[u8],
     ki: &[u8; 32],
-    l: &RistrettoPoint,
-    r: &RistrettoPoint,
+    l: &EdwardsPoint,
+    r: &EdwardsPoint,
 ) -> Scalar {
     scalar_from_hash(&[
         HS_DOMAIN,
@@ -139,7 +193,7 @@ fn ring_bytes(ring: &[[u8; 32]]) -> Vec<u8> {
 /// Sign `msg` as ring member `index` (whose secret is `secret`), linkable within
 /// `scope`. `ring` is the compressed public keys of every eligible signer, in a
 /// fixed order all verifiers agree on. Fails if the index is out of range, the
-/// secret does not match `ring[index]`, or a ring key does not decompress.
+/// secret does not match `ring[index]`, or a ring key is unusable.
 pub fn ring_sign(
     msg: &[u8],
     scope: &[u8],
@@ -202,6 +256,8 @@ pub fn ring_verify(msg: &[u8], scope: &[u8], ring: &[[u8; 32]], sig: &RingSig) -
             None => return false,
         }
     }
+    // The key image must be prime-order too: a torsion component would let the
+    // same signer produce several distinct images and vote more than once.
     let key_image = match decompress(&sig.key_image) {
         Some(p) => p,
         None => return false,
@@ -231,10 +287,24 @@ mod tests {
 
     fn ring_of(n: usize) -> (Vec<RingKeypair>, Vec<[u8; 32]>) {
         let kps: Vec<RingKeypair> = (0..n)
-            .map(|i| RingKeypair::from_seed(&[i as u8 + 1; 32]))
+            .map(|i| RingKeypair::from_ed25519_seed(&[i as u8 + 1; 32]))
             .collect();
         let pubs: Vec<[u8; 32]> = kps.iter().map(|k| k.public).collect();
         (kps, pubs)
+    }
+
+    /// The property the whole design rests on: a ring key IS the member's Ed25519
+    /// identity key, so a ring needs no key distribution at all.
+    #[test]
+    fn a_ring_key_is_exactly_the_ed25519_identity_key() {
+        let seed = [7u8; 32];
+        let kp = RingKeypair::from_ed25519_seed(&seed);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        assert_eq!(
+            kp.public,
+            signing.verifying_key().to_bytes(),
+            "the ring public key is byte-identical to the Ed25519 verifying key"
+        );
     }
 
     #[test]
@@ -282,7 +352,7 @@ mod tests {
         let (_kps, ring) = ring_of(4);
         // An outsider's key is not in the ring: signing with a claimed index fails
         // (the secret does not match that ring position).
-        let outsider = RingKeypair::from_seed(&[99u8; 32]);
+        let outsider = RingKeypair::from_ed25519_seed(&[99u8; 32]);
         assert!(ring_sign(b"x", b"p", &ring, &outsider.secret, 0).is_err());
         assert!(
             outsider.sign(b"x", b"p", &ring).is_err(),
@@ -291,7 +361,7 @@ mod tests {
         // A signature made over a DIFFERENT ring does not verify against this one.
         let other: Vec<RingKeypair> = [50u8, 51, 52, 53]
             .iter()
-            .map(|i| RingKeypair::from_seed(&[*i; 32]))
+            .map(|i| RingKeypair::from_ed25519_seed(&[*i; 32]))
             .collect();
         let other_ring: Vec<[u8; 32]> = other.iter().map(|k| k.public).collect();
         let sig = other[0].sign(b"x", b"p", &other_ring).unwrap();
@@ -303,5 +373,46 @@ mod tests {
             !ring_verify(b"x", b"p", &ring, &sig),
             "the original ring rejects it"
         );
+    }
+
+    /// The cofactor defence. A point with a torsion component must never be
+    /// accepted as a ring key or a key image: that is precisely what would make a
+    /// key image malleable and let one member vote twice without linking.
+    #[test]
+    fn small_order_points_are_refused_everywhere() {
+        use curve25519_dalek::constants::EIGHT_TORSION;
+
+        let (kps, mut ring) = ring_of(3);
+        let good = ring_sign(b"v", b"poll", &ring, &kps[0].secret, 0).unwrap();
+        assert!(ring_verify(b"v", b"poll", &ring, &good));
+
+        // A torsion point smuggled into the ring is rejected outright.
+        for t in EIGHT_TORSION.iter().skip(1) {
+            let mut poisoned = ring.clone();
+            poisoned[1] = t.compress().to_bytes();
+            assert!(
+                !ring_verify(b"v", b"poll", &poisoned, &good),
+                "a ring containing a torsion point is refused"
+            );
+            assert!(
+                ring_sign(b"v", b"poll", &poisoned, &kps[0].secret, 0).is_err(),
+                "and cannot be signed against either"
+            );
+        }
+
+        // A key image with a torsion component is rejected.
+        for t in EIGHT_TORSION.iter().skip(1) {
+            let mut bad = good.clone();
+            let ki = decompress(&good.key_image).expect("genuine image is prime-order");
+            bad.key_image = (ki + t).compress().to_bytes();
+            assert!(
+                !ring_verify(b"v", b"poll", &ring, &bad),
+                "a torsion-tainted key image is refused"
+            );
+        }
+
+        // The identity point is not a usable key either.
+        ring[1] = EdwardsPoint::default().compress().to_bytes();
+        assert!(!ring_verify(b"v", b"poll", &ring, &good));
     }
 }

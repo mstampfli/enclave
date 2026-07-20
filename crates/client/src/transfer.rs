@@ -326,12 +326,6 @@ pub struct Profile {
     /// (last-writer-wins), so a reordered or duplicated update never regresses a
     /// profile to an older state.
     pub version: u64,
-    /// The user's ring-signature voting public key (Ristretto point, 32 bytes),
-    /// broadcast so peers can build the ring for anonymous polls. `None` for a
-    /// client that predates anonymous polls. Deterministic per account (from a
-    /// persisted seed), so it is stable across sessions.
-    #[serde(default)]
-    pub voting_key: Option<[u8; 32]>,
 }
 
 /// Where a profile's avatar image lives: an encrypted, content-addressed blob on
@@ -1196,7 +1190,7 @@ mod tests {
         let poll = [5u8; 16];
         let key = [9u8; 32];
         let members: Vec<enclave_crypto::RingKeypair> = (0..3u8)
-            .map(|n| enclave_crypto::RingKeypair::from_seed(&[n; 32]))
+            .map(|n| enclave_crypto::RingKeypair::from_ed25519_seed(&[n; 32]))
             .collect();
         let ring: Vec<[u8; 32]> = members.iter().map(|m| m.public).collect();
 
