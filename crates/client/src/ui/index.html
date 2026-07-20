@@ -1165,6 +1165,20 @@ label.member-row:hover { background: var(--raised); }
 .side-hit .sh-text { font-size: 13px; color: var(--muted); overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
 .side-msgs-empty { padding: 6px 9px; font-size: 12px; color: var(--faint); }
+/* PRIMITIVE: a clear "x" inside a text field. Visibility is declarative --
+   :placeholder-shown is false exactly when the field has content -- so the
+   button is correct even when code empties the field with a bare .value = "",
+   which no input listener would ever see. Every field it is applied to must
+   therefore carry a placeholder. */
+.clearable { position: relative; display: block; }
+.clearable > input { padding-right: 30px; }
+.field-clear { position: absolute; top: 50%; right: 6px; transform: translateY(-50%);
+  width: 20px; height: 20px; display: none; place-items: center; padding: 0;
+  background: none; border: none; border-radius: var(--radius);
+  color: var(--faint); cursor: pointer; }
+.clearable > input:not(:placeholder-shown) ~ .field-clear { display: grid; }
+.field-clear:hover { color: var(--ink); background: var(--raised); }
+.field-clear .icon { width: 13px; height: 13px; }
 .side-search input {
   width: 100%; padding: 7px 10px; border-radius: var(--radius);
   background: var(--bg); border: 1px solid var(--border); color: var(--ink);
@@ -2836,6 +2850,40 @@ function setTab(tab) {
 }
 $("tab-chats").addEventListener("click", () => setTab("chats"));
 $("tab-people").addEventListener("click", () => setTab("people"));
+
+// Give a text field an inline clear button. One mechanism for every search
+// field so they cannot drift apart, and clearing dispatches a real input event
+// so each field's existing handler re-runs exactly as if it had been emptied by
+// hand. Shown/hidden purely in CSS (see .field-clear).
+function makeClearable(id) {
+  const input = document.getElementById(id);
+  if (!input || input.dataset.clearable) return;
+  input.dataset.clearable = "1";
+  const wrap = document.createElement("span");
+  wrap.className = "clearable";
+  // Carry the field's own margins to the wrapper, so the button centres on the
+  // input's box rather than on the input plus its margin.
+  const cs = getComputedStyle(input);
+  wrap.style.margin = cs.marginTop + " " + cs.marginRight + " " + cs.marginBottom + " " + cs.marginLeft;
+  input.style.margin = "0";
+  input.parentNode.insertBefore(wrap, input);
+  wrap.appendChild(input);
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "field-clear";
+  btn.tabIndex = -1;
+  btn.title = "Clear";
+  btn.setAttribute("aria-label", "Clear");
+  btn.innerHTML = '<svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+  wrap.appendChild(btn);
+  btn.addEventListener("click", () => {
+    input.value = "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.focus();
+  });
+}
+["side-search", "search-input", "forward-search", "members-search", "group-search"]
+  .forEach(makeClearable);
 
 let sideQuery = "";
 const matches = (...fields) => {
