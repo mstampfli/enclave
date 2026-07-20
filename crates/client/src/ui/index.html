@@ -409,16 +409,38 @@ input[type="checkbox"], select { cursor: pointer; }
   background: var(--bg); border: 1px solid var(--border); color: var(--ink); font-size: 12.5px; }
 .pm-note { font-size: 11.5px; color: var(--faint); padding: 0 9px 6px; }
 
-.side-tabs { display: flex; padding: 0 14px; gap: 16px; border-bottom: 1px solid var(--border); }
-.side-tabs button {
-  padding: 7px 2px 8px; font-size: 13px; font-weight: 550; color: var(--muted);
-  border-bottom: 1px solid transparent; margin-bottom: -1px;
-  transition: color 130ms ease-out;
-}
-.side-tabs button:hover { color: var(--ink); }
-.side-tabs button.active { color: var(--ink-strong); border-bottom-color: var(--ink-strong); }
-.side-tabs .count { font-size: 11px; margin-left: 4px; color: var(--muted); }
-.side-tabs .count.attention { color: var(--ink-strong); font-weight: 600; }
+/* The header "back to your people" button, with a badge for pending requests
+   (the only people-side notification that needs surfacing while a chat is open). */
+.home-btn { position: relative; }
+.home-badge { position: absolute; top: -3px; right: -3px; min-width: 15px; height: 15px;
+  padding: 0 3px; display: grid; place-items: center; font-size: 10px; font-weight: 700;
+  color: #fff; background: var(--danger); border-radius: 999px; }
+
+/* Home ("Your people") view: fills the room when no chat is open. */
+#home-view { max-width: 760px; margin: 0 auto; padding: 26px 24px 40px; }
+.home-head { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; flex-wrap: wrap; }
+.home-title { font-size: 19px; font-weight: 650; color: var(--ink-strong); }
+.home-add { margin-left: auto; padding: 0; max-width: 320px; flex: 1 1 220px; }
+#home-view .side-section { margin-bottom: 18px; }
+.home-friends .head { margin-bottom: 8px; }
+.friend-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.friend-card { position: relative; display: flex; flex-direction: column; align-items: center;
+  gap: 8px; padding: 16px 12px 14px; text-align: center; cursor: pointer;
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+  transition: border-color 130ms ease-out, background 130ms ease-out; }
+.friend-card:hover { border-color: var(--border-strong); background: var(--raised); }
+.friend-card .avatar-wrap .avatar { width: 52px; height: 52px; font-size: 19px; }
+.friend-card .avatar-wrap .presence-dot { right: 0; bottom: 0; }
+.friend-card .fc-name { font-size: 13.5px; font-weight: 600; color: var(--ink);
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.friend-card .fc-status { font-size: 12px; color: var(--muted); max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-height: 15px; }
+.friend-card .fc-remove { position: absolute; top: 5px; right: 5px; width: 22px; height: 22px;
+  display: none; place-items: center; padding: 0; color: var(--faint);
+  background: none; border: none; border-radius: var(--radius); }
+.friend-card:hover .fc-remove { display: grid; }
+.friend-card .fc-remove:hover { color: var(--danger); background: var(--bg); }
+.friend-card .fc-remove .icon { width: 14px; height: 14px; }
 
 .side-scroll { flex: 1; overflow-y: auto; min-height: 0; padding: 8px; }
 
@@ -1309,11 +1331,6 @@ label.member-row:hover { background: var(--raised); }
       </div>
     </div>
 
-    <div class="side-tabs">
-      <button class="active" id="tab-chats">Chats</button>
-      <button id="tab-people">People <span class="count attention" id="req-count" hidden>0</span></button>
-    </div>
-
     <div class="side-search">
       <input id="side-search" placeholder="Search chats and messages" autocomplete="off" spellcheck="false">
     </div>
@@ -1332,7 +1349,7 @@ label.member-row:hover { background: var(--raised); }
           </div>
         </div>
         <div id="convo-list"></div>
-        <div class="pick-empty" id="convos-empty" hidden>No conversations yet. Find your people in the People tab.</div>
+        <div class="pick-empty" id="convos-empty" hidden>No conversations yet. Message a friend from your people list to start one.</div>
       </div>
       <div class="side-section" id="sec-archived" hidden>
         <button class="archived-toggle" id="archived-toggle" aria-expanded="false">
@@ -1347,27 +1364,6 @@ label.member-row:hover { background: var(--raised); }
       </div>
     </div>
 
-    <div class="side-scroll" id="pane-people" hidden>
-      <div class="add-friend">
-        <input id="friend" placeholder="add by username" spellcheck="false">
-        <button class="btn" id="add-friend" style="padding:7px 10px" title="Send friend request" aria-label="Send friend request">
-          <svg class="icon sm" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
-        </button>
-      </div>
-      <div class="side-section" id="sec-incoming" hidden>
-        <div class="head"><span>Requests for you</span></div>
-        <div id="incoming-list"></div>
-      </div>
-      <div class="side-section" id="sec-outgoing" hidden>
-        <div class="head"><span>Sent requests</span></div>
-        <div id="outgoing-list"></div>
-      </div>
-      <div class="side-section">
-        <div class="head"><span>Friends</span></div>
-        <div id="friend-list"></div>
-        <div class="pick-empty" id="friends-empty">No friends yet. Add one by username above.</div>
-      </div>
-    </div>
 
     <div class="callbar" id="callbar" hidden>
       <button class="callbar-go" id="callbar-return" title="Go back to the call">
@@ -1396,6 +1392,10 @@ label.member-row:hover { background: var(--raised); }
     <header class="room-header">
       <button class="sidebar-toggle" id="sidebar-toggle" title="Show conversations" aria-label="Show conversations">
         <svg class="icon" viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
+      <button class="icon-btn home-btn" id="btn-home" hidden title="Close chat (back to your people)" aria-label="Close chat">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M3 11l9-8 9 8"/><path d="M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10"/></svg>
+        <span class="home-badge" id="home-badge" hidden>0</span>
       </button>
       <button class="seal-btn" id="header-seal" title="Verify identity"></button>
       <div class="title-wrap">
@@ -1503,7 +1503,31 @@ label.member-row:hover { background: var(--raised); }
       </div>
     </section>
 
-    <div id="messages"><div id="pin-bar" hidden></div><div class="msg-col" id="msg-col"></div></div>
+    <div id="messages"><div id="pin-bar" hidden></div><div class="msg-col" id="msg-col"></div>
+      <div id="home-view" hidden>
+        <div class="home">
+          <div class="home-head">
+            <div class="home-title">Your people</div>
+            <div class="add-friend home-add">
+              <input id="friend" placeholder="Add a friend by username" spellcheck="false" autocomplete="off">
+              <button class="btn" id="add-friend" title="Send friend request" aria-label="Send friend request">Add</button>
+            </div>
+          </div>
+          <div class="side-section" id="sec-incoming" hidden>
+            <div class="head"><span>Requests for you</span></div>
+            <div id="incoming-list"></div>
+          </div>
+          <div class="side-section" id="sec-outgoing" hidden>
+            <div class="head"><span>Sent requests</span></div>
+            <div id="outgoing-list"></div>
+          </div>
+          <div class="home-friends">
+            <div class="head"><span>Friends</span></div>
+            <div class="friend-grid" id="friend-grid"></div>
+            <div class="pick-empty" id="friends-empty">No friends yet. Add someone by username above.</div>
+          </div>
+        </div>
+      </div></div>
 
     <footer id="composer-bar">
       <div id="xfers"></div>
@@ -2836,15 +2860,21 @@ function copyText(t) {
 }
 
 // ---- sidebar: tabs, conversations, people ----
-function setTab(tab) {
-  $("tab-chats").classList.toggle("active", tab === "chats");
-  $("tab-people").classList.toggle("active", tab === "people");
-  $("pane-chats").hidden = tab !== "chats";
-  $("pane-people").hidden = tab !== "people";
-  $("side-search").placeholder = tab === "chats" ? "Search chats and messages" : "Search friends";
+// Close the open chat and return to the "Your people" home view. This is a
+// UI-only state change: unread counting is gated on activeConv (see the message
+// handlers), so a closed chat correctly resumes counting unread, and the core's
+// own active pointer only gates send actions, which the home screen does not
+// offer. No round-trip to the core is needed.
+function closeChat() {
+  activeConv = null;
+  activeSafety = "";
+  activeVerified = false;
+  renderConvoList();
+  renderHeader();
+  renderChat();
+  renderCall();
 }
-$("tab-chats").addEventListener("click", () => setTab("chats"));
-$("tab-people").addEventListener("click", () => setTab("people"));
+$("btn-home").addEventListener("click", closeChat);
 
 // Give a text field an inline clear button. One mechanism for every search
 // field so they cannot drift apart, and clearing dispatches a real input event
@@ -3165,42 +3195,77 @@ function renderPeople() {
   }
   $("sec-outgoing").hidden = !outgoing.length;
 
-  const fr = $("friend-list"); fr.innerHTML = "";
-  const shownFriends = friends.filter((f) => matches(displayOf(f.username), f.username));
+  const grid = $("friend-grid"); grid.innerHTML = "";
   $("friends-empty").hidden = friends.length > 0;
-  if (friends.length && !shownFriends.length) {
-    const d = document.createElement("div");
-    d.className = "pick-empty";
-    d.textContent = "No friend matches that.";
-    fr.appendChild(d);
-  }
-  for (const f of shownFriends) {
-    // The whole friend row opens the DM; remove is the only sibling action.
-    const row = personRow(f, statusOf(f.username), () => openProfile(f.username));
-    const acts = row.querySelector(".row-actions");
-    const rm = actionBtn("no", "Remove friend", SVG_TRASH);
-    rm.addEventListener("click", () => askConfirm(
-      "Remove friend",
-      "Remove " + displayOf(f.username) + " from your friends? Your conversation stays and you can reconnect later.",
-      "Remove",
-      () => send({ type: "RemoveFriend", handle: f.username })
-    ));
-    acts.appendChild(rm);
-    fr.appendChild(row);
+  for (const f of friends) {
+    grid.appendChild(friendCard(f));
   }
 
+  // Pending incoming requests are the one people-side event that can arrive while
+  // a chat is open, so they badge the header's home button.
   const n = incoming.length;
-  $("req-count").textContent = n;
-  $("req-count").hidden = !n;
+  $("home-badge").textContent = n > 9 ? "9+" : n;
+  $("home-badge").hidden = !n;
+}
+
+// A friend as a card on the home view: avatar + presence, name, status line.
+// Clicking it opens the DM; a hover x removes the friend.
+function friendCard(f) {
+  const card = document.createElement("button");
+  card.type = "button";
+  card.className = "friend-card";
+  const name = displayOf(f.username);
+
+  const av = document.createElement("div");
+  av.className = "avatar-wrap";
+  av.innerHTML = '<div class="avatar"></div><span class="presence-dot"></span>';
+  paintAvatar(av.querySelector(".avatar"), f.username, name);
+  av.querySelector(".presence-dot").classList.add(statusOf(f.username));
+
+  const nm = document.createElement("div");
+  nm.className = "fc-name";
+  nm.textContent = name;
+
+  const st = document.createElement("div");
+  st.className = "fc-status";
+  st.textContent = statusLine(f.username) || statusOf(f.username);
+
+  card.append(av, nm, st);
+  // Opening the DM is the card's primary action.
+  card.addEventListener("click", () => send({ type: "OpenDm", handle: f.username }));
+
+  const rm = document.createElement("button");
+  rm.type = "button";
+  rm.className = "fc-remove";
+  rm.title = "Remove friend";
+  rm.setAttribute("aria-label", "Remove friend");
+  rm.innerHTML = SVG_TRASH;
+  rm.addEventListener("click", (e) => {
+    e.stopPropagation(); // do not open the DM when removing
+    askConfirm(
+      "Remove friend",
+      "Remove " + name + " from your friends? Your conversation stays and you can reconnect later.",
+      "Remove",
+      () => send({ type: "RemoveFriend", handle: f.username })
+    );
+  });
+  card.appendChild(rm);
+  return card;
 }
 
 // ---- conversation header + messages ----
 function renderHeader() {
   const conv = convById(activeConv);
   const sub = $("room-subtitle");
+  // The home button leaves the open chat; it exists only while one is open, and
+  // carries the pending-request badge so people-side news is visible from a chat.
+  $("btn-home").hidden = !conv;
+  const reqs = incoming.length;
+  $("home-badge").textContent = reqs > 9 ? "9+" : reqs;
+  $("home-badge").hidden = !reqs;
   if (!conv) {
     $("room-title").textContent = "Enclave";
-    sub.textContent = "Pick a conversation, or press Ctrl+K";
+    sub.textContent = "Your people are here. Pick a conversation, or press Ctrl+K.";
     $("header-seal").innerHTML = "";
     $("btn-members").hidden = true;
     $("btn-convmenu").hidden = true;
@@ -4501,15 +4566,12 @@ function renderChat() {
   col.innerHTML = "";
   lastGroup = null;
   $("composer-bar").hidden = !conv;
+  // No chat open: show the "Your people" home view instead of the message column.
+  $("home-view").hidden = !!conv;
+  $("msg-col").hidden = !conv;
+  $("pin-bar").hidden = !conv || $("pin-bar").hidden;
   if (!conv) {
-    const d = document.createElement("div");
-    d.className = "empty-room";
-    d.style.padding = "80px 0";
-    d.innerHTML = '<div class="inner"><span id="empty-brand"></span>' +
-      '<div class="big">Nothing open</div>' +
-      '<div>Pick a conversation on the left, message a friend from the People tab, or press Ctrl+K.</div></div>';
-    col.appendChild(d);
-    d.querySelector("#empty-brand").innerHTML = sealSVG(BRAND_SAFETY, true, 44);
+    renderPeople(); // (re)fill the home view's requests + friend grid
     renderCall();
     return;
   }
@@ -4716,7 +4778,7 @@ function filterMembers() {
 $("members-search").addEventListener("input", filterMembers);
 $("new-group").addEventListener("click", openGroupModal);
 // Notes to self: open (or create on first use) the local-only, on-device scratchpad.
-$("self-notes").addEventListener("click", () => { setTab("chats"); send({ type: "OpenSelfNotes" }); });
+$("self-notes").addEventListener("click", () => { send({ type: "OpenSelfNotes" }); });
 $("group-create").addEventListener("click", () => {
   const name = $("group-name").value.trim() || "New group";
   const members = Array.from(document.querySelectorAll("#group-picks input:checked")).map((el) => el.value);
@@ -4787,7 +4849,7 @@ function openProfile(username) {
   const st = statusLine(username);
   $("pv-status").textContent = st; $("pv-status").hidden = !st;
   $("pv-bio").textContent = p.bio || ""; $("pv-bio").hidden = !p.bio;
-  $("pv-message").onclick = () => { closeModals(); setTab("chats"); send({ type: "OpenDm", handle: username }); };
+  $("pv-message").onclick = () => { closeModals(); send({ type: "OpenDm", handle: username }); };
   // Groups you share (incl. deleted ones): clicking restores/opens the group.
   pvGroupsFor = username;
   $("pv-groups").hidden = true; $("pv-groups-list").innerHTML = "";
@@ -4803,7 +4865,7 @@ function renderSharedGroups(handle, groups) {
     const b = document.createElement("button");
     b.className = "pv-group";
     b.textContent = title;
-    b.addEventListener("click", () => { closeModals(); setTab("chats"); send({ type: "SwitchConversation", conv: id }); });
+    b.addEventListener("click", () => { closeModals(); send({ type: "SwitchConversation", conv: id }); });
     box.appendChild(b);
   }
 }
@@ -5178,7 +5240,7 @@ function paletteItems(q) {
     { label: "New group", kind: "action", icon: '<svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>', run: openGroupModal },
     { label: "Add friend", kind: "action",
       icon: '<svg class="icon" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6M23 11h-6"/></svg>',
-      run: () => { setTab("people"); $("friend").focus(); } },
+      run: () => { closeChat(); setTimeout(() => $("friend").focus(), 0); } },
     { label: "Export encrypted backup", kind: "action",
       icon: '<svg class="icon" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>',
       run: () => send({ type: "ExportSession" }) },
@@ -5232,7 +5294,18 @@ document.addEventListener("keydown", (e) => {
     if (activeConv) { openSearch(); }
     else { setSidebar(true); const ss = $("side-search"); ss.focus(); ss.select(); }
   }
-  if (e.key === "Escape") { closeModals(); closeMsgMenu(); cancelReply(); $("presence-menu").hidden = true; $("emoji-pop").hidden = true; $("row-menu").hidden = true; $("conv-menu").hidden = true; setSidebar(false); }
+  if (e.key === "Escape") {
+    // Was anything dismissable open? If so, Escape closes that; only a "clean"
+    // Escape (nothing else open) closes the chat itself, so it never yanks you
+    // out of a conversation while you were only dismissing a menu.
+    const wasOpen = ["presence-menu", "emoji-pop", "row-menu", "conv-menu"]
+      .some((id) => { const el = document.getElementById(id); return el && !el.hidden; })
+      || document.querySelector(".overlay:not([hidden])") || replyTo;
+    closeModals(); closeMsgMenu(); cancelReply();
+    $("presence-menu").hidden = true; $("emoji-pop").hidden = true;
+    $("row-menu").hidden = true; $("conv-menu").hidden = true; setSidebar(false);
+    if (!wasOpen && activeConv) closeChat();
+  }
   if (!$("palette-overlay").hidden) {
     const items = paletteItems($("palette-input").value);
     if (e.key === "ArrowDown") { paletteSel = Math.min(paletteSel + 1, items.length - 1); renderPalette(); e.preventDefault(); }
@@ -5255,7 +5328,6 @@ function showApp(username, display) {
   selfPresence.mode = "online"; selfPresence.until = null; lastSent = "online";
   lastActivity = Date.now();
   applyPresence();
-  setTab("chats");
 }
 function showLogin() {
   $("app-view").hidden = true;
