@@ -51,8 +51,10 @@ crypto  media  transport
   nonce-safe frame sealer/opener, safety numbers, the off-ratchet file-chunk
   sealer (`seal_chunk`/`open_chunk`), the off-ratchet ballot sealer
   (`seal_ballot`/`open_ballot`) and the linkable ring signatures (`ring`) that
-  make an anonymous poll unattributable, and the self-update `rekey` that heals a
-  desynced group.
+  make an anonymous poll unattributable -- keyed by each member's existing Ed25519
+  identity key, so a ring is assembled from local group state with no key
+  distribution and nobody needing to be reachable -- and the self-update `rekey`
+  that heals a desynced group.
 - `enclave-media` -- the audio/video pipeline: Opus codec (`audio`), tested
   framing/format helpers (`frame`), cpal mic/speaker device I/O (`device`),
   H.264 encode (`video`), webcam capture (`camera`), and the per-platform
