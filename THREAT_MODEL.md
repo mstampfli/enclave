@@ -362,15 +362,27 @@ and `reopening_a_poll_id_is_refused_and_cannot_discard_cast_ballots`.
   delivered which ciphertext), not inside the signature.
 
   This is **not cleanly fixable in this architecture**, and is recorded rather
-  than papered over. A real fix is a different system: an additively homomorphic
-  tally (exponential ElGamal / Paillier) where individual ballots are *never*
-  decryptable and only the aggregate is opened, under threshold keys split across
-  members, plus a verifiable re-encryption mixnet so an input ciphertext cannot be
-  linked to an output one, plus ZK validity proofs so a voter cannot encrypt a
-  thousand votes. That conflicts head-on with two of this feature's constraints:
-  threshold decryption needs a quorum online when the poll closes (the whole point
-  of the buffered design is that nobody need be), and re-randomization needs an
-  algebraic cipher rather than the AEAD used everywhere else here.
+  than papered over. The textbook alternative is an additively homomorphic tally
+  (exponential ElGamal / Paillier) where individual ballots are *never* decrypted
+  and only the aggregate is opened, under threshold keys split across members,
+  plus a verifiable re-encryption mixnet so an input ciphertext cannot be linked
+  to an output one, plus ZK validity proofs so a voter cannot encrypt a thousand
+  votes. It is deliberately **not** adopted here, and it is worth being precise
+  about why, because it is a fix for a different availability model rather than a
+  strictly better one:
+
+  - Threshold decryption needs a quorum **online when the poll closes**. The whole
+    point of the buffered design is that nobody need be. Weakening it so a tally
+    can be opened with everyone offline means one party holds the key (or the
+    server holds a share), which reconstructs exactly the situation above with far
+    more machinery.
+  - It does not make deanonymization impossible, only more expensive: nothing
+    forces a quorum to run the decryption protocol against the *product* rather
+    than against a single ballot. It buys "no fewer than `t` colluding members"
+    in place of "one member who also runs the server".
+  - Re-randomization needs an algebraic cipher rather than the AEAD used
+    everywhere else here.
+  - It does nothing at all for the tally-inference leaks below.
 
   So the honest scope of "anonymous poll" is: **anonymous from the other people in
   the chat**, which is what it is for. It is not a secret ballot against the person
