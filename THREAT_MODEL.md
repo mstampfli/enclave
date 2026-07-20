@@ -350,12 +350,35 @@ and `reopening_a_poll_id_is_refused_and_cannot_discard_cast_ballots`.
 
 ### Residual / accepted risks
 
-- **Anonymity is from peers, not from the relay operator.** The relay sees which
-  connection submitted a ballot, even though it cannot read it and strips the id
-  on release. An operator who logs connections can therefore link a ballot to an
-  account -- but still not to a *choice*. Hiding the submitter as well needs a
-  different transport (mixnet / sealed sender), not a poll change. On a
-  self-hosted server this is the accepted tradeoff.
+- **Anonymity is from peers, not from an operator who is also a member.** The
+  relay by itself learns nothing about a vote: it holds no ballot key, the
+  ciphertext is a constant size, and it strips the submitter id on release. But
+  the ballot key travels in the poll body to *every* member (they all need it to
+  tally), while the relay sees which connection submitted which ciphertext.
+  Anyone holding both -- i.e. any group member who also runs the server, which on
+  a self-hosted box is one person -- can decrypt each ballot and attribute it to
+  its submitter, deanonymizing the whole poll. The ring signature does not
+  prevent this, because the link is made at the transport layer (which connection
+  delivered which ciphertext), not inside the signature.
+
+  This is **not cleanly fixable in this architecture**, and is recorded rather
+  than papered over. A real fix is a different system: an additively homomorphic
+  tally (exponential ElGamal / Paillier) where individual ballots are *never*
+  decryptable and only the aggregate is opened, under threshold keys split across
+  members, plus a verifiable re-encryption mixnet so an input ciphertext cannot be
+  linked to an output one, plus ZK validity proofs so a voter cannot encrypt a
+  thousand votes. That conflicts head-on with two of this feature's constraints:
+  threshold decryption needs a quorum online when the poll closes (the whole point
+  of the buffered design is that nobody need be), and re-randomization needs an
+  algebraic cipher rather than the AEAD used everywhere else here.
+
+  So the honest scope of "anonymous poll" is: **anonymous from the other people in
+  the chat**, which is what it is for. It is not a secret ballot against the person
+  who owns the server. Where that matters, do not use this for the vote.
+
+- **Turnout bounds what unanimity reveals.** The tally leak below is total only at
+  full turnout: if 3 of 5 members vote and the result is 3-0, members learn three
+  people chose that option but not *which* three, so no individual is pinned.
 - **Unanimity leaks regardless of the crypto.** If every voter picks the same
   option, the published tally tells everyone how each of them voted. No ballot
   scheme prevents this; it is a property of publishing a tally over a small
