@@ -2537,3 +2537,54 @@ async fn a_private_channel_is_readable_only_by_its_members() {
         "a non-channel-member of the workspace sees no private-channel traffic"
     );
 }
+
+/// M4: voice channel presence. When members join/leave a voice channel, the
+/// relay broadcasts the roster to the channel's members, so everyone sees who is
+/// in voice (the audio itself rides the existing SFU/call path, started
+/// separately). Presence is what makes a voice channel visible.
+#[tokio::test]
+async fn voice_channel_presence_tracks_who_is_connected() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let mut bob = account(&url, "bob").await;
+    let owner_h = owner.name().to_string();
+    let bob_h = bob.name().to_string();
+
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+    owner.workspace_add_member(&ws, &bob_h).await.unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
+    })
+    .await;
+    let chan = owner.create_voice_channel(&ws, "Lounge").unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
+    })
+    .await;
+    pump_until(&mut bob, |c| {
+        c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
+    })
+    .await;
+
+    // Owner joins voice; Bob (a channel member) sees the roster update.
+    owner.join_voice_channel(&ws, &chan).unwrap();
+    pump_until(&mut bob, |c| c.voice_members(&ws, &chan).contains(&owner_h)).await;
+    assert_eq!(bob.voice_members(&ws, &chan), vec![owner_h.clone()]);
+
+    // Bob joins too; both are now in voice, visible to both.
+    bob.join_voice_channel(&ws, &chan).unwrap();
+    pump_until(&mut owner, |c| c.voice_members(&ws, &chan).len() == 2).await;
+    pump_until(&mut bob, |c| c.voice_members(&ws, &chan).len() == 2).await;
+    assert!(bob.voice_members(&ws, &chan).contains(&bob_h));
+    assert!(owner.voice_members(&ws, &chan).contains(&bob_h));
+
+    // Owner leaves; Bob sees them drop out.
+    owner.leave_voice_channel();
+    pump_until(&mut bob, |c| {
+        !c.voice_members(&ws, &chan).contains(&owner_h)
+    })
+    .await;
+    assert_eq!(bob.voice_members(&ws, &chan), vec![bob_h]);
+}

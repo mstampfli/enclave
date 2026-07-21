@@ -352,6 +352,19 @@ pub enum ClientMsg {
         workspace: WorkspaceId,
         channel: ChannelId,
     },
+    /// Join a voice channel's presence (we are now connected). The relay tracks
+    /// it and broadcasts the updated roster to the channel's members, so everyone
+    /// sees who is in voice without joining. The actual media rides the existing
+    /// call/SFU path on the voice channel's group.
+    VoiceJoin {
+        workspace: WorkspaceId,
+        channel: ChannelId,
+    },
+    /// Leave a voice channel's presence.
+    VoiceLeave {
+        workspace: WorkspaceId,
+        channel: ChannelId,
+    },
 }
 
 /// A person in the friend graph: the unique `username` (login/add id) plus the
@@ -716,6 +729,13 @@ pub enum ServerMsg {
         workspace: WorkspaceId,
         channel: ChannelId,
         messages: Vec<(u64, Sealed)>,
+    },
+    /// The current occupants of a voice channel (handles), broadcast to the
+    /// channel's members whenever someone joins or leaves.
+    VoicePresence {
+        workspace: WorkspaceId,
+        channel: ChannelId,
+        members: Vec<String>,
     },
 }
 

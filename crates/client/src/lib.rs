@@ -371,6 +371,12 @@ pub enum Event {
     /// (membership, roles, categories, or channels). The UI re-reads workspace
     /// state from the client.
     WorkspacesChanged,
+    /// A voice channel's occupants changed. `members` is the current roster.
+    VoicePresence {
+        workspace: String,
+        channel: String,
+        members: Vec<String>,
+    },
     /// A message arrived (or was sent by us) in a workspace channel.
     ChannelMessage {
         workspace: String,
@@ -815,6 +821,11 @@ pub struct Client {
     workspace_op_inflight: HashMap<[u8; 16], enclave_protocol::WorkspaceOp>,
     /// Channel message history, keyed by `(workspace, channel)`.
     channel_history: HashMap<([u8; 16], [u8; 16]), Vec<ChannelMsg>>,
+    /// Who is currently in each voice channel, `(workspace, channel) -> handles`,
+    /// mirrored from the relay so the UI shows voice occupancy.
+    voice_presence: HashMap<([u8; 16], [u8; 16]), Vec<String>>,
+    /// The voice channel we are connected to, if any (its media rides the call).
+    voice_channel: Option<([u8; 16], [u8; 16])>,
     /// Handles that removed US (they initiated the un-friend). Only these auto-
     /// reconnect when they re-add us; a person WE removed does not. Cleared once
     /// we are friends again. Persisted so the direction survives a restart.
@@ -926,6 +937,8 @@ impl Client {
             workspace_op_queue: HashMap::new(),
             workspace_op_inflight: HashMap::new(),
             channel_history: HashMap::new(),
+            voice_presence: HashMap::new(),
+            voice_channel: None,
             active: None,
             pending: VecDeque::new(),
             export_key: Vec::new(),
@@ -1095,6 +1108,8 @@ impl Client {
         self.workspace_op_queue.clear();
         self.workspace_op_inflight.clear();
         self.channel_history.clear();
+        self.voice_presence.clear();
+        self.voice_channel = None;
         self.active = None;
         self.export_key.clear();
         self.password = Zeroizing::new(String::new());
@@ -4445,6 +4460,27 @@ impl Client {
         Ok(hex::encode(channel))
     }
 
+    /// Create a public **voice** channel (members join it to talk). Returns its
+    /// hex id.
+    pub fn create_voice_channel(
+        &mut self,
+        ws_hex: &str,
+        name: &str,
+    ) -> Result<String, ClientError> {
+        let channel = new_transfer_id();
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::CreateChannel {
+                channel,
+                name: name.to_string(),
+                kind: enclave_protocol::ChannelKind::Voice,
+                private: false,
+                category: None,
+            },
+        )?;
+        Ok(hex::encode(channel))
+    }
+
     /// Create a **private** channel: a subset channel with its own MLS group so
     /// its keys and messages are unreadable to non-members (even other workspace
     /// members, and the relay). Returns its hex id; the creator is its first
@@ -4595,6 +4631,107 @@ impl Client {
             ts,
             mine: true,
         });
+        Ok(())
+    }
+
+    /// Join a voice channel's presence so its members see us in voice. The audio
+    /// itself is started separately by [`start_voice_media`](Self::start_voice_media)
+    /// (kept apart so presence works even where audio devices do not).
+    pub fn join_voice_channel(
+        &mut self,
+        ws_hex: &str,
+        channel_hex: &str,
+    ) -> Result<(), ClientError> {
+        let ws = decode_offer_id(ws_hex)
+            .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
+        let channel = decode_offer_id(channel_hex)
+            .ok_or_else(|| ClientError::Workspace("bad channel id".into()))?;
+        // One voice channel at a time: leave the previous.
+        if let Some((pw, pc)) = self.voice_channel.take() {
+            self.conn.send(ClientMsg::VoiceLeave {
+                workspace: pw,
+                channel: pc,
+            });
+        }
+        self.voice_channel = Some((ws, channel));
+        self.conn.send(ClientMsg::VoiceJoin {
+            workspace: ws,
+            channel,
+        });
+        Ok(())
+    }
+
+    /// Leave the voice channel we are in (presence + media teardown).
+    pub fn leave_voice_channel(&mut self) {
+        if let Some((ws, channel)) = self.voice_channel.take() {
+            self.conn.send(ClientMsg::VoiceLeave {
+                workspace: ws,
+                channel,
+            });
+            self.leave_call();
+        }
+    }
+
+    /// Whether we are currently connected to a voice channel.
+    pub fn in_voice(&self) -> bool {
+        self.voice_channel.is_some()
+    }
+
+    /// The current occupants of a voice channel (handles), for the UI.
+    pub fn voice_members(&self, ws_hex: &str, channel_hex: &str) -> Vec<String> {
+        match (decode_offer_id(ws_hex), decode_offer_id(channel_hex)) {
+            (Some(ws), Some(ch)) => self
+                .voice_presence
+                .get(&(ws, ch))
+                .cloned()
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Start the media pipeline for the voice channel we joined, keyed by its
+    /// group (the WG for a public channel, the channel's own group for a private
+    /// one). Reuses the call machinery on a deterministic per-voice-channel
+    /// routing id. Call after [`join_voice_channel`](Self::join_voice_channel).
+    pub async fn start_voice_media(&mut self) -> Result<(), ClientError> {
+        if self.call.is_some() {
+            return Ok(());
+        }
+        let (ws, channel) = self
+            .voice_channel
+            .ok_or_else(|| ClientError::Workspace("not in a voice channel".into()))?;
+        let media_addr = self
+            .media_addr
+            .ok_or_else(|| ClientError::Audio("no media address".into()))?;
+        let voice_group = voice_group_id(&ws, &channel);
+        let me = self.me()?;
+        let params = {
+            let identity = self.identity()?;
+            // Private channel -> its own group; public -> the WG.
+            let group = if self.channel_is_private(ws, channel) {
+                self.channel_groups.get(&(ws, channel))
+            } else {
+                self.workspace_groups.get(&ws)
+            }
+            .ok_or_else(|| ClientError::Workspace("voice group missing".into()))?;
+            call::CallParams {
+                media_addr,
+                group: voice_group.clone(),
+                me,
+                root_secret: group.media_root_secret(identity)?,
+                my_identity_key: identity.identity_key(),
+                signer: identity.media_signer()?,
+                member_keys: group.member_keys().into_iter().collect(),
+                input_device: self.input_device.clone(),
+                output_device: self.output_device.clone(),
+            }
+        };
+        let (call, screen_rx) = call::Call::start(params).await?;
+        self.call = Some(call);
+        self.screen_rx = Some(screen_rx);
+        self.call_group = Some(voice_group.clone());
+        // Route media among voice participants via the voice group.
+        self.conn.send(ClientMsg::JoinGroup { group: voice_group });
         Ok(())
     }
 
@@ -6047,6 +6184,19 @@ impl Client {
                 channel,
                 messages,
             } => self.receive_channel_history(workspace, channel, messages),
+            ServerMsg::VoicePresence {
+                workspace,
+                channel,
+                members,
+            } => {
+                self.voice_presence
+                    .insert((workspace, channel), members.clone());
+                Some(Event::VoicePresence {
+                    workspace: hex::encode(workspace),
+                    channel: hex::encode(channel),
+                    members,
+                })
+            }
             ServerMsg::Workspaces { workspaces } => {
                 // Fetch the full log for any workspace we do not yet hold, so a
                 // fresh login / new device catches up. Known ones are already live.
@@ -6181,6 +6331,18 @@ fn now_ms() -> u64 {
 /// Wall-clock now in unix seconds, for workspace op timestamps.
 fn now_secs() -> u64 {
     now_ms() / 1000
+}
+
+/// The deterministic media-routing group id for a voice channel, so every
+/// participant's SFU traffic lands on the same fan-out set without an op-log
+/// entry. Domain-separated from any real MLS group id.
+fn voice_group_id(ws: &[u8; 16], channel: &[u8; 16]) -> GroupId {
+    let mut h = sha2::Sha256::new();
+    use sha2::Digest;
+    h.update(b"enclave-voice-group-v1");
+    h.update(ws);
+    h.update(channel);
+    GroupId(h.finalize().into())
 }
 
 /// Read up to `buf.len()` bytes, retrying short reads so a full chunk is

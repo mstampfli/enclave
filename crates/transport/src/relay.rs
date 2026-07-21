@@ -138,6 +138,9 @@ pub struct Relay {
     friends: FriendStore,
     /// Workspace op-logs + membership index (metadata; content stays E2E).
     workspaces: WorkspaceStore,
+    /// Who is currently connected to each voice channel, `(workspace, channel) ->
+    /// handles`. In memory; cleared for a handle on disconnect.
+    voice_presence: HashMap<([u8; 16], [u8; 16]), HashSet<String>>,
     /// The server's long-term OPAQUE state (OPRF seed + static keypair).
     opaque: OpaqueServer,
     /// In-flight OPAQUE logins, keyed by connection, between the two round-trips.
@@ -243,6 +246,7 @@ impl Relay {
             accounts: AccountStore::default(),
             friends: FriendStore::default(),
             workspaces: WorkspaceStore::new(),
+            voice_presence: HashMap::new(),
             opaque: OpaqueServer::default(),
             pending_login: HashMap::new(),
             reserved: HashSet::new(),
@@ -328,6 +332,8 @@ impl Relay {
             // skipped by fan-out (they are not in device_conn).
             // But do drop them from any live call and tell the other participants.
             out.extend(self.drop_from_calls(&device));
+            // Drop them from any voice channel presence too.
+            out.extend(self.clear_voice_for(&device.0));
             // Tear down live file offers the device was streaming, and drop it
             // from live offers it was receiving (a stored offer survives: its
             // blob is on disk and can be delivered/accepted after reconnect).
@@ -1213,6 +1219,33 @@ impl Relay {
                 }]
             }
 
+            ClientMsg::VoiceJoin { workspace, channel } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                if !self.workspaces.is_channel_member(&workspace, &channel, &me) {
+                    return vec![];
+                }
+                self.voice_presence
+                    .entry((workspace, channel))
+                    .or_default()
+                    .insert(me);
+                self.voice_broadcast(workspace, channel)
+            }
+
+            ClientMsg::VoiceLeave { workspace, channel } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                if let Some(set) = self.voice_presence.get_mut(&(workspace, channel)) {
+                    set.remove(&me);
+                    if set.is_empty() {
+                        self.voice_presence.remove(&(workspace, channel));
+                    }
+                }
+                self.voice_broadcast(workspace, channel)
+            }
+
             ClientMsg::RequestDm { to } => {
                 let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
                     return vec![];
@@ -2066,6 +2099,48 @@ impl Relay {
                     })
             })
             .collect()
+    }
+
+    /// Broadcast a voice channel's current roster to the channel's members (so
+    /// everyone sees who is in voice, joined or not).
+    fn voice_broadcast(&self, ws: [u8; 16], channel: [u8; 16]) -> Vec<Outgoing> {
+        let mut members: Vec<String> = self
+            .voice_presence
+            .get(&(ws, channel))
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        members.sort();
+        let channel_members = self.workspaces.channel_members(&ws, &channel);
+        self.deliver_to_members(
+            &channel_members,
+            ServerMsg::VoicePresence {
+                workspace: ws,
+                channel,
+                members,
+            },
+        )
+    }
+
+    /// Drop a disconnected handle from every voice channel, returning the presence
+    /// broadcasts for the channels they were in.
+    fn clear_voice_for(&mut self, handle: &str) -> Vec<Outgoing> {
+        let affected: Vec<([u8; 16], [u8; 16])> = self
+            .voice_presence
+            .iter()
+            .filter(|(_, set)| set.contains(handle))
+            .map(|(k, _)| *k)
+            .collect();
+        let mut out = Vec::new();
+        for (ws, channel) in affected {
+            if let Some(set) = self.voice_presence.get_mut(&(ws, channel)) {
+                set.remove(handle);
+                if set.is_empty() {
+                    self.voice_presence.remove(&(ws, channel));
+                }
+            }
+            out.extend(self.voice_broadcast(ws, channel));
+        }
+        out
     }
 
     /// The relay clock as unix seconds, for stamping account/friendship times.

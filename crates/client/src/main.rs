@@ -823,6 +823,12 @@ enum UiEvent {
         ts: u64,
         mine: bool,
     },
+    /// A voice channel's occupants changed.
+    VoicePresence {
+        workspace: String,
+        channel: String,
+        members: Vec<String>,
+    },
     /// Groups we share with `handle` (hex id, title), for their profile card.
     SharedGroups {
         handle: String,
@@ -1538,6 +1544,18 @@ async fn run_client(
                         text,
                         ts,
                         mine,
+                    },
+                ),
+                Event::VoicePresence {
+                    workspace,
+                    channel,
+                    members,
+                } => emit(
+                    &proxy,
+                    UiEvent::VoicePresence {
+                        workspace,
+                        channel,
+                        members,
                     },
                 ),
                 Event::FriendsChanged => {
