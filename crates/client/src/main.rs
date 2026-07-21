@@ -356,6 +356,62 @@ enum UiCommand {
     SetPresence {
         status: String,
     },
+
+    // ---- Workspaces ----
+    CreateWorkspace {
+        name: String,
+    },
+    CreateChannel {
+        workspace: String,
+        name: String,
+    },
+    CreateVoiceChannel {
+        workspace: String,
+        name: String,
+    },
+    CreatePrivateChannel {
+        workspace: String,
+        name: String,
+    },
+    AddWorkspaceMember {
+        workspace: String,
+        handle: String,
+    },
+    RemoveWorkspaceMember {
+        workspace: String,
+        handle: String,
+    },
+    AddChannelMember {
+        workspace: String,
+        channel: String,
+        handle: String,
+    },
+    SetWorkspaceRole {
+        workspace: String,
+        handle: String,
+        /// "admin" grants Admin; "member" revokes it.
+        role: String,
+    },
+    CreateCategory {
+        workspace: String,
+        name: String,
+    },
+    SendChannelPost {
+        workspace: String,
+        channel: String,
+        text: String,
+    },
+    /// Load a text channel's history (op-log gives structure; messages come via
+    /// the channel keys + backfill). Emits the channel's messages.
+    OpenChannel {
+        workspace: String,
+        channel: String,
+    },
+    JoinVoice {
+        workspace: String,
+        channel: String,
+    },
+    LeaveVoice,
 }
 
 /// A message line for the UI.
@@ -454,12 +510,110 @@ impl From<enclave_client::PollView> for PollViewOut {
     }
 }
 
-/// A workspace as summarized for the sidebar rail. Channel/role detail is read
-/// on demand per workspace as later phases build the UI for it.
+/// A workspace with the full detail the UI renders: the channel tree, members,
+/// and our own role.
 #[derive(serde::Serialize, Clone)]
 struct WorkspaceOut {
     id: String,
     name: String,
+    /// Our role: "owner" | "admin" | "member".
+    my_role: String,
+    categories: Vec<CategoryOut>,
+    channels: Vec<ChannelOut>,
+    members: Vec<MemberOut>,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct CategoryOut {
+    id: String,
+    name: String,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct ChannelOut {
+    id: String,
+    name: String,
+    /// "text" | "voice".
+    kind: String,
+    private: bool,
+    category: Option<String>,
+    /// Whether we are a member of this (possibly private) channel.
+    member: bool,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct MemberOut {
+    handle: String,
+    role: String,
+}
+
+/// One channel message for the UI's channel view.
+#[derive(serde::Serialize, Clone)]
+struct ChannelLineOut {
+    id: String,
+    user: String,
+    text: String,
+    ts: u64,
+    mine: bool,
+}
+
+/// Build the rich per-workspace views for the UI from replayed op-log state.
+fn workspace_views(c: &enclave_client::Client) -> Vec<WorkspaceOut> {
+    let me = c.name().to_string();
+    let mut out = Vec::new();
+    for (id_hex, _name) in c.workspace_list() {
+        let Some(state) = c.workspace(&id_hex) else {
+            continue;
+        };
+        let role_str = |r: enclave_protocol::Role| match r {
+            enclave_protocol::Role::Owner => "owner",
+            enclave_protocol::Role::Admin => "admin",
+            enclave_protocol::Role::Member => "member",
+        };
+        let categories = state
+            .categories
+            .iter()
+            .map(|(cid, name)| CategoryOut {
+                id: hex::encode(cid),
+                name: name.clone(),
+            })
+            .collect();
+        let channels = state
+            .channels
+            .values()
+            .map(|ch| ChannelOut {
+                id: hex::encode(ch.id),
+                name: ch.name.clone(),
+                kind: match ch.kind {
+                    enclave_protocol::ChannelKind::Text => "text",
+                    enclave_protocol::ChannelKind::Voice => "voice",
+                }
+                .to_string(),
+                private: ch.private,
+                category: ch.category.map(hex::encode),
+                member: state.is_channel_member(&ch.id, &me),
+            })
+            .collect();
+        let members = state
+            .members
+            .keys()
+            .map(|h| MemberOut {
+                handle: h.clone(),
+                role: role_str(state.role_of(h).unwrap_or(enclave_protocol::Role::Member))
+                    .to_string(),
+            })
+            .collect();
+        out.push(WorkspaceOut {
+            id: id_hex,
+            name: state.name.clone(),
+            my_role: role_str(state.role_of(&me).unwrap_or(enclave_protocol::Role::Member))
+                .to_string(),
+            categories,
+            channels,
+            members,
+        });
+    }
+    out
 }
 
 /// One message-search result, for the UI's results list.
@@ -828,6 +982,12 @@ enum UiEvent {
         workspace: String,
         channel: String,
         members: Vec<String>,
+    },
+    /// A channel's message history, loaded when the channel is opened.
+    ChannelHistory {
+        workspace: String,
+        channel: String,
+        messages: Vec<ChannelLineOut>,
     },
     /// Groups we share with `handle` (hex id, title), for their profile card.
     SharedGroups {
@@ -1517,11 +1677,7 @@ async fn run_client(
                         emit(
                             &proxy,
                             UiEvent::Workspaces {
-                                workspaces: c
-                                    .workspace_list()
-                                    .into_iter()
-                                    .map(|(id, name)| WorkspaceOut { id, name })
-                                    .collect(),
+                                workspaces: workspace_views(c),
                             },
                         );
                     }
@@ -2497,6 +2653,144 @@ async fn handle_command(
                     _ => Presence::Online,
                 };
                 c.set_status(status);
+            }
+        }
+
+        // ---- Workspaces ----
+        UiCommand::CreateWorkspace { name } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.create_workspace(&name) {
+                    error_status(proxy, format!("Could not create workspace: {e}"));
+                }
+            }
+        }
+        UiCommand::CreateChannel { workspace, name } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.create_channel(&workspace, &name) {
+                    error_status(proxy, format!("Could not create channel: {e}"));
+                }
+            }
+        }
+        UiCommand::CreateVoiceChannel { workspace, name } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.create_voice_channel(&workspace, &name) {
+                    error_status(proxy, format!("Could not create channel: {e}"));
+                }
+            }
+        }
+        UiCommand::CreatePrivateChannel { workspace, name } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.create_private_channel(&workspace, &name) {
+                    error_status(proxy, format!("Could not create channel: {e}"));
+                }
+            }
+        }
+        UiCommand::AddWorkspaceMember { workspace, handle } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.workspace_add_member(&workspace, &handle).await {
+                    error_status(proxy, format!("Could not add member: {e}"));
+                }
+            }
+        }
+        UiCommand::RemoveWorkspaceMember { workspace, handle } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.workspace_remove_member(&workspace, &handle) {
+                    error_status(proxy, format!("Could not remove member: {e}"));
+                }
+            }
+        }
+        UiCommand::AddChannelMember {
+            workspace,
+            channel,
+            handle,
+        } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.add_channel_member(&workspace, &channel, &handle).await {
+                    error_status(proxy, format!("Could not add to channel: {e}"));
+                }
+            }
+        }
+        UiCommand::SetWorkspaceRole {
+            workspace,
+            handle,
+            role,
+        } => {
+            if let Some(c) = client.as_mut() {
+                let op = if role == "admin" {
+                    enclave_protocol::WorkspaceOp::GrantRole {
+                        member: handle,
+                        role: enclave_protocol::Role::Admin,
+                    }
+                } else {
+                    enclave_protocol::WorkspaceOp::RevokeRole {
+                        member: handle,
+                        role: enclave_protocol::Role::Admin,
+                    }
+                };
+                if let Err(e) = c.workspace_submit(&workspace, op) {
+                    error_status(proxy, format!("Could not change role: {e}"));
+                }
+            }
+        }
+        UiCommand::CreateCategory { workspace, name } => {
+            if let Some(c) = client.as_mut() {
+                let mut cat = [0u8; 16];
+                let _ = getrandom::getrandom(&mut cat);
+                let op = enclave_protocol::WorkspaceOp::CreateCategory {
+                    category: cat,
+                    name,
+                };
+                if let Err(e) = c.workspace_submit(&workspace, op) {
+                    error_status(proxy, format!("Could not create category: {e}"));
+                }
+            }
+        }
+        UiCommand::SendChannelPost {
+            workspace,
+            channel,
+            text,
+        } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.send_channel_post(&workspace, &channel, &text) {
+                    error_status(proxy, format!("Could not send: {e}"));
+                }
+            }
+        }
+        UiCommand::OpenChannel { workspace, channel } => {
+            if let Some(c) = client.as_ref() {
+                emit(
+                    proxy,
+                    UiEvent::ChannelHistory {
+                        workspace: workspace.clone(),
+                        channel: channel.clone(),
+                        messages: c
+                            .channel_history(&workspace, &channel)
+                            .into_iter()
+                            .map(|m| ChannelLineOut {
+                                id: m.id,
+                                user: m.user,
+                                text: m.text,
+                                ts: m.ts,
+                                mine: m.mine,
+                            })
+                            .collect(),
+                    },
+                );
+            }
+        }
+        UiCommand::JoinVoice { workspace, channel } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.join_voice_channel(&workspace, &channel) {
+                    error_status(proxy, format!("Could not join voice: {e}"));
+                } else {
+                    // Start the audio best-effort; presence already registered.
+                    let _ = c.start_voice_media().await;
+                }
+            }
+        }
+        UiCommand::LeaveVoice => {
+            if let Some(c) = client.as_mut() {
+                c.leave_voice_channel();
             }
         }
     }

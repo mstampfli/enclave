@@ -369,7 +369,68 @@ input[type="checkbox"], select { cursor: pointer; }
 
 /* ============ APP SHELL ============ */
 
-#app-view { height: 100%; display: grid; grid-template-columns: 288px 1fr; position: relative; }
+#app-view { height: 100%; display: grid; grid-template-columns: 60px 288px 1fr; position: relative; }
+
+/* ---------- workspace rail ---------- */
+#ws-rail { grid-row: 1; background: var(--rail, #16181c); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 10px 0; overflow-y: auto; }
+.rail-btn { width: 42px; height: 42px; flex: none; display: grid; place-items: center;
+  border-radius: 12px; background: var(--bg); border: 1px solid var(--border); color: var(--ink);
+  font-size: 15px; font-weight: 650; cursor: pointer; position: relative;
+  transition: border-radius 130ms ease-out, background 130ms ease-out; overflow: hidden; }
+.rail-btn:hover { border-radius: 14px; background: var(--raised); }
+.rail-btn.active { border-radius: 14px; border-color: var(--accent-ink); }
+.rail-btn.active::before { content: ""; position: absolute; left: -10px; top: 50%; transform: translateY(-50%);
+  width: 4px; height: 22px; background: var(--accent-ink); border-radius: 0 3px 3px 0; }
+.rail-btn .icon { width: 20px; height: 20px; }
+.rail-home { color: var(--accent-ink); }
+.rail-add { color: var(--muted); border-style: dashed; }
+.rail-add:hover { color: var(--accent-ink); border-color: var(--accent-ink); }
+.rail-sep { width: 24px; height: 1px; background: var(--border); flex: none; }
+.rail-badge { position: absolute; top: -2px; right: -2px; min-width: 15px; height: 15px; padding: 0 3px;
+  display: grid; place-items: center; font-size: 10px; font-weight: 700; color: #fff;
+  background: var(--danger); border-radius: 999px; }
+
+/* ---------- workspace panel (channel tree) ---------- */
+#ws-panel { padding: 0; }
+.ws-head { display: flex; align-items: center; gap: 8px; padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--border); }
+.ws-title { flex: 1; font-size: 15px; font-weight: 650; color: var(--ink-strong);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-gear { width: 28px; height: 28px; flex: none; display: grid; place-items: center;
+  border-radius: var(--radius); color: var(--muted); }
+.ws-gear:hover { background: var(--raised); color: var(--ink); }
+.ws-gear .icon { width: 16px; height: 16px; }
+#ws-tree { padding: 8px 8px 20px; }
+.ws-cat { display: flex; align-items: center; gap: 4px; padding: 12px 6px 4px; font-size: 11px;
+  font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--faint); }
+.ws-cat .ws-cat-add { margin-left: auto; width: 18px; height: 18px; display: grid; place-items: center;
+  color: var(--faint); border-radius: 3px; }
+.ws-cat .ws-cat-add:hover { color: var(--ink); background: var(--raised); }
+.ws-chan { display: flex; align-items: center; gap: 7px; width: 100%; text-align: left;
+  padding: 6px 8px; border-radius: var(--radius); color: var(--muted); font-size: 14px; cursor: pointer; }
+.ws-chan:hover { background: var(--raised); color: var(--ink); }
+.ws-chan.active { background: var(--accent-bg); color: var(--accent-ink); }
+.ws-chan .ws-chan-ico { width: 16px; height: 16px; flex: none; color: var(--faint); }
+.ws-chan .ws-chan-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-chan .ws-lock { width: 12px; height: 12px; color: var(--faint); flex: none; }
+.ws-voice-here { padding: 2px 8px 6px 30px; display: flex; flex-direction: column; gap: 3px; }
+.ws-voice-here .vh { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
+.ws-voice-here .vh .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+.ws-sec-add { display: flex; align-items: center; gap: 7px; width: 100%; text-align: left;
+  padding: 6px 8px; border-radius: var(--radius); color: var(--faint); font-size: 13px; cursor: pointer; }
+.ws-sec-add:hover { background: var(--raised); color: var(--ink); }
+/* channel header in the room */
+.ch-head-ico { color: var(--muted); width: 18px; height: 18px; }
+.voice-stage { max-width: 640px; margin: 0 auto; padding: 40px 24px; text-align: center; }
+.voice-stage .vs-title { font-size: 18px; font-weight: 650; color: var(--ink-strong); margin-bottom: 6px; }
+.voice-stage .vs-sub { font-size: 13.5px; color: var(--muted); margin-bottom: 22px; }
+.voice-roster { display: flex; flex-wrap: wrap; gap: 16px; justify-content: center; margin-bottom: 26px; }
+.voice-face { display: flex; flex-direction: column; align-items: center; gap: 7px; }
+.voice-face .avatar { width: 64px; height: 64px; font-size: 22px; }
+.voice-face .vf-name { font-size: 12.5px; color: var(--ink); max-width: 90px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.voice-empty { color: var(--faint); font-size: 13px; margin-bottom: 22px; }
 
 /* ---------- sidebar ---------- */
 
@@ -1335,6 +1396,17 @@ label.member-row:hover { background: var(--raised); }
 <!-- ================= APP ================= -->
 <div id="app-view" hidden>
 
+  <nav id="ws-rail">
+    <button class="rail-btn rail-home active" id="rail-home" title="Direct messages">
+      <svg class="icon" viewBox="0 0 24 24"><path d="M3 11l9-8 9 8"/><path d="M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10"/></svg>
+    </button>
+    <div class="rail-sep"></div>
+    <div id="ws-rail-list" style="display:flex;flex-direction:column;gap:8px;align-items:center"></div>
+    <button class="rail-btn rail-add" id="ws-create" title="Create a workspace">
+      <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+    </button>
+  </nav>
+
   <aside id="sidebar">
     <div class="self-card">
       <div class="avatar-wrap">
@@ -1374,8 +1446,19 @@ label.member-row:hover { background: var(--raised); }
       </div>
     </div>
 
-    <div class="side-search">
+    <div class="side-search" id="side-search-wrap">
       <input id="side-search" placeholder="Search chats and messages" autocomplete="off" spellcheck="false">
+    </div>
+
+    <!-- Workspace panel: replaces the DM panes when a workspace is selected. -->
+    <div class="side-scroll" id="ws-panel" hidden>
+      <div class="ws-head">
+        <div class="ws-title" id="ws-title"></div>
+        <button class="ws-gear" id="ws-manage" title="Manage workspace" hidden aria-label="Manage workspace">
+          <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+      </div>
+      <div id="ws-tree"></div>
     </div>
 
     <div class="side-scroll" id="pane-chats">
@@ -2941,6 +3024,7 @@ function copyText(t) {
 // offer. No round-trip to the core is needed.
 function closeChat() {
   activeConv = null;
+  activeChannel = null;
   activeSafety = "";
   activeVerified = false;
   // Tell the core to deselect too, so a later conversation-list refresh (e.g.
@@ -5200,8 +5284,15 @@ function renderPending() {
 }
 // Send: the typed message (if any) plus every attachment, in one action.
 function sendComposed() {
-  if (!activeConv) return;
   const input = $("message");
+  // A workspace channel is open: post to it (channels have no file attachments yet).
+  if (activeChannel && !activeConv) {
+    const text = input.value.trim();
+    if (text) sendActiveChannelPost(text);
+    input.value = "";
+    return;
+  }
+  if (!activeConv) return;
   const text = input.value.trim();
   if (!text && !attachments.length) return;
   // One compose = one message: send the files FIRST (so they render above the
@@ -5512,6 +5603,277 @@ function updateServerCard() {
 }
 
 // ---- events from the core ----
+// ============================ Workspaces UI ============================
+let workspaces = [];        // [{id,name,my_role,categories,channels,members}]
+let activeWs = null;        // active workspace id (hex) or null (home)
+let activeChannel = null;   // active channel id (hex) or null
+const channelMsgs = {};     // channel hex -> [{id,user,text,ts,mine}]
+const voicePresence = {};   // channel hex -> [handle]
+
+function wsById(id) { return workspaces.find((w) => w.id === id) || null; }
+function activeWsObj() { return activeWs ? wsById(activeWs) : null; }
+function channelById(ws, chId) { return ws ? (ws.channels || []).find((c) => c.id === chId) : null; }
+
+function onWorkspaces(list) {
+  workspaces = list || [];
+  // If our active workspace vanished (left/deleted), fall back home.
+  if (activeWs && !wsById(activeWs)) selectHome();
+  renderRail();
+  if (activeWs) renderWsPanel();
+}
+
+function renderRail() {
+  const list = $("ws-rail-list");
+  list.innerHTML = "";
+  for (const w of workspaces) {
+    const b = document.createElement("button");
+    b.className = "rail-btn" + (w.id === activeWs ? " active" : "");
+    b.title = w.name;
+    // Initials icon.
+    b.textContent = w.name.trim().slice(0, 2).toUpperCase() || "?";
+    b.addEventListener("click", () => selectWorkspace(w.id));
+    list.appendChild(b);
+  }
+  $("rail-home").classList.toggle("active", !activeWs);
+}
+
+function selectHome() {
+  activeWs = null; activeChannel = null;
+  $("ws-panel").hidden = true;
+  $("pane-chats").hidden = false;
+  $("side-search-wrap").hidden = false;
+  renderRail();
+  closeChat();
+}
+
+function selectWorkspace(id) {
+  activeWs = id; activeChannel = null;
+  $("ws-panel").hidden = false;
+  $("pane-chats").hidden = true;
+  $("side-search-wrap").hidden = true;
+  // Leaving the DM view: clear any open conversation.
+  activeConv = null; renderHeader(); renderChat(); renderCall();
+  renderRail();
+  renderWsPanel();
+  // Auto-open the first text channel.
+  const ws = activeWsObj();
+  const firstText = ws && (ws.channels || []).find((c) => c.kind === "text");
+  if (firstText) openChannel(id, firstText.id);
+}
+
+function renderWsPanel() {
+  const ws = activeWsObj();
+  if (!ws) return;
+  $("ws-title").textContent = ws.name;
+  const canManage = ws.my_role === "owner" || ws.my_role === "admin";
+  $("ws-manage").hidden = !canManage;
+  const tree = $("ws-tree");
+  tree.innerHTML = "";
+
+  // Group channels by category (uncategorized first).
+  const cats = [{ id: null, name: null }].concat(ws.categories || []);
+  for (const cat of cats) {
+    const chans = (ws.channels || []).filter((c) => (c.category || null) === (cat.id || null));
+    if (!chans.length && cat.id) continue;
+    if (cat.id) {
+      const head = document.createElement("div");
+      head.className = "ws-cat";
+      const label = document.createElement("span");
+      label.textContent = cat.name;
+      head.appendChild(label);
+      tree.appendChild(head);
+    }
+    for (const ch of chans) {
+      tree.appendChild(channelRow(ws, ch));
+    }
+  }
+
+  if (canManage) {
+    const add = document.createElement("button");
+    add.className = "ws-sec-add";
+    add.innerHTML = '<svg class="icon sm" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg><span>Add channel</span>';
+    add.addEventListener("click", () => openChannelCreator(ws.id));
+    tree.appendChild(add);
+  }
+}
+
+function channelRow(ws, ch) {
+  const row = document.createElement("button");
+  row.className = "ws-chan" + (ch.id === activeChannel ? " active" : "");
+  const ico = ch.kind === "voice"
+    ? '<svg class="ws-chan-ico" viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>'
+    : '<span class="ws-chan-ico" style="font-weight:700;text-align:center">#</span>';
+  const lock = ch.private
+    ? '<svg class="ws-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="1.5"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>'
+    : "";
+  row.innerHTML = ico + '<span class="ws-chan-name"></span>' + lock;
+  row.querySelector(".ws-chan-name").textContent = ch.name;
+  row.addEventListener("click", () => openChannel(ws.id, ch.id));
+  const wrap = document.createElement("div");
+  wrap.appendChild(row);
+  // Voice occupants under a voice channel.
+  if (ch.kind === "voice") {
+    const here = voicePresence[ch.id] || [];
+    if (here.length) {
+      const box = document.createElement("div");
+      box.className = "ws-voice-here";
+      for (const h of here) {
+        const v = document.createElement("div");
+        v.className = "vh";
+        v.innerHTML = '<span class="dot"></span><span></span>';
+        v.querySelector("span:last-child").textContent = displayOf(h);
+        box.appendChild(v);
+      }
+      wrap.appendChild(box);
+    }
+  }
+  return wrap;
+}
+
+function openChannel(wsId, chId) {
+  activeWs = wsId; activeChannel = chId;
+  renderWsPanel();
+  const ws = wsById(wsId);
+  const ch = channelById(ws, chId);
+  if (!ch) return;
+  if (ch.kind === "voice") {
+    renderVoiceStage(ws, ch);
+  } else {
+    send({ type: "OpenChannel", workspace: wsId, channel: chId });
+    renderChannelView(ws, ch);
+  }
+}
+
+function renderChannelView(ws, ch) {
+  activeConv = null; // channels are not conversations
+  $("home-view").hidden = true;
+  $("msg-col").hidden = false;
+  $("composer-bar").hidden = false;
+  $("btn-home").hidden = false;
+  $("btn-members").hidden = true; $("btn-call").hidden = true; $("btn-convmenu").hidden = true;
+  $("room-title").textContent = "# " + ch.name;
+  $("room-title").classList.remove("clickable"); $("room-title").onclick = null;
+  $("room-subtitle").textContent = ch.private ? "Private channel" : ws.name;
+  $("header-seal").innerHTML = "";
+  const col = $("msg-col"); col.innerHTML = "";
+  const msgs = channelMsgs[ch.id] || [];
+  for (const m of msgs) col.appendChild(channelMsgEl(m));
+  col.scrollIntoView(false);
+  $("message").placeholder = "Message # " + ch.name;
+}
+
+function channelMsgEl(m) {
+  const el = document.createElement("div");
+  el.className = "msg-group" + (m.mine ? " mine" : "");
+  const who = m.mine ? "You" : displayOf(m.user);
+  const by = document.createElement("div"); by.className = "byline";
+  by.innerHTML = '<span class="who"></span> <span class="when"></span>';
+  by.querySelector(".who").textContent = who;
+  by.querySelector(".when").textContent = fmtTime(m.ts);
+  const body = document.createElement("div"); body.className = "body";
+  const txt = document.createElement("div"); txt.className = "bubble";
+  txt.appendChild(linkifyText(m.text));
+  body.appendChild(txt);
+  el.append(by, body);
+  return el;
+}
+
+function onChannelHistory(ev) {
+  channelMsgs[ev.channel] = ev.messages || [];
+  const ws = wsById(ev.workspace);
+  const ch = channelById(ws, ev.channel);
+  if (ev.channel === activeChannel && ch) renderChannelView(ws, ch);
+}
+
+function onChannelMessage(ev) {
+  const arr = channelMsgs[ev.channel] || (channelMsgs[ev.channel] = []);
+  if (arr.some((m) => m.id === ev.id)) return;
+  arr.push({ id: ev.id, user: ev.user, text: ev.text, ts: ev.ts, mine: ev.mine });
+  if (ev.channel === activeChannel) {
+    const col = $("msg-col");
+    col.appendChild(channelMsgEl({ id: ev.id, user: ev.user, text: ev.text, ts: ev.ts, mine: ev.mine }));
+    $("messages").scrollTop = $("messages").scrollHeight;
+  } else if (!ev.mine) {
+    ding();
+  }
+}
+
+function onVoicePresence(ev) {
+  voicePresence[ev.channel] = ev.members || [];
+  if (activeWs === ev.workspace) renderWsPanel();
+  const ws = wsById(ev.workspace);
+  const ch = channelById(ws, ev.channel);
+  if (ev.channel === activeChannel && ch && ch.kind === "voice") renderVoiceStage(ws, ch);
+}
+
+function renderVoiceStage(ws, ch) {
+  activeConv = null;
+  $("home-view").hidden = true;
+  $("composer-bar").hidden = true;
+  $("msg-col").hidden = false;
+  $("btn-home").hidden = false;
+  $("btn-members").hidden = true; $("btn-call").hidden = true; $("btn-convmenu").hidden = true;
+  $("room-title").textContent = ch.name;
+  $("room-title").classList.remove("clickable"); $("room-title").onclick = null;
+  $("room-subtitle").textContent = "Voice channel";
+  $("header-seal").innerHTML = "";
+  const here = voicePresence[ch.id] || [];
+  const inHere = here.includes(myUsername);
+  const col = $("msg-col"); col.innerHTML = "";
+  const stage = document.createElement("div"); stage.className = "voice-stage";
+  const roster = here.length
+    ? '<div class="voice-roster">' + here.map((h) =>
+        '<div class="voice-face"><div class="avatar" data-u="' + h + '"></div><div class="vf-name">' +
+        displayOf(h).replace(/</g, "&lt;") + '</div></div>').join("") + '</div>'
+    : '<div class="voice-empty">No one is here yet.</div>';
+  stage.innerHTML =
+    '<div class="vs-title">' + ch.name.replace(/</g, "&lt;") + '</div>' +
+    '<div class="vs-sub">Voice channel &middot; ' + here.length + ' connected</div>' +
+    roster +
+    '<button class="btn ' + (inHere ? "" : "primary") + '" id="voice-toggle">' +
+    (inHere ? "Leave voice" : "Join voice") + '</button>';
+  col.appendChild(stage);
+  stage.querySelectorAll(".avatar[data-u]").forEach((el) =>
+    paintAvatar(el, el.dataset.u, displayOf(el.dataset.u)));
+  $("voice-toggle").addEventListener("click", () => {
+    if (inHere) { send({ type: "LeaveVoice" }); }
+    else { send({ type: "JoinVoice", workspace: ws.id, channel: ch.id }); }
+  });
+}
+
+// ---- creation / admin ----
+function openChannelCreator(wsId) {
+  const name = prompt("Channel name?");
+  if (!name || !name.trim()) return;
+  const kind = confirm("OK = text channel, Cancel = voice channel") ? "text" : "voice";
+  const priv = kind === "text" && confirm("Make it private? (only members you add can see it)");
+  if (kind === "voice") send({ type: "CreateVoiceChannel", workspace: wsId, name: name.trim() });
+  else if (priv) send({ type: "CreatePrivateChannel", workspace: wsId, name: name.trim() });
+  else send({ type: "CreateChannel", workspace: wsId, name: name.trim() });
+}
+
+$("ws-create").addEventListener("click", () => {
+  const name = prompt("Workspace name?");
+  if (name && name.trim()) send({ type: "CreateWorkspace", name: name.trim() });
+});
+$("rail-home").addEventListener("click", selectHome);
+$("ws-manage").addEventListener("click", () => {
+  const ws = activeWsObj();
+  if (!ws) return;
+  const handle = prompt("Add a member by their full username (name#1234):");
+  if (handle && handle.trim()) send({ type: "AddWorkspaceMember", workspace: ws.id, handle: handle.trim() });
+});
+
+// Composer routing: when a channel is open, the composer posts to it.
+const _wsOrigSend = null;
+function sendActiveChannelPost(text) {
+  if (activeChannel && activeWs) {
+    send({ type: "SendChannelPost", workspace: activeWs, channel: activeChannel, text });
+    return true;
+  }
+  return false;
+}
+
 window.onEnclaveEvent = (ev) => {
   switch (ev.type) {
     case "LoggedIn":
@@ -5834,6 +6196,18 @@ window.onEnclaveEvent = (ev) => {
     case "Friends":
       friends = ev.friends; incoming = ev.incoming; outgoing = ev.outgoing;
       renderConvoList(); renderPeople(); renderHeader();
+      break;
+    case "Workspaces":
+      onWorkspaces(ev.workspaces);
+      break;
+    case "ChannelMessage":
+      onChannelMessage(ev);
+      break;
+    case "ChannelHistory":
+      onChannelHistory(ev);
+      break;
+    case "VoicePresence":
+      onVoicePresence(ev);
       break;
     case "SharedGroups":
       renderSharedGroups(ev.handle, ev.groups);
