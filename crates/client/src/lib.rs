@@ -5037,12 +5037,15 @@ impl Client {
             .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
         let channel = decode_offer_id(channel_hex)
             .ok_or_else(|| ClientError::Workspace("bad channel id".into()))?;
-        // One voice channel at a time: leave the previous.
+        // One voice channel at a time: leave the previous, and tear down its media
+        // call so start_voice_media rebuilds the pipeline for the new channel's
+        // group (it early-returns while a call is live).
         if let Some((pw, pc)) = self.voice_channel.take() {
             self.conn.send(ClientMsg::VoiceLeave {
                 workspace: pw,
                 channel: pc,
             });
+            self.leave_call();
         }
         self.voice_channel = Some((ws, channel));
         self.conn.send(ClientMsg::VoiceJoin {

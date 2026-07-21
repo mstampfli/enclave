@@ -434,6 +434,21 @@ input[type="checkbox"], select { cursor: pointer; }
    target, and a dimmed source while dragging. */
 .ws-chan[draggable="true"], .ws-cat[draggable="true"] { cursor: grab; }
 .ws-chan.dragging, .ws-cat.dragging { opacity: 0.45; }
+/* A compact drag image: the browser's default is a full-width snapshot of the
+   row, which renders large. We hand it this small chip instead. It lives
+   off-screen (fixed, negative offset) so it renders for setDragImage but is
+   never seen in place. Populated on pointerdown so dragstart mutates nothing
+   (mutating layout inside dragstart cancels the drag in WebKit). */
+#drag-ghost {
+  position: fixed; top: -9999px; left: -9999px; z-index: -1;
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 9px; border-radius: 6px;
+  background: var(--raised); border: 1px solid var(--border);
+  color: var(--text); font-size: 13px; font-weight: 500;
+  white-space: nowrap; pointer-events: none;
+}
+#drag-ghost svg { width: 14px; height: 14px; flex: none; }
+#drag-ghost .ws-chan-ico { width: auto; height: auto; }
 .ws-chan.drag-over, .ws-cat.drag-over { background: var(--raised); border-radius: var(--radius); }
 /* Drop a channel/category on the workspace header to move it to the top level.
    The header is always present, so highlighting it never reflows the tree (which
@@ -1352,6 +1367,7 @@ label.member-row:hover { background: var(--raised); }
 <!-- Right-click message menu. Rows are built per message in openMessageMenu. -->
 <div id="msg-menu" hidden></div>
 <div id="ws-menu" hidden></div>
+<div id="drag-ghost" aria-hidden="true"></div>
 <!-- Full emoji grid (the built-in default picker), opened from the react "+". -->
 <div id="emoji-menu" hidden></div>
 <div class="conv-menu" id="row-menu" hidden role="menu" style="position:fixed">
@@ -6018,14 +6034,30 @@ function channelRow(ws, ch, depth, canManage) {
 
 // ---- drag and drop (managers): nest channels/categories, move voice members ----
 let dragItem = null; // {type, id, ...}
+// Fill the shared off-screen drag chip with this row's icon + label, so the drag
+// image is a small chip rather than the browser's full-width row snapshot. Done
+// on pointerdown (before the drag starts) so dragstart itself mutates nothing.
+function fillDragGhost(el) {
+  const ghost = $("drag-ghost");
+  ghost.textContent = "";
+  const ico = el.querySelector(".ws-chan-ico, .ws-cat-chev, .ws-lock, svg");
+  if (ico) ghost.appendChild(ico.cloneNode(true));
+  const lab = el.querySelector(".ws-chan-name, .ws-cat-label, .vh span:last-child");
+  const span = document.createElement("span");
+  span.textContent = ((lab ? lab.textContent : el.textContent) || "").trim().slice(0, 48);
+  ghost.appendChild(span);
+}
 function makeDraggable(el, item) {
+  el.addEventListener("pointerdown", () => fillDragGhost(el));
   el.addEventListener("dragstart", (e) => {
     dragItem = item;
     // Mutating layout inside dragstart (revealing/reflowing an element) cancels the
-    // drag in WebKit; only set the transfer data here and dim the source next tick.
+    // drag in WebKit; only set the transfer data + drag image here (the image was
+    // built on pointerdown), and dim the source next tick.
     if (e.dataTransfer) {
       e.dataTransfer.effectAllowed = "move";
       e.dataTransfer.setData("text/plain", item.type + ":" + item.id);
+      if (e.dataTransfer.setDragImage) e.dataTransfer.setDragImage($("drag-ghost"), 12, 12);
     }
     setTimeout(() => el.classList.add("dragging"), 0);
   });
@@ -6187,6 +6219,13 @@ function openChannel(wsId, chId) {
   const ch = channelById(ws, chId);
   if (!ch) return;
   if (ch.kind === "voice") {
+    // Clicking a voice channel connects you to it (like Discord). Already here?
+    // Just show the stage; do not rejoin. Optimistically mark connected so the
+    // controls appear at once; onVoicePresence reconciles with the server roster.
+    if (myVoiceCh !== chId) {
+      myVoiceCh = chId; myVoiceWs = wsId; inCall = true;
+      send({ type: "JoinVoice", workspace: wsId, channel: chId });
+    }
     renderVoiceStage(ws, ch);
   } else {
     send({ type: "OpenChannel", workspace: wsId, channel: chId });
