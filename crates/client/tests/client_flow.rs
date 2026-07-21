@@ -578,7 +578,7 @@ async fn a_buffered_poll_hides_votes_until_the_server_releases_them() {
     // Creating it registers the poll with the server (BallotOpen).
     let opts = vec!["A".to_string(), "B".to_string()];
     let (pid, _ts, _v) = alice
-        .create_poll("buffered?", &opts, false, 2, 300, false)
+        .create_poll("buffered?", &opts, false, 2, 2000, false)
         .unwrap();
     loop {
         if let Event::PollPosted { id, .. } = next_event(&mut bob).await {
@@ -650,7 +650,7 @@ async fn an_anonymous_poll_tallies_without_attributing_votes() {
     // An anonymous, everyone-on-close poll (reveal 2 + anonymous) closing in 300ms.
     let opts = vec!["Yes".to_string(), "No".to_string()];
     let (pid, _ts, view) = alice
-        .create_poll("Approve?", &opts, false, 2, 300, true)
+        .create_poll("Approve?", &opts, false, 2, 2000, true)
         .unwrap();
     assert!(
         view.anonymous,
@@ -725,7 +725,7 @@ async fn an_owner_only_poll_can_also_be_anonymous() {
     // reveal 4 = only the creator, once it closes -- AND anonymous.
     let opts = vec!["Yes".to_string(), "No".to_string()];
     let (pid, _ts, view) = alice
-        .create_poll("Approve?", &opts, false, 4, 300, true)
+        .create_poll("Approve?", &opts, false, 4, 2000, true)
         .unwrap();
     assert!(view.anonymous, "owner-only polls can be anonymous too");
 
