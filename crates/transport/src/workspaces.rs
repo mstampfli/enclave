@@ -1,17 +1,20 @@
 //! Server-side workspace storage: the append-only **op-log** per workspace, plus
 //! a membership/state index derived by replaying each log (for routing and for
-//! rejecting invalid submissions at ingress).
+//! rejecting invalid submissions at ingress), plus a durable, paginated store of
+//! sealed channel messages for scrollback.
 //!
 //! The relay validates every submitted op through `enclave_crypto::workspace`
 //! before appending -- it holds no signing key so it cannot forge an op, and it
 //! refuses invalid ones (bad chain, bad signature, unauthorized) rather than
 //! storing garbage. Authoritative authorization is still each client's own
 //! replay; this store is defense in depth plus the index the relay needs to know
-//! which accounts to deliver a workspace's traffic to. Persisted to JSON so
-//! workspaces survive a restart.
+//! which accounts to deliver a workspace's traffic to. Both the op-log (JSON) and
+//! the channel history (an append-only framed log per channel) are persisted, so
+//! a relay restart keeps workspaces and their scrollback.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,9 +23,14 @@ use enclave_protocol::{ChannelId, Sealed, SignedOp, WorkspaceId, WorkspaceSummar
 
 /// Most stored messages kept per channel for scrollback. Beyond this the oldest
 /// is evicted, so history is bounded (a late joiner still gets a deep backlog).
-/// In memory: a server restart loses stored history (a documented limitation,
-/// like the ballot buffer); the op-log itself is persisted.
 const MAX_HISTORY_PER_CHANNEL: usize = 5000;
+/// Eviction slack: a channel is allowed to grow to `cap + slack` before it is
+/// compacted back to `cap` in one rewrite, so the durable log is rewritten once
+/// per `slack` messages rather than on every message past the cap.
+const HISTORY_COMPACT_SLACK: usize = 512;
+/// Largest history page the relay will return in one fetch (clamps a client's
+/// requested limit), so a single fetch can never dump an unbounded backlog.
+pub const HISTORY_PAGE_MAX: u32 = 500;
 
 /// Why a submitted op was refused.
 #[derive(Debug, PartialEq, Eq)]
@@ -53,17 +61,39 @@ struct PersistedLog {
     ops: Vec<SignedOp>,
 }
 
+/// One stored channel message. `seq` is a per-channel monotonic id assigned at
+/// store time; it is stable across eviction (evicting the front never renumbers
+/// what remains) and across restart, so a client can use it as a paging cursor.
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredMsg {
+    seq: u64,
+    epoch: u64,
+    sealed: Sealed,
+}
+
+/// One channel's scrollback: the retained messages (oldest first, ascending
+/// `seq`) and the next seq to hand out.
+#[derive(Default)]
+struct ChannelLog {
+    msgs: Vec<StoredMsg>,
+    next_seq: u64,
+}
+
 /// The append-only op-logs of every workspace, with replayed state cached in
-/// memory for routing.
+/// memory for routing, and durable per-channel scrollback.
 #[derive(Default)]
 pub struct WorkspaceStore {
     logs: BTreeMap<WorkspaceId, Vec<SignedOp>>,
     /// Cached replay of each log; never serialized (rebuilt from `logs`).
     states: BTreeMap<WorkspaceId, WorkspaceState>,
-    /// Stored channel messages for scrollback: `(epoch, sealed)` per channel,
-    /// oldest first. In memory; sealed (the relay holds no key).
-    history: BTreeMap<(WorkspaceId, ChannelId), Vec<(u64, Sealed)>>,
+    /// Retained sealed channel messages per channel (sealed; the relay holds no
+    /// key). Mirrored to disk under `history_dir` when durable.
+    history: BTreeMap<(WorkspaceId, ChannelId), ChannelLog>,
+    /// JSON path for the op-log (`None` = in-memory, e.g. tests).
     path: Option<PathBuf>,
+    /// Directory holding one append-only log file per channel (`None` =
+    /// in-memory: history is kept in RAM but never persisted).
+    history_dir: Option<PathBuf>,
 }
 
 impl WorkspaceStore {
@@ -72,16 +102,20 @@ impl WorkspaceStore {
     }
 
     /// Load from a JSON file (empty if absent), replaying each log to rebuild the
-    /// state index. A log that fails to replay (corrupt on disk) is dropped rather
-    /// than aborting startup.
+    /// state index, and load durable channel history from a sibling directory
+    /// (`<stem>-history/` next to the op-log file). A log that fails to replay
+    /// (corrupt on disk) is dropped rather than aborting startup.
     pub fn load(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let persisted: Vec<PersistedLog> = std::fs::read_to_string(&path)
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
+        let history_dir = history_dir_for(&path);
+        let _ = std::fs::create_dir_all(&history_dir);
         let mut store = Self {
             path: Some(path),
+            history_dir: Some(history_dir.clone()),
             ..Self::default()
         };
         for entry in persisted {
@@ -96,7 +130,28 @@ impl WorkspaceStore {
                 }
             }
         }
+        store.load_history(&history_dir);
         store
+    }
+
+    /// Read every `<wshex>__<chhex>.log` in the history directory into memory.
+    fn load_history(&mut self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some((ws, channel)) = name.to_str().and_then(parse_history_name) else {
+                continue;
+            };
+            let mut msgs = read_history_file(&entry.path());
+            if msgs.len() > MAX_HISTORY_PER_CHANNEL {
+                let overflow = msgs.len() - MAX_HISTORY_PER_CHANNEL;
+                msgs.drain(0..overflow);
+            }
+            let next_seq = msgs.last().map(|m| m.seq + 1).unwrap_or(0);
+            self.history.insert((ws, channel), ChannelLog { msgs, next_seq });
+        }
     }
 
     /// Validate and append one op. Genesis ops (seq 0) register a new workspace;
@@ -166,8 +221,9 @@ impl WorkspaceStore {
             .is_some_and(|s| s.is_channel_member(channel, handle))
     }
 
-    /// Store one sealed channel message for scrollback, evicting the oldest past
-    /// the per-channel cap so history stays bounded.
+    /// Store one sealed channel message for scrollback: assign it the channel's
+    /// next seq, append it to the durable log, and evict the oldest past the cap
+    /// (compacting the file in one rewrite once the slack fills).
     pub fn store_message(
         &mut self,
         ws: WorkspaceId,
@@ -176,19 +232,54 @@ impl WorkspaceStore {
         sealed: Sealed,
     ) {
         let log = self.history.entry((ws, channel)).or_default();
-        log.push((epoch, sealed));
-        if log.len() > MAX_HISTORY_PER_CHANNEL {
-            let overflow = log.len() - MAX_HISTORY_PER_CHANNEL;
-            log.drain(0..overflow);
+        let seq = log.next_seq;
+        log.next_seq += 1;
+        let record = StoredMsg { seq, epoch, sealed };
+        log.msgs.push(record.clone());
+        // Append to disk (O(1)); compact only when the slack fills, so the file
+        // is rewritten once per `slack` messages, not on every message.
+        if let Some(dir) = &self.history_dir {
+            let file = history_file(dir, &ws, &channel);
+            append_history_record(&file, &record);
+            if log.msgs.len() > MAX_HISTORY_PER_CHANNEL + HISTORY_COMPACT_SLACK {
+                let overflow = log.msgs.len() - MAX_HISTORY_PER_CHANNEL;
+                log.msgs.drain(0..overflow);
+                rewrite_history_file(&file, &log.msgs);
+            }
+        } else if log.msgs.len() > MAX_HISTORY_PER_CHANNEL + HISTORY_COMPACT_SLACK {
+            let overflow = log.msgs.len() - MAX_HISTORY_PER_CHANNEL;
+            log.msgs.drain(0..overflow);
         }
     }
 
-    /// A channel's stored history (`(epoch, sealed)` oldest first) for backfill.
-    pub fn channel_history(&self, ws: &WorkspaceId, channel: &ChannelId) -> Vec<(u64, Sealed)> {
-        self.history
-            .get(&(*ws, *channel))
-            .cloned()
-            .unwrap_or_default()
+    /// One page of a channel's scrollback, oldest-first within the page. `before`
+    /// = `None` returns the newest `limit` messages; `Some(seq)` returns the page
+    /// of messages with a smaller seq (the page just older than what the caller
+    /// holds). Returns `(messages, has_more)` where each message is
+    /// `(seq, epoch, sealed)` and `has_more` says whether still-older retained
+    /// messages exist before this page.
+    pub fn channel_history_page(
+        &self,
+        ws: &WorkspaceId,
+        channel: &ChannelId,
+        before: Option<u64>,
+        limit: u32,
+    ) -> (Vec<(u64, u64, Sealed)>, bool) {
+        let limit = limit.clamp(1, HISTORY_PAGE_MAX) as usize;
+        let Some(log) = self.history.get(&(*ws, *channel)) else {
+            return (Vec::new(), false);
+        };
+        // `msgs` is ascending by seq, so the newest are at the end.
+        let end = match before {
+            Some(b) => log.msgs.partition_point(|m| m.seq < b),
+            None => log.msgs.len(),
+        };
+        let start = end.saturating_sub(limit);
+        let page = log.msgs[start..end]
+            .iter()
+            .map(|m| (m.seq, m.epoch, m.sealed.clone()))
+            .collect();
+        (page, start > 0)
     }
 
     /// The workspaces `handle` currently belongs to, summarized for the sidebar.
@@ -219,6 +310,86 @@ impl WorkspaceStore {
             let _ = std::fs::write(path, text);
         }
     }
+}
+
+/// The directory that holds per-channel history logs for an op-log at `path`:
+/// `<parent>/<stem>-history/`.
+fn history_dir_for(path: &Path) -> PathBuf {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("enclave-workspaces");
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("{stem}-history"))
+}
+
+fn history_file(dir: &Path, ws: &WorkspaceId, channel: &ChannelId) -> PathBuf {
+    dir.join(format!("{}__{}.log", hex::encode(ws), hex::encode(channel)))
+}
+
+/// Parse a `<wshex>__<chhex>.log` filename back into its ids.
+fn parse_history_name(name: &str) -> Option<(WorkspaceId, ChannelId)> {
+    let base = name.strip_suffix(".log")?;
+    let (ws_hex, ch_hex) = base.split_once("__")?;
+    let ws = hex::decode(ws_hex).ok()?;
+    let ch = hex::decode(ch_hex).ok()?;
+    Some((ws.try_into().ok()?, ch.try_into().ok()?))
+}
+
+/// Append one length-framed bincode record to a channel's log file.
+fn append_history_record(path: &Path, record: &StoredMsg) {
+    let Ok(bytes) = bincode::serialize(record) else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let len = bytes.len() as u32;
+        let _ = f.write_all(&len.to_le_bytes());
+        let _ = f.write_all(&bytes);
+    }
+}
+
+/// Rewrite a channel's log file from the retained records (compaction).
+fn rewrite_history_file(path: &Path, msgs: &[StoredMsg]) {
+    let tmp = path.with_extension("log.tmp");
+    let Ok(mut f) = std::fs::File::create(&tmp) else {
+        return;
+    };
+    for record in msgs {
+        let Ok(bytes) = bincode::serialize(record) else {
+            continue;
+        };
+        let len = bytes.len() as u32;
+        if f.write_all(&len.to_le_bytes()).is_err() || f.write_all(&bytes).is_err() {
+            return;
+        }
+    }
+    let _ = f.sync_all();
+    let _ = std::fs::rename(&tmp, path);
+}
+
+/// Read every length-framed record from a channel's log file (empty on any error,
+/// stopping at the first truncated/corrupt frame so a partially-written tail is
+/// tolerated rather than fatal).
+fn read_history_file(path: &Path) -> Vec<StoredMsg> {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 4 <= buf.len() {
+        let len = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
+        i += 4;
+        if i + len > buf.len() {
+            break; // truncated tail
+        }
+        match bincode::deserialize::<StoredMsg>(&buf[i..i + len]) {
+            Ok(record) => out.push(record),
+            Err(_) => break,
+        }
+        i += len;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -280,11 +451,6 @@ mod tests {
         let owner = Identity::generate("owner").unwrap();
         let mut store = WorkspaceStore::new();
         let state = WorkspaceState::default();
-        // A non-genesis op (seq forced >0 by signing against a non-empty state is
-        // awkward; instead craft the simplest: submit a seq-0-less op). Use an
-        // AddMember whose seq is 0 would be a genesis mismatch, so build against a
-        // fake state with next_seq 1 is not reachable -- simplest: unknown ws with
-        // any op that is not seq 0.
         let mut add = sign_op(
             &owner,
             "owner#1",
@@ -301,5 +467,63 @@ mod tests {
             store.submit([9u8; 16], add),
             Err(SubmitError::UnknownWorkspace)
         );
+    }
+
+    #[test]
+    fn history_pages_newest_first_and_walks_older_by_cursor() {
+        let mut store = WorkspaceStore::new();
+        let ws = [3u8; 16];
+        let ch = [4u8; 16];
+        // 250 messages, epoch 0.
+        for i in 0..250u64 {
+            store.store_message(ws, ch, 0, Sealed(vec![i as u8]));
+        }
+        // Newest page of 100.
+        let (page, more) = store.channel_history_page(&ws, &ch, None, 100);
+        assert_eq!(page.len(), 100);
+        assert!(more, "150 older messages remain");
+        assert_eq!(page.first().unwrap().0, 150); // seq 150..249
+        assert_eq!(page.last().unwrap().0, 249);
+        // Older page before the oldest we hold (seq 150).
+        let (older, more2) = store.channel_history_page(&ws, &ch, Some(150), 100);
+        assert_eq!(older.len(), 100);
+        assert!(more2, "50 older still remain");
+        assert_eq!(older.first().unwrap().0, 50);
+        assert_eq!(older.last().unwrap().0, 149);
+        // The last page runs out.
+        let (last, more3) = store.channel_history_page(&ws, &ch, Some(50), 100);
+        assert_eq!(last.len(), 50);
+        assert!(!more3, "reached the start");
+        assert_eq!(last.first().unwrap().0, 0);
+    }
+
+    #[test]
+    fn history_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("enclave-wstest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ws.json");
+        let ws = [5u8; 16];
+        let ch = [6u8; 16];
+        {
+            let mut store = WorkspaceStore::load(&path);
+            for i in 0..30u64 {
+                store.store_message(ws, ch, 0, Sealed(vec![i as u8, (i * 2) as u8]));
+            }
+        }
+        // Reopen: the durable history is reloaded, seq and payloads intact.
+        let store = WorkspaceStore::load(&path);
+        let (page, more) = store.channel_history_page(&ws, &ch, None, 500);
+        assert_eq!(page.len(), 30);
+        assert!(!more);
+        assert_eq!(page.first().unwrap().0, 0);
+        assert_eq!(page.last().unwrap().0, 29);
+        assert_eq!(page.last().unwrap().2 .0, vec![29u8, 58u8]);
+        // A message stored after reload continues the seq, not restarts it.
+        let mut store = store;
+        store.store_message(ws, ch, 0, Sealed(vec![99u8]));
+        let (page, _) = store.channel_history_page(&ws, &ch, None, 1);
+        assert_eq!(page.last().unwrap().0, 30);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

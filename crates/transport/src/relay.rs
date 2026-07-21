@@ -1201,7 +1201,12 @@ impl Relay {
                 }
             }
 
-            ClientMsg::ChannelHistoryFetch { workspace, channel } => {
+            ClientMsg::ChannelHistoryFetch {
+                workspace,
+                channel,
+                before,
+                limit,
+            } => {
                 let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
                     return vec![];
                 };
@@ -1209,12 +1214,16 @@ impl Relay {
                 if !self.workspaces.is_channel_member(&workspace, &channel, &me) {
                     return vec![];
                 }
+                let (messages, has_more) =
+                    self.workspaces
+                        .channel_history_page(&workspace, &channel, before, limit);
                 vec![Outgoing {
                     to: from,
                     msg: ServerMsg::ChannelHistory {
                         workspace,
                         channel,
-                        messages: self.workspaces.channel_history(&workspace, &channel),
+                        messages,
+                        has_more,
                     },
                 }]
             }

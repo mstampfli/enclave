@@ -346,11 +346,16 @@ pub enum ClientMsg {
         to: Option<String>,
         message: Sealed,
     },
-    /// Fetch a channel's stored history for backfill, replied to with
-    /// [`ServerMsg::ChannelHistory`]. Members only.
+    /// Fetch one page of a channel's stored history for backfill, replied to with
+    /// [`ServerMsg::ChannelHistory`]. Members only. `before = None` fetches the
+    /// newest page; `Some(seq)` fetches the page just older than `seq` (the cursor
+    /// a client carries from a prior page) so scrollback loads incrementally
+    /// rather than dumping the whole backlog. `limit` is clamped server-side.
     ChannelHistoryFetch {
         workspace: WorkspaceId,
         channel: ChannelId,
+        before: Option<u64>,
+        limit: u32,
     },
     /// Join a voice channel's presence (we are now connected). The relay tracks
     /// it and broadcasts the updated roster to the channel's members, so everyone
@@ -723,12 +728,17 @@ pub enum ServerMsg {
         from: String,
         message: Sealed,
     },
-    /// A channel's stored history for backfill: `(epoch, sealed)` oldest first
-    /// (reply to [`ClientMsg::ChannelHistoryFetch`]).
+    /// One page of a channel's stored history for backfill: `(seq, epoch, sealed)`
+    /// oldest first within the page (reply to
+    /// [`ClientMsg::ChannelHistoryFetch`]). `seq` is the paging cursor: the
+    /// client remembers the smallest it holds to fetch the next older page.
+    /// `has_more` says whether still-older retained messages exist before this
+    /// page, so the UI knows whether to offer "load older".
     ChannelHistory {
         workspace: WorkspaceId,
         channel: ChannelId,
-        messages: Vec<(u64, Sealed)>,
+        messages: Vec<(u64, u64, Sealed)>,
+        has_more: bool,
     },
     /// The current occupants of a voice channel (handles), broadcast to the
     /// channel's members whenever someone joins or leaves.

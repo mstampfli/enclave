@@ -25,6 +25,7 @@ opaque-ke = { version = "4.0.1", features = ["argon2"] }
 sha2 = "0.10"
 rand = "0.8"
 fs2 = "0.4"
+hex = "0.4"
 
 [dev-dependencies]
 enclave-media = { path = "../media" }

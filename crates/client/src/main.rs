@@ -407,6 +407,12 @@ enum UiCommand {
         workspace: String,
         channel: String,
     },
+    /// Fetch the page of channel history just older than the oldest we hold, for
+    /// scroll-up "load older".
+    LoadOlderChannel {
+        workspace: String,
+        channel: String,
+    },
     JoinVoice {
         workspace: String,
         channel: String,
@@ -555,6 +561,27 @@ struct ChannelLineOut {
     text: String,
     ts: u64,
     mine: bool,
+}
+
+/// Build the ChannelHistory UI event from the client's current (timestamp-sorted)
+/// history for a channel plus whether older pages remain to load.
+fn channel_history_event(c: &enclave_client::Client, workspace: &str, channel: &str) -> UiEvent {
+    UiEvent::ChannelHistory {
+        workspace: workspace.to_string(),
+        channel: channel.to_string(),
+        messages: c
+            .channel_history(workspace, channel)
+            .into_iter()
+            .map(|m| ChannelLineOut {
+                id: m.id,
+                user: m.user,
+                text: m.text,
+                ts: m.ts,
+                mine: m.mine,
+            })
+            .collect(),
+        has_more: c.channel_has_more(workspace, channel),
+    }
 }
 
 /// Build the rich per-workspace views for the UI from replayed op-log state.
@@ -983,11 +1010,14 @@ enum UiEvent {
         channel: String,
         members: Vec<String>,
     },
-    /// A channel's message history, loaded when the channel is opened.
+    /// A channel's message history, loaded when the channel is opened or when a
+    /// fetched page (newest catch-up or older backfill) lands. `has_more` says
+    /// whether older pages remain, so the UI can offer "load older".
     ChannelHistory {
         workspace: String,
         channel: String,
         messages: Vec<ChannelLineOut>,
+        has_more: bool,
     },
     /// Groups we share with `handle` (hex id, title), for their profile card.
     SharedGroups {
@@ -1702,6 +1732,15 @@ async fn run_client(
                         mine,
                     },
                 ),
+                Event::ChannelHistoryChanged {
+                    workspace,
+                    channel,
+                    ..
+                } => {
+                    if let Some(c) = client.as_ref() {
+                        emit(&proxy, channel_history_event(c, &workspace, &channel));
+                    }
+                }
                 Event::VoicePresence {
                     workspace,
                     channel,
@@ -2757,25 +2796,18 @@ async fn handle_command(
             }
         }
         UiCommand::OpenChannel { workspace, channel } => {
-            if let Some(c) = client.as_ref() {
-                emit(
-                    proxy,
-                    UiEvent::ChannelHistory {
-                        workspace: workspace.clone(),
-                        channel: channel.clone(),
-                        messages: c
-                            .channel_history(&workspace, &channel)
-                            .into_iter()
-                            .map(|m| ChannelLineOut {
-                                id: m.id,
-                                user: m.user,
-                                text: m.text,
-                                ts: m.ts,
-                                mine: m.mine,
-                            })
-                            .collect(),
-                    },
-                );
+            if let Some(c) = client.as_mut() {
+                // Render what we already hold immediately, then fetch the newest
+                // page to catch up on anything posted while we were offline (channel
+                // posts are fan-out, not the reliable per-recipient queue). The
+                // fetch reply arrives as ChannelHistoryChanged and re-renders.
+                emit(proxy, channel_history_event(c, &workspace, &channel));
+                c.refresh_channel_history(&workspace, &channel);
+            }
+        }
+        UiCommand::LoadOlderChannel { workspace, channel } => {
+            if let Some(c) = client.as_mut() {
+                c.fetch_channel_history_older(&workspace, &channel);
             }
         }
         UiCommand::JoinVoice { workspace, channel } => {

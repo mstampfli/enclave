@@ -5663,7 +5663,9 @@ function updateServerCard() {
 let workspaces = [];        // [{id,name,my_role,categories,channels,members}]
 let activeWs = null;        // active workspace id (hex) or null (home)
 let activeChannel = null;   // active channel id (hex) or null
-const channelMsgs = {};     // channel hex -> [{id,user,text,ts,mine}]
+const channelMsgs = {};     // channel hex -> [{id,user,text,ts,mine}] (ts-sorted by the core)
+const channelHasMore = {};  // channel hex -> older history remains to load
+let loadingOlder = false;   // a "load older" fetch is in flight
 const voicePresence = {};   // channel hex -> [handle]
 
 function wsById(id) { return workspaces.find((w) => w.id === id) || null; }
@@ -5792,6 +5794,7 @@ function channelRow(ws, ch) {
 
 function openChannel(wsId, chId) {
   activeWs = wsId; activeChannel = chId;
+  loadingOlder = false; // any older-page load belonged to the channel we left
   renderWsPanel();
   const ws = wsById(wsId);
   const ch = channelById(ws, chId);
@@ -5804,7 +5807,8 @@ function openChannel(wsId, chId) {
   }
 }
 
-function renderChannelView(ws, ch) {
+function renderChannelView(ws, ch, opts) {
+  opts = opts || {};
   activeConv = null; // channels are not conversations
   $("home-view").hidden = true;
   $("msg-col").hidden = false;
@@ -5818,13 +5822,17 @@ function renderChannelView(ws, ch) {
   $("header-seal").innerHTML = "";
   const col = $("msg-col"); col.innerHTML = "";
   const msgs = channelMsgs[ch.id] || [];
-  // Reuse the same message renderer DMs use, so channel messages fold, get
-  // avatars, bylines, links and mentions identically. lastGroup is the shared
-  // folding cursor; only one view paints into #msg-col at a time.
-  lastGroup = null;
-  if (!msgs.length) {
+  // At the very top: the sealed-start note once the whole backlog is loaded, or a
+  // quiet "earlier messages" line while older pages remain (a scroll to the top
+  // loads them). Only one of the two ever shows.
+  if (channelHasMore[ch.id]) {
+    const older = document.createElement("div");
+    older.className = "chat-notice";
+    older.textContent = loadingOlder ? "Loading earlier messages" : "Scroll up for earlier messages";
+    col.appendChild(older);
+  } else {
     const d = document.createElement("div");
-    d.className = "empty-room"; d.style.padding = "60px 0";
+    d.className = "empty-room"; d.style.padding = msgs.length ? "20px 0 8px" : "60px 0";
     d.innerHTML = '<div class="inner"><div class="big"></div><div class="empty-sub"></div></div>';
     d.querySelector(".big").textContent = "# " + ch.name;
     d.querySelector(".empty-sub").textContent = ch.private
@@ -5832,8 +5840,12 @@ function renderChannelView(ws, ch) {
       : "The start of this channel. Messages are sealed to its members; the server relays ciphertext and nothing else.";
     col.appendChild(d);
   }
+  // Reuse the same message renderer DMs use, so channel messages fold, get
+  // avatars, bylines, links and mentions identically. lastGroup is the shared
+  // folding cursor; only one view paints into #msg-col at a time.
+  lastGroup = null;
   for (const m of msgs) lastGroup = appendInto(col, chanMsg(m), lastGroup);
-  $("messages").scrollTop = $("messages").scrollHeight;
+  if (!opts.keepScroll) $("messages").scrollTop = $("messages").scrollHeight;
   $("message").placeholder = "Message # " + ch.name;
   setTimeout(focusComposer, 0);
 }
@@ -5849,11 +5861,36 @@ function chanMsg(m) {
 }
 
 function onChannelHistory(ev) {
-  channelMsgs[ev.channel] = ev.messages || [];
+  const prev = channelMsgs[ev.channel] || [];
+  const next = ev.messages || [];
+  channelMsgs[ev.channel] = next;
+  channelHasMore[ev.channel] = !!ev.has_more;
   const ws = wsById(ev.workspace);
   const ch = channelById(ws, ev.channel);
-  if (ev.channel === activeChannel && ch) renderChannelView(ws, ch);
+  if (ev.channel !== activeChannel || !ch) { loadingOlder = false; return; }
+  // Older messages prepended (count grew and the oldest changed): keep the
+  // viewport pinned to the same content instead of jumping to the bottom.
+  const grewAtTop = next.length > prev.length && prev.length &&
+    prev[0] && next[0] && next[0].id !== prev[0].id;
+  const box = $("messages");
+  const fromBottom = box.scrollHeight - box.scrollTop;
+  renderChannelView(ws, ch, { keepScroll: grewAtTop });
+  if (grewAtTop) box.scrollTop = box.scrollHeight - fromBottom;
+  loadingOlder = false;
 }
+
+// Load older channel history when the message pane is scrolled near its top and
+// older pages remain. One fetch at a time (loadingOlder gates re-entry).
+function onMessagesScroll() {
+  if (!activeChannel || loadingOlder) return;
+  if (!channelHasMore[activeChannel]) return;
+  if ($("messages").scrollTop > 48) return;
+  loadingOlder = true;
+  const top = $("msg-col").querySelector(".chat-notice");
+  if (top) top.textContent = "Loading earlier messages";
+  send({ type: "LoadOlderChannel", workspace: activeWs, channel: activeChannel });
+}
+$("messages").addEventListener("scroll", onMessagesScroll);
 
 function onChannelMessage(ev) {
   const arr = channelMsgs[ev.channel] || (channelMsgs[ev.channel] = []);

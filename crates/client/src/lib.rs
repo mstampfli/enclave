@@ -159,6 +159,10 @@ struct KeyBundle {
 /// Signing context for channel-message sender authentication.
 const WS_CHANNEL_MSG_CONTEXT: &[u8] = b"enclave/ws-channel-msg/v1";
 
+/// How many channel messages we fetch per history page (newest first, then older
+/// pages on demand), so opening a busy channel never pulls its whole backlog.
+const CHANNEL_PAGE: u32 = 100;
+
 /// The signed body for a channel message: binds channel, id, sender, text, ts.
 fn channel_msg_body(
     channel: &[u8; 16],
@@ -388,6 +392,14 @@ pub enum Event {
         text: String,
         ts: u64,
         mine: bool,
+    },
+    /// A channel's stored history changed (a fetched page landed: newest catch-up
+    /// or older backfill). The UI re-reads the channel's messages from the client.
+    /// `has_more` says whether still-older pages remain to load.
+    ChannelHistoryChanged {
+        workspace: String,
+        channel: String,
+        has_more: bool,
     },
     Error(String),
 }
@@ -821,6 +833,13 @@ pub struct Client {
     workspace_op_inflight: HashMap<[u8; 16], enclave_protocol::WorkspaceOp>,
     /// Channel message history, keyed by `(workspace, channel)`.
     channel_history: HashMap<([u8; 16], [u8; 16]), Vec<ChannelMsg>>,
+    /// Paging cursor per channel: the smallest history `seq` we currently hold, so
+    /// a "load older" fetch asks for the page just before it. Absent until the
+    /// first page lands.
+    channel_hist_cursor: HashMap<([u8; 16], [u8; 16]), u64>,
+    /// Whether the relay reported still-older retained messages before our oldest
+    /// held page, i.e. whether "load older" has anything to load.
+    channel_hist_more: HashMap<([u8; 16], [u8; 16]), bool>,
     /// Who is currently in each voice channel, `(workspace, channel) -> handles`,
     /// mirrored from the relay so the UI shows voice occupancy.
     voice_presence: HashMap<([u8; 16], [u8; 16]), Vec<String>>,
@@ -937,6 +956,8 @@ impl Client {
             workspace_op_queue: HashMap::new(),
             workspace_op_inflight: HashMap::new(),
             channel_history: HashMap::new(),
+            channel_hist_cursor: HashMap::new(),
+            channel_hist_more: HashMap::new(),
             voice_presence: HashMap::new(),
             voice_channel: None,
             active: None,
@@ -1108,6 +1129,8 @@ impl Client {
         self.workspace_op_queue.clear();
         self.workspace_op_inflight.clear();
         self.channel_history.clear();
+        self.channel_hist_cursor.clear();
+        self.channel_hist_more.clear();
         self.voice_presence.clear();
         self.voice_channel = None;
         self.active = None;
@@ -4742,7 +4765,10 @@ impl Client {
                 .channel_history
                 .get(&(ws, ch))
                 .map(|v| {
-                    v.iter()
+                    // Live posts append newest-last; backfilled older pages arrive
+                    // after them, so order by timestamp (id breaks ties stably).
+                    let mut lines: Vec<ChannelLine> = v
+                        .iter()
                         .map(|m| ChannelLine {
                             id: hex::encode(m.id),
                             user: m.user.clone(),
@@ -4750,7 +4776,9 @@ impl Client {
                             ts: m.ts,
                             mine: m.mine,
                         })
-                        .collect()
+                        .collect();
+                    lines.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
+                    lines
                 })
                 .unwrap_or_default(),
             _ => Vec::new(),
@@ -4945,26 +4973,33 @@ impl Client {
             }
             // A gap (epoch > len) is ignored; a later full bundle fills it.
         }
-        // Backfill any channel we just learned the first key for.
+        // Backfill any channel we just learned the first key for: the newest page,
+        // then the UI can walk older on demand.
         for channel in new_channels {
             self.conn.send(ClientMsg::ChannelHistoryFetch {
                 workspace: ws,
                 channel,
+                before: None,
+                limit: CHANNEL_PAGE,
             });
         }
     }
 
     /// Apply a fetched channel-history page: open each stored message like a live
-    /// one (dedup handles overlap with live delivery). Emits a `WorkspacesChanged`
-    /// so the UI re-reads the (now backfilled) channel.
+    /// one (dedup handles overlap with live delivery), advance the paging cursor
+    /// to the oldest seq in the page, and record whether older pages remain. Emits
+    /// a `WorkspacesChanged` so the UI re-reads the (now backfilled) channel.
     fn receive_channel_history(
         &mut self,
         ws: [u8; 16],
         channel: [u8; 16],
-        messages: Vec<(u64, Sealed)>,
+        messages: Vec<(u64, u64, Sealed)>,
+        has_more: bool,
     ) -> Option<Event> {
+        // The page's smallest seq becomes our cursor for the next older fetch.
+        let page_min = messages.iter().map(|(seq, _, _)| *seq).min();
         let mut any = false;
-        for (epoch, sealed) in messages {
+        for (_seq, epoch, sealed) in messages {
             if self
                 .receive_channel_post(ws, channel, epoch, &sealed.0)
                 .is_some()
@@ -4972,7 +5007,78 @@ impl Client {
                 any = true;
             }
         }
-        any.then_some(Event::WorkspacesChanged)
+        if let Some(min) = page_min {
+            let cur = self.channel_hist_cursor.entry((ws, channel)).or_insert(min);
+            *cur = (*cur).min(min);
+            self.channel_hist_more.insert((ws, channel), has_more);
+        } else {
+            // An empty page means nothing older exists at this cursor.
+            self.channel_hist_more.insert((ws, channel), false);
+        }
+        // Signal even when the page added nothing new, so the UI can settle its
+        // "load older" affordance (has_more may have flipped to false). `any` is
+        // consumed only to keep it meaningful for future callers.
+        let _ = any;
+        Some(Event::ChannelHistoryChanged {
+            workspace: hex::encode(ws),
+            channel: hex::encode(channel),
+            has_more: self
+                .channel_hist_more
+                .get(&(ws, channel))
+                .copied()
+                .unwrap_or(false),
+        })
+    }
+
+    /// Fetch the newest page of a channel's history (catch up on anything posted
+    /// while we were offline, since channel posts are fan-out, not the reliable
+    /// per-recipient queue). Safe to call on every channel open; dedup drops
+    /// overlap with what we already hold.
+    pub fn refresh_channel_history(&mut self, ws_hex: &str, channel_hex: &str) {
+        let (Some(ws), Some(channel)) = (decode_offer_id(ws_hex), decode_offer_id(channel_hex))
+        else {
+            return;
+        };
+        if !self.channel_keys.contains_key(&(ws, channel)) {
+            return; // no key yet: the key-share backfill will fetch once we have one
+        }
+        self.conn.send(ClientMsg::ChannelHistoryFetch {
+            workspace: ws,
+            channel,
+            before: None,
+            limit: CHANNEL_PAGE,
+        });
+    }
+
+    /// Fetch the page of history just older than the oldest we currently hold.
+    /// No-op when we have no cursor yet or the relay said nothing older remains.
+    pub fn fetch_channel_history_older(&mut self, ws_hex: &str, channel_hex: &str) {
+        let (Some(ws), Some(channel)) = (decode_offer_id(ws_hex), decode_offer_id(channel_hex))
+        else {
+            return;
+        };
+        if self.channel_hist_more.get(&(ws, channel)) != Some(&true) {
+            return;
+        }
+        let Some(&before) = self.channel_hist_cursor.get(&(ws, channel)) else {
+            return;
+        };
+        self.conn.send(ClientMsg::ChannelHistoryFetch {
+            workspace: ws,
+            channel,
+            before: Some(before),
+            limit: CHANNEL_PAGE,
+        });
+    }
+
+    /// Whether a channel has older history the UI can still load.
+    pub fn channel_has_more(&self, ws_hex: &str, channel_hex: &str) -> bool {
+        match (decode_offer_id(ws_hex), decode_offer_id(channel_hex)) {
+            (Some(ws), Some(ch)) => {
+                self.channel_hist_more.get(&(ws, ch)).copied().unwrap_or(false)
+            }
+            _ => false,
+        }
     }
 
     /// Sign and submit one structural op (add/remove member, role, channel, ...)
@@ -6183,7 +6289,8 @@ impl Client {
                 workspace,
                 channel,
                 messages,
-            } => self.receive_channel_history(workspace, channel, messages),
+                has_more,
+            } => self.receive_channel_history(workspace, channel, messages, has_more),
             ServerMsg::VoicePresence {
                 workspace,
                 channel,
