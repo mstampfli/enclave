@@ -15,11 +15,12 @@
 //! HARDWARE PATH: the mic/speaker and screen paths cannot be exercised
 //! headlessly; they are compile-verified and validated on a real device.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use enclave_crypto::{MediaOpener, MediaSealer, MediaSigner};
 use enclave_media::{AudioCapture, AudioDecoder, AudioEncoder, AudioPlayback, PlaybackSink};
@@ -45,6 +46,33 @@ pub struct ScreenFrameOut {
     pub h264: Vec<u8>,
     pub keyframe: bool,
     pub camera: bool,
+}
+
+/// A change in whether a participant is talking, from receiver-side voice-activity
+/// detection. `from` is the speaker's handle (our own handle for our mic). Emitted
+/// only on transitions (start/stop), so the UI just toggles a ring.
+#[derive(Debug, Clone)]
+pub struct SpeakingUpdate {
+    pub from: String,
+    pub speaking: bool,
+}
+
+/// Voice-activity threshold on a 20 ms PCM frame, expressed as the mean of the
+/// squared i16 samples (so we never take a sqrt). ~700 RMS is clearly speech and
+/// rejects room noise; tune if mics read hot or quiet.
+const SPEAK_MEAN_SQUARE: i64 = 700 * 700;
+/// Keep a participant "talking" for this long after their last loud frame, so the
+/// ring does not flicker between words or on short pauses.
+const SPEAK_HOLD: Duration = Duration::from_millis(350);
+
+/// Whether a mono i16 frame is loud enough to count as speech: its mean square
+/// beats the threshold. An empty frame is silence.
+fn frame_is_loud(pcm: &[i16]) -> bool {
+    if pcm.is_empty() {
+        return false;
+    }
+    let sum_sq: i64 = pcm.iter().map(|&s| (s as i64) * (s as i64)).sum();
+    sum_sq / (pcm.len() as i64) > SPEAK_MEAN_SQUARE
 }
 
 /// Everything a media session needs, gathered from the live conversation before
@@ -120,7 +148,14 @@ impl Call {
     /// screen frames for the controller to forward to the UI.
     pub async fn start(
         p: CallParams,
-    ) -> Result<(Self, UnboundedReceiver<ScreenFrameOut>), ClientError> {
+    ) -> Result<
+        (
+            Self,
+            UnboundedReceiver<ScreenFrameOut>,
+            UnboundedReceiver<SpeakingUpdate>,
+        ),
+        ClientError,
+    > {
         let (mic_tx, mic_rx) = std_mpsc::channel::<Vec<i16>>();
         let capture = AudioCapture::start_on_into(p.input_device.as_deref(), mic_tx.clone())
             .map_err(audio)?;
@@ -149,6 +184,9 @@ impl Call {
         let sealer = Arc::new(Mutex::new(sealer));
 
         let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel::<MediaFrame>();
+        // Speaking transitions (self + peers) flow out on this channel, mirroring
+        // the screen-frame channel below; the controller forwards them to the UI.
+        let (speak_tx, speak_rx) = tokio::sync::mpsc::unbounded_channel::<SpeakingUpdate>();
 
         // Audio capture thread: mix in shared system audio, Opus-encode, seal.
         let audio_sealer = sealer.clone();
@@ -157,13 +195,31 @@ impl Call {
         let audio_muted = muted.clone();
         let mix: MixRing = Arc::new(Mutex::new(VecDeque::new()));
         let audio_mix = mix.clone();
+        let mic_speak_tx = speak_tx.clone();
+        let mic_me = p.me.clone();
         std::thread::spawn(move || {
             let mut encoder = match AudioEncoder::new() {
                 Ok(e) => e,
                 Err(_) => return,
             };
+            // Own voice activity: track the last loud frame, hold briefly.
+            let mut me_last_loud: Option<Instant> = None;
+            let mut me_speaking = false;
             while let Ok(mut pcm) = mic_rx.recv() {
                 let is_muted = audio_muted.load(Ordering::Relaxed);
+                // Measure the raw mic (before mix_into may zero it) and count it
+                // only when unmuted, so a muted mic never shows as speaking.
+                if !is_muted && frame_is_loud(&pcm) {
+                    me_last_loud = Some(Instant::now());
+                }
+                let now_speaking = me_last_loud.is_some_and(|t| t.elapsed() < SPEAK_HOLD);
+                if now_speaking != me_speaking {
+                    me_speaking = now_speaking;
+                    let _ = mic_speak_tx.send(SpeakingUpdate {
+                        from: mic_me.clone(),
+                        speaking: now_speaking,
+                    });
+                }
                 // Muting silences the mic but NOT shared system audio; sum any
                 // shared audio in. When muted with nothing shared, send nothing.
                 let mixed = mix_into(&audio_mix, &mut pcm, is_muted);
@@ -207,51 +263,86 @@ impl Call {
         let decode_sink = sink_slot.clone();
         let deafened = Arc::new(AtomicBool::new(false));
         let decode_deafened = deafened.clone();
+        let decode_speak_tx = speak_tx;
         std::thread::spawn(move || {
             let Ok(mut decoder) = AudioDecoder::new() else {
                 return;
             };
             let mut openers: HashMap<(String, u64), MediaOpener> = HashMap::new();
-            while let Ok(frame) = raw_rx.recv() {
-                let sender = frame.sender.0.clone();
-                if sender == in_me {
-                    continue;
-                }
-                let Some(sender_key) = members.get(&sender) else {
-                    continue;
-                };
-                let entry = (sender.clone(), frame.epoch);
-                if !openers.contains_key(&entry) {
-                    match MediaOpener::new(&in_root, &in_group, sender_key, frame.epoch) {
-                        Ok(o) => {
-                            openers.insert(entry.clone(), o);
+            // Per-peer voice activity: the last loud frame per sender, and who is
+            // currently "talking" (so we only emit on start/stop transitions).
+            let mut last_loud: HashMap<String, Instant> = HashMap::new();
+            let mut speaking: HashSet<String> = HashSet::new();
+            loop {
+                // A short timeout so a peer who muted and stopped sending still
+                // lets the hold lapse and clears their ring on the next tick.
+                match raw_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(frame) => 'frame: {
+                        let sender = frame.sender.0.clone();
+                        if sender == in_me {
+                            break 'frame;
                         }
-                        Err(_) => continue,
+                        let Some(sender_key) = members.get(&sender) else {
+                            break 'frame;
+                        };
+                        let entry = (sender.clone(), frame.epoch);
+                        if !openers.contains_key(&entry) {
+                            match MediaOpener::new(&in_root, &in_group, sender_key, frame.epoch) {
+                                Ok(o) => {
+                                    openers.insert(entry.clone(), o);
+                                }
+                                Err(_) => break 'frame,
+                            }
+                        }
+                        let opener = openers.get_mut(&entry).expect("just inserted");
+                        let Ok(packet) = opener.open(&frame) else {
+                            break 'frame;
+                        };
+                        match frame.kind {
+                            MediaKind::Audio => {
+                                if let Ok(pcm) = decoder.decode(&packet) {
+                                    // Measure speech even while deafened (so we can
+                                    // still show who talks); just do not play it.
+                                    if frame_is_loud(&pcm) {
+                                        last_loud.insert(sender.clone(), Instant::now());
+                                    }
+                                    if !decode_deafened.load(Ordering::Relaxed) {
+                                        decode_sink.lock().unwrap().push(&pcm);
+                                    }
+                                }
+                            }
+                            MediaKind::Screen | MediaKind::Video => {
+                                let keyframe = is_h264_keyframe(&packet);
+                                let _ = screen_tx.send(ScreenFrameOut {
+                                    from: sender.clone(),
+                                    h264: packet,
+                                    keyframe,
+                                    camera: frame.kind == MediaKind::Video,
+                                });
+                            }
+                        }
                     }
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                let opener = openers.get_mut(&entry).expect("just inserted");
-                let Ok(packet) = opener.open(&frame) else {
-                    continue;
-                };
-                match frame.kind {
-                    MediaKind::Audio => {
-                        if decode_deafened.load(Ordering::Relaxed) {
-                            continue;
-                        }
-                        if let Ok(pcm) = decoder.decode(&packet) {
-                            decode_sink.lock().unwrap().push(&pcm);
-                        }
-                    }
-                    MediaKind::Screen | MediaKind::Video => {
-                        let keyframe = is_h264_keyframe(&packet);
-                        let _ = screen_tx.send(ScreenFrameOut {
-                            from: sender.clone(),
-                            h264: packet,
-                            keyframe,
-                            camera: frame.kind == MediaKind::Video,
+                // Re-evaluate who is talking and emit only the transitions. Drops
+                // senders once their hold lapses so the map stays small.
+                let now = Instant::now();
+                last_loud.retain(|s, t| {
+                    let sp = now.duration_since(*t) < SPEAK_HOLD;
+                    if sp && speaking.insert(s.clone()) {
+                        let _ = decode_speak_tx.send(SpeakingUpdate {
+                            from: s.clone(),
+                            speaking: true,
+                        });
+                    } else if !sp && speaking.remove(s) {
+                        let _ = decode_speak_tx.send(SpeakingUpdate {
+                            from: s.clone(),
+                            speaking: false,
                         });
                     }
-                }
+                    sp
+                });
             }
         });
 
@@ -285,7 +376,7 @@ impl Call {
             muted,
             deafened,
         };
-        Ok((call, screen_rx))
+        Ok((call, screen_rx, speak_rx))
     }
 
     /// Whether we are currently sharing our screen.
@@ -636,6 +727,24 @@ mod tests {
 
     fn ring(samples: &[i16]) -> MixRing {
         Arc::new(Mutex::new(samples.iter().copied().collect()))
+    }
+
+    #[test]
+    fn silence_and_room_noise_are_not_speech() {
+        assert!(!frame_is_loud(&[])); // no samples
+        assert!(!frame_is_loud(&[0i16; 960])); // digital silence
+        assert!(!frame_is_loud(&[300i16; 960])); // low-level noise, below threshold
+        assert!(!frame_is_loud(&[700i16; 960])); // exactly at the threshold, not over
+    }
+
+    #[test]
+    fn speech_level_frames_are_loud() {
+        assert!(frame_is_loud(&[1500i16; 960])); // clear speech
+        assert!(frame_is_loud(&[-2000i16; 960])); // negative swing counts the same
+                                                  // A half-silent frame whose active half is loud enough still averages over.
+        let mut frame = [0i16; 960];
+        frame[..480].fill(2000);
+        assert!(frame_is_loud(&frame));
     }
 
     #[test]

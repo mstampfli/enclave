@@ -147,6 +147,15 @@ A voice channel is a channel-group with an **always-joinable persistent call**:
   occupant is badged muted/deafened. The relay attributes state to the
   authenticated sender only, and only while that sender is present in the channel.
   Audio itself still stops locally; this is purely the visible indicator.
+- **Active speaker** ("who is talking") is detected **locally**, receiver-side: the
+  call's decode thread measures per-sender RMS on the already-per-sender-decoded
+  PCM (`call.rs`, `frame_is_loud` + a short hold), and the mic thread measures our
+  own; transitions ride a `SpeakingUpdate` channel out of `Call` (mirroring
+  `screen_rx`) to `Event::Speaking` -> `UiEvent::Speaking`. The UI rings the
+  talker's avatar/tile green. Because it is computed only from audio we receive,
+  the ring appears **only when we are in the call** -- no wire traffic, no server
+  involvement, and it needs no extra trust (a peer cannot spoof someone else's
+  ring, since it is our own measurement of their audio).
 - No new crypto -- it is the existing call, scoped to a channel and left open.
 
 ---

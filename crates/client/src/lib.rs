@@ -304,6 +304,12 @@ pub enum Event {
         keyframe: bool,
         camera: bool,
     },
+    /// A call participant started or stopped talking (receiver-side voice-activity
+    /// detection). `from` is the speaker's handle (our own for our mic).
+    Speaking {
+        from: String,
+        speaking: bool,
+    },
     /// A user's end-to-end profile (display name, status, accent, avatar)
     /// changed or first arrived; the UI re-reads it via `profile_of`. `user` is
     /// the username. Also fires when a requested avatar blob finishes decrypting,
@@ -923,6 +929,10 @@ pub struct Client {
     call: Option<call::Call>,
     /// Incoming screen frames from the current call, drained by `next_event`.
     screen_rx: Option<tokio::sync::mpsc::UnboundedReceiver<call::ScreenFrameOut>>,
+    /// Speaking (voice-activity) transitions from the current call, drained by
+    /// `next_event`. Present only while a call is live, which is why peers' talk
+    /// rings are visible only when we are in the call.
+    speak_rx: Option<tokio::sync::mpsc::UnboundedReceiver<call::SpeakingUpdate>>,
     /// The conversation the current call belongs to (for the LeaveCall signal,
     /// since the user may switch conversations while in a call).
     call_group: Option<GroupId>,
@@ -1041,6 +1051,7 @@ impl Client {
             media_addr: media_addr_from(server_url),
             call: None,
             screen_rx: None,
+            speak_rx: None,
             call_group: None,
             input_device: None,
             output_device: None,
@@ -4139,9 +4150,10 @@ impl Client {
                 output_device: self.output_device.clone(),
             }
         };
-        let (call, screen_rx) = call::Call::start(params).await?;
+        let (call, screen_rx, speak_rx) = call::Call::start(params).await?;
         self.call = Some(call);
         self.screen_rx = Some(screen_rx);
+        self.speak_rx = Some(speak_rx);
         self.call_group = Some(group_id.clone());
         // Signal the call so the server rings other members and tracks who is in.
         self.conn.send(ClientMsg::JoinCall { group: group_id });
@@ -4153,6 +4165,7 @@ impl Client {
     pub fn leave_call(&mut self) {
         self.call = None;
         self.screen_rx = None;
+        self.speak_rx = None;
         // A fresh call always starts unmuted; drop our announced intent so a later
         // join does not inherit a stale mute/deafen.
         self.voice_muted = false;
@@ -5185,9 +5198,10 @@ impl Client {
                 output_device: self.output_device.clone(),
             }
         };
-        let (call, screen_rx) = call::Call::start(params).await?;
+        let (call, screen_rx, speak_rx) = call::Call::start(params).await?;
         self.call = Some(call);
         self.screen_rx = Some(screen_rx);
+        self.speak_rx = Some(speak_rx);
         self.call_group = Some(voice_group.clone());
         // Route media among voice participants via the voice group.
         self.conn.send(ClientMsg::JoinGroup { group: voice_group });
@@ -6161,26 +6175,36 @@ impl Client {
         enum Src {
             Msg(ServerMsg),
             Screen(call::ScreenFrameOut),
+            Speak(call::SpeakingUpdate),
         }
         loop {
             if let Some(event) = self.pending.pop_front() {
                 return Some(event);
             }
-            // Wait for a server message, or an incoming screen frame from the
-            // active call. Disjoint field borrows so both can be selected on.
+            // Wait for a server message, or an incoming screen frame / speaking
+            // change from the active call. The two call receivers are set and
+            // cleared together, so both are present exactly when a call is live.
+            // Disjoint field borrows so all can be selected on.
             let src = {
                 let Self {
-                    conn, screen_rx, ..
+                    conn,
+                    screen_rx,
+                    speak_rx,
+                    ..
                 } = &mut *self;
-                match screen_rx.as_mut() {
-                    Some(rx) => tokio::select! {
+                match (screen_rx.as_mut(), speak_rx.as_mut()) {
+                    (Some(srx), Some(spx)) => tokio::select! {
                         m = conn.recv() => Src::Msg(m?),
-                        sf = rx.recv() => match sf {
+                        sf = srx.recv() => match sf {
                             Some(sf) => Src::Screen(sf),
                             None => continue, // screen channel closed with the call
                         },
+                        su = spx.recv() => match su {
+                            Some(su) => Src::Speak(su),
+                            None => continue, // speaking channel closed with the call
+                        },
                     },
-                    None => Src::Msg(conn.recv().await?),
+                    _ => Src::Msg(conn.recv().await?),
                 }
             };
             match src {
@@ -6193,6 +6217,12 @@ impl Client {
                         data: sf.h264,
                         keyframe: sf.keyframe,
                         camera: sf.camera,
+                    });
+                }
+                Src::Speak(su) => {
+                    return Some(Event::Speaking {
+                        from: su.from,
+                        speaking: su.speaking,
                     });
                 }
                 Src::Msg(msg) => {

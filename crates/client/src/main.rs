@@ -1099,6 +1099,12 @@ enum UiEvent {
         keyframe: bool,
         camera: bool,
     },
+    /// A participant started or stopped talking (voice-activity detection). The UI
+    /// rings the speaker's avatar/tile; peers only arrive while we are in the call.
+    Speaking {
+        from: String,
+        speaking: bool,
+    },
     /// Whether we are currently sharing our own screen.
     ScreenShareState {
         sharing: bool,
@@ -1862,6 +1868,9 @@ async fn run_client(
                         camera,
                     },
                 ),
+                Event::Speaking { from, speaking } => {
+                    emit(&proxy, UiEvent::Speaking { from, speaking })
+                }
                 Event::WorkspacesChanged => {
                     if let Some(c) = client.as_ref() {
                         emit(

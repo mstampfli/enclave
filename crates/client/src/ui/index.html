@@ -33,6 +33,7 @@
   --accent: #62ad6a;        /* true green: trust, presence, primary */
   --accent-ink: #8ec793;
   --accent-border: #3e7145;
+  --speaking: #43d17a;      /* brighter green: an active speaker's ring */
   --accent-bg: #1e2a20;
   --accent-bg-hover: #253327;
   --danger: #cf5f4d;
@@ -455,10 +456,13 @@ input[type="checkbox"], select { cursor: pointer; }
    would cancel the drag). */
 .ws-head.drag-over { background: var(--raised); box-shadow: inset 0 0 0 1px var(--accent-ink); border-radius: var(--radius); }
 .ws-voice-here { padding: 2px 8px 6px 30px; display: flex; flex-direction: column; gap: 3px; }
-.ws-voice-here .vh { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted);
-  cursor: pointer; border-radius: 5px; padding: 1px 4px; margin-left: -4px; }
+.ws-voice-here .vh { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--muted);
+  cursor: pointer; border-radius: 5px; padding: 2px 4px; margin-left: -4px; }
 .ws-voice-here .vh:hover { background: var(--hover); color: var(--text); }
-.ws-voice-here .vh .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+.ws-voice-here .vh .vh-av { width: 21px; height: 21px; font-size: 9px; border-radius: 50%; }
+/* An active speaker gets a green ring around their avatar, ringed in the panel
+   colour so it reads as sitting on the avatar (no glow: a solid 2px ring). */
+.ws-voice-here .vh.speaking .vh-av { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--speaking); }
 .ws-voice-here .vh .vh-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Mute/deafen glyph trails the name, pushed to the right; danger-tinted so a
    muted/deafened occupant reads at a glance. */
@@ -814,6 +818,9 @@ input[type="checkbox"], select { cursor: pointer; }
   border-radius: var(--radius);
   display: grid; place-items: center; overflow: hidden;
 }
+/* An active speaker's tile gets a crisp green border (a 2px inset ring keeps it
+   inside the tile with no layout shift, no glow). */
+.tile.speaking { border-color: var(--speaking); box-shadow: inset 0 0 0 2px var(--speaking); }
 /* The avatar scales with the tile (container units) so it is large at every
    window size, never a fixed dot in a big tile. */
 .tile .avatar { width: auto; height: 66cqh; max-height: 88%; aspect-ratio: 1;
@@ -2846,7 +2853,7 @@ function joinCall(convId) {
 function leaveCall() {
   send({ type: "LeaveCall" });
   inCall = false; myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false;
-  watchingStream = false; maxedShare = ""; streamEnded(); clearAllCameras(); selfShareEnded();
+  watchingStream = false; maxedShare = ""; streamEnded(); clearAllCameras(); selfShareEnded(); clearSpeakers();
   renderCall();
 }
 // Am I in the active conversation's call? Trust the client flag OR the server's
@@ -2876,7 +2883,8 @@ const SVG_MONITOR = '<svg class="icon" viewBox="0 0 24 24"><rect x="2" y="3" wid
 function personTile(user) {
   const me = user === myUsername;
   const tile = document.createElement("div");
-  tile.className = "tile";
+  tile.className = "tile" + (speakers.has(user) ? " speaking" : "");
+  tile.dataset.u = user; // so speaker updates can ring this tile without a re-render
   const cam = camCanvas[user];
   if (cam) tile.appendChild(cam);
   else {
@@ -5842,7 +5850,7 @@ function showLogin() {
   sharing = false; muted = false; deafened = false; cameraOn = false;
   watchingStream = false; maxedShare = ""; currentSharer = ""; lastSent = "";
   activeShareId = null; activeCameraId = null; shareAudioOn = false;
-  dismissRing(); streamEnded(); clearAllCameras(); selfShareEnded(); closeModals();
+  dismissRing(); streamEnded(); clearAllCameras(); selfShareEnded(); clearSpeakers(); closeModals();
   $("stage").hidden = true; $("callbar").hidden = true;
   $("banner-live").hidden = true; $("conn-banner").hidden = true;
   $("presence-menu").hidden = true;
@@ -5867,7 +5875,11 @@ let activeChannel = null;   // active channel id (hex) or null
 const channelMsgs = {};     // channel hex -> [{id,user,text,ts,mine}] (ts-sorted by the core)
 const channelHasMore = {};  // channel hex -> older history remains to load
 let loadingOlder = false;   // a "load older" fetch is in flight
-const voicePresence = {};   // channel hex -> [handle]
+const voicePresence = {};   // channel hex -> [{handle, muted, deafened}]
+// Handles currently talking, from receiver-side voice-activity detection in the
+// call I am connected to. Empty unless I am in a call, which is exactly why the
+// left-panel speaking ring only appears when I am also in the call.
+const speakers = new Set();
 
 function wsById(id) { return workspaces.find((w) => w.id === id) || null; }
 function activeWsObj() { return activeWs ? wsById(activeWs) : null; }
@@ -6043,10 +6055,13 @@ function channelRow(ws, ch, depth, canManage) {
       box.style.paddingLeft = 30 + depth * 12 + "px";
       for (const m of here) {
         const v = document.createElement("div");
-        v.className = "vh";
-        v.innerHTML = '<span class="dot"></span><span class="vh-name"></span>' +
+        v.className = "vh" + (speakers.has(m.handle) ? " speaking" : "");
+        v.dataset.u = m.handle; // so speaker updates can find this row without a re-render
+        v.innerHTML = '<div class="avatar vh-av" data-u="' + m.handle + '"></div>' +
+          '<span class="vh-name"></span>' +
           '<span class="vh-status">' + voiceStatusIcon(m) + '</span>';
         v.querySelector(".vh-name").textContent = displayOf(m.handle);
+        paintAvatar(v.querySelector(".vh-av"), m.handle, displayOf(m.handle));
         v.title = "View " + displayOf(m.handle) + "'s profile";
         // The occupant row opens the person's profile. It is also a drag handle
         // for admins; a plain click (no drag) still fires this.
@@ -6374,6 +6389,29 @@ function onChannelMessage(ev) {
   }
 }
 
+// A participant started/stopped talking (voice-activity detection from the call
+// I am in). Toggle the green ring on their stage tile and left-panel row. Only
+// ever fires while I am in a call, so left-panel rings appear only then.
+function onSpeaking(ev) {
+  const changed = ev.speaking ? !speakers.has(ev.from) : speakers.has(ev.from);
+  if (!changed) return;
+  if (ev.speaking) speakers.add(ev.from); else speakers.delete(ev.from);
+  applySpeaking(ev.from);
+}
+function applySpeaking(handle) {
+  const on = speakers.has(handle);
+  // Scan rather than build a selector, so an odd handle cannot break it.
+  document.querySelectorAll(".tile[data-u], .vh[data-u]").forEach((el) => {
+    if (el.dataset.u === handle) el.classList.toggle("speaking", on);
+  });
+}
+// Leaving a call: forget who was talking and strip every ring.
+function clearSpeakers() {
+  if (!speakers.size) return;
+  speakers.clear();
+  document.querySelectorAll(".tile.speaking, .vh.speaking").forEach((el) => el.classList.remove("speaking"));
+}
+
 function onVoicePresence(ev) {
   voicePresence[ev.channel] = ev.members || [];
   // The server roster is authoritative for "am I connected here": reconcile the
@@ -6457,7 +6495,7 @@ function leaveVoiceCall() {
   myVoiceCh = null; myVoiceWs = null; inCall = false;
   sharing = false; muted = false; deafened = false; cameraOn = false;
   watchingStream = false; maxedShare = "";
-  streamEnded(); clearAllCameras(); selfShareEnded();
+  streamEnded(); clearAllCameras(); selfShareEnded(); clearSpeakers();
   $("stage").hidden = true;
   if (activeChannel === ch) {
     const ws = wsById(wsId), c = channelById(ws, ch);
@@ -6989,7 +7027,7 @@ window.onEnclaveEvent = (ev) => {
       inCall = ev.in_call;
       if (!inCall) {
         myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false;
-        watchingStream = false; maxedShare = ""; streamEnded(); clearAllCameras(); selfShareEnded();
+        watchingStream = false; maxedShare = ""; streamEnded(); clearAllCameras(); selfShareEnded(); clearSpeakers();
       }
       renderCall(); renderConvoList();
       break;
@@ -7105,6 +7143,9 @@ window.onEnclaveEvent = (ev) => {
       break;
     case "VoicePresence":
       onVoicePresence(ev);
+      break;
+    case "Speaking":
+      onSpeaking(ev);
       break;
     case "InviteCreated":
       onInviteCreated(ev);
