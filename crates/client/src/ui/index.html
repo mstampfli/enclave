@@ -6239,10 +6239,9 @@ function openChannelCreator(wsId, catId) {
   setTimeout(() => $("ch-name").focus(), 0);
 }
 function syncChannelKind() {
-  const voice = $("ch-kind").value === "voice";
-  // Voice channels are not private in this model, so hide the toggle for them.
-  $("ch-private-wrap").hidden = voice;
-  $("ch-private-note").hidden = voice || !$("ch-private").checked;
+  // Both text and voice channels can be private (a private channel gets its own
+  // keys either way); only reveal the explainer note when the box is ticked.
+  $("ch-private-note").hidden = !$("ch-private").checked;
 }
 $("ch-kind").addEventListener("change", syncChannelKind);
 $("ch-private").addEventListener("change", syncChannelKind);
@@ -6252,8 +6251,10 @@ $("ch-create").addEventListener("click", () => {
   if (!name || !channelCreateWs) return;
   const kind = $("ch-kind").value;
   const category = $("ch-category").value || null;
-  if (kind === "voice") send({ type: "CreateVoiceChannel", workspace: channelCreateWs, name, category });
-  else if ($("ch-private").checked) send({ type: "CreatePrivateChannel", workspace: channelCreateWs, name, category });
+  const priv = $("ch-private").checked;
+  if (kind === "voice" && priv) send({ type: "CreatePrivateChannel", workspace: channelCreateWs, name, category, voice: true });
+  else if (kind === "voice") send({ type: "CreateVoiceChannel", workspace: channelCreateWs, name, category });
+  else if (priv) send({ type: "CreatePrivateChannel", workspace: channelCreateWs, name, category, voice: false });
   else send({ type: "CreateChannel", workspace: channelCreateWs, name, category });
   closeModals();
 });

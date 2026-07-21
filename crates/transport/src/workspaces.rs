@@ -167,9 +167,17 @@ impl WorkspaceStore {
                     store.logs.insert(entry.id, entry.ops);
                     store.states.insert(entry.id, state);
                 }
-                Err(_) => {
-                    // Corrupt persisted log; skip it (a fresh empty store is safer
-                    // than crashing the whole relay on one bad file).
+                Err(e) => {
+                    // A log that no longer replays -- corrupt on disk, or written by
+                    // an incompatible older op-log format (e.g. before a WorkspaceOp
+                    // change shifted variant indices). Drop it rather than crash the
+                    // relay, and say so, since the symptom otherwise is a confusing
+                    // "op rejected" for a workspace that half-loaded.
+                    eprintln!(
+                        "enclave: dropping workspace {} on load (incompatible or corrupt op-log: {e:?}); \
+                         it was likely created by an older build -- recreate it",
+                        hex::encode(entry.id)
+                    );
                 }
             }
         }

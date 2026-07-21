@@ -384,6 +384,9 @@ enum UiCommand {
         name: String,
         #[serde(default)]
         category: Option<String>,
+        /// A private voice channel (its own MLS group keys the call) when true.
+        #[serde(default)]
+        voice: bool,
     },
     AddWorkspaceMember {
         workspace: String,
@@ -2901,9 +2904,12 @@ async fn handle_command(
             workspace,
             name,
             category,
+            voice,
         } => {
             if let Some(c) = client.as_mut() {
-                if let Err(e) = c.create_private_channel(&workspace, &name, category.as_deref()) {
+                if let Err(e) =
+                    c.create_private_channel(&workspace, &name, category.as_deref(), voice)
+                {
                     error_status(proxy, format!("Could not create channel: {e}"));
                 }
             }

@@ -4807,6 +4807,7 @@ impl Client {
         ws_hex: &str,
         name: &str,
         category: Option<&str>,
+        voice: bool,
     ) -> Result<String, ClientError> {
         let ws = decode_offer_id(ws_hex)
             .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
@@ -4816,7 +4817,11 @@ impl Client {
             enclave_protocol::WorkspaceOp::CreateChannel {
                 channel,
                 name: name.to_string(),
-                kind: enclave_protocol::ChannelKind::Text,
+                kind: if voice {
+                    enclave_protocol::ChannelKind::Voice
+                } else {
+                    enclave_protocol::ChannelKind::Text
+                },
                 private: true,
                 category: category.and_then(decode_offer_id),
             },

@@ -2246,6 +2246,38 @@ async fn an_invite_code_admits_a_redeemer() {
     .await;
 }
 
+/// A private channel can be a voice channel too: it is created with kind Voice
+/// and its own membership (its own MLS group keys the call), so a non-member of
+/// the channel cannot join it.
+#[tokio::test]
+async fn a_private_voice_channel_is_private_and_voice() {
+    use enclave_protocol::ChannelKind;
+
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let owner_h = owner.name().to_string();
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+
+    owner
+        .create_private_channel(&ws, "backstage", None, true)
+        .unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws)
+            .is_some_and(|s| s.channels.values().any(|ch| ch.name == "backstage"))
+    })
+    .await;
+
+    let s = owner.workspace(&ws).unwrap();
+    let ch = s.channels.values().find(|c| c.name == "backstage").unwrap();
+    assert_eq!(ch.kind, ChannelKind::Voice, "it is a voice channel");
+    assert!(ch.private, "and it is private");
+    // The creator is a member; the private set gates who can join the call.
+    assert!(s.is_channel_member(&ch.id, &owner_h));
+    assert!(!s.is_channel_member(&ch.id, "stranger#9999"));
+}
+
 /// Group history sharing: a member turns it on, sends a message, then adds a new
 /// member -- who backfills the post-enable message but never sees the pre-enable
 /// one. Proves the opt-in scrollback and its "only from here on out" semantics.
@@ -2838,7 +2870,7 @@ async fn a_private_channel_is_readable_only_by_its_members() {
     .await;
 
     // Owner creates a PRIVATE channel and adds only Bob to it.
-    let chan = owner.create_private_channel(&ws, "staff", None).unwrap();
+    let chan = owner.create_private_channel(&ws, "staff", None, false).unwrap();
     pump_until(&mut owner, |c| {
         c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
     })
