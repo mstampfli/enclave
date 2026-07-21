@@ -434,6 +434,26 @@ enum UiCommand {
     CreateCategory {
         workspace: String,
         name: String,
+        /// Parent category (create a subcategory under it), or top-level.
+        #[serde(default)]
+        parent: Option<String>,
+    },
+    /// Rename a category.
+    RenameCategory {
+        workspace: String,
+        category: String,
+        name: String,
+    },
+    /// Rename a channel.
+    RenameChannel {
+        workspace: String,
+        channel: String,
+        name: String,
+    },
+    /// Delete a channel.
+    DeleteChannel {
+        workspace: String,
+        channel: String,
     },
     /// Move a channel under a category (drag onto a category), or to the top
     /// level when `category` is absent.
@@ -2993,16 +3013,43 @@ async fn handle_command(
                 }
             }
         }
-        UiCommand::CreateCategory { workspace, name } => {
+        UiCommand::CreateCategory {
+            workspace,
+            name,
+            parent,
+        } => {
             if let Some(c) = client.as_mut() {
-                let mut cat = [0u8; 16];
-                let _ = getrandom::getrandom(&mut cat);
-                let op = enclave_protocol::WorkspaceOp::CreateCategory {
-                    category: cat,
-                    name,
-                };
-                if let Err(e) = c.workspace_submit(&workspace, op) {
+                if let Err(e) = c.create_category(&workspace, &name, parent.as_deref()) {
                     error_status(proxy, format!("Could not create category: {e}"));
+                }
+            }
+        }
+        UiCommand::RenameCategory {
+            workspace,
+            category,
+            name,
+        } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.rename_category(&workspace, &category, &name) {
+                    error_status(proxy, format!("Could not rename category: {e}"));
+                }
+            }
+        }
+        UiCommand::RenameChannel {
+            workspace,
+            channel,
+            name,
+        } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.rename_channel(&workspace, &channel, &name) {
+                    error_status(proxy, format!("Could not rename channel: {e}"));
+                }
+            }
+        }
+        UiCommand::DeleteChannel { workspace, channel } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.delete_channel(&workspace, &channel) {
+                    error_status(proxy, format!("Could not delete channel: {e}"));
                 }
             }
         }

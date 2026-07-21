@@ -2438,6 +2438,7 @@ async fn a_channel_can_be_created_inside_a_category() {
             WorkspaceOp::CreateCategory {
                 category: cat,
                 name: "Rooms".into(),
+                parent: None,
             },
         )
         .unwrap();

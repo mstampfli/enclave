@@ -4716,6 +4716,73 @@ impl Client {
         )
     }
 
+    /// Create a category, optionally nested under `parent_hex` (a subcategory).
+    /// Returns its hex id. Admin (ManageChannels) only.
+    pub fn create_category(
+        &mut self,
+        ws_hex: &str,
+        name: &str,
+        parent_hex: Option<&str>,
+    ) -> Result<String, ClientError> {
+        let category = new_transfer_id();
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::CreateCategory {
+                category,
+                name: name.to_string(),
+                parent: parent_hex.and_then(decode_offer_id),
+            },
+        )?;
+        Ok(hex::encode(category))
+    }
+
+    /// Rename a category.
+    pub fn rename_category(
+        &mut self,
+        ws_hex: &str,
+        category_hex: &str,
+        name: &str,
+    ) -> Result<(), ClientError> {
+        let category = decode_offer_id(category_hex)
+            .ok_or_else(|| ClientError::Workspace("bad category id".into()))?;
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::RenameCategory {
+                category,
+                name: name.to_string(),
+            },
+        )
+    }
+
+    /// Rename a channel.
+    pub fn rename_channel(
+        &mut self,
+        ws_hex: &str,
+        channel_hex: &str,
+        name: &str,
+    ) -> Result<(), ClientError> {
+        let channel = decode_offer_id(channel_hex)
+            .ok_or_else(|| ClientError::Workspace("bad channel id".into()))?;
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::RenameChannel {
+                channel,
+                name: name.to_string(),
+            },
+        )
+    }
+
+    /// Delete a channel (its structure is removed; a private channel's group is
+    /// dropped). Admin (ManageChannels) only.
+    pub fn delete_channel(&mut self, ws_hex: &str, channel_hex: &str) -> Result<(), ClientError> {
+        let channel = decode_offer_id(channel_hex)
+            .ok_or_else(|| ClientError::Workspace("bad channel id".into()))?;
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::DeleteChannel { channel },
+        )
+    }
+
     /// Create a custom role from permission tokens (unknown tokens are ignored).
     /// Needs `ManageRoles`, and the op-log refuses permissions the author lacks.
     pub fn create_role(

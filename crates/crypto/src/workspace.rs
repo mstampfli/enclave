@@ -388,16 +388,28 @@ impl WorkspaceState {
                 }
             }
 
-            WorkspaceOp::CreateCategory { category, name } => {
+            WorkspaceOp::CreateCategory {
+                category,
+                name,
+                parent,
+            } => {
                 require(self.has_permission(&author, Permission::ManageChannels))?;
                 if self.categories.contains_key(category) {
                     return Err(OpError::BadTarget);
+                }
+                // A parent (subcategory) must exist and keep the nesting bounded.
+                if let Some(p) = parent {
+                    if !self.categories.contains_key(p)
+                        || self.category_depth(p) + 1 >= MAX_CATEGORY_DEPTH
+                    {
+                        return Err(OpError::BadTarget);
+                    }
                 }
                 self.categories.insert(
                     *category,
                     CategoryInfo {
                         name: name.clone(),
-                        parent: None,
+                        parent: *parent,
                     },
                 );
             }
@@ -440,6 +452,15 @@ impl WorkspaceState {
                 require(self.has_permission(&author, Permission::ManageChannels))?;
                 let ch = self.channels.get_mut(channel).ok_or(OpError::BadTarget)?;
                 ch.name = name.clone();
+            }
+
+            WorkspaceOp::RenameCategory { category, name } => {
+                require(self.has_permission(&author, Permission::ManageChannels))?;
+                let cat = self
+                    .categories
+                    .get_mut(category)
+                    .ok_or(OpError::BadTarget)?;
+                cat.name = name.clone();
             }
 
             WorkspaceOp::DeleteChannel { channel } => {
@@ -744,6 +765,7 @@ mod tests {
             WorkspaceOp::CreateCategory {
                 category: cat,
                 name: "Text".into(),
+                parent: None,
             },
         )
         .unwrap();
@@ -795,6 +817,7 @@ mod tests {
             WorkspaceOp::CreateCategory {
                 category: a,
                 name: "A".into(),
+                parent: None,
             },
         ))
         .unwrap();
@@ -803,6 +826,7 @@ mod tests {
             WorkspaceOp::CreateCategory {
                 category: b,
                 name: "B".into(),
+                parent: None,
             },
         ))
         .unwrap();
@@ -870,6 +894,78 @@ mod tests {
     }
 
     #[test]
+    fn categories_and_channels_can_be_renamed_deleted_and_nested_at_creation() {
+        let (mut st, owner, ..) = seed();
+        let mk = |st: &WorkspaceState, op| sign_op(&owner, "owner#1", st, 500, op).unwrap();
+        let (a, sub, ch) = ([30u8; 16], [31u8; 16], [32u8; 16]);
+
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::CreateCategory {
+                category: a,
+                name: "Team".into(),
+                parent: None,
+            },
+        ))
+        .unwrap();
+        // A subcategory created directly under `a`.
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::CreateCategory {
+                category: sub,
+                name: "Sub".into(),
+                parent: Some(a),
+            },
+        ))
+        .unwrap();
+        assert_eq!(st.categories[&sub].parent, Some(a));
+        // Rename the category.
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::RenameCategory {
+                category: a,
+                name: "Squad".into(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(st.categories[&a].name, "Squad");
+        // Create, rename, then delete a channel.
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::CreateChannel {
+                channel: ch,
+                name: "gen".into(),
+                kind: ChannelKind::Text,
+                private: false,
+                category: Some(a),
+            },
+        ))
+        .unwrap();
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::RenameChannel {
+                channel: ch,
+                name: "general".into(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(st.channels[&ch].name, "general");
+        st.apply(&mk(&st, WorkspaceOp::DeleteChannel { channel: ch }))
+            .unwrap();
+        assert!(!st.channels.contains_key(&ch));
+        // A subcategory under a nonexistent parent is refused.
+        let bad = mk(
+            &st,
+            WorkspaceOp::CreateCategory {
+                category: [40u8; 16],
+                name: "x".into(),
+                parent: Some([99u8; 16]),
+            },
+        );
+        assert_eq!(st.apply(&bad), Err(OpError::BadTarget));
+    }
+
+    #[test]
     fn a_category_move_is_rejected_when_it_would_cycle_or_target_is_missing() {
         let (mut st, owner, _admin, _member) = seed();
         let (a, b) = ([1u8; 16], [2u8; 16]);
@@ -879,6 +975,7 @@ mod tests {
             WorkspaceOp::CreateCategory {
                 category: a,
                 name: "A".into(),
+                parent: None,
             },
         ))
         .unwrap();
@@ -887,6 +984,7 @@ mod tests {
             WorkspaceOp::CreateCategory {
                 category: b,
                 name: "B".into(),
+                parent: None,
             },
         ))
         .unwrap();
@@ -960,6 +1058,7 @@ mod tests {
                 WorkspaceOp::CreateCategory {
                     category: *id,
                     name: format!("c{i}"),
+                    parent: None,
                 },
             ))
             .unwrap();

@@ -548,7 +548,12 @@ pub enum WorkspaceOp {
     /// Remove a role from a member. Needs `ManageRoles`.
     UnassignRole { member: String, role: RoleId },
     /// Create a category (a channel group in the sidebar).
-    CreateCategory { category: CategoryId, name: String },
+    CreateCategory {
+        category: CategoryId,
+        name: String,
+        /// Parent category (for a subcategory created under it), or top-level.
+        parent: Option<CategoryId>,
+    },
     /// Create a channel. `private` channels have their own subset membership
     /// (managed by later Add/RemoveChannelMember ops in M3); a public channel is
     /// keyed off the workspace group.
@@ -561,6 +566,8 @@ pub enum WorkspaceOp {
     },
     /// Rename a channel.
     RenameChannel { channel: ChannelId, name: String },
+    /// Rename a category. Admin (ManageChannels) only.
+    RenameCategory { category: CategoryId, name: String },
     /// Delete a channel.
     DeleteChannel { channel: ChannelId },
     /// Add a workspace member to a **private** channel's member set (they can then
