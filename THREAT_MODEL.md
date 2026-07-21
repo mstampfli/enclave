@@ -154,7 +154,7 @@ Target level L2 (private communications). Chapters touched and status:
   release and pins quick-xml 0.39. Waived in CI with this justification; drop
   the ignores when wayland-scanner releases against quick-xml >= 0.41.
 
-- **RUSTSEC-2026-0208 / 0209 / 0211 / 0212** -- the `libcrux-{sha3,aesgcm,secrets}`
+- **RUSTSEC-2026-0207 / 0208 / 0209 / 0211 / 0212** -- the `libcrux-{sha3,aesgcm,secrets}`
   crates pulled transitively by openmls's crypto provider (`openmls_rust_crypto`
   -> `hpke-rs` -> `libcrux-*`), the same exact-pinned chain as 0124 with no
   upgrade path yet. The two that touch the AEAD directly (0209, AES-GCM not

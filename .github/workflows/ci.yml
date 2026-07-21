@@ -56,20 +56,22 @@ jobs:
         # no upgrade path exists yet. See THREAT_MODEL.md; drop these ignores when
         # wayland-scanner releases against quick-xml >= 0.41.
         #
-        # RUSTSEC-2026-0208/0209/0211/0212 are the libcrux-{sha3,aesgcm,secrets}
+        # RUSTSEC-2026-0207/0208/0209/0211/0212 are the libcrux-{sha3,aesgcm,secrets}
         # crates pulled transitively by openmls's crypto provider
         # (openmls_rust_crypto -> hpke-rs -> libcrux-*), exact-pinned with no
         # upgrade path yet (same chain as 0124). Not remotely reachable in
         # Enclave's model: the relay never decrypts (so the AES-GCM tag-timing /
         # AAD-length issues have no attacker-observable oracle), 0212 is Aarch64
-        # -only and 0208 is an AVX2 DoS panic like 0124. See THREAT_MODEL.md; drop
-        # these when openmls ships a provider on patched libcrux.
+        # -only and 0207/0208 are SHAKE correctness/DoS bugs of the 0124 class. See
+        # THREAT_MODEL.md; drop these when openmls ships a provider on patched
+        # libcrux.
         run: >-
           cargo audit
           --ignore RUSTSEC-2026-0124
           --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
-          --ignore RUSTSEC-2026-0208 --ignore RUSTSEC-2026-0209
-          --ignore RUSTSEC-2026-0211 --ignore RUSTSEC-2026-0212
+          --ignore RUSTSEC-2026-0207 --ignore RUSTSEC-2026-0208
+          --ignore RUSTSEC-2026-0209 --ignore RUSTSEC-2026-0211
+          --ignore RUSTSEC-2026-0212
 
   secret-scan:
     name: Secret scan
