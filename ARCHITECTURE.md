@@ -92,6 +92,18 @@ crypto  media  transport
   via `FileSink` (never buffered whole) under a sanitized name in a downloads
   directory (see THREAT_MODEL.md).
 - `enclave-server` -- signaling relay + SFU fan-out; holds no media keys.
+- **Workspaces** (Discord/Slack-style text + voice channels with members, roles,
+  categories, and private channels) are an organizational and key-coordination
+  layer over the existing group machinery -- *a channel is a group* -- spread
+  across the crates above, not a new cryptosystem. `protocol` defines the op
+  types (`WorkspaceOp`, the identity-signed `SignedOp`, the ids); `crypto::sign`
+  signs/verifies ops over identity Ed25519 keys and `crypto::workspace` is the
+  op-log state machine (`WorkspaceState::apply`); `transport::workspaces`
+  (`WorkspaceStore`) stores the signed logs plus the `HK`-sealed channel history
+  and re-validates every op at ingress; `client` coordinates the one workspace
+  MLS group (keys all public channels), a separate MLS group per private channel,
+  the per-channel history-key epochs, and a serialized op-submission queue. Design
+  and keying: docs/WORKSPACES.md; threat posture: THREAT_MODEL.md "Workspaces".
 
 ## UI (self-contained window -- hard requirement)
 
@@ -175,7 +187,29 @@ window by default and only add the WASM/browser target when we choose to.
    codec, and proven by
    `transfer::tests::a_sealed_ballot_is_the_same_size_whatever_it_says` and
    `the_anonymous_ballot_the_relay_stores_is_size_invariant`.
-8. Docs update in the same commit as the change they describe.
+8. Workspace authority is a signed, append-only op-log, not the server. Every
+   structural change (create, add/remove member, grant/revoke role, create/
+   rename/delete channel) is an identity-signed `SignedOp` chained by sequence
+   number + SHA-256 `prev_hash`; clients replay the log and authorize each op
+   locally -- genesis fixes the owner, only the owner grants admin, a remove
+   requires the actor to outrank a non-owner target -- so the relay, holding no
+   signing key, cannot forge membership or roles or splice the chain undetected.
+   Enforced by `crypto::workspace::WorkspaceState::apply` (rejecting `BadSeq` /
+   `BadChain` / `BadSignature` / `Unauthorized`) and `crypto::sign`, re-validated
+   at the relay's ingress (`transport::workspaces`), and proven by the crypto
+   workspace tests (`genesis_establishes_owner_and_roles`,
+   `only_the_owner_grants_admin_and_only_higher_roles_remove`,
+   `a_forged_or_reordered_entry_is_rejected`,
+   `a_tampered_op_body_breaks_the_signature`).
+9. A private channel's content is its own MLS group, not a server-filtered view.
+   Public channels key off the single workspace group (one commit rekeys them
+   all); a private channel gets a separate MLS group over its subset, so a
+   misrouting or malicious relay cannot leak its messages to a workspace member
+   who was never added -- they hold no key. Enforced by `client` giving each
+   private channel its own group and history epoch; proven by
+   `a_private_channel_is_readable_only_by_its_members` and (at the state-machine
+   level) `a_private_channel_tracks_its_own_member_set`.
+10. Docs update in the same commit as the change they describe.
 
 ## Dependency plan (added per-phase, in the crate that first uses them)
 
@@ -254,5 +288,20 @@ window by default and only add the WASM/browser target when we choose to.
    secret scan on every push (`.github/workflows/ci.yml`). One upstream advisory
    (RUSTSEC-2026-0124) is waived as verified
    non-exploitable and tracked.
+8. [DONE] Workspaces (text + voice channels, roles, categories, private
+   channels). Milestones M0-M5 per docs/WORKSPACES.md: the signed op-log and
+   role-chain (`crypto::workspace`, `crypto::sign`); public text channels keyed
+   off the workspace MLS group; server-stored scrollback under rotating
+   per-channel history-key epochs (`transport::workspaces`); private channels
+   each in their own MLS group; persistent per-channel voice with presence; and
+   the workspace UI (rail, channel tree, channel view, voice stage), which reuses
+   the direct-message message renderer and the app's modal system rather than a
+   parallel one. Proven by `crates/crypto` workspace/sign tests and the
+   `crates/client/tests/client_flow.rs` workspace tests (create + add member,
+   members exchange in a channel, a non-member sees nothing, a late joiner reads
+   pre-join history, a private channel is readable only by its members, voice
+   presence tracks who is connected). Remaining scale items, deferred and stated
+   in docs/WORKSPACES.md section 10/11: rekey batching, history paging, a durable
+   (not in-memory) server history store, and a dedicated invite flow.
 
 Each phase ends compiling and tested; no half-done work carried forward.

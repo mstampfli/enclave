@@ -1,9 +1,13 @@
 # Workspaces -- design & plan
 
-Status: **DESIGN** (not yet built). This is the plan; the code follows the phases
-in section 11. Decisions locked with the user: **scrollback history**, **full
-structure** (roles + private channels + categories), **medium-community scale**
-(up to a few hundred members).
+Status: **IMPLEMENTED** (M0-M5, 2026-07). This document is now the design record;
+the shipped feature follows the phased roadmap in section 10, and each milestone's
+tests are cited in ARCHITECTURE.md roadmap item 8 and THREAT_MODEL.md "Workspaces".
+The remaining scale items (rekey batching, history paging, a durable server
+history store, a dedicated invite flow) are called out in sections 10 and 11.
+Decisions locked with the user: **scrollback history**, **full structure** (roles
++ private channels + categories), **medium-community scale** (up to a few hundred
+members).
 
 A workspace is a Discord/Slack-style container: named text and voice channels,
 grouped into categories, with members, roles, and invites. It is E2E encrypted
@@ -192,9 +196,12 @@ model and section 2 of THREAT_MODEL). Threats at the boundary and their controls
 | **E** Elevation | Member performs admin action without the role | **Mitigate.** Authorization is the signed Owner-chained grant; clients reject ops whose signer lacks the role. Server cannot elevate. |
 | **E** Elevation | Removed member keeps reading | **Mitigate.** Removal triggers a WG commit (public) / group commit (private) **and** a history-epoch rotation; they hold no post-removal key. |
 
-Open threat items to resolve during the crypto phase: exact op-log fork-detection
-(hash-chain vs per-signer sequence), and whether the convenience roster is worth
-the reconciliation complexity or should be dropped in favour of MLS-only.
+Resolved during implementation: op-log fork-detection is **both** a per-signer
+sequence number and a SHA-256 `prev_hash` chain (`crypto::workspace`), not one or
+the other, so a gap and a reorder are each caught. The server's convenience roster
+was kept (it is what lets the relay fan channel traffic out), but it is never the
+authority: content access is the MLS roster, and the metadata roster is reconciled
+from the same signed op-log the clients replay.
 
 ---
 
@@ -218,25 +225,38 @@ Target: up to a few hundred members, tens of channels. Costs:
 
 ## 10. Phased roadmap
 
-- **M0 -- data model & op-log.** Workspace/channel/role types; signed append-only
-  op-log; server storage + protocol; role-chain verification in the client. No UI
-  beyond a debug view. Tests: op-log signing/verification, role-chain, fork
-  detection.
-- **M1 -- public text channels.** WG group + per-channel derived keys; create
-  workspace, add members, `#public` text channels reusing the chat surface.
-  Tests: two members exchange in a channel; a non-member cannot; membership change
-  rekeys.
-- **M2 -- scrollback history.** History-key epochs; server sealed history store +
-  quotas; new-member bootstrap; removal rotation. Tests: a late joiner reads full
-  history; a removed member cannot read post-removal history.
-- **M3 -- private channels & roles UI.** Per-private-channel MLS groups; role/perm
-  management behind the verified-role admin panel; categories.
-- **M4 -- voice channels.** Persistent call per channel; join/leave; voice-presence
-  panel; reuse media/screenshare/video.
-- **M5 -- polish & scale.** Rekey batching, history paging, quotas tuning,
-  invites, search scoped to workspace/channel.
+- **M0 [DONE] -- data model & op-log.** Workspace/channel/role types
+  (`enclave-protocol`); signed append-only op-log + role-chain verification
+  (`crypto::sign`, `crypto::workspace`); server storage + protocol
+  (`transport::workspaces`). Tests: `genesis_establishes_owner_and_roles`,
+  `only_the_owner_grants_admin_and_only_higher_roles_remove`,
+  `a_forged_or_reordered_entry_is_rejected`, `a_tampered_op_body_breaks_the_signature`.
+- **M1 [DONE] -- public text channels.** Workspace MLS group + per-channel derived
+  keys; create workspace, add members, `#public` text channels reusing the chat
+  surface. Tests: `a_workspace_is_created_and_a_member_is_added_end_to_end`,
+  `members_exchange_messages_in_a_workspace_channel`,
+  `a_non_member_never_sees_a_workspaces_channel_traffic`.
+- **M2 [DONE] -- scrollback history.** History-key epochs; server sealed history
+  store + oldest-first eviction cap; new-member bootstrap; removal rotation. Test:
+  `a_late_joiner_reads_channel_history_from_before_they_joined`. Removal rotates
+  every channel's history epoch (`client::workspace_remove_member`).
+- **M3 [DONE] -- private channels & roles UI.** Per-private-channel MLS groups;
+  role/permission management behind the verified-role admin panel; categories.
+  Test: `a_private_channel_is_readable_only_by_its_members`.
+- **M4 [DONE] -- voice channels.** Persistent call per channel; join/leave;
+  voice-presence panel; reuse media/screenshare/video. Test:
+  `voice_channel_presence_tracks_who_is_connected`.
+- **M5 [DONE, minus the scale items below] -- UI & op serialization.** The
+  workspace UI (rail, channel tree, channel view, voice stage) built by reusing
+  the direct-message message renderer (`appendInto`) and the app's modal system,
+  not a parallel one; back-to-back structural ops serialized through a
+  per-workspace op-submission queue that re-signs on a sequence conflict. **Still
+  open:** rekey batching (one WG commit per tick under churn), history paging
+  (backfill is sent whole today), a durable server history store (in memory
+  today), and a dedicated invite flow (add-by-username via the manage dialog for
+  now).
 
-Each milestone lands with its tests and a THREAT_MODEL update in the same commit.
+Each milestone landed with its tests and a THREAT_MODEL update.
 
 ---
 
@@ -249,6 +269,9 @@ Each milestone lands with its tests and a THREAT_MODEL update in the same commit
   self-hosted async delivery, not a gap).
 - **The relay can censor** (drop ops/messages) though it cannot forge or read --
   a liveness limit inherent to depending on a server.
+- **The server history store is in memory** -- a server restart drops stored
+  backfill (the same limitation as buffered ballots); a durable store is future
+  work.
 - **Scale ceiling ~ a few hundred**; this is not a 50k-member public-server design.
 - **Big build**: M0-M5 is the largest feature since calls. It is additive -- DMs,
   groups, and the home screen are untouched.

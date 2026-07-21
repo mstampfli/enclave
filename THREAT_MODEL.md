@@ -723,3 +723,97 @@ buys is that an honest server plus an unreliable network never loses a message.
   server) scan file content. Received files are inert on disk until the user
   chooses to open them externally, where OS protections apply. The consent gate
   and name-in-prompt are the user's first line of defense.
+
+## Workspaces (STRIDE + ASVS L2)
+
+A workspace is a Discord/Slack-style container of text and voice channels with
+members, roles, categories, and private channels. It adds **no new cryptosystem**:
+a channel is a group. Public channels key off one workspace MLS group; a private
+channel is its own MLS group over a subset; a voice channel is a persistent call.
+The design and keying live in docs/WORKSPACES.md (its section 8 is the design-time
+STRIDE pass); this section records the posture **as built** and where each control
+is enforced.
+
+Target level **L2**. Chapters touched: V1 (design), V4 (access control), V7
+(logging / accountability, via the op-log), V8 (data protection), V11 (business
+logic / anti-automation).
+
+### Trust boundary and the authority question
+
+Same boundary as everywhere else: **client <-> untrusted relay**. Channel content
+is E2E; the workspace's *structure* (name, channel tree, roster, voice presence)
+is server-visible metadata. The new question a workspace raises is **authority**:
+who may add a member, grant an admin, delete a channel? The answer must not be
+"whoever the server says", or a malicious relay could quietly promote itself into
+any room.
+
+**The op-log is the trust anchor.** Every structural change is an identity-signed
+`SignedOp` (`enclave-protocol`), chained by sequence number + SHA-256 `prev_hash`
+into an append-only log. A client replays the log and **authorizes each op
+locally**: the genesis establishes the owner; only the owner grants admin; a
+remove requires the actor to outrank a non-owner target. The relay stores and
+orders the log but holds no signing key, so it cannot mint a grant, forge
+membership, or splice the chain without detection. Enforced by
+`crypto::workspace::WorkspaceState::apply` (rejecting `BadSeq` / `BadChain` /
+`BadSignature` / `Unauthorized`) and `crypto::sign`, and re-validated at the
+relay's own ingress (`transport::workspaces`, `SubmitError::Op`) so one malformed
+op cannot brick a log's chain for everyone. Proven by the crypto workspace tests
+`genesis_establishes_owner_and_roles`,
+`only_the_owner_grants_admin_and_only_higher_roles_remove`,
+`a_forged_or_reordered_entry_is_rejected`, and
+`a_tampered_op_body_breaks_the_signature`.
+
+### STRIDE (as built)
+
+- **Spoofing -- relay injects a ghost into a channel to read it.** *Mitigate.*
+  Read access is the MLS roster, not the server's convenience roster: a member
+  with no signed Welcome holds no key. Posting is MLS-authenticated to the sender,
+  as in any group.
+- **Tampering -- relay forges roles/membership, or reorders/drops log entries.**
+  *Mitigate.* The signed, hash-chained op-log above; a fork or reorder shows up as
+  a `prev_hash` mismatch. Withholding entries is a liveness issue (see DoS), not
+  an integrity one.
+- **Repudiation -- "who kicked or promoted whom?"** *Mitigate.* Every admin op is
+  signed and timestamped in the log: accountability (V7) without trusting the
+  server.
+- **Information disclosure -- relay reads channel content.** *Mitigate.* E2E; the
+  relay sees only sealed blobs and `HK`-sealed backfill history it cannot open.
+- **Information disclosure -- a private channel leaks to a non-member.**
+  *Mitigate.* A private channel is its own MLS group, so even if the relay
+  misroutes its ciphertext to a workspace member who was never added, that member
+  holds no key. Proven by `a_private_channel_is_readable_only_by_its_members` (and
+  at the state-machine level `a_private_channel_tracks_its_own_member_set`). The
+  relay still sees the channel *exists* in order to route it: metadata tier below.
+- **Information disclosure -- workspace structure, roster, voice presence.**
+  *Accept -- forced, not chosen.* These are the same self-hosted-relay metadata as
+  the rest of the app; see "Metadata the server sees, and what hides it". Hiding
+  the roster by broadcasting to everyone is the same non-viable tradeoff rejected
+  there.
+- **Denial of service -- op / message / rekey spam, unbounded history.**
+  *Mitigate.* The client serializes structural ops through a per-workspace
+  submission queue (re-signing on a sequence conflict) instead of racing the log,
+  and channel history is bounded per channel with oldest-first eviction
+  (`transport::workspaces`, `MAX_HISTORY_PER_CHANNEL`). Rekey batching and history
+  paging are the remaining scale items (docs/WORKSPACES.md section 10).
+- **Denial of service -- relay censors (drops ops or messages).** *Accept.* A
+  liveness limit inherent to depending on a server you host; it can withhold but
+  cannot forge or read.
+- **Elevation of privilege -- a member performs an admin action.** *Mitigate.*
+  Authorization is the owner-chained signed grant; a client rejects any op whose
+  signer lacks the role. The server cannot elevate.
+- **Elevation of privilege -- a removed member keeps reading.** *Mitigate.*
+  Removal drives an MLS commit (public channels rekey in one commit; each private
+  channel rekeys its own group) **and** rotates every channel's history-key epoch,
+  so the removed member holds no post-removal key
+  (`client::workspace_remove_member`).
+
+### Residual / accepted risks
+
+- **Scrollback weakens forward secrecy for backfilled history** -- a per-channel
+  symmetric epoch key shared with a channel's members, the deliberate cost of
+  Discord-style history (docs/WORKSPACES.md section 3). The server never holds it.
+- **Workspace structure is visible to the relay you host** -- forced by
+  self-hosted async delivery, not a gap (the metadata theorem above).
+- **The server-side history store is in memory** today, so a server restart drops
+  stored backfill (the same limitation as buffered ballots). A durable store is
+  future work (`transport::workspaces`).
