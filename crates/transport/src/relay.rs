@@ -1061,6 +1061,70 @@ impl Relay {
                 }]
             }
 
+            ClientMsg::WorkspaceWelcome {
+                workspace,
+                to,
+                welcome,
+            } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                // Both sides must be members: the sender to send, the recipient
+                // because the AddMember op is submitted before the Welcome.
+                if !self.workspaces.is_member(&workspace, &me)
+                    || !self.workspaces.is_member(&workspace, &to)
+                {
+                    return vec![];
+                }
+                let msg = ServerMsg::WorkspaceWelcome {
+                    workspace,
+                    from: me,
+                    welcome,
+                };
+                match self.device_conn.get(&DeviceId(to)) {
+                    Some(&conn) => vec![Outgoing { to: conn, msg }],
+                    None => vec![], // offline: they resync the WG on next login (M1: via re-add)
+                }
+            }
+
+            ClientMsg::WorkspaceCommit { workspace, commit } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                if !self.workspaces.is_member(&workspace, &me) {
+                    return vec![];
+                }
+                let members = self.workspaces.members(&workspace);
+                self.deliver_to_members_except(
+                    &members,
+                    &me,
+                    ServerMsg::WorkspaceCommit {
+                        workspace,
+                        from: me.clone(),
+                        commit,
+                    },
+                )
+            }
+
+            ClientMsg::ChannelPost { workspace, message } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                if !self.workspaces.is_member(&workspace, &me) {
+                    return vec![];
+                }
+                let members = self.workspaces.members(&workspace);
+                self.deliver_to_members_except(
+                    &members,
+                    &me,
+                    ServerMsg::ChannelPost {
+                        workspace,
+                        from: me.clone(),
+                        message,
+                    },
+                )
+            }
+
             ClientMsg::RequestDm { to } => {
                 let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
                     return vec![];
@@ -1891,8 +1955,20 @@ impl Relay {
     /// skipped (they resync via `WorkspaceFetch` on reconnect), so this never
     /// grows the offline queue with workspace ops.
     fn deliver_to_members(&self, members: &[String], msg: ServerMsg) -> Vec<Outgoing> {
+        self.deliver_to_members_except(members, "", msg)
+    }
+
+    /// As [`deliver_to_members`](Self::deliver_to_members), but skips `except`
+    /// (the sender, who already has the content locally).
+    fn deliver_to_members_except(
+        &self,
+        members: &[String],
+        except: &str,
+        msg: ServerMsg,
+    ) -> Vec<Outgoing> {
         members
             .iter()
+            .filter(|m| m.as_str() != except)
             .filter_map(|m| {
                 self.device_conn
                     .get(&DeviceId(m.clone()))

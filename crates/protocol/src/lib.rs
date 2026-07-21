@@ -305,6 +305,28 @@ pub enum ClientMsg {
     /// List the workspaces this account is a member of, replied to with
     /// [`ServerMsg::Workspaces`].
     WorkspaceListMine,
+    /// Deliver a workspace-group (WG) MLS Welcome to a member the owner/admin just
+    /// added, so they can join the WG that keys the public channels. `to` must be
+    /// a current member (the AddMember op is submitted first). Opaque.
+    WorkspaceWelcome {
+        workspace: WorkspaceId,
+        to: String,
+        welcome: Sealed,
+    },
+    /// Broadcast a WG MLS commit (from an add/remove) to the workspace's members
+    /// so they advance to the new epoch. Opaque.
+    WorkspaceCommit {
+        workspace: WorkspaceId,
+        commit: Sealed,
+    },
+    /// Post a message to a channel. The sealed payload is a WG-encrypted
+    /// `(channel_id, text)` -- the channel is *inside* the ciphertext, so the
+    /// relay sees only "a message in this workspace", not which channel. Fanned
+    /// to the workspace's members.
+    ChannelPost {
+        workspace: WorkspaceId,
+        message: Sealed,
+    },
 }
 
 /// A person in the friend graph: the unique `username` (login/add id) plus the
@@ -621,6 +643,26 @@ pub enum ServerMsg {
     /// [`ClientMsg::WorkspaceListMine`]).
     Workspaces {
         workspaces: Vec<WorkspaceSummary>,
+    },
+    /// A WG MLS Welcome for a workspace we were just added to: join the WG to
+    /// read its public channels. `from` is the adder.
+    WorkspaceWelcome {
+        workspace: WorkspaceId,
+        from: String,
+        welcome: Sealed,
+    },
+    /// A WG MLS commit to apply (advance the WG epoch). `from` is its author.
+    WorkspaceCommit {
+        workspace: WorkspaceId,
+        from: String,
+        commit: Sealed,
+    },
+    /// A channel message: the WG-encrypted `(channel_id, text)`. `from` is the
+    /// MLS-authenticated sender (re-checked on decrypt).
+    ChannelPost {
+        workspace: WorkspaceId,
+        from: String,
+        message: Sealed,
     },
 }
 

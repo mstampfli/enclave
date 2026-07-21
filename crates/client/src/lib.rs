@@ -112,6 +112,38 @@ pub enum ClientError {
     Workspace(String),
 }
 
+/// One channel message in local history (the decrypted, authenticated form).
+#[derive(Clone)]
+struct ChannelMsg {
+    id: [u8; 16],
+    /// Sender handle (MLS-authenticated by the WG).
+    user: String,
+    text: String,
+    ts: u64,
+    mine: bool,
+}
+
+/// A channel message as the UI reads it (hex ids, resolved fields).
+#[derive(Clone, Debug)]
+pub struct ChannelLine {
+    pub id: String,
+    pub user: String,
+    pub text: String,
+    pub ts: u64,
+    pub mine: bool,
+}
+
+/// The sealed plaintext of a channel post, carried *inside* the WG ciphertext so
+/// the relay never sees which channel or what was said. The sender is
+/// MLS-authenticated by the WG, so it is not repeated here.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ChannelWire {
+    channel: [u8; 16],
+    id: [u8; 16],
+    text: String,
+    ts: u64,
+}
+
 /// A file that arrived (or was sent) in a conversation. The bytes live on
 /// disk at `path`; only this descriptor crosses the IPC bridge.
 #[derive(Debug, Clone)]
@@ -313,6 +345,18 @@ pub enum Event {
     /// (membership, roles, categories, or channels). The UI re-reads workspace
     /// state from the client.
     WorkspacesChanged,
+    /// A message arrived (or was sent by us) in a workspace channel.
+    ChannelMessage {
+        workspace: String,
+        channel: String,
+        /// Stable message id.
+        id: String,
+        /// Sender handle (MLS-authenticated); empty for our own echo.
+        user: String,
+        text: String,
+        ts: u64,
+        mine: bool,
+    },
     Error(String),
 }
 
@@ -727,6 +771,11 @@ pub struct Client {
     /// authoritative structure/membership we verify locally (never trusting the
     /// relay's copy). See `enclave_crypto::workspace`.
     workspaces: HashMap<[u8; 16], enclave_crypto::workspace::WorkspaceState>,
+    /// Per-workspace WG MLS group -- the shared key schedule that seals public
+    /// channel messages. Membership tracks the workspace's (public) membership.
+    workspace_groups: HashMap<[u8; 16], Group>,
+    /// Channel message history, keyed by `(workspace, channel)`.
+    channel_history: HashMap<([u8; 16], [u8; 16]), Vec<ChannelMsg>>,
     /// Handles that removed US (they initiated the un-friend). Only these auto-
     /// reconnect when they re-add us; a person WE removed does not. Cleared once
     /// we are friends again. Persisted so the direction survives a restart.
@@ -832,6 +881,8 @@ impl Client {
             keystore_dir: PathBuf::from("."),
             conversations: HashMap::new(),
             workspaces: HashMap::new(),
+            workspace_groups: HashMap::new(),
+            channel_history: HashMap::new(),
             active: None,
             pending: VecDeque::new(),
             export_key: Vec::new(),
@@ -995,6 +1046,8 @@ impl Client {
         self.call = None;
         self.conversations.clear();
         self.workspaces.clear();
+        self.workspace_groups.clear();
+        self.channel_history.clear();
         self.active = None;
         self.export_key.clear();
         self.password = Zeroizing::new(String::new());
@@ -4177,12 +4230,201 @@ impl Client {
     /// the caller can navigate to it once it appears.
     pub fn create_workspace(&mut self, name: &str) -> Result<String, ClientError> {
         let me = self.me()?;
-        let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
         let id = new_transfer_id();
-        let op = enclave_crypto::workspace::sign_genesis(identity, &me, name, now_secs())?;
+        let (op, wg) = {
+            let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
+            let op = enclave_crypto::workspace::sign_genesis(identity, &me, name, now_secs())?;
+            // The WG MLS group that keys this workspace's public channels. Created
+            // now (locally); other members join it via a Welcome when added.
+            let wg = Group::create(identity)?;
+            (op, wg)
+        };
+        self.workspace_groups.insert(id, wg);
         self.conn
             .send(ClientMsg::WorkspaceSubmitOp { workspace: id, op });
         Ok(hex::encode(id))
+    }
+
+    /// Add `handle` to a workspace: fetch their key package, add them to the WG
+    /// MLS group, record them in the op-log, and deliver the Welcome + commit.
+    /// The op is submitted first so the relay will route the Welcome to them.
+    pub async fn workspace_add_member(
+        &mut self,
+        ws_hex: &str,
+        handle: &str,
+    ) -> Result<(), ClientError> {
+        let id = decode_offer_id(ws_hex)
+            .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
+        let kp = self.fetch_key_package(handle).await?;
+        let (add, member_key) = {
+            let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
+            let member_key = Group::key_package_signature_key(identity, &kp)?;
+            let wg = self
+                .workspace_groups
+                .get_mut(&id)
+                .ok_or_else(|| ClientError::Workspace("workspace group missing".into()))?;
+            (wg.add_member(identity, &kp, handle)?, member_key)
+        };
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::AddMember {
+                member: handle.to_string(),
+                member_key,
+            },
+        )?;
+        self.conn.send(ClientMsg::WorkspaceWelcome {
+            workspace: id,
+            to: handle.to_string(),
+            welcome: Sealed(add.welcome),
+        });
+        self.conn.send(ClientMsg::WorkspaceCommit {
+            workspace: id,
+            commit: Sealed(add.commit),
+        });
+        Ok(())
+    }
+
+    /// Create a public text channel in a workspace; returns its hex id.
+    pub fn create_channel(&mut self, ws_hex: &str, name: &str) -> Result<String, ClientError> {
+        let channel = new_transfer_id();
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::CreateChannel {
+                channel,
+                name: name.to_string(),
+                kind: enclave_protocol::ChannelKind::Text,
+                private: false,
+                category: None,
+            },
+        )?;
+        Ok(hex::encode(channel))
+    }
+
+    /// Post a text message to a channel: seal `(channel, id, text, ts)` under the
+    /// WG group (so the relay sees neither the channel nor the text) and fan it to
+    /// members. Records it locally and emits our own [`Event::ChannelMessage`].
+    pub fn send_channel_post(
+        &mut self,
+        ws_hex: &str,
+        channel_hex: &str,
+        text: &str,
+    ) -> Result<(), ClientError> {
+        let me = self.me()?;
+        let ws = decode_offer_id(ws_hex)
+            .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
+        let channel = decode_offer_id(channel_hex)
+            .ok_or_else(|| ClientError::Workspace("bad channel id".into()))?;
+        let msg_id = new_transfer_id();
+        let ts = now_ms();
+        let wire = ChannelWire {
+            channel,
+            id: msg_id,
+            text: text.to_string(),
+            ts,
+        };
+        let plaintext = bincode::serialize(&wire).unwrap_or_default();
+        let sealed = {
+            let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
+            let wg = self
+                .workspace_groups
+                .get_mut(&ws)
+                .ok_or_else(|| ClientError::Workspace("workspace group missing".into()))?;
+            wg.encrypt_text(identity, &plaintext)?
+        };
+        self.channel_history
+            .entry((ws, channel))
+            .or_default()
+            .push(ChannelMsg {
+                id: msg_id,
+                user: me.clone(),
+                text: text.to_string(),
+                ts,
+                mine: true,
+            });
+        self.conn.send(ClientMsg::ChannelPost {
+            workspace: ws,
+            message: Sealed(sealed),
+        });
+        self.pending.push_back(Event::ChannelMessage {
+            workspace: ws_hex.to_string(),
+            channel: channel_hex.to_string(),
+            id: hex::encode(msg_id),
+            user: me,
+            text: text.to_string(),
+            ts,
+            mine: true,
+        });
+        Ok(())
+    }
+
+    /// A channel's local message history, oldest first (for the UI and tests).
+    pub fn channel_history(&self, ws_hex: &str, channel_hex: &str) -> Vec<ChannelLine> {
+        match (decode_offer_id(ws_hex), decode_offer_id(channel_hex)) {
+            (Some(ws), Some(ch)) => self
+                .channel_history
+                .get(&(ws, ch))
+                .map(|v| {
+                    v.iter()
+                        .map(|m| ChannelLine {
+                            id: hex::encode(m.id),
+                            user: m.user.clone(),
+                            text: m.text.clone(),
+                            ts: m.ts,
+                            mine: m.mine,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Join a WG from a Welcome we were sent when added to a workspace.
+    fn join_workspace_group(&mut self, ws: [u8; 16], welcome: &[u8]) {
+        let joined = self
+            .identity
+            .as_ref()
+            .and_then(|id| Group::join(id, welcome).ok());
+        if let Some(wg) = joined {
+            self.workspace_groups.insert(ws, wg);
+        }
+    }
+
+    /// Apply a WG MLS commit (add/remove) to advance our epoch.
+    fn apply_workspace_commit(&mut self, ws: [u8; 16], commit: &[u8]) {
+        if let (Some(id), Some(wg)) = (self.identity.as_ref(), self.workspace_groups.get_mut(&ws)) {
+            let _ = wg.apply_commit(id, commit);
+        }
+    }
+
+    /// Decrypt an incoming channel post via the WG and record it.
+    fn receive_channel_post(&mut self, ws: [u8; 16], message: &[u8]) -> Option<Event> {
+        let decoded = match (self.identity.as_ref(), self.workspace_groups.get_mut(&ws)) {
+            (Some(id), Some(wg)) => wg.decrypt_text(id, message).ok(),
+            _ => None,
+        }?;
+        let wire: ChannelWire = bincode::deserialize(&decoded.plaintext).ok()?;
+        // Attribute to the MLS-authenticated sender, not the relay's `from`.
+        let user = String::from_utf8_lossy(&decoded.sender).into_owned();
+        self.channel_history
+            .entry((ws, wire.channel))
+            .or_default()
+            .push(ChannelMsg {
+                id: wire.id,
+                user: user.clone(),
+                text: wire.text.clone(),
+                ts: wire.ts,
+                mine: false,
+            });
+        Some(Event::ChannelMessage {
+            workspace: hex::encode(ws),
+            channel: hex::encode(wire.channel),
+            id: hex::encode(wire.id),
+            user,
+            text: wire.text,
+            ts: wire.ts,
+            mine: false,
+        })
     }
 
     /// Sign and submit one structural op (add/remove member, role, channel, ...)
@@ -5284,6 +5526,21 @@ impl Client {
                 Some(Event::FriendsChanged)
             }
             ServerMsg::WorkspaceOps { workspace, ops } => self.apply_workspace_ops(workspace, ops),
+            ServerMsg::WorkspaceWelcome {
+                workspace, welcome, ..
+            } => {
+                self.join_workspace_group(workspace, &welcome.0);
+                None
+            }
+            ServerMsg::WorkspaceCommit {
+                workspace, commit, ..
+            } => {
+                self.apply_workspace_commit(workspace, &commit.0);
+                None
+            }
+            ServerMsg::ChannelPost {
+                workspace, message, ..
+            } => self.receive_channel_post(workspace, &message.0),
             ServerMsg::Workspaces { workspaces } => {
                 // Fetch the full log for any workspace we do not yet hold, so a
                 // fresh login / new device catches up. Known ones are already live.

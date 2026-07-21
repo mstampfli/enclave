@@ -2169,3 +2169,117 @@ async fn a_workspace_is_created_and_a_member_is_added_end_to_end() {
     // Same chain head -> identical, verified history on both sides.
     assert_eq!(owner_view.head_hash(), bob_view.head_hash());
 }
+
+/// M1 end to end: an owner creates a workspace, adds a member, creates a public
+/// text channel, and the two exchange messages sealed under the workspace MLS
+/// group -- proving the WG lifecycle (create / Welcome-join / commit) and
+/// channel messaging work across two real clients through the relay.
+#[tokio::test]
+async fn members_exchange_messages_in_a_workspace_channel() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let mut bob = account(&url, "bob").await;
+    let owner_h = owner.name().to_string();
+    let bob_h = bob.name().to_string();
+
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+
+    // Add Bob: fetches his key package, adds him to the WG, records the op, sends
+    // the Welcome + commit. Both converge on a two-member workspace.
+    owner.workspace_add_member(&ws, &bob_h).await.unwrap();
+    pump_until(&mut bob, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
+    })
+    .await;
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
+    })
+    .await;
+
+    // Owner creates a public text channel; both see it in the op-log.
+    let chan = owner.create_channel(&ws, "general").unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
+    })
+    .await;
+    pump_until(&mut bob, |c| {
+        c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
+    })
+    .await;
+
+    // Owner posts; Bob receives and decrypts via the WG, attributed to the owner.
+    owner
+        .send_channel_post(&ws, &chan, "hello channel")
+        .unwrap();
+    pump_until(&mut bob, |c| !c.channel_history(&ws, &chan).is_empty()).await;
+    let bobs = bob.channel_history(&ws, &chan);
+    assert_eq!(bobs[0].text, "hello channel");
+    assert_eq!(bobs[0].user, owner_h, "sender is MLS-authenticated");
+    assert!(!bobs[0].mine);
+
+    // Bob replies; the owner receives it.
+    bob.send_channel_post(&ws, &chan, "hi back").unwrap();
+    pump_until(&mut owner, |c| {
+        c.channel_history(&ws, &chan).iter().any(|m| !m.mine)
+    })
+    .await;
+    let owners = owner.channel_history(&ws, &chan);
+    assert!(owners
+        .iter()
+        .any(|m| m.text == "hi back" && m.user == bob_h && !m.mine));
+    // The owner's own post is also in history.
+    assert!(owners.iter().any(|m| m.text == "hello channel" && m.mine));
+}
+
+/// A non-member online during a workspace's channel traffic receives none of it:
+/// the relay fans channel posts only to members (deny-by-default), and a
+/// non-member holds no WG key to decrypt even if they did. Membership access
+/// control for workspace content.
+#[tokio::test]
+async fn a_non_member_never_sees_a_workspaces_channel_traffic() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let mut bob = account(&url, "bob").await;
+    let mut mallory = account(&url, "mallory").await; // online, but never added
+    let bob_h = bob.name().to_string();
+
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+    owner.workspace_add_member(&ws, &bob_h).await.unwrap();
+    // Wait for the owner's own AddMember echo (state advanced) before the next
+    // structural op, so create_channel signs against the current head.
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
+    })
+    .await;
+    pump_until(&mut bob, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
+    })
+    .await;
+    let chan = owner.create_channel(&ws, "general").unwrap();
+    pump_until(&mut bob, |c| {
+        c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
+    })
+    .await;
+
+    owner.send_channel_post(&ws, &chan, "members only").unwrap();
+    pump_until(&mut bob, |c| !c.channel_history(&ws, &chan).is_empty()).await;
+
+    // Give Mallory ample opportunity to have received anything, then confirm she
+    // got nothing: not the workspace, not the channel traffic.
+    for _ in 0..30 {
+        let _ = tokio::time::timeout(Duration::from_millis(20), mallory.next_event()).await;
+    }
+    assert!(
+        mallory.workspace(&ws).is_none(),
+        "a non-member does not learn the workspace"
+    );
+    assert!(
+        mallory.channel_history(&ws, &chan).is_empty(),
+        "a non-member receives no channel messages"
+    );
+}
+// appended diagnostic

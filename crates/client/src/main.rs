@@ -813,6 +813,16 @@ enum UiEvent {
     Workspaces {
         workspaces: Vec<WorkspaceOut>,
     },
+    /// A message in a workspace channel (ours or a peer's).
+    ChannelMessage {
+        workspace: String,
+        channel: String,
+        id: String,
+        user: String,
+        text: String,
+        ts: u64,
+        mine: bool,
+    },
     /// Groups we share with `handle` (hex id, title), for their profile card.
     SharedGroups {
         handle: String,
@@ -1510,6 +1520,26 @@ async fn run_client(
                         );
                     }
                 }
+                Event::ChannelMessage {
+                    workspace,
+                    channel,
+                    id,
+                    user,
+                    text,
+                    ts,
+                    mine,
+                } => emit(
+                    &proxy,
+                    UiEvent::ChannelMessage {
+                        workspace,
+                        channel,
+                        id,
+                        user,
+                        text,
+                        ts,
+                        mine,
+                    },
+                ),
                 Event::FriendsChanged => {
                     if let Some(c) = client.as_ref() {
                         emit(

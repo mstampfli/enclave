@@ -186,6 +186,21 @@ impl Group {
         Ok(String::from_utf8_lossy(kp.leaf_node().credential().serialized_content()).into_owned())
     }
 
+    /// The Ed25519 identity (signature) public key bound to a key package -- what a
+    /// workspace owner records in the op-log when adding this member, so the
+    /// member's future ops verify against it. Validated like `key_package_identity`.
+    pub fn key_package_signature_key(
+        owner: &Identity,
+        key_package_bytes: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        let kp_in = KeyPackageIn::tls_deserialize(&mut &key_package_bytes[..])
+            .map_err(|e| CryptoError::KeyPackage(format!("deserialize: {e}")))?;
+        let kp = kp_in
+            .validate(owner.provider.crypto(), ProtocolVersion::Mls10)
+            .map_err(|e| CryptoError::KeyPackageInvalid(e.to_string()))?;
+        Ok(kp.leaf_node().signature_key().as_slice().to_vec())
+    }
+
     /// Rekey the group by committing a self-update: start a fresh epoch whose
     /// secret tree resets every member's message ratchets to generation 0. Used
     /// to HEAL a conversation whose application-message ratchet desynced (a
