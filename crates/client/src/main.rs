@@ -1621,6 +1621,17 @@ async fn run_client(
             }
             // Heal any DM found to be forked (peer on a different MLS group).
             c.pump_reinvites().await;
+            // Admit any queued workspace members freed by the last op's echo (a
+            // burst of invite redemptions drains one per freed slot).
+            for (_workspace, handle) in c.pump_workspace_adds().await {
+                emit(
+                    &proxy,
+                    UiEvent::Status {
+                        message: format!("Admitted {handle}."),
+                        error: false,
+                    },
+                );
+            }
         }
 
         // A share can end without a command: the user cancels the system
@@ -1764,19 +1775,12 @@ async fn run_client(
                     requester,
                 } => {
                     // An online admin admits an invite redeemer via the normal
-                    // signed add flow (the op-log records us as the adder).
+                    // signed add flow (the op-log records us as the adder). The add
+                    // is queued; the "Admitted X" toast fires from pump_workspace_adds
+                    // once it actually lands, so a burst is admitted in turn.
                     if let Some(c) = client.as_mut() {
-                        match c.workspace_add_member(&workspace, &requester).await {
-                            Ok(()) => emit(
-                                &proxy,
-                                UiEvent::Status {
-                                    message: format!("Admitted {requester} via invite."),
-                                    error: false,
-                                },
-                            ),
-                            Err(e) => {
-                                error_status(&proxy, format!("Could not admit {requester}: {e}"))
-                            }
+                        if let Err(e) = c.workspace_add_member(&workspace, &requester).await {
+                            error_status(&proxy, format!("Could not admit {requester}: {e}"));
                         }
                     }
                 }

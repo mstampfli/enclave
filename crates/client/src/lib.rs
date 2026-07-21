@@ -842,6 +842,11 @@ pub struct Client {
     workspace_op_queue: HashMap<[u8; 16], VecDeque<enclave_protocol::WorkspaceOp>>,
     /// The op currently sent and awaiting its echo, per workspace.
     workspace_op_inflight: HashMap<[u8; 16], enclave_protocol::WorkspaceOp>,
+    /// Members waiting to be added to a workspace, drained one at a time as the
+    /// op-log frees up. A burst of adds (a shared invite link redeemed by several
+    /// people at once) queues here instead of racing the MLS commit / op seq and
+    /// dropping all but the first.
+    workspace_pending_adds: HashMap<[u8; 16], VecDeque<String>>,
     /// Channel message history, keyed by `(workspace, channel)`.
     channel_history: HashMap<([u8; 16], [u8; 16]), Vec<ChannelMsg>>,
     /// Paging cursor per channel: the smallest history `seq` we currently hold, so
@@ -966,6 +971,7 @@ impl Client {
             channel_keys: HashMap::new(),
             workspace_op_queue: HashMap::new(),
             workspace_op_inflight: HashMap::new(),
+            workspace_pending_adds: HashMap::new(),
             channel_history: HashMap::new(),
             channel_hist_cursor: HashMap::new(),
             channel_hist_more: HashMap::new(),
@@ -1139,6 +1145,7 @@ impl Client {
         self.channel_keys.clear();
         self.workspace_op_queue.clear();
         self.workspace_op_inflight.clear();
+        self.workspace_pending_adds.clear();
         self.channel_history.clear();
         self.channel_hist_cursor.clear();
         self.channel_hist_more.clear();
@@ -4364,9 +4371,12 @@ impl Client {
         Ok(hex::encode(id))
     }
 
-    /// Add `handle` to a workspace: fetch their key package, add them to the WG
-    /// MLS group, record them in the op-log, and deliver the Welcome + commit.
-    /// The op is submitted first so the relay will route the Welcome to them.
+    /// Queue `handle` to be added to a workspace and drive the queue. Adds are
+    /// serialized through [`Self::drive_workspace_adds`] so a burst (several people
+    /// redeeming one invite link at once) is admitted one after another instead of
+    /// all-but-one failing on a busy op-log. Returns once the handle is queued; the
+    /// admission itself completes as the log frees up (surfaced by
+    /// [`Event::WorkspacesChanged`] and [`Self::pump_workspace_adds`]).
     pub async fn workspace_add_member(
         &mut self,
         ws_hex: &str,
@@ -4374,11 +4384,62 @@ impl Client {
     ) -> Result<(), ClientError> {
         let id = decode_offer_id(ws_hex)
             .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
-        if self.workspace_busy(&id) {
-            return Err(ClientError::Workspace(
-                "a workspace change is in progress; try again".into(),
-            ));
+        self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
+        // Skip a no-op: already a member, or already queued.
+        let already = self
+            .workspaces
+            .get(&id)
+            .is_some_and(|s| s.members.contains_key(handle));
+        let queued = self
+            .workspace_pending_adds
+            .get(&id)
+            .is_some_and(|q| q.iter().any(|h| h == handle));
+        if !already && !queued {
+            self.workspace_pending_adds
+                .entry(id)
+                .or_default()
+                .push_back(handle.to_string());
         }
+        self.drive_workspace_adds(id).await;
+        Ok(())
+    }
+
+    /// Admit the next queued member for a workspace if the op-log is free. Does the
+    /// real work: fetch the key package, add to the WG, submit the AddMember op
+    /// (which marks the workspace busy), and deliver the Welcome, commit, and
+    /// history keys. Returns the admitted handle, or `None` if nothing was ready.
+    /// One per call: the submitted op makes the workspace busy until its echo.
+    async fn drive_workspace_adds(&mut self, id: [u8; 16]) -> Option<String> {
+        loop {
+            if self.workspace_busy(&id) {
+                return None;
+            }
+            let handle = self.workspace_pending_adds.get_mut(&id)?.pop_front()?;
+            // Drop a handle that became a member while it waited in the queue.
+            if self
+                .workspaces
+                .get(&id)
+                .is_some_and(|s| s.members.contains_key(&handle))
+            {
+                continue;
+            }
+            match self.admit_workspace_member(id, &handle).await {
+                Ok(()) => return Some(handle),
+                // A bad handle (no key package, fetch failure) is dropped rather
+                // than wedging the queue; the next one still gets its chance.
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// The actual add: fetch the key package, add to the WG MLS group, record the
+    /// op, and deliver the Welcome + commit + history keys. The op is submitted
+    /// first so the relay routes the Welcome to the newcomer.
+    async fn admit_workspace_member(
+        &mut self,
+        id: [u8; 16],
+        handle: &str,
+    ) -> Result<(), ClientError> {
         let kp = self.fetch_key_package(handle).await?;
         let (add, member_key) = {
             let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
@@ -4390,7 +4451,7 @@ impl Client {
             (wg.add_member(identity, &kp, handle)?, member_key)
         };
         self.workspace_submit(
-            ws_hex,
+            &hex::encode(id),
             enclave_protocol::WorkspaceOp::AddMember {
                 member: handle.to_string(),
                 member_key,
@@ -4415,6 +4476,26 @@ impl Client {
             self.share_key_bundle(id, None, Some(handle.to_string()), &bundle);
         }
         Ok(())
+    }
+
+    /// Drive every workspace's pending-add queue that the op-log has freed. Called
+    /// from the app's main loop so a queued add is admitted as soon as the prior
+    /// op's echo lands. Returns `(workspace_hex, handle)` for each admission, so
+    /// the caller can surface it.
+    pub async fn pump_workspace_adds(&mut self) -> Vec<(String, String)> {
+        let ids: Vec<[u8; 16]> = self
+            .workspace_pending_adds
+            .iter()
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(id, _)| *id)
+            .collect();
+        let mut admitted = Vec::new();
+        for id in ids {
+            if let Some(handle) = self.drive_workspace_adds(id).await {
+                admitted.push((hex::encode(id), handle));
+            }
+        }
+        admitted
     }
 
     /// Remove `handle` from a workspace: remove them from the WG, record it in the

@@ -2238,6 +2238,94 @@ async fn an_invite_code_admits_a_redeemer() {
     .await;
 }
 
+/// A shared invite link redeemed by several people at once must admit ALL of
+/// them: the adds queue and drain one per freed op-log slot rather than racing
+/// the MLS commit and dropping all but the first (the old busy-check behavior).
+#[tokio::test]
+async fn a_burst_of_invite_redemptions_all_get_admitted() {
+    use enclave_protocol::Role;
+
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let mut r1 = account(&url, "ann").await;
+    let mut r2 = account(&url, "ben").await;
+    let mut r3 = account(&url, "cal").await;
+    let names = [
+        r1.name().to_string(),
+        r2.name().to_string(),
+        r3.name().to_string(),
+    ];
+
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+
+    owner.create_invite(&ws, 0, 0);
+    let mut code = String::new();
+    for _ in 0..100 {
+        if let Ok(Some(Event::InviteCreated { code: c, .. })) =
+            tokio::time::timeout(Duration::from_millis(50), owner.next_event()).await
+        {
+            code = c;
+            break;
+        }
+    }
+    assert!(!code.is_empty());
+
+    // Three people redeem the same link at once.
+    r1.redeem_invite(&code);
+    r2.redeem_invite(&code);
+    r3.redeem_invite(&code);
+
+    // Drive the owner exactly as the app loop does: admit on each JoinRequested
+    // (which queues), then drain the queue as the op-log frees up. Pump the
+    // redeemers so their Welcomes land.
+    for _ in 0..600 {
+        if let Ok(Some(Event::JoinRequested {
+            workspace,
+            requester,
+        })) = tokio::time::timeout(Duration::from_millis(20), owner.next_event()).await
+        {
+            owner
+                .workspace_add_member(&workspace, &requester)
+                .await
+                .unwrap();
+        }
+        let _ = owner.pump_workspace_adds().await;
+        let _ = tokio::time::timeout(Duration::from_millis(5), r1.next_event()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(5), r2.next_event()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(5), r3.next_event()).await;
+        if names
+            .iter()
+            .all(|n| owner.workspace(&ws).is_some_and(|s| s.members.contains_key(n)))
+        {
+            break;
+        }
+    }
+
+    // No drops: owner + all three redeemers, and each redeemer sees itself joined.
+    let s = owner.workspace(&ws).unwrap();
+    assert_eq!(s.members.len(), 4, "all three admitted without a drop");
+    for n in &names {
+        assert!(s.members.contains_key(n), "{n} was dropped");
+    }
+    pump_until(&mut r1, |c| {
+        c.workspace(&ws)
+            .is_some_and(|st| st.role_of(&names[0]) == Some(Role::Member))
+    })
+    .await;
+    pump_until(&mut r2, |c| {
+        c.workspace(&ws)
+            .is_some_and(|st| st.role_of(&names[1]) == Some(Role::Member))
+    })
+    .await;
+    pump_until(&mut r3, |c| {
+        c.workspace(&ws)
+            .is_some_and(|st| st.role_of(&names[2]) == Some(Role::Member))
+    })
+    .await;
+}
+
 /// M1 end to end: an owner creates a workspace, adds a member, creates a public
 /// text channel, and the two exchange messages sealed under the workspace MLS
 /// group -- proving the WG lifecycle (create / Welcome-join / commit) and
