@@ -435,6 +435,11 @@ input[type="checkbox"], select { cursor: pointer; }
 .ws-chan[draggable="true"], .ws-cat[draggable="true"] { cursor: grab; }
 .ws-chan.dragging, .ws-cat.dragging { opacity: 0.45; }
 .ws-chan.drag-over, .ws-cat.drag-over { background: var(--raised); border-radius: var(--radius); }
+/* "Move to top level" zone: only visible while a channel/category is being dragged. */
+.ws-root-drop { display: none; margin: 4px 4px 6px; padding: 9px; border-radius: var(--radius);
+  border: 1px dashed var(--border-strong); color: var(--faint); font-size: 12px; text-align: center; }
+#ws-tree.dragging-item .ws-root-drop { display: block; }
+.ws-root-drop.drag-over { background: var(--raised); color: var(--ink); border-color: var(--accent-ink); }
 .ws-voice-here { padding: 2px 8px 6px 30px; display: flex; flex-direction: column; gap: 3px; }
 .ws-voice-here .vh { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
 .ws-voice-here .vh .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
@@ -5863,6 +5868,20 @@ function renderWsPanel() {
   const chansIn = (catId) => (ws.channels || []).filter((c) => (c.category || null) === (catId || null));
   const subsOf = (catId) => (ws.categories || []).filter((c) => (c.parent || null) === (catId || null));
 
+  // A "move to top level" drop zone, shown only while dragging a channel/category
+  // (so dragging one OUT of a category always has a reliable target, even when no
+  // uncategorized rows exist to drop between).
+  if (canManageChannels) {
+    const rootDrop = document.createElement("div");
+    rootDrop.className = "ws-root-drop";
+    rootDrop.textContent = "Move to top level";
+    makeDropTarget(rootDrop, (item) => {
+      if (item.type === "channel") send({ type: "MoveChannel", workspace: ws.id, channel: item.id });
+      else if (item.type === "category") send({ type: "MoveCategory", workspace: ws.id, category: item.id });
+    }, (item) => item.type === "channel" || item.type === "category");
+    tree.appendChild(rootDrop);
+  }
+
   // Top-level channels (no category) first, then each top-level category and its
   // nested subtree -- the expandable, draggable hierarchy.
   for (const ch of chansIn(null)) tree.appendChild(channelRow(ws, ch, 0, canManageChannels));
@@ -5987,6 +6006,8 @@ function makeDraggable(el, item) {
   el.addEventListener("dragstart", (e) => {
     dragItem = item;
     el.classList.add("dragging");
+    // Reveal the "move to top level" drop zone while a channel/category is dragged.
+    if (item.type === "channel" || item.type === "category") $("ws-tree").classList.add("dragging-item");
     if (e.dataTransfer) {
       e.dataTransfer.effectAllowed = "move";
       e.dataTransfer.setData("text/plain", item.type + ":" + item.id);
@@ -5994,6 +6015,7 @@ function makeDraggable(el, item) {
   });
   el.addEventListener("dragend", () => {
     el.classList.remove("dragging");
+    $("ws-tree").classList.remove("dragging-item");
     dragItem = null;
     document.querySelectorAll(".drag-over").forEach((x) => x.classList.remove("drag-over"));
   });
