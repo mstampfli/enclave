@@ -2111,6 +2111,62 @@ label.member-row:hover { background: var(--raised); }
   </div>
 </div>
 
+<div class="overlay" id="modal-channel" hidden>
+  <div class="modal">
+    <div class="m-head">
+      <h2>New channel</h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="field">
+      <label for="ch-name">Name</label>
+      <input id="ch-name" maxlength="60" placeholder="e.g. general" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="ch-kind">Type</label>
+      <select id="ch-kind">
+        <option value="text">Text channel</option>
+        <option value="voice">Voice channel</option>
+      </select>
+    </div>
+    <label class="poll-check" id="ch-private-wrap">
+      <input type="checkbox" id="ch-private"> Private, only members you add can see it
+    </label>
+    <div class="poll-note" id="ch-private-note">
+      A private channel gets its own keys. Members you don't add can't read it, no matter what the server does.
+    </div>
+    <div class="m-actions">
+      <button class="btn" data-close>Cancel</button>
+      <button class="btn primary" id="ch-create">Create channel</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="modal-ws" hidden>
+  <div class="modal">
+    <div class="m-head">
+      <h2 id="ws-manage-title">Manage workspace</h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="m-section">
+      <div class="s-head">Members</div>
+      <div class="modal-search">
+        <input id="ws-mem-search" placeholder="Search members" autocomplete="off" spellcheck="false">
+      </div>
+      <div id="ws-mem-list"></div>
+      <div class="pick-empty" id="ws-mem-none" hidden>No member matches that.</div>
+    </div>
+    <div class="m-section">
+      <div class="s-head">Add someone</div>
+      <div class="add-friend" style="padding:0">
+        <input placeholder="username" spellcheck="false" id="ws-mem-add-input">
+        <button class="btn" style="padding:7px 12px" id="ws-mem-add-btn">Add</button>
+      </div>
+      <span class="hint" style="font-size:12.5px;color:var(--muted)">
+        New members can read every public channel's history. Private channels stay invite-only.</span>
+    </div>
+  </div>
+</div>
+
 <div class="overlay" id="palette-overlay" hidden>
   <div class="palette">
     <input id="palette-input" placeholder="Jump to a conversation or run a command..." autocomplete="off">
@@ -5620,6 +5676,10 @@ function onWorkspaces(list) {
   if (activeWs && !wsById(activeWs)) selectHome();
   renderRail();
   if (activeWs) renderWsPanel();
+  // Keep the open manage dialog in step with role/member ops as they echo back.
+  if (!$("modal-ws").hidden) {
+    if (activeWsObj()) renderWsMembers(); else closeModals();
+  }
 }
 
 function renderRail() {
@@ -5749,6 +5809,7 @@ function renderChannelView(ws, ch) {
   $("home-view").hidden = true;
   $("msg-col").hidden = false;
   $("composer-bar").hidden = false;
+  $("composer").hidden = false; $("composer-locked").hidden = true; $("composer-hint").hidden = true;
   $("btn-home").hidden = false;
   $("btn-members").hidden = true; $("btn-call").hidden = true; $("btn-convmenu").hidden = true;
   $("room-title").textContent = "# " + ch.name;
@@ -5757,25 +5818,34 @@ function renderChannelView(ws, ch) {
   $("header-seal").innerHTML = "";
   const col = $("msg-col"); col.innerHTML = "";
   const msgs = channelMsgs[ch.id] || [];
-  for (const m of msgs) col.appendChild(channelMsgEl(m));
-  col.scrollIntoView(false);
+  // Reuse the same message renderer DMs use, so channel messages fold, get
+  // avatars, bylines, links and mentions identically. lastGroup is the shared
+  // folding cursor; only one view paints into #msg-col at a time.
+  lastGroup = null;
+  if (!msgs.length) {
+    const d = document.createElement("div");
+    d.className = "empty-room"; d.style.padding = "60px 0";
+    d.innerHTML = '<div class="inner"><div class="big"></div><div class="empty-sub"></div></div>';
+    d.querySelector(".big").textContent = "# " + ch.name;
+    d.querySelector(".empty-sub").textContent = ch.private
+      ? "The start of this private channel. Only the members you add hold its keys; the server relays ciphertext and nothing else."
+      : "The start of this channel. Messages are sealed to its members; the server relays ciphertext and nothing else.";
+    col.appendChild(d);
+  }
+  for (const m of msgs) lastGroup = appendInto(col, chanMsg(m), lastGroup);
+  $("messages").scrollTop = $("messages").scrollHeight;
   $("message").placeholder = "Message # " + ch.name;
+  setTimeout(focusComposer, 0);
 }
 
-function channelMsgEl(m) {
-  const el = document.createElement("div");
-  el.className = "msg-group" + (m.mine ? " mine" : "");
-  const who = m.mine ? "You" : displayOf(m.user);
-  const by = document.createElement("div"); by.className = "byline";
-  by.innerHTML = '<span class="who"></span> <span class="when"></span>';
-  by.querySelector(".who").textContent = who;
-  by.querySelector(".when").textContent = fmtTime(m.ts);
-  const body = document.createElement("div"); body.className = "body";
-  const txt = document.createElement("div"); txt.className = "bubble";
-  txt.appendChild(linkifyText(m.text));
-  body.appendChild(txt);
-  el.append(by, body);
-  return el;
+// Shape a channel message the way appendInto/messageGroup expect: `from` drives
+// the fold key and the avatar for other people's lines; `file` stays null so the
+// text branch renders.
+function chanMsg(m) {
+  return {
+    id: m.id, ts: m.ts, text: m.text, mine: m.mine,
+    user: m.user, from: m.mine ? myUsername : m.user, file: null,
+  };
 }
 
 function onChannelHistory(ev) {
@@ -5788,10 +5858,12 @@ function onChannelHistory(ev) {
 function onChannelMessage(ev) {
   const arr = channelMsgs[ev.channel] || (channelMsgs[ev.channel] = []);
   if (arr.some((m) => m.id === ev.id)) return;
-  arr.push({ id: ev.id, user: ev.user, text: ev.text, ts: ev.ts, mine: ev.mine });
+  const m = { id: ev.id, user: ev.user, text: ev.text, ts: ev.ts, mine: ev.mine };
+  arr.push(m);
   if (ev.channel === activeChannel) {
-    const col = $("msg-col");
-    col.appendChild(channelMsgEl({ id: ev.id, user: ev.user, text: ev.text, ts: ev.ts, mine: ev.mine }));
+    const placeholder = $("msg-col").querySelector(".empty-room");
+    if (placeholder) { placeholder.remove(); lastGroup = null; }
+    lastGroup = appendInto($("msg-col"), chanMsg(m), lastGroup);
     $("messages").scrollTop = $("messages").scrollHeight;
   } else if (!ev.mine) {
     ding();
@@ -5842,26 +5914,139 @@ function renderVoiceStage(ws, ch) {
 }
 
 // ---- creation / admin ----
+// Channel creator: one dialog that names the channel, picks text/voice, and
+// (text only) makes it private, instead of a stack of native prompts.
+let channelCreateWs = null;
 function openChannelCreator(wsId) {
-  const name = prompt("Channel name?");
-  if (!name || !name.trim()) return;
-  const kind = confirm("OK = text channel, Cancel = voice channel") ? "text" : "voice";
-  const priv = kind === "text" && confirm("Make it private? (only members you add can see it)");
-  if (kind === "voice") send({ type: "CreateVoiceChannel", workspace: wsId, name: name.trim() });
-  else if (priv) send({ type: "CreatePrivateChannel", workspace: wsId, name: name.trim() });
-  else send({ type: "CreateChannel", workspace: wsId, name: name.trim() });
+  channelCreateWs = wsId;
+  $("ch-name").value = "";
+  $("ch-kind").value = "text";
+  $("ch-private").checked = false;
+  syncChannelKind();
+  openModal("modal-channel");
+  setTimeout(() => $("ch-name").focus(), 0);
 }
+function syncChannelKind() {
+  const voice = $("ch-kind").value === "voice";
+  // Voice channels are not private in this model, so hide the toggle for them.
+  $("ch-private-wrap").hidden = voice;
+  $("ch-private-note").hidden = voice || !$("ch-private").checked;
+}
+$("ch-kind").addEventListener("change", syncChannelKind);
+$("ch-private").addEventListener("change", syncChannelKind);
+$("ch-name").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("ch-create").click(); } });
+$("ch-create").addEventListener("click", () => {
+  const name = $("ch-name").value.trim();
+  if (!name || !channelCreateWs) return;
+  const kind = $("ch-kind").value;
+  if (kind === "voice") send({ type: "CreateVoiceChannel", workspace: channelCreateWs, name });
+  else if ($("ch-private").checked) send({ type: "CreatePrivateChannel", workspace: channelCreateWs, name });
+  else send({ type: "CreateChannel", workspace: channelCreateWs, name });
+  closeModals();
+});
 
 $("ws-create").addEventListener("click", () => {
-  const name = prompt("Workspace name?");
-  if (name && name.trim()) send({ type: "CreateWorkspace", name: name.trim() });
+  askInput("New workspace", "Name your workspace. You will be its owner.",
+    "Workspace name", "Create",
+    (name) => send({ type: "CreateWorkspace", name }));
 });
 $("rail-home").addEventListener("click", selectHome);
-$("ws-manage").addEventListener("click", () => {
+$("ws-manage").addEventListener("click", openWorkspaceManage);
+
+// Manage-workspace dialog: the same member-row list the group members modal
+// uses, plus role changes and add-by-username. Owner grants/revokes admin; you
+// can only remove someone your role outranks (never the owner or yourself).
+function roleLabel(r) { return r === "owner" ? "Owner" : r === "admin" ? "Admin" : "Member"; }
+const ROLE_RANK = { owner: 0, admin: 1, member: 2 };
+function openWorkspaceManage() {
   const ws = activeWsObj();
   if (!ws) return;
-  const handle = prompt("Add a member by their full username (name#1234):");
-  if (handle && handle.trim()) send({ type: "AddWorkspaceMember", workspace: ws.id, handle: handle.trim() });
+  $("ws-manage-title").textContent = "Manage " + ws.name;
+  $("ws-mem-search").value = "";
+  $("ws-mem-add-input").value = "";
+  renderWsMembers();
+  openModal("modal-ws");
+}
+function renderWsMembers() {
+  const ws = activeWsObj();
+  if (!ws) return;
+  const mine = ws.my_role;
+  const list = $("ws-mem-list");
+  list.innerHTML = "";
+  const members = (ws.members || []).slice().sort((a, b) =>
+    (ROLE_RANK[a.role] - ROLE_RANK[b.role]) ||
+    displayOf(a.handle).localeCompare(displayOf(b.handle)));
+  for (const mem of members) {
+    const u = mem.handle;
+    const row = document.createElement("div");
+    row.className = "member-row";
+    row.dataset.search = (displayOf(u) + " " + u).toLowerCase();
+    const av = document.createElement("div");
+    av.className = "avatar"; paintAvatar(av, u, displayOf(u));
+    row.appendChild(av);
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.innerHTML = '<div class="display"></div><div class="handle"></div>';
+    meta.querySelector(".display").textContent = displayOf(u) + (u === myUsername ? " (you)" : "");
+    meta.querySelector(".handle").textContent = u;
+    row.appendChild(meta);
+    // Clicking the person (not a trailing control) opens their card.
+    for (const t of [av, meta]) {
+      t.style.cursor = "pointer";
+      t.addEventListener("click", () => { closeModals(); openProfile(u); });
+    }
+    // Role marker for owner/admin (identity, no box); members stay unmarked.
+    if (mem.role !== "member") {
+      const tag = document.createElement("span");
+      tag.textContent = roleLabel(mem.role);
+      tag.style.cssText = "font-size:11.5px;color:var(--faint);flex:none";
+      row.appendChild(tag);
+    }
+    // Only the owner promotes/demotes, and never themselves or the owner seat.
+    if (mine === "owner" && u !== myUsername && mem.role !== "owner") {
+      const toggle = document.createElement("button");
+      toggle.className = "btn ghost";
+      toggle.style.cssText = "padding:4px 9px;font-size:12px;flex:none";
+      toggle.textContent = mem.role === "admin" ? "Remove admin" : "Make admin";
+      toggle.addEventListener("click", () => send({
+        type: "SetWorkspaceRole", workspace: ws.id, handle: u,
+        role: mem.role === "admin" ? "member" : "admin",
+      }));
+      row.appendChild(toggle);
+    }
+    // Remove: your role must outrank theirs; never the owner or yourself.
+    if (u !== myUsername && mem.role !== "owner" && ROLE_RANK[mine] < ROLE_RANK[mem.role]) {
+      const kick = actionBtn("kick", "Remove from workspace", SVG_X);
+      kick.addEventListener("click", () => askConfirm(
+        "Remove from workspace",
+        "Remove " + displayOf(u) + " from " + ws.name +
+          "? Public channels rekey so they can't read anything sent after.",
+        "Remove",
+        () => send({ type: "RemoveWorkspaceMember", workspace: ws.id, handle: u })));
+      row.appendChild(kick);
+    }
+    list.appendChild(row);
+  }
+  filterWsMembers();
+}
+function filterWsMembers() {
+  const q = $("ws-mem-search").value.trim().toLowerCase();
+  let any = false;
+  for (const row of $("ws-mem-list").querySelectorAll(".member-row")) {
+    const hit = !q || row.dataset.search.includes(q);
+    row.style.display = hit ? "" : "none";
+    any = any || hit;
+  }
+  $("ws-mem-none").hidden = any;
+}
+$("ws-mem-search").addEventListener("input", filterWsMembers);
+$("ws-mem-add-btn").addEventListener("click", () => {
+  const ws = activeWsObj();
+  const v = $("ws-mem-add-input").value.trim();
+  if (ws && v) { send({ type: "AddWorkspaceMember", workspace: ws.id, handle: v }); $("ws-mem-add-input").value = ""; }
+});
+$("ws-mem-add-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); $("ws-mem-add-btn").click(); }
 });
 
 // Composer routing: when a channel is open, the composer posts to it.
