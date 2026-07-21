@@ -386,6 +386,15 @@ pub enum ClientMsg {
     RedeemInvite {
         code: String,
     },
+    /// Move another member from their current voice channel to `channel`. Admin
+    /// only; the relay verifies the role and directs the member's client with
+    /// [`ServerMsg::VoiceMoved`] (presence then flows via the member's normal
+    /// join/leave, so it is never double counted).
+    VoiceMoveMember {
+        workspace: WorkspaceId,
+        channel: ChannelId,
+        member: String,
+    },
 }
 
 /// A person in the friend graph: the unique `username` (login/add id) plus the
@@ -480,6 +489,19 @@ pub enum WorkspaceOp {
     AddChannelMember { channel: ChannelId, member: String },
     /// Remove a member from a private channel (its key rotates for the rest).
     RemoveChannelMember { channel: ChannelId, member: String },
+    /// Move a channel under a category (or to the top level with `None`), e.g. by
+    /// dragging it onto a category in the sidebar. Admin only.
+    SetChannelCategory {
+        channel: ChannelId,
+        category: Option<CategoryId>,
+    },
+    /// Nest a category under another (or move it to the top level with `None`),
+    /// e.g. by dragging a category onto a category. Admin only; the op-log rejects
+    /// a move that would form a cycle or exceed the nesting depth.
+    SetCategoryParent {
+        category: CategoryId,
+        parent: Option<CategoryId>,
+    },
 }
 
 /// An op-log entry: one [`WorkspaceOp`] made attributable and tamper-evident.
@@ -775,6 +797,12 @@ pub enum ServerMsg {
     JoinRequest {
         workspace: WorkspaceId,
         requester: String,
+    },
+    /// An admin moved us to `channel`: our client joins that voice channel (which
+    /// leaves the one we were in), so presence updates through the normal path.
+    VoiceMoved {
+        workspace: WorkspaceId,
+        channel: ChannelId,
     },
 }
 

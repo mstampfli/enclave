@@ -192,18 +192,20 @@ window by default and only add the WASM/browser target when we choose to.
    `the_anonymous_ballot_the_relay_stores_is_size_invariant`.
 8. Workspace authority is a signed, append-only op-log, not the server. Every
    structural change (create, add/remove member, grant/revoke role, create/
-   rename/delete channel) is an identity-signed `SignedOp` chained by sequence
-   number + SHA-256 `prev_hash`; clients replay the log and authorize each op
-   locally -- genesis fixes the owner, only the owner grants admin, a remove
-   requires the actor to outrank a non-owner target -- so the relay, holding no
-   signing key, cannot forge membership or roles or splice the chain undetected.
-   Enforced by `crypto::workspace::WorkspaceState::apply` (rejecting `BadSeq` /
-   `BadChain` / `BadSignature` / `Unauthorized`) and `crypto::sign`, re-validated
-   at the relay's ingress (`transport::workspaces`), and proven by the crypto
-   workspace tests (`genesis_establishes_owner_and_roles`,
+   rename/delete channel, move a channel or nest a category) is an identity-signed
+   `SignedOp` chained by sequence number + SHA-256 `prev_hash`; clients replay the
+   log and authorize each op locally -- genesis fixes the owner, only the owner
+   grants admin, a remove requires the actor to outrank a non-owner target, and a
+   category move that would form a cycle or exceed `MAX_CATEGORY_DEPTH` is refused
+   -- so the relay, holding no signing key, cannot forge membership or roles or
+   splice the chain undetected. Enforced by `crypto::workspace::WorkspaceState::apply`
+   (rejecting `BadSeq` / `BadChain` / `BadSignature` / `Unauthorized` / `BadTarget`)
+   and `crypto::sign`, re-validated at the relay's ingress (`transport::workspaces`),
+   and proven by the crypto workspace tests (`genesis_establishes_owner_and_roles`,
    `only_the_owner_grants_admin_and_only_higher_roles_remove`,
-   `a_forged_or_reordered_entry_is_rejected`,
-   `a_tampered_op_body_breaks_the_signature`).
+   `a_forged_or_reordered_entry_is_rejected`, `a_tampered_op_body_breaks_the_signature`,
+   `a_category_move_is_rejected_when_it_would_cycle_or_target_is_missing`,
+   `category_nesting_is_depth_bounded`).
 9. A private channel's content is its own MLS group, not a server-filtered view.
    Public channels key off the single workspace group (one commit rekeys them
    all); a private channel gets a separate MLS group over its subset, so a
@@ -299,13 +301,18 @@ window by default and only add the WASM/browser target when we choose to.
    private channels each in their own MLS group; persistent per-channel voice with
    presence; the workspace UI (rail, channel tree, channel view, voice stage),
    which reuses the direct-message message renderer and the app's modal system
-   rather than a parallel one; and admin-minted invite codes with a
-   concurrent-add queue so a burst of redemptions is admitted without drops.
-   Proven by `crates/crypto` workspace/sign tests, the `transport::workspaces`
-   store tests (history paging, restart durability, invite validation), and the
+   rather than a parallel one; admin-minted invite codes with a concurrent-add
+   queue so a burst of redemptions is admitted without drops; a collapsible,
+   drag-to-nest sidebar hierarchy (channels and categories reparent by drag,
+   cycle- and depth-bounded in the op-log); and an admin drag to move a member
+   between voice channels. Proven by `crates/crypto` workspace/sign tests (incl.
+   reparent / cycle / depth), the `transport::workspaces` store tests (history
+   paging, restart durability, invite validation), and the
    `crates/client/tests/client_flow.rs` workspace tests (create + add member,
    members exchange in a channel, a non-member sees nothing, a late joiner reads
    pre-join history, a private channel is readable only by its members, voice
-   presence, an invite admits a redeemer, and a burst of redemptions all get in).
+   presence, an invite admits a redeemer, a burst of redemptions all get in, a
+   channel is created inside a category, and an admin moves a member between
+   voice channels).
 
 Each phase ends compiling and tested; no half-done work carried forward.

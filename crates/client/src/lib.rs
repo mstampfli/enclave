@@ -412,6 +412,12 @@ pub enum Event {
         workspace: String,
         requester: String,
     },
+    /// An admin moved us to a voice channel: our client should join it (which
+    /// leaves the one we were in).
+    VoiceMoveTo {
+        workspace: String,
+        channel: String,
+    },
     Error(String),
 }
 
@@ -4625,6 +4631,45 @@ impl Client {
         Ok(hex::encode(channel))
     }
 
+    /// Move a channel under a category (or to the top level with `None`) -- e.g.
+    /// dragging it onto a category in the sidebar. Admin only (the op-log enforces).
+    pub fn move_channel(
+        &mut self,
+        ws_hex: &str,
+        channel_hex: &str,
+        category_hex: Option<&str>,
+    ) -> Result<(), ClientError> {
+        let channel = decode_offer_id(channel_hex)
+            .ok_or_else(|| ClientError::Workspace("bad channel id".into()))?;
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::SetChannelCategory {
+                channel,
+                category: category_hex.and_then(decode_offer_id),
+            },
+        )
+    }
+
+    /// Nest a category under another (or move it to the top level with `None`) --
+    /// e.g. dragging a category onto a category. Admin only; the op-log rejects a
+    /// move that would form a cycle or exceed the nesting depth.
+    pub fn move_category(
+        &mut self,
+        ws_hex: &str,
+        category_hex: &str,
+        parent_hex: Option<&str>,
+    ) -> Result<(), ClientError> {
+        let category = decode_offer_id(category_hex)
+            .ok_or_else(|| ClientError::Workspace("bad category id".into()))?;
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::SetCategoryParent {
+                category,
+                parent: parent_hex.and_then(decode_offer_id),
+            },
+        )
+    }
+
     /// Create a **private** channel: a subset channel with its own MLS group so
     /// its keys and messages are unreadable to non-members (even other workspace
     /// members, and the relay). Returns its hex id; the creator is its first
@@ -4802,6 +4847,26 @@ impl Client {
         self.conn.send(ClientMsg::VoiceJoin {
             workspace: ws,
             channel,
+        });
+        Ok(())
+    }
+
+    /// As an admin, move `member` to a voice channel. The relay verifies our role
+    /// and directs the member's client to switch (its join/leave carry presence).
+    pub fn voice_move_member(
+        &mut self,
+        ws_hex: &str,
+        channel_hex: &str,
+        member: &str,
+    ) -> Result<(), ClientError> {
+        let workspace = decode_offer_id(ws_hex)
+            .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
+        let channel = decode_offer_id(channel_hex)
+            .ok_or_else(|| ClientError::Workspace("bad channel id".into()))?;
+        self.conn.send(ClientMsg::VoiceMoveMember {
+            workspace,
+            channel,
+            member: member.to_string(),
         });
         Ok(())
     }
@@ -6436,6 +6501,10 @@ impl Client {
             } => Some(Event::JoinRequested {
                 workspace: hex::encode(workspace),
                 requester,
+            }),
+            ServerMsg::VoiceMoved { workspace, channel } => Some(Event::VoiceMoveTo {
+                workspace: hex::encode(workspace),
+                channel: hex::encode(channel),
             }),
             ServerMsg::Workspaces { workspaces } => {
                 // Fetch the full log for any workspace we do not yet hold, so a

@@ -61,6 +61,17 @@ pub struct ChannelInfo {
     pub category: Option<CategoryId>,
 }
 
+/// One category's structure: its name and (for nested categories) its parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryInfo {
+    pub name: String,
+    pub parent: Option<CategoryId>,
+}
+
+/// How deep categories may nest (root is depth 0). Bounds the sidebar tree so a
+/// pathological chain of parents cannot be built.
+pub const MAX_CATEGORY_DEPTH: usize = 6;
+
 /// The state produced by replaying a workspace's op-log. Authoritative for who
 /// is a member, their roles and identity keys, and the channel/category tree.
 #[derive(Debug, Clone, Default)]
@@ -72,7 +83,7 @@ pub struct WorkspaceState {
     pub members: BTreeMap<String, Vec<u8>>,
     /// Members -> role. Every member has an entry; absent means `Member`.
     pub roles: BTreeMap<String, Role>,
-    pub categories: BTreeMap<CategoryId, String>,
+    pub categories: BTreeMap<CategoryId, CategoryInfo>,
     pub channels: BTreeMap<ChannelId, ChannelInfo>,
     /// Explicit member set of each **private** channel. Public channels are not
     /// tracked here -- their members are the whole workspace ([`channel_members`]).
@@ -244,7 +255,13 @@ impl WorkspaceState {
                 if self.categories.contains_key(category) {
                     return Err(OpError::BadTarget);
                 }
-                self.categories.insert(*category, name.clone());
+                self.categories.insert(
+                    *category,
+                    CategoryInfo {
+                        name: name.clone(),
+                        parent: None,
+                    },
+                );
             }
 
             WorkspaceOp::CreateChannel {
@@ -322,8 +339,70 @@ impl WorkspaceState {
                     return Err(OpError::BadTarget);
                 }
             }
+
+            WorkspaceOp::SetChannelCategory { channel, category } => {
+                require(actor >= Role::Admin)?;
+                if let Some(cat) = category {
+                    if !self.categories.contains_key(cat) {
+                        return Err(OpError::BadTarget);
+                    }
+                }
+                let ch = self.channels.get_mut(channel).ok_or(OpError::BadTarget)?;
+                ch.category = *category;
+            }
+
+            WorkspaceOp::SetCategoryParent { category, parent } => {
+                require(actor >= Role::Admin)?;
+                if !self.categories.contains_key(category) {
+                    return Err(OpError::BadTarget);
+                }
+                if let Some(p) = parent {
+                    // Parent must exist, must not be the category itself or one of
+                    // its descendants (a cycle), and the nesting must stay bounded.
+                    if !self.categories.contains_key(p) {
+                        return Err(OpError::BadTarget);
+                    }
+                    if self.category_reaches(p, category) || self.category_depth(p) + 1 >= MAX_CATEGORY_DEPTH
+                    {
+                        return Err(OpError::BadTarget);
+                    }
+                }
+                self.categories
+                    .get_mut(category)
+                    .ok_or(OpError::BadTarget)?
+                    .parent = *parent;
+            }
         }
         Ok(())
+    }
+
+    /// Whether `from` is `target` or has `target` among its ancestors (walking up
+    /// the parent chain). Used to reject a category move that would form a cycle.
+    fn category_reaches(&self, from: &CategoryId, target: &CategoryId) -> bool {
+        let mut cur = Some(*from);
+        // Bounded by the existing (acyclic) tree; the depth cap also stops here.
+        for _ in 0..=MAX_CATEGORY_DEPTH {
+            match cur {
+                Some(c) if &c == target => return true,
+                Some(c) => cur = self.categories.get(&c).and_then(|ci| ci.parent),
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// The depth of a category (root = 0), clamped so a corrupt chain terminates.
+    fn category_depth(&self, cat: &CategoryId) -> usize {
+        let mut depth = 0;
+        let mut cur = self.categories.get(cat).and_then(|ci| ci.parent);
+        while let Some(p) = cur {
+            depth += 1;
+            if depth > MAX_CATEGORY_DEPTH {
+                break;
+            }
+            cur = self.categories.get(&p).and_then(|ci| ci.parent);
+        }
+        depth
     }
 
     /// The effective members of a channel: for a private channel, its explicit
@@ -532,6 +611,102 @@ mod tests {
         .unwrap();
         assert_eq!(st.apply(&bad), Err(OpError::Unauthorized));
         assert_eq!(st.channels.len(), 1);
+    }
+
+    #[test]
+    fn channels_and_categories_can_be_reparented() {
+        let (mut st, owner, _admin, _member) = seed();
+        let (a, b, chan) = ([1u8; 16], [2u8; 16], [3u8; 16]);
+        let mk = |st: &WorkspaceState, op| sign_op(&owner, "owner#1", st, 200, op).unwrap();
+
+        st.apply(&mk(&st, WorkspaceOp::CreateCategory { category: a, name: "A".into() }))
+            .unwrap();
+        st.apply(&mk(&st, WorkspaceOp::CreateCategory { category: b, name: "B".into() }))
+            .unwrap();
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::CreateChannel {
+                channel: chan,
+                name: "general".into(),
+                kind: ChannelKind::Text,
+                private: false,
+                category: None,
+            },
+        ))
+        .unwrap();
+
+        // Move the channel into A, then B, then back to the top level.
+        st.apply(&mk(&st, WorkspaceOp::SetChannelCategory { channel: chan, category: Some(a) }))
+            .unwrap();
+        assert_eq!(st.channels[&chan].category, Some(a));
+        st.apply(&mk(&st, WorkspaceOp::SetChannelCategory { channel: chan, category: Some(b) }))
+            .unwrap();
+        assert_eq!(st.channels[&chan].category, Some(b));
+        st.apply(&mk(&st, WorkspaceOp::SetChannelCategory { channel: chan, category: None }))
+            .unwrap();
+        assert_eq!(st.channels[&chan].category, None);
+
+        // Nest B under A.
+        st.apply(&mk(&st, WorkspaceOp::SetCategoryParent { category: b, parent: Some(a) }))
+            .unwrap();
+        assert_eq!(st.categories[&b].parent, Some(a));
+        // Un-nest.
+        st.apply(&mk(&st, WorkspaceOp::SetCategoryParent { category: b, parent: None }))
+            .unwrap();
+        assert_eq!(st.categories[&b].parent, None);
+    }
+
+    #[test]
+    fn a_category_move_is_rejected_when_it_would_cycle_or_target_is_missing() {
+        let (mut st, owner, _admin, _member) = seed();
+        let (a, b) = ([1u8; 16], [2u8; 16]);
+        let mk = |st: &WorkspaceState, op| sign_op(&owner, "owner#1", st, 200, op).unwrap();
+        st.apply(&mk(&st, WorkspaceOp::CreateCategory { category: a, name: "A".into() }))
+            .unwrap();
+        st.apply(&mk(&st, WorkspaceOp::CreateCategory { category: b, name: "B".into() }))
+            .unwrap();
+        // B under A is fine.
+        st.apply(&mk(&st, WorkspaceOp::SetCategoryParent { category: b, parent: Some(a) }))
+            .unwrap();
+        // A under B would form a cycle: rejected, state unchanged.
+        let bad = mk(&st, WorkspaceOp::SetCategoryParent { category: a, parent: Some(b) });
+        assert_eq!(st.apply(&bad), Err(OpError::BadTarget));
+        assert_eq!(st.categories[&a].parent, None);
+        // A category cannot be its own parent.
+        let selfp = mk(&st, WorkspaceOp::SetCategoryParent { category: a, parent: Some(a) });
+        assert_eq!(st.apply(&selfp), Err(OpError::BadTarget));
+        // A missing parent / a missing category / a missing channel are rejected.
+        let missing_parent = mk(&st, WorkspaceOp::SetCategoryParent { category: a, parent: Some([9u8; 16]) });
+        assert_eq!(st.apply(&missing_parent), Err(OpError::BadTarget));
+        let missing_cat = mk(&st, WorkspaceOp::SetCategoryParent { category: [8u8; 16], parent: None });
+        assert_eq!(st.apply(&missing_cat), Err(OpError::BadTarget));
+        let missing_chan = mk(&st, WorkspaceOp::SetChannelCategory { channel: [7u8; 16], category: Some(a) });
+        assert_eq!(st.apply(&missing_chan), Err(OpError::BadTarget));
+    }
+
+    #[test]
+    fn category_nesting_is_depth_bounded() {
+        let (mut st, owner, _admin, _member) = seed();
+        let mk = |st: &WorkspaceState, op| sign_op(&owner, "owner#1", st, 200, op).unwrap();
+        // Create a chain of categories and nest each under the previous, up to the
+        // cap; the move that would exceed MAX_CATEGORY_DEPTH is rejected.
+        let ids: Vec<[u8; 16]> = (0..(MAX_CATEGORY_DEPTH as u8 + 2)).map(|i| [i + 1; 16]).collect();
+        for (i, id) in ids.iter().enumerate() {
+            st.apply(&mk(&st, WorkspaceOp::CreateCategory { category: *id, name: format!("c{i}") }))
+                .unwrap();
+        }
+        let mut last_ok = 0usize;
+        for i in 1..ids.len() {
+            let op = mk(&st, WorkspaceOp::SetCategoryParent { category: ids[i], parent: Some(ids[i - 1]) });
+            match st.apply(&op) {
+                Ok(()) => last_ok = i,
+                Err(OpError::BadTarget) => break,
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        // The deepest child sits at depth MAX_CATEGORY_DEPTH - 1 (root is 0), so the
+        // op that would push a child to MAX_CATEGORY_DEPTH is refused.
+        assert!(last_ok >= 1 && last_ok < ids.len() - 1, "nesting stopped at the cap");
     }
 
     #[test]

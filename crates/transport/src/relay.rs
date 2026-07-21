@@ -1323,6 +1323,42 @@ impl Relay {
                 }]
             }
 
+            ClientMsg::VoiceMoveMember {
+                workspace,
+                channel,
+                member,
+            } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                // Only an admin may move others between voice channels.
+                if !self.workspaces.is_admin(&workspace, &me) {
+                    return workspace_error(from, "only an admin can move members between voice channels");
+                }
+                // The target must be a voice channel the member is allowed into.
+                if !self.workspaces.is_voice_channel(&workspace, &channel)
+                    || !self.workspaces.is_channel_member(&workspace, &channel, &member)
+                {
+                    return vec![];
+                }
+                // The member must currently be in some OTHER voice channel here.
+                let in_other_voice = self.voice_presence.iter().any(|((ws, ch), set)| {
+                    *ws == workspace && *ch != channel && set.contains(&member)
+                });
+                if !in_other_voice {
+                    return workspace_error(from, "that member is not in another voice channel here");
+                }
+                // Direct the member's client to switch; its VoiceJoin/Leave carry
+                // the presence change, so nothing is double counted here.
+                match self.device_conn.get(&DeviceId(member)) {
+                    Some(&conn) => vec![Outgoing {
+                        to: conn,
+                        msg: ServerMsg::VoiceMoved { workspace, channel },
+                    }],
+                    None => vec![],
+                }
+            }
+
             ClientMsg::RequestDm { to } => {
                 let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
                     return vec![];

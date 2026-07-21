@@ -272,6 +272,20 @@ Target: up to a few hundred members, tens of channels. Costs:
     single multi-member MLS commit would trim commits under churn; at
     medium-community scale the serial queue is correct and sufficient, so that
     micro-optimization is intentionally not built.)
+- **M7 [DONE] -- sidebar hierarchy & voice moves.**
+  - **Nested, draggable tree.** Categories collapse/expand (one chevron per
+    header; a single header `+` chooses channel-or-category), and channels and
+    categories reparent by drag: `SetChannelCategory` moves a channel, and
+    `SetCategoryParent` nests a category under another. The op-log refuses a move
+    that would form a cycle or exceed `MAX_CATEGORY_DEPTH`. Tests:
+    `channels_and_categories_can_be_reparented`, `a_channel_can_be_created_inside_a_category`,
+    `a_category_move_is_rejected_when_it_would_cycle_or_target_is_missing`,
+    `category_nesting_is_depth_bounded`.
+  - **Admin voice moves.** An admin drags a member from one voice channel onto
+    another; the relay (checking the admin role and that the target is a voice
+    channel the member may enter) directs the member's client to switch, so
+    presence flows through the member's own join/leave and is never double
+    counted. Test: `an_admin_moves_a_member_between_voice_channels`.
 
 Each milestone landed with its tests and a THREAT_MODEL update.
 

@@ -815,6 +815,19 @@ op cannot brick a log's chain for everyone. Proven by the crypto workspace tests
   channel rekeys its own group) **and** rotates every channel's history-key epoch,
   so the removed member holds no post-removal key
   (`client::workspace_remove_member`).
+- **Tampering / DoS -- sidebar reorganization (drag-to-nest).** *Mitigate.*
+  Moving a channel to a category (`SetChannelCategory`) or nesting a category
+  under another (`SetCategoryParent`) is an admin-only signed op like any other,
+  and the op-log refuses a category move that would form a cycle or exceed
+  `MAX_CATEGORY_DEPTH`, so a malicious or buggy client cannot build a
+  non-terminating tree. Proven by the crypto category-move tests.
+- **Elevation of privilege -- moving a member between voice channels.**
+  *Mitigate.* Only an admin may drag another member to a voice channel; the relay
+  checks the mover's role and that the target is a voice channel the member may
+  enter, then merely *directs* the member's client, which switches via its own
+  join/leave (`ClientMsg::VoiceMoveMember` -> `ServerMsg::VoiceMoved`). A
+  non-admin's attempt is refused; proven by
+  `an_admin_moves_a_member_between_voice_channels`.
 
 ### Residual / accepted risks
 

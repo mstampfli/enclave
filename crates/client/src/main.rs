@@ -402,6 +402,22 @@ enum UiCommand {
         workspace: String,
         name: String,
     },
+    /// Move a channel under a category (drag onto a category), or to the top
+    /// level when `category` is absent.
+    MoveChannel {
+        workspace: String,
+        channel: String,
+        #[serde(default)]
+        category: Option<String>,
+    },
+    /// Nest a category under another (drag onto a category), or to the top level
+    /// when `parent` is absent.
+    MoveCategory {
+        workspace: String,
+        category: String,
+        #[serde(default)]
+        parent: Option<String>,
+    },
     SendChannelPost {
         workspace: String,
         channel: String,
@@ -433,6 +449,12 @@ enum UiCommand {
     /// Redeem an invite code to join its workspace.
     RedeemInvite {
         code: String,
+    },
+    /// As an admin, move a member to another voice channel (drag them onto it).
+    VoiceMoveMember {
+        workspace: String,
+        channel: String,
+        member: String,
     },
 }
 
@@ -549,6 +571,8 @@ struct WorkspaceOut {
 struct CategoryOut {
     id: String,
     name: String,
+    /// Parent category id (hex) for nesting, or `None` at the top level.
+    parent: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -616,9 +640,10 @@ fn workspace_views(c: &enclave_client::Client) -> Vec<WorkspaceOut> {
         let categories = state
             .categories
             .iter()
-            .map(|(cid, name)| CategoryOut {
+            .map(|(cid, info)| CategoryOut {
                 id: hex::encode(cid),
-                name: name.clone(),
+                name: info.name.clone(),
+                parent: info.parent.map(hex::encode),
             })
             .collect();
         let channels = state
@@ -1790,6 +1815,22 @@ async fn run_client(
                         }
                     }
                 }
+                Event::VoiceMoveTo { workspace, channel } => {
+                    // An admin moved us: join the target voice channel (which leaves
+                    // the one we were in) and start audio best-effort.
+                    if let Some(c) = client.as_mut() {
+                        if c.join_voice_channel(&workspace, &channel).is_ok() {
+                            let _ = c.start_voice_media().await;
+                            emit(
+                                &proxy,
+                                UiEvent::Status {
+                                    message: "You were moved to another voice channel.".into(),
+                                    error: false,
+                                },
+                            );
+                        }
+                    }
+                }
                 Event::VoicePresence {
                     workspace,
                     channel,
@@ -2845,6 +2886,28 @@ async fn handle_command(
                 }
             }
         }
+        UiCommand::MoveChannel {
+            workspace,
+            channel,
+            category,
+        } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.move_channel(&workspace, &channel, category.as_deref()) {
+                    error_status(proxy, format!("Could not move channel: {e}"));
+                }
+            }
+        }
+        UiCommand::MoveCategory {
+            workspace,
+            category,
+            parent,
+        } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.move_category(&workspace, &category, parent.as_deref()) {
+                    error_status(proxy, format!("Could not move category: {e}"));
+                }
+            }
+        }
         UiCommand::SendChannelPost {
             workspace,
             channel,
@@ -2883,6 +2946,17 @@ async fn handle_command(
         UiCommand::RedeemInvite { code } => {
             if let Some(c) = client.as_mut() {
                 c.redeem_invite(&code);
+            }
+        }
+        UiCommand::VoiceMoveMember {
+            workspace,
+            channel,
+            member,
+        } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.voice_move_member(&workspace, &channel, &member) {
+                    error_status(proxy, format!("Could not move member: {e}"));
+                }
             }
         }
         UiCommand::JoinVoice { workspace, channel } => {

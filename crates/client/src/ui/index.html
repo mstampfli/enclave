@@ -429,6 +429,11 @@ input[type="checkbox"], select { cursor: pointer; }
   font-size: 15px; line-height: 1; }
 .ws-chan .ws-chan-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ws-chan .ws-lock { width: 12px; height: 12px; color: var(--faint); flex: none; }
+/* Drag-to-nest: a grab cursor on draggable rows, a neutral fill on the drop
+   target, and a dimmed source while dragging. */
+.ws-chan[draggable="true"], .ws-cat[draggable="true"] { cursor: grab; }
+.ws-chan.dragging, .ws-cat.dragging { opacity: 0.45; }
+.ws-chan.drag-over, .ws-cat.drag-over { background: var(--raised); border-radius: var(--radius); }
 .ws-voice-here { padding: 2px 8px 6px 30px; display: flex; flex-direction: column; gap: 3px; }
 .ws-voice-here .vh { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
 .ws-voice-here .vh .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
@@ -1469,6 +1474,9 @@ label.member-row:hover { background: var(--raised); }
     <div class="side-scroll" id="ws-panel" hidden>
       <div class="ws-head">
         <div class="ws-title" id="ws-title"></div>
+        <button class="ws-gear" id="ws-add-item" title="Add a channel or category" hidden aria-label="Add a channel or category">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
         <button class="ws-gear" id="ws-manage" title="Manage workspace" hidden aria-label="Manage workspace">
           <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         </button>
@@ -2122,6 +2130,21 @@ label.member-row:hover { background: var(--raised); }
     <div class="m-actions">
       <button class="btn" data-close>Cancel</button>
       <button class="btn primary" id="group-create">Create group</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="modal-add-item" hidden>
+  <div class="modal modal-narrow">
+    <div class="m-head">
+      <h2>Add to workspace</h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="m-section">
+      <button class="btn primary" id="add-channel-btn" style="width:100%">Channel</button>
+      <button class="btn" id="add-category-btn" style="width:100%">Category</button>
+      <span class="hint" style="font-size:12.5px;color:var(--muted)">
+        Drag a channel or category onto another category to nest it.</span>
     </div>
   </div>
 </div>
@@ -5771,36 +5794,36 @@ function renderWsPanel() {
   $("ws-title").textContent = ws.name;
   const canManage = ws.my_role === "owner" || ws.my_role === "admin";
   $("ws-manage").hidden = !canManage;
+  $("ws-add-item").hidden = !canManage;
   const tree = $("ws-tree");
   tree.innerHTML = "";
 
-  // Uncategorized channels first (no header), then each category as a collapsible
-  // group of its channels -- the expandable hierarchy.
-  const cats = [{ id: null, name: null }].concat(ws.categories || []);
-  for (const cat of cats) {
-    const chans = (ws.channels || []).filter((c) => (c.category || null) === (cat.id || null));
-    if (!cat.id) {
-      for (const ch of chans) tree.appendChild(channelRow(ws, ch));
-      continue;
-    }
-    // Hide an empty category from members; managers keep it so they can fill it.
-    if (!chans.length && !canManage) continue;
-    const collapsed = collapsedCats.has(cat.id);
-    tree.appendChild(categoryHeader(ws, cat, collapsed, canManage));
-    for (const ch of chans) {
-      // Collapsed hides the group, but the channel you're in stays visible so it
-      // never vanishes from under you.
-      if (!collapsed || ch.id === activeChannel) tree.appendChild(channelRow(ws, ch));
-    }
-  }
+  const chansIn = (catId) => (ws.channels || []).filter((c) => (c.category || null) === (catId || null));
+  const subsOf = (catId) => (ws.categories || []).filter((c) => (c.parent || null) === (catId || null));
 
-  if (canManage) {
-    tree.appendChild(sectionAdd("Add channel", () => openChannelCreator(ws.id, null)));
-    tree.appendChild(
-      sectionAdd("New category", () =>
-        askInput("New category", "Group channels under a heading.", "Category name", "Create",
-          (name) => send({ type: "CreateCategory", workspace: ws.id, name }))));
+  // Top-level channels (no category) first, then each top-level category and its
+  // nested subtree -- the expandable, draggable hierarchy.
+  for (const ch of chansIn(null)) tree.appendChild(channelRow(ws, ch, 0, canManage));
+  for (const cat of subsOf(null)) renderCategory(ws, cat, 0, canManage, chansIn, subsOf, tree);
+}
+
+// Render one category header and, unless collapsed, its channels then its child
+// categories (recursively, each indented one level).
+function renderCategory(ws, cat, depth, canManage, chansIn, subsOf, tree) {
+  const chans = chansIn(cat.id);
+  const subs = subsOf(cat.id);
+  // Hide an empty category (no channels, no sub-categories) from members; managers
+  // keep it so they can fill or nest it.
+  if (!chans.length && !subs.length && !canManage) return;
+  const collapsed = collapsedCats.has(cat.id);
+  tree.appendChild(categoryHeader(ws, cat, collapsed, canManage, depth));
+  if (collapsed) {
+    // Keep the channel you're in visible even when its category is collapsed.
+    for (const ch of chans) if (ch.id === activeChannel) tree.appendChild(channelRow(ws, ch, depth + 1, canManage));
+    return;
   }
+  for (const ch of chans) tree.appendChild(channelRow(ws, ch, depth + 1, canManage));
+  for (const sub of subs) renderCategory(ws, sub, depth + 1, canManage, chansIn, subsOf, tree);
 }
 
 // Local, persisted collapse state for category headers (per category id).
@@ -5820,11 +5843,13 @@ function toggleCategory(catId) {
   renderWsPanel();
 }
 
-// A category heading: a chevron+name toggle that expands/collapses its channels,
-// plus (for managers) a + that creates a channel straight into this category.
-function categoryHeader(ws, cat, collapsed, canManage) {
+// A category heading: an indented chevron+name toggle that expands/collapses its
+// contents. Managers can drag it (to nest under another category) and drop a
+// channel or category onto it (to make that a child).
+function categoryHeader(ws, cat, collapsed, canManage, depth) {
   const head = document.createElement("div");
   head.className = "ws-cat" + (collapsed ? " collapsed" : "");
+  head.style.paddingLeft = 6 + depth * 12 + "px";
   const toggle = document.createElement("button");
   toggle.className = "ws-cat-toggle";
   toggle.innerHTML =
@@ -5835,30 +5860,17 @@ function categoryHeader(ws, cat, collapsed, canManage) {
   toggle.addEventListener("click", () => toggleCategory(cat.id));
   head.appendChild(toggle);
   if (canManage) {
-    const add = document.createElement("button");
-    add.className = "ws-cat-add";
-    add.title = "Create a channel in " + cat.name;
-    add.setAttribute("aria-label", add.title);
-    add.innerHTML = '<svg class="icon sm" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>';
-    add.addEventListener("click", () => openChannelCreator(ws.id, cat.id));
-    head.appendChild(add);
+    head.draggable = true;
+    makeDraggable(head, { type: "category", id: cat.id });
+    makeDropTarget(head, (item) => dropOnCategory(ws, item, cat.id));
   }
   return head;
 }
 
-// The "Add channel" / "New category" rows at the bottom of the tree.
-function sectionAdd(label, fn) {
-  const b = document.createElement("button");
-  b.className = "ws-sec-add";
-  b.innerHTML = '<svg class="icon sm" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg><span></span>';
-  b.querySelector("span").textContent = label;
-  b.addEventListener("click", fn);
-  return b;
-}
-
-function channelRow(ws, ch) {
+function channelRow(ws, ch, depth, canManage) {
   const row = document.createElement("button");
   row.className = "ws-chan" + (ch.id === activeChannel ? " active" : "");
+  row.style.paddingLeft = 8 + depth * 12 + "px";
   const ico = ch.kind === "voice"
     ? '<svg class="ws-chan-ico" viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>'
     : '<span class="ws-chan-ico">#</span>';
@@ -5868,19 +5880,30 @@ function channelRow(ws, ch) {
   row.innerHTML = ico + '<span class="ws-chan-name"></span>' + lock;
   row.querySelector(".ws-chan-name").textContent = ch.name;
   row.addEventListener("click", () => openChannel(ws.id, ch.id));
+  if (canManage) {
+    row.draggable = true;
+    makeDraggable(row, { type: "channel", id: ch.id });
+  }
   const wrap = document.createElement("div");
   wrap.appendChild(row);
-  // Voice occupants under a voice channel.
+  // Voice occupants under a voice channel. A manager can drag a person from one
+  // voice channel onto another (the voice row is a drop target for a person).
   if (ch.kind === "voice") {
+    if (canManage) makeVoiceDropTarget(row, ws, ch.id);
     const here = voicePresence[ch.id] || [];
     if (here.length) {
       const box = document.createElement("div");
       box.className = "ws-voice-here";
+      box.style.paddingLeft = 30 + depth * 12 + "px";
       for (const h of here) {
         const v = document.createElement("div");
         v.className = "vh";
         v.innerHTML = '<span class="dot"></span><span></span>';
         v.querySelector("span:last-child").textContent = displayOf(h);
+        if (canManage) {
+          v.draggable = true;
+          makeDraggable(v, { type: "voice-member", id: h, channel: ch.id });
+        }
         box.appendChild(v);
       }
       wrap.appendChild(box);
@@ -5888,6 +5911,87 @@ function channelRow(ws, ch) {
   }
   return wrap;
 }
+
+// ---- drag and drop (managers): nest channels/categories, move voice members ----
+let dragItem = null; // {type, id, ...}
+function makeDraggable(el, item) {
+  el.addEventListener("dragstart", (e) => {
+    dragItem = item;
+    el.classList.add("dragging");
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", item.type + ":" + item.id);
+    }
+  });
+  el.addEventListener("dragend", () => {
+    el.classList.remove("dragging");
+    dragItem = null;
+    document.querySelectorAll(".drag-over").forEach((x) => x.classList.remove("drag-over"));
+  });
+}
+function makeDropTarget(el, onDrop, accepts) {
+  el.addEventListener("dragover", (e) => {
+    if (!dragItem || (accepts && !accepts(dragItem))) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    el.classList.add("drag-over");
+  });
+  el.addEventListener("dragleave", () => el.classList.remove("drag-over"));
+  el.addEventListener("drop", (e) => {
+    if (!dragItem || (accepts && !accepts(dragItem))) return;
+    e.preventDefault();
+    e.stopPropagation();
+    el.classList.remove("drag-over");
+    onDrop(dragItem);
+  });
+}
+// Dropping a channel/category onto a category makes it a child of that category.
+function dropOnCategory(ws, item, catId) {
+  if (item.type === "channel") {
+    send({ type: "MoveChannel", workspace: ws.id, channel: item.id, category: catId });
+  } else if (item.type === "category" && item.id !== catId) {
+    send({ type: "MoveCategory", workspace: ws.id, category: item.id, parent: catId });
+  }
+}
+// A voice channel row accepts a dragged voice member from another voice channel.
+function makeVoiceDropTarget(row, ws, channelId) {
+  makeDropTarget(
+    row,
+    (item) => {
+      if (item.channel !== channelId) {
+        send({ type: "VoiceMoveMember", workspace: ws.id, channel: channelId, member: item.id });
+      }
+    },
+    (item) => item.type === "voice-member"
+  );
+}
+
+// The single "+" in the header: choose whether to add a channel or a category.
+$("ws-add-item").addEventListener("click", () => { if (activeWs) openModal("modal-add-item"); });
+$("add-channel-btn").addEventListener("click", () => {
+  closeModals();
+  if (activeWs) openChannelCreator(activeWs, null);
+});
+$("add-category-btn").addEventListener("click", () => {
+  closeModals();
+  if (!activeWs) return;
+  askInput("New category", "Group channels under a heading. Drag channels or categories onto it to nest them.",
+    "Category name", "Create",
+    (name) => send({ type: "CreateCategory", workspace: activeWs, name }));
+});
+// Dropping a channel or category in the tree's empty area moves it to the top
+// level (a category header's own drop handler stops propagation before this).
+(function initTreeRootDrop() {
+  const tree = $("ws-tree");
+  const nestable = () => dragItem && (dragItem.type === "channel" || dragItem.type === "category");
+  tree.addEventListener("dragover", (e) => { if (nestable()) e.preventDefault(); });
+  tree.addEventListener("drop", (e) => {
+    if (!nestable()) return;
+    e.preventDefault();
+    if (dragItem.type === "channel") send({ type: "MoveChannel", workspace: activeWs, channel: dragItem.id });
+    else send({ type: "MoveCategory", workspace: activeWs, category: dragItem.id });
+  });
+})();
 
 function openChannel(wsId, chId) {
   activeWs = wsId; activeChannel = chId;

@@ -264,6 +264,14 @@ impl WorkspaceStore {
             .is_some_and(|s| s.is_channel_member(channel, handle))
     }
 
+    /// Whether `channel` is a voice channel of `ws`.
+    pub fn is_voice_channel(&self, ws: &WorkspaceId, channel: &ChannelId) -> bool {
+        self.states
+            .get(ws)
+            .and_then(|s| s.channels.get(channel))
+            .is_some_and(|ch| ch.kind == enclave_protocol::ChannelKind::Voice)
+    }
+
     /// Store one sealed channel message for scrollback: assign it the channel's
     /// next seq, append it to the durable log, and evict the oldest past the cap
     /// (compacting the file in one rewrite once the slack fills).

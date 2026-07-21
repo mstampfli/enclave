@@ -25,6 +25,19 @@ async fn pump_until<F: Fn(&Client) -> bool>(client: &mut Client, pred: F) {
     assert!(pred(client), "condition never became true");
 }
 
+/// Pump two clients together until `pred` holds (or give up), so neither side's
+/// op-queue or delivery stalls waiting on the other.
+async fn pump2<F: Fn(&Client, &Client) -> bool>(a: &mut Client, b: &mut Client, pred: F) {
+    for _ in 0..300 {
+        if pred(a, b) {
+            return;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(20), a.next_event()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(20), b.next_event()).await;
+    }
+    assert!(pred(a, b), "pump2 condition never became true");
+}
+
 /// Make `a` and `b` mutual friends (request + accept), pumping both to settle.
 async fn become_friends(a: &mut Client, b: &mut Client) {
     let a_h = a.name().to_string();
@@ -2234,6 +2247,71 @@ async fn an_invite_code_admits_a_redeemer() {
     );
     pump_until(&mut owner, |c| {
         c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
+    })
+    .await;
+}
+
+/// An admin can drag a member from one voice channel to another: the relay
+/// (checking the admin role) directs the member's client, which joins the target
+/// -- so presence moves. A non-admin's move is refused. Proves the voice-move
+/// authorization and directive path end to end.
+#[tokio::test]
+async fn an_admin_moves_a_member_between_voice_channels() {
+    use enclave_protocol::Role;
+
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let mut bob = account(&url, "bob").await;
+    let bob_h = bob.name().to_string();
+
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+    owner.workspace_add_member(&ws, &bob_h).await.unwrap();
+    pump2(&mut owner, &mut bob, |_, b| {
+        b.workspace(&ws).is_some_and(|s| s.role_of(&bob_h) == Some(Role::Member))
+    })
+    .await;
+
+    let vc1 = owner.create_voice_channel(&ws, "Room A", None).unwrap();
+    let vc2 = owner.create_voice_channel(&ws, "Room B", None).unwrap();
+    pump2(&mut owner, &mut bob, |o, b| {
+        o.workspace(&ws).is_some_and(|s| s.channels.len() == 2)
+            && b.workspace(&ws).is_some_and(|s| s.channels.len() == 2)
+    })
+    .await;
+
+    // Bob joins Room A; the owner sees him there.
+    bob.join_voice_channel(&ws, &vc1).unwrap();
+    pump2(&mut owner, &mut bob, |o, _| o.voice_members(&ws, &vc1).contains(&bob_h)).await;
+
+    // A non-admin (bob) cannot move anyone: no presence change results.
+    bob.voice_move_member(&ws, &vc2, &bob_h).unwrap();
+    for _ in 0..10 {
+        let _ = tokio::time::timeout(Duration::from_millis(30), owner.next_event()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(30), bob.next_event()).await;
+    }
+    assert!(owner.voice_members(&ws, &vc1).contains(&bob_h), "non-admin move had no effect");
+
+    // The owner (admin) moves bob to Room B. Bob's client acts on the directive
+    // exactly as the app loop does (join the target on Event::VoiceMoveTo).
+    owner.voice_move_member(&ws, &vc2, &bob_h).unwrap();
+    let mut moved = false;
+    for _ in 0..200 {
+        if let Ok(Some(Event::VoiceMoveTo { workspace, channel })) =
+            tokio::time::timeout(Duration::from_millis(30), bob.next_event()).await
+        {
+            bob.join_voice_channel(&workspace, &channel).unwrap();
+            moved = true;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(10), owner.next_event()).await;
+        if owner.voice_members(&ws, &vc2).contains(&bob_h) {
+            break;
+        }
+    }
+    assert!(moved, "bob never received the move directive");
+    pump_until(&mut owner, |c| {
+        c.voice_members(&ws, &vc2).contains(&bob_h) && !c.voice_members(&ws, &vc1).contains(&bob_h)
     })
     .await;
 }
