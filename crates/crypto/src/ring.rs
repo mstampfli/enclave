@@ -269,12 +269,13 @@ pub fn ring_verify(msg: &[u8], scope: &[u8], ring: &[[u8; 32]], sig: &RingSig) -
     let h = hash_to_point(scope);
     let rb = ring_bytes(ring);
     let mut c = c0;
-    for i in 0..n {
-        let si = match scalar_from_canonical(&sig.s[i]) {
+    // `sig.s.len() == n == pubs.len()` (guarded above), so zip walks both fully.
+    for (pk, s) in pubs.iter().zip(sig.s.iter()) {
+        let si = match scalar_from_canonical(s) {
             Some(x) => x,
             None => return false,
         };
-        let l = si * G + c * pubs[i];
+        let l = si * G + c * pk;
         let r = si * h + c * key_image;
         c = challenge(msg, &rb, &sig.key_image, &l, &r);
     }

@@ -500,7 +500,8 @@ impl WorkspaceState {
                     if !self.categories.contains_key(p) {
                         return Err(OpError::BadTarget);
                     }
-                    if self.category_reaches(p, category) || self.category_depth(p) + 1 >= MAX_CATEGORY_DEPTH
+                    if self.category_reaches(p, category)
+                        || self.category_depth(p) + 1 >= MAX_CATEGORY_DEPTH
                     {
                         return Err(OpError::BadTarget);
                     }
@@ -789,10 +790,22 @@ mod tests {
         let (a, b, chan) = ([1u8; 16], [2u8; 16], [3u8; 16]);
         let mk = |st: &WorkspaceState, op| sign_op(&owner, "owner#1", st, 200, op).unwrap();
 
-        st.apply(&mk(&st, WorkspaceOp::CreateCategory { category: a, name: "A".into() }))
-            .unwrap();
-        st.apply(&mk(&st, WorkspaceOp::CreateCategory { category: b, name: "B".into() }))
-            .unwrap();
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::CreateCategory {
+                category: a,
+                name: "A".into(),
+            },
+        ))
+        .unwrap();
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::CreateCategory {
+                category: b,
+                name: "B".into(),
+            },
+        ))
+        .unwrap();
         st.apply(&mk(
             &st,
             WorkspaceOp::CreateChannel {
@@ -806,23 +819,53 @@ mod tests {
         .unwrap();
 
         // Move the channel into A, then B, then back to the top level.
-        st.apply(&mk(&st, WorkspaceOp::SetChannelCategory { channel: chan, category: Some(a) }))
-            .unwrap();
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::SetChannelCategory {
+                channel: chan,
+                category: Some(a),
+            },
+        ))
+        .unwrap();
         assert_eq!(st.channels[&chan].category, Some(a));
-        st.apply(&mk(&st, WorkspaceOp::SetChannelCategory { channel: chan, category: Some(b) }))
-            .unwrap();
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::SetChannelCategory {
+                channel: chan,
+                category: Some(b),
+            },
+        ))
+        .unwrap();
         assert_eq!(st.channels[&chan].category, Some(b));
-        st.apply(&mk(&st, WorkspaceOp::SetChannelCategory { channel: chan, category: None }))
-            .unwrap();
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::SetChannelCategory {
+                channel: chan,
+                category: None,
+            },
+        ))
+        .unwrap();
         assert_eq!(st.channels[&chan].category, None);
 
         // Nest B under A.
-        st.apply(&mk(&st, WorkspaceOp::SetCategoryParent { category: b, parent: Some(a) }))
-            .unwrap();
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::SetCategoryParent {
+                category: b,
+                parent: Some(a),
+            },
+        ))
+        .unwrap();
         assert_eq!(st.categories[&b].parent, Some(a));
         // Un-nest.
-        st.apply(&mk(&st, WorkspaceOp::SetCategoryParent { category: b, parent: None }))
-            .unwrap();
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::SetCategoryParent {
+                category: b,
+                parent: None,
+            },
+        ))
+        .unwrap();
         assert_eq!(st.categories[&b].parent, None);
     }
 
@@ -831,26 +874,74 @@ mod tests {
         let (mut st, owner, _admin, _member) = seed();
         let (a, b) = ([1u8; 16], [2u8; 16]);
         let mk = |st: &WorkspaceState, op| sign_op(&owner, "owner#1", st, 200, op).unwrap();
-        st.apply(&mk(&st, WorkspaceOp::CreateCategory { category: a, name: "A".into() }))
-            .unwrap();
-        st.apply(&mk(&st, WorkspaceOp::CreateCategory { category: b, name: "B".into() }))
-            .unwrap();
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::CreateCategory {
+                category: a,
+                name: "A".into(),
+            },
+        ))
+        .unwrap();
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::CreateCategory {
+                category: b,
+                name: "B".into(),
+            },
+        ))
+        .unwrap();
         // B under A is fine.
-        st.apply(&mk(&st, WorkspaceOp::SetCategoryParent { category: b, parent: Some(a) }))
-            .unwrap();
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::SetCategoryParent {
+                category: b,
+                parent: Some(a),
+            },
+        ))
+        .unwrap();
         // A under B would form a cycle: rejected, state unchanged.
-        let bad = mk(&st, WorkspaceOp::SetCategoryParent { category: a, parent: Some(b) });
+        let bad = mk(
+            &st,
+            WorkspaceOp::SetCategoryParent {
+                category: a,
+                parent: Some(b),
+            },
+        );
         assert_eq!(st.apply(&bad), Err(OpError::BadTarget));
         assert_eq!(st.categories[&a].parent, None);
         // A category cannot be its own parent.
-        let selfp = mk(&st, WorkspaceOp::SetCategoryParent { category: a, parent: Some(a) });
+        let selfp = mk(
+            &st,
+            WorkspaceOp::SetCategoryParent {
+                category: a,
+                parent: Some(a),
+            },
+        );
         assert_eq!(st.apply(&selfp), Err(OpError::BadTarget));
         // A missing parent / a missing category / a missing channel are rejected.
-        let missing_parent = mk(&st, WorkspaceOp::SetCategoryParent { category: a, parent: Some([9u8; 16]) });
+        let missing_parent = mk(
+            &st,
+            WorkspaceOp::SetCategoryParent {
+                category: a,
+                parent: Some([9u8; 16]),
+            },
+        );
         assert_eq!(st.apply(&missing_parent), Err(OpError::BadTarget));
-        let missing_cat = mk(&st, WorkspaceOp::SetCategoryParent { category: [8u8; 16], parent: None });
+        let missing_cat = mk(
+            &st,
+            WorkspaceOp::SetCategoryParent {
+                category: [8u8; 16],
+                parent: None,
+            },
+        );
         assert_eq!(st.apply(&missing_cat), Err(OpError::BadTarget));
-        let missing_chan = mk(&st, WorkspaceOp::SetChannelCategory { channel: [7u8; 16], category: Some(a) });
+        let missing_chan = mk(
+            &st,
+            WorkspaceOp::SetChannelCategory {
+                channel: [7u8; 16],
+                category: Some(a),
+            },
+        );
         assert_eq!(st.apply(&missing_chan), Err(OpError::BadTarget));
     }
 
@@ -860,14 +951,28 @@ mod tests {
         let mk = |st: &WorkspaceState, op| sign_op(&owner, "owner#1", st, 200, op).unwrap();
         // Create a chain of categories and nest each under the previous, up to the
         // cap; the move that would exceed MAX_CATEGORY_DEPTH is rejected.
-        let ids: Vec<[u8; 16]> = (0..(MAX_CATEGORY_DEPTH as u8 + 2)).map(|i| [i + 1; 16]).collect();
+        let ids: Vec<[u8; 16]> = (0..(MAX_CATEGORY_DEPTH as u8 + 2))
+            .map(|i| [i + 1; 16])
+            .collect();
         for (i, id) in ids.iter().enumerate() {
-            st.apply(&mk(&st, WorkspaceOp::CreateCategory { category: *id, name: format!("c{i}") }))
-                .unwrap();
+            st.apply(&mk(
+                &st,
+                WorkspaceOp::CreateCategory {
+                    category: *id,
+                    name: format!("c{i}"),
+                },
+            ))
+            .unwrap();
         }
         let mut last_ok = 0usize;
         for i in 1..ids.len() {
-            let op = mk(&st, WorkspaceOp::SetCategoryParent { category: ids[i], parent: Some(ids[i - 1]) });
+            let op = mk(
+                &st,
+                WorkspaceOp::SetCategoryParent {
+                    category: ids[i],
+                    parent: Some(ids[i - 1]),
+                },
+            );
             match st.apply(&op) {
                 Ok(()) => last_ok = i,
                 Err(OpError::BadTarget) => break,
@@ -876,7 +981,10 @@ mod tests {
         }
         // The deepest child sits at depth MAX_CATEGORY_DEPTH - 1 (root is 0), so the
         // op that would push a child to MAX_CATEGORY_DEPTH is refused.
-        assert!(last_ok >= 1 && last_ok < ids.len() - 1, "nesting stopped at the cap");
+        assert!(
+            last_ok >= 1 && last_ok < ids.len() - 1,
+            "nesting stopped at the cap"
+        );
     }
 
     #[test]

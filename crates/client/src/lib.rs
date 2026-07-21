@@ -168,7 +168,7 @@ const CHANNEL_PAGE: u32 = 100;
 fn parse_permissions(tokens: &[String]) -> Vec<enclave_protocol::Permission> {
     tokens
         .iter()
-        .filter_map(|s| enclave_protocol::Permission::from_str(s))
+        .filter_map(|s| enclave_protocol::Permission::from_token(s))
         .collect()
 }
 
@@ -876,6 +876,7 @@ pub struct Client {
     /// Per-channel history keys, epoch-indexed: `channel_keys[(ws,ch)][epoch]`.
     /// Seals channel messages and stored history; a new member is handed the
     /// current set so they can read scrollback.
+    #[allow(clippy::type_complexity)]
     channel_keys: HashMap<([u8; 16], [u8; 16]), Vec<[u8; 32]>>,
     /// Queued structural ops per workspace, submitted one at a time against the
     /// advancing op-log head so back-to-back ops never collide on a seq.
@@ -4041,7 +4042,7 @@ impl Client {
                 });
             }
         }
-        hits.sort_by(|a, b| b.ts.cmp(&a.ts));
+        hits.sort_by_key(|h| std::cmp::Reverse(h.ts));
         hits.truncate(300);
         hits
     }
@@ -4374,7 +4375,7 @@ impl Client {
             .iter()
             .map(|(id, s)| (hex::encode(id), s.name.clone()))
             .collect();
-        list.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        list.sort_by_key(|a| a.1.to_lowercase());
         list
     }
 
@@ -5394,9 +5395,11 @@ impl Client {
     /// Whether a channel has older history the UI can still load.
     pub fn channel_has_more(&self, ws_hex: &str, channel_hex: &str) -> bool {
         match (decode_offer_id(ws_hex), decode_offer_id(channel_hex)) {
-            (Some(ws), Some(ch)) => {
-                self.channel_hist_more.get(&(ws, ch)).copied().unwrap_or(false)
-            }
+            (Some(ws), Some(ch)) => self
+                .channel_hist_more
+                .get(&(ws, ch))
+                .copied()
+                .unwrap_or(false),
             _ => false,
         }
     }
@@ -6232,10 +6235,7 @@ impl Client {
                 let view = {
                     let conv = self.conversations.get_mut(&group)?;
                     let p = conv.polls.get_mut(&poll)?;
-                    let key = match p.ballot_key {
-                        Some(k) => k,
-                        None => return None, // not a buffered poll we know
-                    };
+                    let key = p.ballot_key?;
                     p.closed = true;
                     for (dev, sealed) in ballots {
                         // For an anonymous poll the ballot is a ring-signed AnonBallot:
@@ -6283,11 +6283,11 @@ impl Client {
                     Self::build_poll_view(p, &me)
                 };
                 self.save_session();
-                return Some(Event::PollUpdated {
+                Some(Event::PollUpdated {
                     conv: hex_id(&group),
                     id: hex::encode(poll),
                     poll: view,
-                });
+                })
             }
             ServerMsg::Text { group, message, .. } => {
                 // Decrypt one sealed part and hand it to this conversation's
@@ -6877,9 +6877,9 @@ impl Client {
             ServerMsg::GroupHistoryConfig { group, message, .. } => {
                 self.receive_group_hist_config(group, &message.0)
             }
-            ServerMsg::GroupHistory { group, messages, .. } => {
-                self.receive_group_history(group, messages)
-            }
+            ServerMsg::GroupHistory {
+                group, messages, ..
+            } => self.receive_group_history(group, messages),
             ServerMsg::VoicePresence {
                 workspace,
                 channel,

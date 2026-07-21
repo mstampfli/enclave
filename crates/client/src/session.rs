@@ -336,6 +336,8 @@ mod tests {
             edited: Vec::new(),
             polls: Vec::new(),
             pinned: Vec::new(),
+            history_epoch: None,
+            history_keys: Vec::new(),
         };
         let data = SessionData {
             conversations: vec![notes],

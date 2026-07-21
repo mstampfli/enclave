@@ -2186,7 +2186,6 @@ async fn a_workspace_is_created_and_a_member_is_added_end_to_end() {
 /// username. Proves the create -> redeem -> route-to-admin -> admit path.
 #[tokio::test]
 async fn an_invite_code_admits_a_redeemer() {
-
     let handle = serve("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", handle.addr);
     let mut owner = account(&url, "owner").await;
@@ -2215,17 +2214,16 @@ async fn an_invite_code_admits_a_redeemer() {
     carol.redeem_invite(&code);
     let mut admitted = false;
     for _ in 0..200 {
-        if let Ok(Some(ev)) =
-            tokio::time::timeout(Duration::from_millis(50), owner.next_event()).await
+        if let Ok(Some(Event::JoinRequested {
+            workspace,
+            requester,
+        })) = tokio::time::timeout(Duration::from_millis(50), owner.next_event()).await
         {
-            if let Event::JoinRequested {
-                workspace,
-                requester,
-            } = ev
-            {
-                owner.workspace_add_member(&workspace, &requester).await.unwrap();
-                admitted = true;
-            }
+            owner
+                .workspace_add_member(&workspace, &requester)
+                .await
+                .unwrap();
+            admitted = true;
         }
         let _ = tokio::time::timeout(Duration::from_millis(50), carol.next_event()).await;
         if carol
@@ -2237,7 +2235,9 @@ async fn an_invite_code_admits_a_redeemer() {
     }
     assert!(admitted, "owner never received the join request");
     assert!(
-        carol.workspace(&ws).is_some_and(|s| s.members.contains_key(&carol_h)),
+        carol
+            .workspace(&ws)
+            .is_some_and(|s| s.members.contains_key(&carol_h)),
         "redeemer did not become a member"
     );
     pump_until(&mut owner, |c| {
@@ -2353,7 +2353,6 @@ async fn group_history_sharing_backfills_a_new_member_from_when_it_was_enabled()
 /// authorization and directive path end to end.
 #[tokio::test]
 async fn an_admin_moves_a_member_between_voice_channels() {
-
     let handle = serve("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", handle.addr);
     let mut owner = account(&url, "owner").await;
@@ -2364,7 +2363,8 @@ async fn an_admin_moves_a_member_between_voice_channels() {
     pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
     owner.workspace_add_member(&ws, &bob_h).await.unwrap();
     pump2(&mut owner, &mut bob, |_, b| {
-        b.workspace(&ws).is_some_and(|s| s.members.contains_key(&bob_h))
+        b.workspace(&ws)
+            .is_some_and(|s| s.members.contains_key(&bob_h))
     })
     .await;
 
@@ -2378,7 +2378,10 @@ async fn an_admin_moves_a_member_between_voice_channels() {
 
     // Bob joins Room A; the owner sees him there.
     bob.join_voice_channel(&ws, &vc1).unwrap();
-    pump2(&mut owner, &mut bob, |o, _| o.voice_members(&ws, &vc1).contains(&bob_h)).await;
+    pump2(&mut owner, &mut bob, |o, _| {
+        o.voice_members(&ws, &vc1).contains(&bob_h)
+    })
+    .await;
 
     // A non-admin (bob) cannot move anyone: no presence change results.
     bob.voice_move_member(&ws, &vc2, &bob_h).unwrap();
@@ -2386,7 +2389,10 @@ async fn an_admin_moves_a_member_between_voice_channels() {
         let _ = tokio::time::timeout(Duration::from_millis(30), owner.next_event()).await;
         let _ = tokio::time::timeout(Duration::from_millis(30), bob.next_event()).await;
     }
-    assert!(owner.voice_members(&ws, &vc1).contains(&bob_h), "non-admin move had no effect");
+    assert!(
+        owner.voice_members(&ws, &vc1).contains(&bob_h),
+        "non-admin move had no effect"
+    );
 
     // The owner (admin) moves bob to Room B. Bob's client acts on the directive
     // exactly as the app loop does (join the target on Event::VoiceMoveTo).
@@ -2458,7 +2464,6 @@ async fn a_channel_can_be_created_inside_a_category() {
 /// the MLS commit and dropping all but the first (the old busy-check behavior).
 #[tokio::test]
 async fn a_burst_of_invite_redemptions_all_get_admitted() {
-
     let handle = serve("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", handle.addr);
     let mut owner = account(&url, "owner").await;
@@ -2509,10 +2514,11 @@ async fn a_burst_of_invite_redemptions_all_get_admitted() {
         let _ = tokio::time::timeout(Duration::from_millis(5), r1.next_event()).await;
         let _ = tokio::time::timeout(Duration::from_millis(5), r2.next_event()).await;
         let _ = tokio::time::timeout(Duration::from_millis(5), r3.next_event()).await;
-        if names
-            .iter()
-            .all(|n| owner.workspace(&ws).is_some_and(|s| s.members.contains_key(n)))
-        {
+        if names.iter().all(|n| {
+            owner
+                .workspace(&ws)
+                .is_some_and(|s| s.members.contains_key(n))
+        }) {
             break;
         }
     }
@@ -2870,7 +2876,9 @@ async fn a_private_channel_is_readable_only_by_its_members() {
     .await;
 
     // Owner creates a PRIVATE channel and adds only Bob to it.
-    let chan = owner.create_private_channel(&ws, "staff", None, false).unwrap();
+    let chan = owner
+        .create_private_channel(&ws, "staff", None, false)
+        .unwrap();
     pump_until(&mut owner, |c| {
         c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
     })

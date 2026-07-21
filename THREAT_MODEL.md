@@ -154,6 +154,19 @@ Target level L2 (private communications). Chapters touched and status:
   release and pins quick-xml 0.39. Waived in CI with this justification; drop
   the ignores when wayland-scanner releases against quick-xml >= 0.41.
 
+- **RUSTSEC-2026-0208 / 0209 / 0211 / 0212** -- the `libcrux-{sha3,aesgcm,secrets}`
+  crates pulled transitively by openmls's crypto provider (`openmls_rust_crypto`
+  -> `hpke-rs` -> `libcrux-*`), the same exact-pinned chain as 0124 with no
+  upgrade path yet. The two that touch the AEAD directly (0209, AES-GCM not
+  enforcing AAD length; 0211, non-constant-time tag check on decrypt) are **not
+  remotely reachable in Enclave's model:** the relay holds no key and never
+  decrypts, so there is no attacker-observable timing oracle on tag verification,
+  and Enclave's MLS uses small fixed AAD. 0212 (constant-time swap/select) is
+  Aarch64-only and 0208 is an AVX2 SHAKE-256 DoS panic of the same class as 0124.
+  Waived in CI; drop the ignores when openmls ships a provider on patched
+  libcrux. (Residual risk acknowledged: these are in the MLS AEAD path, so track
+  the upstream fix and re-evaluate rather than treat the waiver as permanent.)
+
 ## Account authentication (STRIDE + ASVS L2) -- zero-knowledge via OPAQUE
 
 Target level **L2**. Scope: account create / login / logout, credential storage,

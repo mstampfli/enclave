@@ -732,7 +732,11 @@ fn workspace_views(c: &enclave_client::Client) -> Vec<WorkspaceOut> {
             .map(|(rid, def)| RoleOut {
                 id: hex::encode(rid),
                 name: def.name.clone(),
-                permissions: def.permissions.iter().map(|p| p.as_str().to_string()).collect(),
+                permissions: def
+                    .permissions
+                    .iter()
+                    .map(|p| p.as_str().to_string())
+                    .collect(),
                 builtin: *rid == enclave_crypto::workspace::OWNER_ROLE_ID,
             })
             .collect();
@@ -1868,9 +1872,7 @@ async fn run_client(
                     },
                 ),
                 Event::ChannelHistoryChanged {
-                    workspace,
-                    channel,
-                    ..
+                    workspace, channel, ..
                 } => {
                     if let Some(c) = client.as_ref() {
                         emit(&proxy, channel_history_event(c, &workspace, &channel));
@@ -2242,32 +2244,32 @@ async fn handle_command(
             if let Some(c) = client.as_mut() {
                 c.set_display_name(&display);
                 emit_conversations(proxy, c);
-                emit_profile(proxy, c, &c.name().to_string());
+                emit_profile(proxy, c, c.name());
             }
         }
         UiCommand::SetCustomStatus { emoji, text } => {
             if let Some(c) = client.as_mut() {
                 c.set_custom_status(&emoji, &text);
-                emit_profile(proxy, c, &c.name().to_string());
+                emit_profile(proxy, c, c.name());
             }
         }
         UiCommand::SetAccent { accent } => {
             if let Some(c) = client.as_mut() {
                 c.set_accent(&accent);
-                emit_profile(proxy, c, &c.name().to_string());
+                emit_profile(proxy, c, c.name());
             }
         }
         UiCommand::SetBio { bio } => {
             if let Some(c) = client.as_mut() {
                 c.set_bio(&bio);
-                emit_profile(proxy, c, &c.name().to_string());
+                emit_profile(proxy, c, c.name());
             }
         }
         UiCommand::SetAvatar { data, mime } => {
             if let Some(c) = client.as_mut() {
                 match base64_decode(&data) {
                     Some(bytes) => match c.set_avatar(&bytes, &mime) {
-                        Ok(()) => emit_profile(proxy, c, &c.name().to_string()),
+                        Ok(()) => emit_profile(proxy, c, c.name()),
                         Err(e) => error_status(proxy, e.to_string()),
                     },
                     None => error_status(proxy, "avatar image could not be read".into()),
@@ -2277,7 +2279,7 @@ async fn handle_command(
         UiCommand::ClearAvatar => {
             if let Some(c) = client.as_mut() {
                 c.clear_avatar();
-                emit_profile(proxy, c, &c.name().to_string());
+                emit_profile(proxy, c, c.name());
             }
         }
         UiCommand::ExportSession => {

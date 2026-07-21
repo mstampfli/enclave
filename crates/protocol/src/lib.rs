@@ -408,9 +408,7 @@ pub enum ClientMsg {
     /// validates the code and routes a [`ServerMsg::JoinRequest`] to an online
     /// admin, whose client performs the (signed, op-logged) add. A dead code or
     /// no online admin comes back as [`ServerMsg::Error`].
-    RedeemInvite {
-        code: String,
-    },
+    RedeemInvite { code: String },
     /// Move another member from their current voice channel to `channel`. Admin
     /// only; the relay verifies the role and directs the member's client with
     /// [`ServerMsg::VoiceMoved`] (presence then flows via the member's normal
@@ -502,7 +500,7 @@ impl Permission {
     }
 
     /// Parse the token produced by [`Permission::as_str`].
-    pub fn from_str(s: &str) -> Option<Permission> {
+    pub fn from_token(s: &str) -> Option<Permission> {
         Permission::ALL.into_iter().find(|p| p.as_str() == s)
     }
 }

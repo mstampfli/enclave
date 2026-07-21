@@ -1216,9 +1216,9 @@ impl Relay {
                 if !self.workspaces.is_channel_member(&workspace, &channel, &me) {
                     return vec![];
                 }
-                let (messages, has_more) =
-                    self.workspaces
-                        .channel_history_page(&workspace, &channel, before, limit);
+                let (messages, has_more) = self
+                    .workspaces
+                    .channel_history_page(&workspace, &channel, before, limit);
                 vec![Outgoing {
                     to: from,
                     msg: ServerMsg::ChannelHistory {
@@ -1440,7 +1440,9 @@ impl Relay {
                 }
                 // The target must be a voice channel the member is allowed into.
                 if !self.workspaces.is_voice_channel(&workspace, &channel)
-                    || !self.workspaces.is_channel_member(&workspace, &channel, &member)
+                    || !self
+                        .workspaces
+                        .is_channel_member(&workspace, &channel, &member)
                 {
                     return vec![];
                 }
@@ -1449,7 +1451,10 @@ impl Relay {
                     *ws == workspace && *ch != channel && set.contains(&member)
                 });
                 if !in_other_voice {
-                    return workspace_error(from, "that member is not in another voice channel here");
+                    return workspace_error(
+                        from,
+                        "that member is not in another voice channel here",
+                    );
                 }
                 // Direct the member's client to switch; its VoiceJoin/Leave carry
                 // the presence change, so nothing is double counted here.

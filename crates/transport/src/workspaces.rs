@@ -201,7 +201,8 @@ impl WorkspaceStore {
                 msgs.drain(0..overflow);
             }
             let next_seq = msgs.last().map(|m| m.seq + 1).unwrap_or(0);
-            self.history.insert((ws, channel), ChannelLog { msgs, next_seq });
+            self.history
+                .insert((ws, channel), ChannelLog { msgs, next_seq });
         }
     }
 
@@ -449,7 +450,10 @@ impl WorkspaceStore {
 /// The JSON file holding invite codes for an op-log at `path`:
 /// `<parent>/<stem>-invites.json`.
 fn invites_path_for(path: &Path) -> PathBuf {
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("enclave-workspaces");
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("enclave-workspaces");
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!("{stem}-invites.json"))
 }
@@ -457,7 +461,10 @@ fn invites_path_for(path: &Path) -> PathBuf {
 /// The directory that holds per-channel history logs for an op-log at `path`:
 /// `<parent>/<stem>-history/`.
 fn history_dir_for(path: &Path) -> PathBuf {
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("enclave-workspaces");
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("enclave-workspaces");
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!("{stem}-history"))
 }
@@ -480,7 +487,11 @@ fn append_history_record(path: &Path, record: &StoredMsg) {
     let Ok(bytes) = bincode::serialize(record) else {
         return;
     };
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let len = bytes.len() as u32;
         let _ = f.write_all(&len.to_le_bytes());
         let _ = f.write_all(&bytes);
