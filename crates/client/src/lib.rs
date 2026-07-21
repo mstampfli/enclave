@@ -710,6 +710,31 @@ struct Conversation {
     /// Ids of messages pinned in this conversation. Pins are shared: any member
     /// may pin or unpin, and every member sees the same set.
     pinned: HashSet<[u8; 16]>,
+    /// Group history sharing: `Some(epoch)` means it is on -- new text is also
+    /// off-ratchet-sealed under `history_keys[epoch]` and stored server-side so a
+    /// future member can read it; `None` means off. Opt-in per group; while on,
+    /// the stored copies have no forward secrecy. A disable then re-enable starts
+    /// a fresh epoch, and a new member only ever gets the current epoch's key.
+    history_epoch: Option<u64>,
+    /// The per-epoch history keys we hold (to seal our sends and open backfill).
+    history_keys: std::collections::BTreeMap<u64, [u8; 32]>,
+}
+
+/// The MLS-sealed control message that toggles group history sharing and carries
+/// the epoch key. `enabled = false` turns it off (key ignored).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GroupHistCtl {
+    enabled: bool,
+    epoch: u64,
+    key: [u8; 32],
+}
+
+/// The 16-byte id a group's stored history is keyed/AAD-bound by (the first half
+/// of the 32-byte group id). Must match the relay's `group_store_id`.
+fn group_hist_id(group: &GroupId) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&group.0[..16]);
+    id
 }
 
 #[derive(Clone)]
@@ -1684,6 +1709,8 @@ impl Client {
                 edited: HashSet::new(),
                 polls: HashMap::new(),
                 pinned: HashSet::new(),
+                history_epoch: None,
+                history_keys: std::collections::BTreeMap::new(),
             },
         );
         self.invite_peer(&dm_id, friend, "").await?;
@@ -1728,6 +1755,8 @@ impl Client {
                 edited: HashSet::new(),
                 polls: HashMap::new(),
                 pinned: HashSet::new(),
+                history_epoch: None,
+                history_keys: std::collections::BTreeMap::new(),
             },
         );
         for member in members {
@@ -1774,6 +1803,8 @@ impl Client {
                 edited: HashSet::new(),
                 polls: HashMap::new(),
                 pinned: HashSet::new(),
+                history_epoch: None,
+                history_keys: std::collections::BTreeMap::new(),
             },
         );
         self.active = Some(id.clone());
@@ -1838,6 +1869,9 @@ impl Client {
             group: group_id.clone(),
             message: Sealed(add.commit),
         });
+        // If group history sharing is on, hand the joiner the current epoch key so
+        // they can read history shared since it was enabled.
+        self.share_group_history_key_with(group_id, friend);
         Ok(())
     }
 
@@ -2819,6 +2853,8 @@ impl Client {
         };
         let id = self.send_transfer(&group_id, TransferMeta::Text, &body.encode())?;
         let ts = now_ms();
+        // If group history sharing is on, also store this text for scrollback.
+        self.store_group_history_text(&group_id, id, &me, text, ts);
         if let Some(conv) = self.conversations.get_mut(&group_id) {
             conv.history.push(ChatLine {
                 id,
@@ -5510,6 +5546,263 @@ impl Client {
 
     /// Persist the live conversations (MLS group state + scoped history)
     /// encrypted at rest under the OPAQUE export key.
+    /// Turn group history sharing on or off. On starts a fresh epoch with a new
+    /// key (so only messages from now on are stored and readable by future
+    /// members); off stops storing. The setting + key are MLS-sealed to members.
+    /// While on, the stored copies have no forward secrecy (see the field docs).
+    pub fn set_group_history(&mut self, conv: &str, enable: bool) -> Result<(), ClientError> {
+        let group = self
+            .conversations
+            .keys()
+            .find(|k| hex_id(k) == conv)
+            .cloned()
+            .ok_or(ClientError::NoGroup)?;
+        let ctl = if enable {
+            let next = self
+                .conversations
+                .get(&group)
+                .and_then(|c| c.history_keys.keys().max().copied())
+                .map(|m| m + 1)
+                .unwrap_or(0);
+            let mut key = [0u8; 32];
+            let _ = getrandom::getrandom(&mut key);
+            GroupHistCtl {
+                enabled: true,
+                epoch: next,
+                key,
+            }
+        } else {
+            GroupHistCtl {
+                enabled: false,
+                epoch: 0,
+                key: [0u8; 32],
+            }
+        };
+        let plaintext = bincode::serialize(&ctl).unwrap_or_default();
+        let sealed = {
+            let Self {
+                identity,
+                conversations,
+                ..
+            } = self;
+            let c = conversations.get_mut(&group).ok_or(ClientError::NoGroup)?;
+            let idn = identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
+            let g = c.group.as_mut().ok_or(ClientError::NoGroup)?;
+            g.encrypt_text(idn, &plaintext)?
+        };
+        self.apply_group_hist_ctl(&group, &ctl);
+        self.conn.send(ClientMsg::GroupHistoryConfig {
+            group,
+            to: None,
+            message: Sealed(sealed),
+        });
+        self.save_session();
+        Ok(())
+    }
+
+    /// Whether group history sharing is currently on for a conversation.
+    pub fn group_history_on(&self, conv: &str) -> bool {
+        self.conversations
+            .iter()
+            .find(|(k, _)| hex_id(k) == conv)
+            .is_some_and(|(_, c)| c.history_epoch.is_some())
+    }
+
+    /// Apply a history-sharing control (ours or a peer's): update the epoch and
+    /// keys, and if we just learned a key we lacked (we are likely a new member),
+    /// fetch that epoch's backlog.
+    fn apply_group_hist_ctl(&mut self, group: &GroupId, ctl: &GroupHistCtl) {
+        let mut fetch = false;
+        if let Some(c) = self.conversations.get_mut(group) {
+            if ctl.enabled {
+                fetch = !c.history_keys.contains_key(&ctl.epoch);
+                c.history_keys.insert(ctl.epoch, ctl.key);
+                c.history_epoch = Some(ctl.epoch);
+            } else {
+                c.history_epoch = None;
+            }
+        }
+        if fetch {
+            self.conn.send(ClientMsg::GroupHistoryFetch {
+                group: group.clone(),
+                before: None,
+                limit: CHANNEL_PAGE,
+            });
+        }
+    }
+
+    /// If group history sharing is on, also store one text line for scrollback:
+    /// off-ratchet-seal it under the epoch key and post it to the relay.
+    fn store_group_history_text(
+        &mut self,
+        group: &GroupId,
+        id: [u8; 16],
+        sender: &str,
+        text: &str,
+        ts: u64,
+    ) {
+        let (epoch, key) = match self.conversations.get(group).and_then(|c| {
+            c.history_epoch
+                .and_then(|e| c.history_keys.get(&e).map(|k| (e, *k)))
+        }) {
+            Some(v) => v,
+            None => return,
+        };
+        let sid = group_hist_id(group);
+        let sig = match self.identity.as_ref() {
+            Some(idn) => {
+                let body = channel_msg_body(&sid, &id, sender, text, ts);
+                match idn.sign_op(WS_CHANNEL_MSG_CONTEXT, &body) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                }
+            }
+            None => return,
+        };
+        let wire = ChannelWire {
+            id,
+            sender: sender.to_string(),
+            text: text.to_string(),
+            ts,
+            sig,
+        };
+        let plaintext = bincode::serialize(&wire).unwrap_or_default();
+        if let Ok(sealed) = enclave_crypto::seal_channel(&key, &sid, epoch, &plaintext) {
+            self.conn.send(ClientMsg::GroupHistoryPost {
+                group: group.clone(),
+                epoch,
+                message: Sealed(sealed),
+            });
+        }
+    }
+
+    /// Hand a new group member the current epoch's history key (directed), so they
+    /// can read history shared since it was enabled. No-op if sharing is off.
+    fn share_group_history_key_with(&mut self, group: &GroupId, handle: &str) {
+        let ctl = match self.conversations.get(group).and_then(|c| {
+            c.history_epoch
+                .and_then(|e| c.history_keys.get(&e).map(|k| (e, *k)))
+        }) {
+            Some((epoch, key)) => GroupHistCtl {
+                enabled: true,
+                epoch,
+                key,
+            },
+            None => return,
+        };
+        let plaintext = bincode::serialize(&ctl).unwrap_or_default();
+        let sealed = {
+            let Self {
+                identity,
+                conversations,
+                ..
+            } = self;
+            let (Some(c), Some(idn)) = (conversations.get_mut(group), identity.as_ref()) else {
+                return;
+            };
+            let Some(g) = c.group.as_mut() else {
+                return;
+            };
+            match g.encrypt_text(idn, &plaintext) {
+                Ok(s) => s,
+                Err(_) => return,
+            }
+        };
+        self.conn.send(ClientMsg::GroupHistoryConfig {
+            group: group.clone(),
+            to: Some(handle.to_string()),
+            message: Sealed(sealed),
+        });
+    }
+
+    /// Receive a peer's history-sharing control (MLS-sealed): decrypt and apply.
+    fn receive_group_hist_config(&mut self, group: GroupId, message: &[u8]) -> Option<Event> {
+        let plaintext = {
+            let Self {
+                identity,
+                conversations,
+                ..
+            } = self;
+            let c = conversations.get_mut(&group)?;
+            let g = c.group.as_mut()?;
+            let idn = identity.as_ref()?;
+            g.decrypt_text(idn, message).ok()?.plaintext
+        };
+        let ctl: GroupHistCtl = bincode::deserialize(&plaintext).ok()?;
+        self.apply_group_hist_ctl(&group, &ctl);
+        self.save_session();
+        Some(Event::ConversationsChanged)
+    }
+
+    /// Receive a page of group history backfill: open each, verify the sender's
+    /// signature against their group identity key, dedup, and insert in order.
+    fn receive_group_history(
+        &mut self,
+        group: GroupId,
+        messages: Vec<(u64, u64, Sealed)>,
+    ) -> Option<Event> {
+        let sid = group_hist_id(&group);
+        let me = self.username.clone();
+        let mut any = false;
+        for (_seq, epoch, sealed) in messages {
+            let Some(key) = self
+                .conversations
+                .get(&group)
+                .and_then(|c| c.history_keys.get(&epoch).copied())
+            else {
+                continue;
+            };
+            let Ok(pt) = enclave_crypto::open_channel(&key, &sid, epoch, &sealed.0) else {
+                continue;
+            };
+            let Ok(wire) = bincode::deserialize::<ChannelWire>(&pt) else {
+                continue;
+            };
+            let sender_key = self
+                .conversations
+                .get(&group)
+                .and_then(|c| c.group.as_ref())
+                .and_then(|g| {
+                    g.member_keys()
+                        .into_iter()
+                        .find(|(n, _)| n == &wire.sender)
+                        .map(|(_, k)| k)
+                });
+            let Some(sender_key) = sender_key else {
+                continue;
+            };
+            let body = channel_msg_body(&sid, &wire.id, &wire.sender, &wire.text, wire.ts);
+            if !enclave_crypto::verify_op(&sender_key, WS_CHANNEL_MSG_CONTEXT, &body, &wire.sig) {
+                continue;
+            }
+            if let Some(c) = self.conversations.get_mut(&group) {
+                if c.history.iter().any(|l| l.id == wire.id) {
+                    continue;
+                }
+                let mine = Some(&wire.sender) == me.as_ref();
+                c.history.push(ChatLine {
+                    id: wire.id,
+                    ts: wire.ts,
+                    from: wire.sender.clone(),
+                    text: wire.text.clone(),
+                    mine,
+                    file: None,
+                    system: false,
+                    deleted: false,
+                    reply_to: None,
+                    voice_ms: None,
+                    waveform: Vec::new(),
+                });
+                c.history.sort_by_key(|l| l.ts);
+                any = true;
+            }
+        }
+        if any {
+            self.save_session();
+        }
+        any.then_some(Event::ConversationsChanged)
+    }
+
     fn save_session(&self) {
         if self.export_key.is_empty() {
             return;
@@ -5541,6 +5834,8 @@ impl Client {
                 edited: c.edited.iter().copied().collect(),
                 polls: c.polls.iter().map(|(k, v)| (*k, v.into())).collect(),
                 pinned: c.pinned.iter().copied().collect(),
+                history_epoch: c.history_epoch,
+                history_keys: c.history_keys.iter().map(|(e, k)| (*e, *k)).collect(),
                 history: c
                     .history
                     .iter()
@@ -5686,6 +5981,8 @@ impl Client {
                     edited: pc.edited.into_iter().collect(),
                     polls: pc.polls.into_iter().map(|(id, p)| (id, p.into())).collect(),
                     pinned: pc.pinned.into_iter().collect(),
+                    history_epoch: pc.history_epoch,
+                    history_keys: pc.history_keys.into_iter().collect(),
                 },
             ));
         }
@@ -5901,6 +6198,8 @@ impl Client {
                                 edited: HashSet::new(),
                                 polls: HashMap::new(),
                                 pinned: HashSet::new(),
+                                history_epoch: None,
+                                history_keys: std::collections::BTreeMap::new(),
                             },
                         );
                     }
@@ -6570,6 +6869,12 @@ impl Client {
                 messages,
                 has_more,
             } => self.receive_channel_history(workspace, channel, messages, has_more),
+            ServerMsg::GroupHistoryConfig { group, message, .. } => {
+                self.receive_group_hist_config(group, &message.0)
+            }
+            ServerMsg::GroupHistory { group, messages, .. } => {
+                self.receive_group_history(group, messages)
+            }
             ServerMsg::VoicePresence {
                 workspace,
                 channel,

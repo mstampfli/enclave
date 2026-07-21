@@ -724,6 +724,30 @@ buys is that an honest server plus an unreliable network never loses a message.
   chooses to open them externally, where OS protections apply. The consent gate
   and name-in-prompt are the user's first line of defense.
 
+## Group history sharing (STRIDE + ASVS L2)
+
+By default a new group member reads nothing sent before they joined -- MLS forward
+secrecy means they cannot decrypt earlier messages, so old messages (pinned or not)
+never appear for them. An opt-in per-group setting lets a group choose otherwise:
+while it is on, each text message is *also* off-ratchet-sealed under a per-epoch
+**history key** and stored by the relay, so a future member can backfill it.
+
+- **The key is shared, so those stored copies have no forward secrecy** -- the same
+  key opens every message in its epoch. This is the deliberate, stated tradeoff
+  (surfaced in the UI when the user turns it on), identical in spirit to the
+  workspace scrollback tradeoff.
+- **Opt-in and reversible with clean epochs.** Off by default. Enabling starts a
+  fresh epoch with a new key; only messages from that point on are stored. Disable
+  stops storing; re-enable starts a *new* epoch, and a new member is handed only the
+  **current** epoch's key, so the earlier enabled stretch and the disabled gap stay
+  hidden ("only from here on out").
+- **Confidentiality / integrity.** The relay stores only sealed blobs (it holds no
+  key), and each stored line is identity-signed by its sender and verified against
+  the group roster on backfill, so the relay cannot forge or read group history. The
+  setting and its key travel MLS-sealed to members; a new member's key is delivered
+  directed, only after they are in the MLS group. Proven by
+  `group_history_sharing_backfills_a_new_member_from_when_it_was_enabled`.
+
 ## Workspaces (STRIDE + ASVS L2)
 
 A workspace is a Discord/Slack-style container of text and voice channels with

@@ -357,6 +357,31 @@ pub enum ClientMsg {
         before: Option<u64>,
         limit: u32,
     },
+    /// Share a group's history-sharing configuration (MLS-sealed: the epoch and its
+    /// history key, or an "off" marker). `to = None` broadcasts to the group; `to
+    /// = Some(handle)` hands the current epoch's key to one new member on join.
+    /// Opt-in per group; while on, messages are also stored for scrollback, which
+    /// costs forward secrecy on that stored copy.
+    GroupHistoryConfig {
+        group: GroupId,
+        to: Option<String>,
+        message: Sealed,
+    },
+    /// Store one group message for scrollback, off-ratchet-sealed under the group's
+    /// current epoch history key. The relay stores it (holding no key) so a future
+    /// member can backfill it. Members only.
+    GroupHistoryPost {
+        group: GroupId,
+        epoch: u64,
+        message: Sealed,
+    },
+    /// Fetch a page of a group's stored history (reply: [`ServerMsg::GroupHistory`]).
+    /// Members only; paged by seq like a channel's.
+    GroupHistoryFetch {
+        group: GroupId,
+        before: Option<u64>,
+        limit: u32,
+    },
     /// Join a voice channel's presence (we are now connected). The relay tracks
     /// it and broadcasts the updated roster to the channel's members, so everyone
     /// sees who is in voice without joining. The actual media rides the existing
@@ -832,6 +857,20 @@ pub enum ServerMsg {
     ChannelHistory {
         workspace: WorkspaceId,
         channel: ChannelId,
+        messages: Vec<(u64, u64, Sealed)>,
+        has_more: bool,
+    },
+    /// A group's history-sharing configuration, MLS-sealed (reply to
+    /// [`ClientMsg::GroupHistoryConfig`]). `from` is the member who set it.
+    GroupHistoryConfig {
+        group: GroupId,
+        from: String,
+        message: Sealed,
+    },
+    /// A page of a group's stored history: `(seq, epoch, sealed)` oldest first
+    /// (reply to [`ClientMsg::GroupHistoryFetch`]).
+    GroupHistory {
+        group: GroupId,
         messages: Vec<(u64, u64, Sealed)>,
         has_more: bool,
     },

@@ -280,6 +280,12 @@ enum UiCommand {
         conv: String,
         ms: u32,
     },
+    /// Turn group history sharing on or off (new members can read messages from
+    /// when it was enabled). No forward secrecy on the stored copies while on.
+    SetGroupHistory {
+        conv: String,
+        enable: bool,
+    },
     /// Start recording a voice message for the active conversation.
     StartVoice,
     /// Stop recording and hold it for preview (does not send).
@@ -787,6 +793,9 @@ struct ConvSummary {
     /// The local-only "Notes to self" scratchpad: rendered distinctly, and its
     /// call/verify/members controls are hidden.
     self_notes: bool,
+    /// Whether group history sharing is on (new members can read messages from
+    /// when it was enabled).
+    history_on: bool,
 }
 
 /// A file the user attached to the composer (path + display name + size), before
@@ -1414,17 +1423,21 @@ fn error_status(proxy: &EventLoopProxy<UiEvent>, message: String) {
 fn conv_summaries(c: &Client) -> Vec<ConvSummary> {
     c.conversations()
         .into_iter()
-        .map(|i| ConvSummary {
-            id: i.id,
-            title: i.title,
-            is_dm: i.is_dm,
-            pending: i.pending,
-            members: i.members,
-            archived: i.archived,
-            left: i.left,
-            can_send: i.can_send,
-            reconnect: i.reconnect,
-            self_notes: i.self_notes,
+        .map(|i| {
+            let history_on = c.group_history_on(&i.id);
+            ConvSummary {
+                id: i.id,
+                title: i.title,
+                is_dm: i.is_dm,
+                pending: i.pending,
+                members: i.members,
+                archived: i.archived,
+                left: i.left,
+                can_send: i.can_send,
+                reconnect: i.reconnect,
+                self_notes: i.self_notes,
+                history_on,
+            }
         })
         .collect()
 }
@@ -2708,6 +2721,13 @@ async fn handle_command(
         UiCommand::SetDisappearing { conv, ms } => {
             if let Some(c) = client.as_mut() {
                 c.set_disappearing(&conv, ms);
+            }
+        }
+        UiCommand::SetGroupHistory { conv, enable } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.set_group_history(&conv, enable) {
+                    error_status(proxy, format!("Could not change history sharing: {e}"));
+                }
             }
         }
         UiCommand::StartVoice => {

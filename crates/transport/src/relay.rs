@@ -1230,6 +1230,97 @@ impl Relay {
                 }]
             }
 
+            ClientMsg::GroupHistoryConfig { group, to, message } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                let Some(members) = self.groups.members(&group) else {
+                    return vec![];
+                };
+                if !members.contains(&DeviceId(me.clone())) {
+                    return vec![];
+                }
+                let out = ServerMsg::GroupHistoryConfig {
+                    group: group.clone(),
+                    from: me.clone(),
+                    message,
+                };
+                match to {
+                    // Hand the current key to one member (a new joiner).
+                    Some(handle) if members.contains(&DeviceId(handle.clone())) => {
+                        match self.device_conn.get(&DeviceId(handle)) {
+                            Some(&conn) => vec![Outgoing { to: conn, msg: out }],
+                            None => vec![],
+                        }
+                    }
+                    Some(_) => vec![],
+                    // Broadcast the setting to every other member.
+                    None => {
+                        let me_dev = DeviceId(me);
+                        members
+                            .iter()
+                            .filter(|d| **d != me_dev)
+                            .filter_map(|d| self.device_conn.get(d).copied())
+                            .map(|conn| Outgoing {
+                                to: conn,
+                                msg: out.clone(),
+                            })
+                            .collect()
+                    }
+                }
+            }
+
+            ClientMsg::GroupHistoryPost {
+                group,
+                epoch,
+                message,
+            } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                let is_member = self
+                    .groups
+                    .members(&group)
+                    .is_some_and(|m| m.contains(&DeviceId(me)));
+                if !is_member {
+                    return vec![];
+                }
+                self.workspaces
+                    .store_message(group_store_id(&group), [0u8; 16], epoch, message);
+                vec![]
+            }
+
+            ClientMsg::GroupHistoryFetch {
+                group,
+                before,
+                limit,
+            } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                let is_member = self
+                    .groups
+                    .members(&group)
+                    .is_some_and(|m| m.contains(&DeviceId(me)));
+                if !is_member {
+                    return vec![];
+                }
+                let (messages, has_more) = self.workspaces.channel_history_page(
+                    &group_store_id(&group),
+                    &[0u8; 16],
+                    before,
+                    limit,
+                );
+                vec![Outgoing {
+                    to: from,
+                    msg: ServerMsg::GroupHistory {
+                        group,
+                        messages,
+                        has_more,
+                    },
+                }]
+            }
+
             ClientMsg::VoiceJoin { workspace, channel } => {
                 let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
                     return vec![];
@@ -2430,6 +2521,14 @@ pub fn spillable(msg: &ServerMsg) -> bool {
 
 /// Refuse a workspace op, telling the submitter why. The client applies ops
 /// idempotently and resyncs on gaps, so a refusal is reported once, not retried.
+/// The 16-byte id a group's stored history is keyed by (reusing the durable,
+/// paged channel-history store). Derived from the 32-byte group id.
+fn group_store_id(group: &GroupId) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&group.0[..16]);
+    id
+}
+
 fn workspace_error(to: ConnId, detail: &str) -> Vec<Outgoing> {
     vec![Outgoing {
         to,

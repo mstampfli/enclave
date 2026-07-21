@@ -62,6 +62,12 @@ pub struct PersistConv {
     /// Ids of pinned messages. Old sessions without this field default to empty.
     #[serde(default)]
     pub pinned: Vec<[u8; 16]>,
+    /// Group history-sharing epoch (`Some` = on). Old sessions default to off.
+    #[serde(default)]
+    pub history_epoch: Option<u64>,
+    /// The per-epoch history keys held for this group. Old sessions default empty.
+    #[serde(default)]
+    pub history_keys: Vec<(u64, [u8; 32])>,
 }
 
 /// A persisted poll: its definition, state, and per-member votes.

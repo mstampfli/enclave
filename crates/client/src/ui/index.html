@@ -2099,8 +2099,20 @@ label.member-row:hover { background: var(--raised); }
         <input placeholder="friend's username" spellcheck="false" id="member-add-input">
         <button class="btn" style="padding:7px 12px" id="member-add-btn">Add</button>
       </div>
-      <span class="hint" style="font-size:12.5px;color:var(--muted)">
+      <span class="hint" style="font-size:12.5px;color:var(--muted)" id="member-add-hint">
         Adding rekeys the group; the newcomer cannot read anything sent before.</span>
+    </div>
+    <div class="m-section" id="members-history-section">
+      <div class="s-head">History for new members</div>
+      <label class="poll-check" style="margin:0">
+        <input type="checkbox" id="members-history-toggle">
+        Let new members read messages from now on
+      </label>
+      <span class="hint" style="font-size:12.5px;color:var(--muted)">
+        Off (default): a new member only sees messages sent after they join. On:
+        messages sent from now on are stored so a future member can read them, which
+        means those stored copies have no forward secrecy. Turning it off then on
+        again only shares from the new point on, never the gap.</span>
     </div>
     <div class="divider"></div>
     <div class="m-actions" style="justify-content:flex-start">
@@ -5022,8 +5034,17 @@ function openMembers() {
   }
   $("members-search").value = "";
   filterMembers();
+  // History-sharing toggle: groups only (a DM has no "new members"), reflecting
+  // the conversation's current setting.
+  const showHistory = !conv.is_dm && !conv.self_notes;
+  $("members-history-section").hidden = !showHistory;
+  if (showHistory) $("members-history-toggle").checked = !!conv.history_on;
   openModal("modal-members");
 }
+$("members-history-toggle").addEventListener("change", (e) => {
+  const conv = convById(activeConv);
+  if (conv) send({ type: "SetGroupHistory", conv: conv.id, enable: e.target.checked });
+});
 $("btn-members").addEventListener("click", openMembers);
 $("member-add-btn").addEventListener("click", () => {
   const v = $("member-add-input").value.trim();

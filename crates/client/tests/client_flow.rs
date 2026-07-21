@@ -2246,6 +2246,75 @@ async fn an_invite_code_admits_a_redeemer() {
     .await;
 }
 
+/// Group history sharing: a member turns it on, sends a message, then adds a new
+/// member -- who backfills the post-enable message but never sees the pre-enable
+/// one. Proves the opt-in scrollback and its "only from here on out" semantics.
+#[tokio::test]
+async fn group_history_sharing_backfills_a_new_member_from_when_it_was_enabled() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut alice = account(&url, "alice").await;
+    let mut bob = account(&url, "bob").await;
+    let mut carol = account(&url, "carol").await;
+    let bob_h = bob.name().to_string();
+    let carol_h = carol.name().to_string();
+    become_friends(&mut alice, &mut bob).await;
+    become_friends(&mut alice, &mut carol).await;
+
+    alice
+        .create_group("team", std::slice::from_ref(&bob_h))
+        .await
+        .unwrap();
+    pump_until(&mut bob, |c| !c.conversations().is_empty()).await;
+    let gid = alice.conversations().first().map(|c| c.id.clone()).unwrap();
+    alice.switch(&gid);
+
+    // A message BEFORE enabling history (must never reach a future member).
+    alice.send_text("before-history", None).await.unwrap();
+    for _ in 0..20 {
+        let _ = tokio::time::timeout(Duration::from_millis(15), alice.next_event()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(15), bob.next_event()).await;
+    }
+
+    // Enable sharing, then a message AFTER (must reach the future member).
+    alice.set_group_history(&gid, true).unwrap();
+    assert!(alice.group_history_on(&gid));
+    alice.send_text("after-history", None).await.unwrap();
+
+    // Add Carol; she joins, gets the current epoch key, and backfills.
+    alice.add_to_active_group(&carol_h).await.unwrap();
+    let mut carol_gid = String::new();
+    for _ in 0..400 {
+        let _ = tokio::time::timeout(Duration::from_millis(15), alice.next_event()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(15), bob.next_event()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(15), carol.next_event()).await;
+        if let Some(cg) = carol.conversations().first().map(|c| c.id.clone()) {
+            carol_gid = cg.clone();
+            if carol
+                .conversation_history(&cg)
+                .iter()
+                .any(|l| l.text == "after-history")
+            {
+                break;
+            }
+        }
+    }
+    assert!(!carol_gid.is_empty(), "carol never joined the group");
+    let texts: Vec<String> = carol
+        .conversation_history(&carol_gid)
+        .into_iter()
+        .map(|l| l.text)
+        .collect();
+    assert!(
+        texts.iter().any(|t| t == "after-history"),
+        "carol should backfill the post-enable message: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t == "before-history"),
+        "carol must NOT see the pre-enable message: {texts:?}"
+    );
+}
+
 /// An admin can drag a member from one voice channel to another: the relay
 /// (checking the admin role) directs the member's client, which joins the target
 /// -- so presence moves. A non-admin's move is refused. Proves the voice-move
