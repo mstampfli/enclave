@@ -912,6 +912,66 @@ mod tests {
     }
 
     #[test]
+    fn a_member_with_multiple_roles_gets_the_union_of_their_permissions() {
+        let (mut st, owner, _admin, _member) = seed();
+        let mk = |st: &WorkspaceState, op| sign_op(&owner, "owner#1", st, 400, op).unwrap();
+        // Two disjoint single-permission roles.
+        let a = [20u8; 16];
+        let b = [21u8; 16];
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::CreateRole {
+                role: a,
+                name: "Channels".into(),
+                permissions: vec![Permission::ManageChannels],
+            },
+        ))
+        .unwrap();
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::CreateRole {
+                role: b,
+                name: "Voice".into(),
+                permissions: vec![Permission::MoveVoiceMembers],
+            },
+        ))
+        .unwrap();
+        // member#3 holds neither yet.
+        assert!(st.permissions_of("member#3").is_empty());
+        // Assign both: effective permissions are the union.
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::AssignRole {
+                member: "member#3".into(),
+                role: a,
+            },
+        ))
+        .unwrap();
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::AssignRole {
+                member: "member#3".into(),
+                role: b,
+            },
+        ))
+        .unwrap();
+        assert!(st.has_permission("member#3", Permission::ManageChannels));
+        assert!(st.has_permission("member#3", Permission::MoveVoiceMembers));
+        assert!(!st.has_permission("member#3", Permission::ManageRoles));
+        // Removing one role drops only its permission; the other stays.
+        st.apply(&mk(
+            &st,
+            WorkspaceOp::UnassignRole {
+                member: "member#3".into(),
+                role: a,
+            },
+        ))
+        .unwrap();
+        assert!(!st.has_permission("member#3", Permission::ManageChannels));
+        assert!(st.has_permission("member#3", Permission::MoveVoiceMembers));
+    }
+
+    #[test]
     fn role_ops_prevent_privilege_escalation_and_protect_the_owner_role() {
         let (mut st, _owner, admin, _member) = seed();
         // admin#2 (Manager: everything except MoveVoiceMembers) has ManageRoles, so
