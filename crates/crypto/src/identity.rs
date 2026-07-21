@@ -63,6 +63,14 @@ impl Identity {
         self.signer.to_public_vec()
     }
 
+    /// Sign `msg` under `context` with this device's identity key, producing a
+    /// detached signature a peer verifies with [`crate::verify_op`] against this
+    /// device's [`identity_key`](Self::identity_key). Used to make workspace
+    /// op-log entries attributable to their author and unforgeable by the relay.
+    pub fn sign_op(&self, context: &[u8], msg: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        crate::sign::sign_detached(&self.signer, context, msg)
+    }
+
     /// A [`MediaSigner`] over this device's Ed25519 identity key, for signing
     /// outgoing media frames. It signs through a clone of the MLS keypair; the
     /// private key never leaves the crypto crate. Fails if the identity is not

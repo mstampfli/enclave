@@ -289,6 +289,22 @@ pub enum ClientMsg {
     /// `seq` is a per-session monotonic counter, meaningful only between this
     /// sender and the server.
     Reliable { seq: u64, msg: Box<ClientMsg> },
+
+    // ---- Workspaces ----
+    /// Append a signed op to a workspace's log. `workspace` is the id; for the
+    /// genesis `Create` op the server registers the new workspace. The server
+    /// validates the entry (signature, chain, monotonic seq) before appending,
+    /// then broadcasts it to the workspace's members as [`ServerMsg::WorkspaceOps`].
+    WorkspaceSubmitOp {
+        workspace: WorkspaceId,
+        op: SignedOp,
+    },
+    /// Fetch a workspace's full op-log (on join or reconnect), replied to with
+    /// [`ServerMsg::WorkspaceOps`].
+    WorkspaceFetch { workspace: WorkspaceId },
+    /// List the workspaces this account is a member of, replied to with
+    /// [`ServerMsg::Workspaces`].
+    WorkspaceListMine,
 }
 
 /// A person in the friend graph: the unique `username` (login/add id) plus the
@@ -306,6 +322,112 @@ pub struct Friend {
     /// for accounts that predate the server tracking it.
     #[serde(default)]
     pub member_since: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// Workspaces: Discord/Slack-style containers of text/voice channels. Structure
+// and membership are server-visible metadata (the accepted tier); channel
+// *content* stays end-to-end encrypted and never appears here. The authoritative
+// record of a workspace's structure is its **op-log**: an append-only,
+// hash-chained sequence of identity-signed [`SignedOp`]s. Roles and membership
+// are decided by replaying that log (see `enclave_crypto::workspace`), so the
+// relay cannot forge who is a member or an admin -- only route and store.
+// ---------------------------------------------------------------------------
+
+/// 16-byte opaque ids (random at creation), so ids leak no ordering or count.
+pub type WorkspaceId = [u8; 16];
+pub type ChannelId = [u8; 16];
+pub type CategoryId = [u8; 16];
+
+/// What a channel carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelKind {
+    Text,
+    Voice,
+}
+
+/// A member's standing in a workspace. `Owner` is the creator (exactly one, set
+/// in the genesis op); `Admin` is granted by the owner and may manage channels
+/// and members; `Member` is the default and may participate but not manage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Role {
+    Member,
+    Admin,
+    Owner,
+}
+
+/// One structural change to a workspace. The op-log is a sequence of these, each
+/// wrapped in a signed, chained [`SignedOp`]. Content (messages) is NOT here --
+/// only structure, membership, and roles.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceOp {
+    /// Genesis (seq 0 only): names the workspace and fixes its owner. `owner_key`
+    /// is the owner's identity public key, the root of all later authorization.
+    Create {
+        name: String,
+        owner: String,
+        owner_key: Vec<u8>,
+    },
+    /// Add a member, recording the identity key their future ops are verified
+    /// against. Authorized for owner/admin.
+    AddMember { member: String, member_key: Vec<u8> },
+    /// Remove a member (they lose access; channels they were in rekey).
+    RemoveMember { member: String },
+    /// Grant a role. Only the owner may grant `Admin`.
+    GrantRole { member: String, role: Role },
+    /// Revoke a role, dropping the member back to `Member`.
+    RevokeRole { member: String, role: Role },
+    /// Create a category (a channel group in the sidebar).
+    CreateCategory { category: CategoryId, name: String },
+    /// Create a channel. `private` channels have their own subset membership
+    /// (managed by later Add/RemoveChannelMember ops in M3); a public channel is
+    /// keyed off the workspace group.
+    CreateChannel {
+        channel: ChannelId,
+        name: String,
+        kind: ChannelKind,
+        private: bool,
+        category: Option<CategoryId>,
+    },
+    /// Rename a channel.
+    RenameChannel { channel: ChannelId, name: String },
+    /// Delete a channel.
+    DeleteChannel { channel: ChannelId },
+}
+
+/// An op-log entry: one [`WorkspaceOp`] made attributable and tamper-evident.
+/// `sig` is `author`'s identity-key signature over the entry's body (everything
+/// but `sig`, via [`SignedOp::body_bytes`]); `prev_hash` chains it to the prior
+/// entry so a reordered or forked log is detectable. Verified by replay in
+/// `enclave_crypto::workspace`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedOp {
+    /// Per-workspace position, starting at 0 (the genesis `Create`).
+    pub seq: u64,
+    /// SHA-256 of the previous entry's `body_bytes` (all-zero for seq 0).
+    pub prev_hash: [u8; 32],
+    /// The acting member's handle.
+    pub author: String,
+    /// The author's identity public key, so the signature is self-contained.
+    pub author_key: Vec<u8>,
+    /// Unix seconds (server-independent; set by the author, sanity-checked).
+    pub ts: u64,
+    pub op: WorkspaceOp,
+    /// Detached identity signature over `body_bytes()` under context
+    /// [`WS_OP_CONTEXT`].
+    pub sig: Vec<u8>,
+}
+
+/// Signing/hashing domain tag for workspace op-log entries. The canonical bytes
+/// that are signed and hashed (every field but `sig`) are produced by
+/// `enclave_crypto::workspace`, which owns all op-log verification.
+pub const WS_OP_CONTEXT: &[u8] = b"enclave/ws-op/v1";
+
+/// A workspace as summarized for the sidebar list (metadata only).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceSummary {
+    pub id: WorkspaceId,
+    pub name: String,
 }
 
 /// Server -> client messages.
@@ -484,6 +606,21 @@ pub enum ServerMsg {
     },
     Error {
         detail: String,
+    },
+
+    // ---- Workspaces ----
+    /// One or more op-log entries for a workspace: the full log (reply to
+    /// [`ClientMsg::WorkspaceFetch`] or on membership) or a single newly-appended
+    /// op broadcast to members. `ops` are contiguous by `seq`; the client applies
+    /// them in order via `enclave_crypto::workspace`.
+    WorkspaceOps {
+        workspace: WorkspaceId,
+        ops: Vec<SignedOp>,
+    },
+    /// The workspaces this account belongs to (reply to
+    /// [`ClientMsg::WorkspaceListMine`]).
+    Workspaces {
+        workspaces: Vec<WorkspaceSummary>,
     },
 }
 

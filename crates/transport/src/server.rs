@@ -223,13 +223,16 @@ impl Server {
         accounts: crate::accounts::AccountStore,
         opaque: crate::opaque::OpaqueServer,
         friends: crate::friends::FriendStore,
+        workspaces: crate::workspaces::WorkspaceStore,
         groups: crate::groups::GroupStore,
         queue: crate::msgqueue::MessageQueue,
         files_dir: std::path::PathBuf,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(ServerState {
-                relay: Relay::with_auth(accounts, opaque, friends, groups, queue, files_dir),
+                relay: Relay::with_auth(
+                    accounts, opaque, friends, workspaces, groups, queue, files_dir,
+                ),
                 txs: HashMap::new(),
             })),
         }

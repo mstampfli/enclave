@@ -28,6 +28,7 @@ pub mod opaque;
 pub mod ratelimit;
 pub mod relay;
 pub mod server;
+pub mod workspaces;
 
 pub use accounts::{AccountStore, AuthOutcome};
 pub use client::Connection;

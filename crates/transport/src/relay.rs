@@ -26,6 +26,7 @@ use crate::friends::{FriendStore, RequestOutcome};
 use crate::groups::GroupStore;
 use crate::msgqueue::MessageQueue;
 use crate::opaque::{OpaqueServer, ServerLoginState};
+use crate::workspaces::WorkspaceStore;
 
 /// Opaque handle for one client connection. Assigned by the relay on connect.
 pub type ConnId = u64;
@@ -135,6 +136,8 @@ pub struct Relay {
     accounts: AccountStore,
     /// The friend graph (accepted friends + pending requests). Metadata.
     friends: FriendStore,
+    /// Workspace op-logs + membership index (metadata; content stays E2E).
+    workspaces: WorkspaceStore,
     /// The server's long-term OPAQUE state (OPRF seed + static keypair).
     opaque: OpaqueServer,
     /// In-flight OPAQUE logins, keyed by connection, between the two round-trips.
@@ -239,6 +242,7 @@ impl Relay {
             presence_watchers: HashMap::new(),
             accounts: AccountStore::default(),
             friends: FriendStore::default(),
+            workspaces: WorkspaceStore::new(),
             opaque: OpaqueServer::default(),
             pending_login: HashMap::new(),
             reserved: HashSet::new(),
@@ -273,6 +277,7 @@ impl Relay {
         accounts: AccountStore,
         opaque: OpaqueServer,
         friends: FriendStore,
+        workspaces: WorkspaceStore,
         groups: GroupStore,
         queue: MessageQueue,
         files_dir: PathBuf,
@@ -281,6 +286,7 @@ impl Relay {
             accounts,
             opaque,
             friends,
+            workspaces,
             groups,
             queue,
             avatars: AvatarStore::load(files_dir.join("avatars")),
@@ -1000,6 +1006,59 @@ impl Relay {
                 }];
                 out.extend(self.wire_friend_presence(from, &me));
                 out
+            }
+
+            // ---- Workspaces ----
+            ClientMsg::WorkspaceSubmitOp { workspace, op } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                // A submitter may only append ops they signed themselves; the
+                // store then verifies chain, signature, and authorization.
+                if op.author != me {
+                    return workspace_error(from, "you can only submit your own ops");
+                }
+                match self.workspaces.submit(workspace, op.clone()) {
+                    Ok(members) => {
+                        let msg = ServerMsg::WorkspaceOps {
+                            workspace,
+                            ops: vec![op],
+                        };
+                        // Broadcast to every online member (the sender included --
+                        // clients apply ops idempotently by seq). Offline members
+                        // catch up via WorkspaceFetch on reconnect, so nothing is
+                        // queued here.
+                        self.deliver_to_members(&members, msg)
+                    }
+                    Err(e) => workspace_error(from, e.reason()),
+                }
+            }
+
+            ClientMsg::WorkspaceFetch { workspace } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                // Deny-by-default: only a current member may read the log.
+                if !self.workspaces.is_member(&workspace, &me) {
+                    return vec![];
+                }
+                let ops = self.workspaces.log(&workspace).to_vec();
+                vec![Outgoing {
+                    to: from,
+                    msg: ServerMsg::WorkspaceOps { workspace, ops },
+                }]
+            }
+
+            ClientMsg::WorkspaceListMine => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                vec![Outgoing {
+                    to: from,
+                    msg: ServerMsg::Workspaces {
+                        workspaces: self.workspaces.workspaces_of(&me),
+                    },
+                }]
             }
 
             ClientMsg::RequestDm { to } => {
@@ -1828,6 +1887,23 @@ impl Relay {
         }
     }
 
+    /// Deliver `msg` to every currently-online member handle. Offline members are
+    /// skipped (they resync via `WorkspaceFetch` on reconnect), so this never
+    /// grows the offline queue with workspace ops.
+    fn deliver_to_members(&self, members: &[String], msg: ServerMsg) -> Vec<Outgoing> {
+        members
+            .iter()
+            .filter_map(|m| {
+                self.device_conn
+                    .get(&DeviceId(m.clone()))
+                    .map(|&conn| Outgoing {
+                        to: conn,
+                        msg: msg.clone(),
+                    })
+            })
+            .collect()
+    }
+
     /// The relay clock as unix seconds, for stamping account/friendship times.
     fn now_secs(&self) -> u64 {
         (self.now)()
@@ -1986,6 +2062,17 @@ pub fn spillable(msg: &ServerMsg) -> bool {
             | ServerMsg::Welcome { .. }
             | ServerMsg::FileOffered { .. }
     )
+}
+
+/// Refuse a workspace op, telling the submitter why. The client applies ops
+/// idempotently and resyncs on gaps, so a refusal is reported once, not retried.
+fn workspace_error(to: ConnId, detail: &str) -> Vec<Outgoing> {
+    vec![Outgoing {
+        to,
+        msg: ServerMsg::Error {
+            detail: detail.to_string(),
+        },
+    }]
 }
 
 /// Refuse a poll operation, telling the sender why in words their client can

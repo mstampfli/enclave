@@ -454,6 +454,14 @@ impl From<enclave_client::PollView> for PollViewOut {
     }
 }
 
+/// A workspace as summarized for the sidebar rail. Channel/role detail is read
+/// on demand per workspace as later phases build the UI for it.
+#[derive(serde::Serialize, Clone)]
+struct WorkspaceOut {
+    id: String,
+    name: String,
+}
+
 /// One message-search result, for the UI's results list.
 #[derive(serde::Serialize, Clone)]
 struct SearchHitOut {
@@ -799,6 +807,11 @@ enum UiEvent {
         friends: Vec<Friend>,
         incoming: Vec<Friend>,
         outgoing: Vec<Friend>,
+    },
+    /// The workspaces we belong to (hex id + name), for the sidebar rail. The
+    /// full channel/role detail is read on demand per workspace (later phases).
+    Workspaces {
+        workspaces: Vec<WorkspaceOut>,
     },
     /// Groups we share with `handle` (hex id, title), for their profile card.
     SharedGroups {
@@ -1483,6 +1496,20 @@ async fn run_client(
                         camera,
                     },
                 ),
+                Event::WorkspacesChanged => {
+                    if let Some(c) = client.as_ref() {
+                        emit(
+                            &proxy,
+                            UiEvent::Workspaces {
+                                workspaces: c
+                                    .workspace_list()
+                                    .into_iter()
+                                    .map(|(id, name)| WorkspaceOut { id, name })
+                                    .collect(),
+                            },
+                        );
+                    }
+                }
                 Event::FriendsChanged => {
                     if let Some(c) = client.as_ref() {
                         emit(

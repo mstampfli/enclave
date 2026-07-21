@@ -108,6 +108,8 @@ pub enum ClientError {
     Audio(String),
     #[error("profile: {0}")]
     Profile(String),
+    #[error("workspace: {0}")]
+    Workspace(String),
 }
 
 /// A file that arrived (or was sent) in a conversation. The bytes live on
@@ -167,11 +169,17 @@ pub enum Event {
     /// An offer we were shown resolved into a delivered file (or a transfer we
     /// completed): the UI removes the pending prompt, the file itself now shows
     /// in chat. Only for a clean resolution -- never for a withdrawal.
-    FileOfferClosed { conv: String, offer_id: String },
+    FileOfferClosed {
+        conv: String,
+        offer_id: String,
+    },
     /// An offer we were shown is no longer available: the sender withdrew it or
     /// went offline. The UI marks the offer's message "no longer available" but
     /// KEEPS it in chat (name, size, the whole file row) -- nothing is removed.
-    FileOfferUnavailable { conv: String, offer_id: String },
+    FileOfferUnavailable {
+        conv: String,
+        offer_id: String,
+    },
     /// Progress of an in-flight transfer we are sending or receiving, 0..=1.
     /// `label` names it (a filename, or "message"); `done` marks completion.
     TransferProgress {
@@ -186,14 +194,22 @@ pub enum Event {
     /// the UI re-reads them via `conversations()`.
     ConversationsChanged,
     /// A watched friend's presence changed ("online" / "away" / "offline").
-    Presence { user: String, status: String },
+    Presence {
+        user: String,
+        status: String,
+    },
     /// Someone sent us a friend request (their full handle).
-    FriendRequest { from: String },
+    FriendRequest {
+        from: String,
+    },
     /// The friends list or pending requests changed; read them via the getters.
     FriendsChanged,
     /// An incoming call started in conversation `conv`, initiated by `from`
     /// (display name). The UI rings.
-    CallOffer { conv: String, from: String },
+    CallOffer {
+        conv: String,
+        from: String,
+    },
     /// The participant list of conversation `conv`'s call changed (usernames;
     /// the UI resolves display names). Empty means the call ended.
     CallParticipants {
@@ -201,7 +217,10 @@ pub enum Event {
         participants: Vec<String>,
     },
     /// `from` (display name) declined our call in conversation `conv`.
-    CallDeclined { conv: String, from: String },
+    CallDeclined {
+        conv: String,
+        from: String,
+    },
     /// An H.264 video frame from `from` (username; the UI resolves the name and
     /// keys the per-user canvas by it) to show in the UI. `data` is the Annex-B
     /// bytes; the UI decodes it with WebCodecs. `camera` routes it: a per-user
@@ -216,14 +235,22 @@ pub enum Event {
     /// changed or first arrived; the UI re-reads it via `profile_of`. `user` is
     /// the username. Also fires when a requested avatar blob finishes decrypting,
     /// so the tile can swap initials for the picture.
-    ProfileChanged { user: String },
+    ProfileChanged {
+        user: String,
+    },
     /// A neutral status line shown INSIDE conversation `conv` (hex id) rather
     /// than as a popup: e.g. a file was declined or delivered. It is not stored
     /// in history; it is a transient in-chat note.
-    Notice { conv: String, text: String },
+    Notice {
+        conv: String,
+        text: String,
+    },
     /// A message was deleted (by us, or by its author for everyone): the UI marks
     /// the line as a "message deleted" placeholder, never removing it.
-    MessageDeleted { conv: String, id: String },
+    MessageDeleted {
+        conv: String,
+        id: String,
+    },
     /// A message's emoji reactions changed (someone reacted or un-reacted). The
     /// UI replaces that message's reaction chips with `reactions`.
     ReactionsChanged {
@@ -264,7 +291,10 @@ pub enum Event {
     },
     /// The peer changed the disappearing-messages setting for `conv` (ms, 0=off).
     /// The UI reflects it; the local sweep enforces it.
-    DisappearingChanged { conv: String, ms: u32 },
+    DisappearingChanged {
+        conv: String,
+        ms: u32,
+    },
     /// A voice message arrived (or we sent one): the UI shows a small player.
     /// `path` is the local clip (played via `play_voice`), `duration_ms` its length.
     VoiceMessage {
@@ -279,6 +309,10 @@ pub enum Event {
         mine: bool,
     },
     /// A non-fatal error worth showing.
+    /// A workspace we belong to changed: created/joined, or its op-log advanced
+    /// (membership, roles, categories, or channels). The UI re-reads workspace
+    /// state from the client.
+    WorkspacesChanged,
     Error(String),
 }
 
@@ -689,6 +723,10 @@ pub struct Client {
     friends: Vec<Friend>,
     incoming: Vec<Friend>,
     outgoing: Vec<Friend>,
+    /// Workspaces we belong to, keyed by id, as the replayed op-log state -- the
+    /// authoritative structure/membership we verify locally (never trusting the
+    /// relay's copy). See `enclave_crypto::workspace`.
+    workspaces: HashMap<[u8; 16], enclave_crypto::workspace::WorkspaceState>,
     /// Handles that removed US (they initiated the un-friend). Only these auto-
     /// reconnect when they re-add us; a person WE removed does not. Cleared once
     /// we are friends again. Persisted so the direction survives a restart.
@@ -793,6 +831,7 @@ impl Client {
             username: None,
             keystore_dir: PathBuf::from("."),
             conversations: HashMap::new(),
+            workspaces: HashMap::new(),
             active: None,
             pending: VecDeque::new(),
             export_key: Vec::new(),
@@ -955,6 +994,7 @@ impl Client {
         self.username = None;
         self.call = None;
         self.conversations.clear();
+        self.workspaces.clear();
         self.active = None;
         self.export_key.clear();
         self.password = Zeroizing::new(String::new());
@@ -985,6 +1025,9 @@ impl Client {
         self.display_names
             .insert(username.to_string(), display.clone());
         self.display = display;
+        // Discover the workspaces we belong to; the reply drives a full-log fetch
+        // for any we do not already hold (a fresh login or new device).
+        self.conn.send(ClientMsg::WorkspaceListMine);
     }
 
     /// Pump messages until the auth result arrives; queue any other events.
@@ -1064,6 +1107,12 @@ impl Client {
     /// The logged-in username, or "" if not logged in.
     pub fn name(&self) -> &str {
         self.username.as_deref().unwrap_or("")
+    }
+
+    /// This device's long-term identity public key -- what a workspace owner
+    /// records when adding us so our future ops verify, and what a peer pins.
+    pub fn identity_key(&self) -> Option<Vec<u8>> {
+        self.identity.as_ref().map(|i| i.identity_key())
     }
 
     /// Whether we are logged in.
@@ -4099,6 +4148,104 @@ impl Client {
         self.username.clone().ok_or(ClientError::NotLoggedIn)
     }
 
+    // ---- Workspaces ----------------------------------------------------------
+    //
+    // The op-log is applied only from the server's authoritative broadcast (never
+    // optimistically), so every member -- submitter included -- converges on the
+    // same linear history and a concurrent, now-stale op is simply rejected and
+    // resigned rather than diverging local state.
+
+    /// A read-only view of a workspace's replayed state, by hex id.
+    pub fn workspace(&self, ws_hex: &str) -> Option<&enclave_crypto::workspace::WorkspaceState> {
+        decode_offer_id(ws_hex).and_then(|id| self.workspaces.get(&id))
+    }
+
+    /// The workspaces we currently hold: `(hex id, name)`, for the sidebar rail.
+    pub fn workspace_list(&self) -> Vec<(String, String)> {
+        let mut list: Vec<(String, String)> = self
+            .workspaces
+            .iter()
+            .map(|(id, s)| (hex::encode(id), s.name.clone()))
+            .collect();
+        list.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        list
+    }
+
+    /// Create a workspace owned by us. Mints a random id, signs the genesis op,
+    /// and submits it. State is populated when the server echoes the op back
+    /// (surfaced as [`Event::WorkspacesChanged`]); the hex id is returned now so
+    /// the caller can navigate to it once it appears.
+    pub fn create_workspace(&mut self, name: &str) -> Result<String, ClientError> {
+        let me = self.me()?;
+        let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
+        let id = new_transfer_id();
+        let op = enclave_crypto::workspace::sign_genesis(identity, &me, name, now_secs())?;
+        self.conn
+            .send(ClientMsg::WorkspaceSubmitOp { workspace: id, op });
+        Ok(hex::encode(id))
+    }
+
+    /// Sign and submit one structural op (add/remove member, role, channel, ...)
+    /// against a workspace we hold. Signed against our current known head; if the
+    /// log has advanced under us the server rejects it and the caller re-issues.
+    /// Not applied locally -- the echo advances our state.
+    pub fn workspace_submit(
+        &mut self,
+        ws_hex: &str,
+        op: enclave_protocol::WorkspaceOp,
+    ) -> Result<(), ClientError> {
+        let me = self.me()?;
+        let id = decode_offer_id(ws_hex)
+            .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
+        let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
+        let state = self
+            .workspaces
+            .get(&id)
+            .ok_or_else(|| ClientError::Workspace("unknown workspace".into()))?;
+        let signed = enclave_crypto::workspace::sign_op(identity, &me, state, now_secs(), op)?;
+        self.conn.send(ClientMsg::WorkspaceSubmitOp {
+            workspace: id,
+            op: signed,
+        });
+        Ok(())
+    }
+
+    /// Apply op-log entries from the server -- the single place workspace state
+    /// advances. Idempotent by `seq` (a re-broadcast echo of an op we already
+    /// hold is ignored); on a gap (we are behind) it refetches the full log.
+    fn apply_workspace_ops(
+        &mut self,
+        ws: [u8; 16],
+        ops: Vec<enclave_protocol::SignedOp>,
+    ) -> Option<Event> {
+        let state = self.workspaces.entry(ws).or_default();
+        let mut changed = false;
+        for op in ops {
+            match op.seq.cmp(&state.next_seq()) {
+                std::cmp::Ordering::Less => {} // already applied (echo / dup)
+                std::cmp::Ordering::Equal => {
+                    if state.apply(&op).is_ok() {
+                        changed = true;
+                    }
+                    // A verification failure here means the relay accepted an op
+                    // we reject; we simply do not advance, keeping our view sound.
+                }
+                std::cmp::Ordering::Greater => {
+                    // We are behind: request the whole log and stop applying this
+                    // batch (the refetch will deliver a contiguous run).
+                    self.conn.send(ClientMsg::WorkspaceFetch { workspace: ws });
+                    break;
+                }
+            }
+        }
+        // Drop a workspace that ended up empty (e.g. a stray fetch of nothing).
+        if self.workspaces.get(&ws).is_some_and(|s| s.owner.is_empty()) {
+            self.workspaces.remove(&ws);
+            return None;
+        }
+        changed.then_some(Event::WorkspacesChanged)
+    }
+
     /// The per-account session file (encrypted MLS state + conversations).
     fn session_path(&self) -> PathBuf {
         let user = self.username.as_deref().unwrap_or("unknown");
@@ -5136,6 +5283,18 @@ impl Client {
                 self.removed_me.insert(handle);
                 Some(Event::FriendsChanged)
             }
+            ServerMsg::WorkspaceOps { workspace, ops } => self.apply_workspace_ops(workspace, ops),
+            ServerMsg::Workspaces { workspaces } => {
+                // Fetch the full log for any workspace we do not yet hold, so a
+                // fresh login / new device catches up. Known ones are already live.
+                for w in &workspaces {
+                    if !self.workspaces.contains_key(&w.id) {
+                        self.conn
+                            .send(ClientMsg::WorkspaceFetch { workspace: w.id });
+                    }
+                }
+                None
+            }
             ServerMsg::GroupMembers { group, members } => {
                 // The server's authoritative routing membership for a GROUP. It is
                 // the source of truth for the displayed member list/count (a leaver
@@ -5254,6 +5413,11 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Wall-clock now in unix seconds, for workspace op timestamps.
+fn now_secs() -> u64 {
+    now_ms() / 1000
 }
 
 /// Read up to `buf.len()` bytes, retrying short reads so a full chunk is

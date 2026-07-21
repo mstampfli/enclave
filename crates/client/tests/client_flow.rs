@@ -2110,3 +2110,62 @@ async fn a_closed_chat_is_not_reopened_by_a_friend_change() {
         "accepting a friend must not re-open the chat Alice closed"
     );
 }
+
+/// M0 end to end: an owner creates a workspace and adds a member; both clients
+/// converge on the same op-log state -- owner as Owner, the added member as
+/// Member -- driven entirely by the signed, server-relayed op-log. Proves the
+/// crypto op-log, the protocol messages, the relay store, and the client
+/// plumbing all agree.
+#[tokio::test]
+async fn a_workspace_is_created_and_a_member_is_added_end_to_end() {
+    use enclave_protocol::{Role, WorkspaceOp};
+
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let mut bob = account(&url, "bob").await;
+    let owner_h = owner.name().to_string();
+    let bob_h = bob.name().to_string();
+    let bob_key = bob.identity_key().unwrap();
+
+    // Owner creates the workspace; state arrives on the server echo.
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+    assert_eq!(
+        owner.workspace(&ws).unwrap().role_of(&owner_h),
+        Some(Role::Owner)
+    );
+
+    // Owner adds Bob (needs Bob's identity key, as a real invite flow would carry).
+    owner
+        .workspace_submit(
+            &ws,
+            WorkspaceOp::AddMember {
+                member: bob_h.clone(),
+                member_key: bob_key,
+            },
+        )
+        .unwrap();
+
+    // Both converge: owner sees two members; Bob learns the workspace (via the
+    // broadcast -> gap -> full-log fetch) and sees himself as a Member.
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
+    })
+    .await;
+    pump_until(&mut bob, |c| {
+        c.workspace(&ws)
+            .is_some_and(|s| s.role_of(&bob_h) == Some(Role::Member))
+    })
+    .await;
+
+    let owner_view = owner.workspace(&ws).unwrap();
+    let bob_view = bob.workspace(&ws).unwrap();
+    assert_eq!(owner_view.name, "Team");
+    assert_eq!(bob_view.name, "Team");
+    assert_eq!(owner_view.role_of(&owner_h), Some(Role::Owner));
+    assert_eq!(bob_view.role_of(&owner_h), Some(Role::Owner));
+    assert_eq!(bob_view.role_of(&bob_h), Some(Role::Member));
+    // Same chain head -> identical, verified history on both sides.
+    assert_eq!(owner_view.head_hash(), bob_view.head_hash());
+}

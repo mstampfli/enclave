@@ -48,13 +48,17 @@ async fn main() {
     let accounts = AccountStore::load("enclave-accounts.json");
     let opaque = OpaqueServer::load_or_generate(Path::new("enclave-opaque.setup"));
     let friends = FriendStore::load("enclave-friends.json");
+    // Workspace op-logs (structure + membership metadata; channel content stays E2E).
+    let workspaces = enclave_transport::workspaces::WorkspaceStore::load("enclave-workspaces.json");
     // Group routing membership persists too, so conversations survive a restart.
     let groups = GroupStore::load("enclave-groups.json");
     // Store-and-forward queue for offline members (opaque ciphertext only).
     let queue = MessageQueue::load("enclave-queue.json");
     // On-disk store for offered files awaiting the recipient's consent.
     let files_dir = std::path::PathBuf::from("enclave-files");
-    let server = Server::with_auth(accounts, opaque, friends, groups, queue, files_dir);
+    let server = Server::with_auth(
+        accounts, opaque, friends, workspaces, groups, queue, files_dir,
+    );
 
     // Signaling: TLS when a cert + key are provided, plaintext otherwise.
     let tls = std::env::var("ENCLAVE_TLS_CERT")
