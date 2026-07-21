@@ -800,6 +800,10 @@ pub struct Client {
     /// Per-workspace WG MLS group -- used to seal the channel-key bundle to
     /// members (membership tracks the workspace's public membership).
     workspace_groups: HashMap<[u8; 16], Group>,
+    /// Per-**private**-channel MLS group, keyed `(workspace, channel)`: a subset
+    /// group so a private channel's keys/messages are unreadable even to a
+    /// workspace member not in the channel (and to the relay).
+    channel_groups: HashMap<([u8; 16], [u8; 16]), Group>,
     /// Per-channel history keys, epoch-indexed: `channel_keys[(ws,ch)][epoch]`.
     /// Seals channel messages and stored history; a new member is handed the
     /// current set so they can read scrollback.
@@ -917,6 +921,7 @@ impl Client {
             conversations: HashMap::new(),
             workspaces: HashMap::new(),
             workspace_groups: HashMap::new(),
+            channel_groups: HashMap::new(),
             channel_keys: HashMap::new(),
             workspace_op_queue: HashMap::new(),
             workspace_op_inflight: HashMap::new(),
@@ -1085,6 +1090,7 @@ impl Client {
         self.conversations.clear();
         self.workspaces.clear();
         self.workspace_groups.clear();
+        self.channel_groups.clear();
         self.channel_keys.clear();
         self.workspace_op_queue.clear();
         self.workspace_op_inflight.clear();
@@ -4320,19 +4326,21 @@ impl Client {
         )?;
         self.conn.send(ClientMsg::WorkspaceWelcome {
             workspace: id,
+            channel: None,
             to: handle.to_string(),
             welcome: Sealed(add.welcome),
         });
         self.conn.send(ClientMsg::WorkspaceCommit {
             workspace: id,
+            channel: None,
             commit: Sealed(add.commit),
         });
-        // Hand the new member every channel history key we hold, sealed under the
+        // Hand the new member every PUBLIC channel history key we hold, sealed under the
         // WG at the epoch they just joined, so they can read scrollback. Sent
         // after the Welcome, which they process first.
         let bundle = self.key_bundle_for(id);
         if !bundle.entries.is_empty() {
-            self.share_key_bundle(id, Some(handle.to_string()), &bundle);
+            self.share_key_bundle(id, None, Some(handle.to_string()), &bundle);
         }
         Ok(())
     }
@@ -4377,6 +4385,7 @@ impl Client {
         )?;
         self.conn.send(ClientMsg::WorkspaceCommit {
             workspace: id,
+            channel: None,
             commit: Sealed(commit),
         });
         // Rotate every channel to a fresh epoch and share the new keys with the
@@ -4397,7 +4406,7 @@ impl Client {
             rotated.push((ch, epoch, key));
         }
         if !rotated.is_empty() {
-            self.share_key_bundle(id, None, &KeyBundle { entries: rotated });
+            self.share_key_bundle(id, None, None, &KeyBundle { entries: rotated });
         }
         Ok(())
     }
@@ -4428,11 +4437,99 @@ impl Client {
         self.share_key_bundle(
             ws,
             None,
+            None,
             &KeyBundle {
                 entries: vec![(channel, 0, key)],
             },
         );
         Ok(hex::encode(channel))
+    }
+
+    /// Create a **private** channel: a subset channel with its own MLS group so
+    /// its keys and messages are unreadable to non-members (even other workspace
+    /// members, and the relay). Returns its hex id; the creator is its first
+    /// member. Add others with [`add_channel_member`](Self::add_channel_member).
+    pub fn create_private_channel(
+        &mut self,
+        ws_hex: &str,
+        name: &str,
+    ) -> Result<String, ClientError> {
+        let ws = decode_offer_id(ws_hex)
+            .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
+        let channel = new_transfer_id();
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::CreateChannel {
+                channel,
+                name: name.to_string(),
+                kind: enclave_protocol::ChannelKind::Text,
+                private: true,
+                category: None,
+            },
+        )?;
+        // The channel's own MLS group (creator only, for now) and first history key.
+        let group = {
+            let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
+            Group::create(identity)?
+        };
+        self.channel_groups.insert((ws, channel), group);
+        let mut key = [0u8; 32];
+        let _ = getrandom::getrandom(&mut key);
+        self.channel_keys
+            .entry((ws, channel))
+            .or_default()
+            .push(key);
+        Ok(hex::encode(channel))
+    }
+
+    /// Add `handle` to a private channel: add them to the channel's MLS group,
+    /// record the op, deliver the Welcome + commit, and share the channel's key
+    /// bundle (sealed under the channel group) so they can read its history.
+    pub async fn add_channel_member(
+        &mut self,
+        ws_hex: &str,
+        channel_hex: &str,
+        handle: &str,
+    ) -> Result<(), ClientError> {
+        let ws = decode_offer_id(ws_hex)
+            .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
+        let channel = decode_offer_id(channel_hex)
+            .ok_or_else(|| ClientError::Workspace("bad channel id".into()))?;
+        if self.workspace_busy(&ws) {
+            return Err(ClientError::Workspace(
+                "a workspace change is in progress; try again".into(),
+            ));
+        }
+        let kp = self.fetch_key_package(handle).await?;
+        let add = {
+            let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
+            let g = self
+                .channel_groups
+                .get_mut(&(ws, channel))
+                .ok_or_else(|| ClientError::Workspace("channel group missing".into()))?;
+            g.add_member(identity, &kp, handle)?
+        };
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::AddChannelMember {
+                channel,
+                member: handle.to_string(),
+            },
+        )?;
+        self.conn.send(ClientMsg::WorkspaceWelcome {
+            workspace: ws,
+            channel: Some(channel),
+            to: handle.to_string(),
+            welcome: Sealed(add.welcome),
+        });
+        self.conn.send(ClientMsg::WorkspaceCommit {
+            workspace: ws,
+            channel: Some(channel),
+            commit: Sealed(add.commit),
+        });
+        let bundle = self.channel_key_bundle(ws, channel);
+        self.share_key_bundle(ws, Some(channel), Some(handle.to_string()), &bundle);
+        Ok(())
     }
 
     /// Post a text message to a channel: sign it with our identity key (sender
@@ -4524,20 +4621,27 @@ impl Client {
     }
 
     /// Join a WG from a Welcome we were sent when added to a workspace.
-    fn join_workspace_group(&mut self, ws: [u8; 16], welcome: &[u8]) {
+    fn join_workspace_group(&mut self, ws: [u8; 16], channel: Option<[u8; 16]>, welcome: &[u8]) {
         let joined = self
             .identity
             .as_ref()
             .and_then(|id| Group::join(id, welcome).ok());
-        if let Some(wg) = joined {
-            self.workspace_groups.insert(ws, wg);
+        if let Some(g) = joined {
+            match channel {
+                Some(ch) => {
+                    self.channel_groups.insert((ws, ch), g);
+                }
+                None => {
+                    self.workspace_groups.insert(ws, g);
+                }
+            }
         }
     }
 
-    /// Apply a WG MLS commit (add/remove) to advance our epoch.
-    fn apply_workspace_commit(&mut self, ws: [u8; 16], commit: &[u8]) {
-        if let (Some(id), Some(wg)) = (self.identity.as_ref(), self.workspace_groups.get_mut(&ws)) {
-            let _ = wg.apply_commit(id, commit);
+    /// Apply an MLS commit to a workspace group (WG or a private channel's).
+    fn apply_workspace_commit(&mut self, ws: [u8; 16], channel: Option<[u8; 16]>, commit: &[u8]) {
+        if let (Some(id), Some(g)) = self.ws_group_mut(ws, channel) {
+            let _ = g.apply_commit(id, commit);
         }
     }
 
@@ -4592,15 +4696,45 @@ impl Client {
 
     /// Seal a key bundle under the WG and send it (broadcast if `to` is None, else
     /// directed to one member) as a `ChannelKeyShare`.
-    fn share_key_bundle(&mut self, ws: [u8; 16], to: Option<String>, bundle: &KeyBundle) {
+    /// The workspace group for `(ws, group_channel)`: the WG (`None`) or a private
+    /// channel's own group (`Some`). Disjoint field access so callers can also
+    /// hold `identity`.
+    fn ws_group_mut(
+        &mut self,
+        ws: [u8; 16],
+        group_channel: Option<[u8; 16]>,
+    ) -> (Option<&Identity>, Option<&mut Group>) {
+        let Self {
+            identity,
+            channel_groups,
+            workspace_groups,
+            ..
+        } = self;
+        let group = match group_channel {
+            Some(ch) => channel_groups.get_mut(&(ws, ch)),
+            None => workspace_groups.get_mut(&ws),
+        };
+        (identity.as_ref(), group)
+    }
+
+    /// Seal a key bundle under the WG (`group_channel = None`) or a private
+    /// channel's group, and send it (broadcast if `to` is None, else directed).
+    fn share_key_bundle(
+        &mut self,
+        ws: [u8; 16],
+        group_channel: Option<[u8; 16]>,
+        to: Option<String>,
+        bundle: &KeyBundle,
+    ) {
         let plaintext = bincode::serialize(bundle).unwrap_or_default();
-        let sealed = match (self.identity.as_ref(), self.workspace_groups.get_mut(&ws)) {
-            (Some(id), Some(wg)) => wg.encrypt_text(id, &plaintext).ok(),
+        let sealed = match self.ws_group_mut(ws, group_channel) {
+            (Some(id), Some(g)) => g.encrypt_text(id, &plaintext).ok(),
             _ => None,
         };
         if let Some(sealed) = sealed {
             self.conn.send(ClientMsg::ChannelKeyShare {
                 workspace: ws,
+                group_channel,
                 to,
                 message: Sealed(sealed),
             });
@@ -4609,10 +4743,12 @@ impl Client {
 
     /// The full set of channel keys we hold for a workspace, for handing to a new
     /// member (so they can read all scrollback).
+    /// The keys for a new **workspace** member: every PUBLIC channel's keys (they
+    /// are not in any private channel yet). Sealed under the WG.
     fn key_bundle_for(&self, ws: [u8; 16]) -> KeyBundle {
         let mut entries = Vec::new();
         for ((w, ch), keys) in &self.channel_keys {
-            if *w == ws {
+            if *w == ws && !self.channel_is_private(ws, *ch) {
                 for (epoch, key) in keys.iter().enumerate() {
                     entries.push((*ch, epoch as u64, *key));
                 }
@@ -4621,11 +4757,35 @@ impl Client {
         KeyBundle { entries }
     }
 
-    /// Receive shared channel key(s), sealed under the WG. Stores any new keys and,
-    /// for each channel we just learned about, fetches its stored history.
-    fn receive_key_share(&mut self, ws: [u8; 16], message: &[u8]) {
-        let plaintext = match (self.identity.as_ref(), self.workspace_groups.get_mut(&ws)) {
-            (Some(id), Some(wg)) => match wg.decrypt_text(id, message) {
+    /// The keys for one channel (for a new private-channel member), sealed under
+    /// that channel's group.
+    fn channel_key_bundle(&self, ws: [u8; 16], channel: [u8; 16]) -> KeyBundle {
+        let entries = self
+            .channel_keys
+            .get(&(ws, channel))
+            .map(|keys| {
+                keys.iter()
+                    .enumerate()
+                    .map(|(e, k)| (channel, e as u64, *k))
+                    .collect()
+            })
+            .unwrap_or_default();
+        KeyBundle { entries }
+    }
+
+    fn channel_is_private(&self, ws: [u8; 16], channel: [u8; 16]) -> bool {
+        self.workspaces
+            .get(&ws)
+            .and_then(|s| s.channels.get(&channel))
+            .is_some_and(|c| c.private)
+    }
+
+    /// Receive shared channel key(s), sealed under the WG (`group_channel = None`)
+    /// or a private channel's group. Stores new keys and backfills newly-known
+    /// channels.
+    fn receive_key_share(&mut self, ws: [u8; 16], group_channel: Option<[u8; 16]>, message: &[u8]) {
+        let plaintext = match self.ws_group_mut(ws, group_channel) {
+            (Some(id), Some(g)) => match g.decrypt_text(id, message) {
                 Ok(tm) => tm.plaintext,
                 Err(_) => return,
             },
@@ -5849,15 +6009,21 @@ impl Client {
             }
             ServerMsg::WorkspaceOps { workspace, ops } => self.apply_workspace_ops(workspace, ops),
             ServerMsg::WorkspaceWelcome {
-                workspace, welcome, ..
+                workspace,
+                channel,
+                welcome,
+                ..
             } => {
-                self.join_workspace_group(workspace, &welcome.0);
+                self.join_workspace_group(workspace, channel, &welcome.0);
                 None
             }
             ServerMsg::WorkspaceCommit {
-                workspace, commit, ..
+                workspace,
+                channel,
+                commit,
+                ..
             } => {
-                self.apply_workspace_commit(workspace, &commit.0);
+                self.apply_workspace_commit(workspace, channel, &commit.0);
                 None
             }
             ServerMsg::ChannelPost {
@@ -5868,9 +6034,12 @@ impl Client {
                 ..
             } => self.receive_channel_post(workspace, channel, epoch, &message.0),
             ServerMsg::ChannelKeyShare {
-                workspace, message, ..
+                workspace,
+                group_channel,
+                message,
+                ..
             } => {
-                self.receive_key_share(workspace, &message.0);
+                self.receive_key_share(workspace, group_channel, &message.0);
                 None
             }
             ServerMsg::ChannelHistory {

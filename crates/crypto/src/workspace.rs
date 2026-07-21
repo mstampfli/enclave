@@ -18,7 +18,7 @@
 //! Both the client (authoritative) and the relay (ingress validation) replay
 //! through here; never re-derive membership elsewhere.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest, Sha256};
 
@@ -74,6 +74,9 @@ pub struct WorkspaceState {
     pub roles: BTreeMap<String, Role>,
     pub categories: BTreeMap<CategoryId, String>,
     pub channels: BTreeMap<ChannelId, ChannelInfo>,
+    /// Explicit member set of each **private** channel. Public channels are not
+    /// tracked here -- their members are the whole workspace ([`channel_members`]).
+    private_members: BTreeMap<ChannelId, BTreeSet<String>>,
     /// Next expected `seq`.
     next_seq: u64,
     /// SHA-256 of the last applied entry's body (chain head); all-zero at genesis.
@@ -211,6 +214,10 @@ impl WorkspaceState {
                 require(actor > target && target != Role::Owner)?;
                 self.members.remove(member);
                 self.roles.remove(member);
+                // Drop them from every private channel too.
+                for set in self.private_members.values_mut() {
+                    set.remove(member);
+                }
             }
 
             WorkspaceOp::GrantRole { member, role } => {
@@ -266,6 +273,12 @@ impl WorkspaceState {
                         category: *category,
                     },
                 );
+                // A private channel starts with just its creator as a member.
+                if *private {
+                    let mut set = BTreeSet::new();
+                    set.insert(entry.author.clone());
+                    self.private_members.insert(*channel, set);
+                }
             }
 
             WorkspaceOp::RenameChannel { channel, name } => {
@@ -279,9 +292,64 @@ impl WorkspaceState {
                 if self.channels.remove(channel).is_none() {
                     return Err(OpError::BadTarget);
                 }
+                self.private_members.remove(channel);
+            }
+
+            WorkspaceOp::AddChannelMember { channel, member } => {
+                require(actor >= Role::Admin)?;
+                // The channel must exist and be private, and the target must be a
+                // workspace member.
+                match self.channels.get(channel) {
+                    Some(ch) if ch.private => {}
+                    _ => return Err(OpError::BadTarget),
+                }
+                if !self.members.contains_key(member) {
+                    return Err(OpError::BadTarget);
+                }
+                self.private_members
+                    .entry(*channel)
+                    .or_default()
+                    .insert(member.clone());
+            }
+
+            WorkspaceOp::RemoveChannelMember { channel, member } => {
+                require(actor >= Role::Admin)?;
+                let removed = self
+                    .private_members
+                    .get_mut(channel)
+                    .is_some_and(|set| set.remove(member));
+                if !removed {
+                    return Err(OpError::BadTarget);
+                }
             }
         }
         Ok(())
+    }
+
+    /// The effective members of a channel: for a private channel, its explicit
+    /// set; for a public channel (or an unknown id), the whole workspace.
+    pub fn channel_members(&self, channel: &ChannelId) -> Vec<String> {
+        match self.channels.get(channel) {
+            Some(ch) if ch.private => self
+                .private_members
+                .get(channel)
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default(),
+            _ => self.members.keys().cloned().collect(),
+        }
+    }
+
+    /// Whether `handle` may see `channel` (a member of a private channel, or any
+    /// member for a public one).
+    pub fn is_channel_member(&self, channel: &ChannelId, handle: &str) -> bool {
+        match self.channels.get(channel) {
+            Some(ch) if ch.private => self
+                .private_members
+                .get(channel)
+                .is_some_and(|s| s.contains(handle)),
+            Some(_) => self.members.contains_key(handle),
+            None => false,
+        }
     }
 }
 
@@ -508,6 +576,79 @@ mod tests {
         .unwrap();
         st.apply(&ok_rm).unwrap();
         assert_eq!(st.role_of("member#3"), None);
+    }
+
+    #[test]
+    fn a_private_channel_tracks_its_own_member_set() {
+        let (mut st, owner, _admin, _member) = seed();
+        let chan = [4u8; 16];
+        // Owner creates a PRIVATE channel: starts with just the owner.
+        let c = sign_op(
+            &owner,
+            "owner#1",
+            &st,
+            700,
+            WorkspaceOp::CreateChannel {
+                channel: chan,
+                name: "secret".into(),
+                kind: ChannelKind::Text,
+                private: true,
+                category: None,
+            },
+        )
+        .unwrap();
+        st.apply(&c).unwrap();
+        assert_eq!(st.channel_members(&chan), vec!["owner#1".to_string()]);
+        assert!(st.is_channel_member(&chan, "owner#1"));
+        assert!(!st.is_channel_member(&chan, "member#3"));
+
+        // Add member#3 to it.
+        let add = sign_op(
+            &owner,
+            "owner#1",
+            &st,
+            701,
+            WorkspaceOp::AddChannelMember {
+                channel: chan,
+                member: "member#3".into(),
+            },
+        )
+        .unwrap();
+        st.apply(&add).unwrap();
+        assert!(st.is_channel_member(&chan, "member#3"));
+
+        // Removing member#3 from the WORKSPACE drops them from the private channel.
+        let rm = sign_op(
+            &owner,
+            "owner#1",
+            &st,
+            702,
+            WorkspaceOp::RemoveMember {
+                member: "member#3".into(),
+            },
+        )
+        .unwrap();
+        st.apply(&rm).unwrap();
+        assert!(!st.is_channel_member(&chan, "member#3"));
+
+        // A public channel's members are the whole workspace, untracked here.
+        let pub_ch = [5u8; 16];
+        let pc = sign_op(
+            &owner,
+            "owner#1",
+            &st,
+            703,
+            WorkspaceOp::CreateChannel {
+                channel: pub_ch,
+                name: "general".into(),
+                kind: ChannelKind::Text,
+                private: false,
+                category: None,
+            },
+        )
+        .unwrap();
+        st.apply(&pc).unwrap();
+        assert!(st.is_channel_member(&pub_ch, "admin#2"));
     }
 
     #[test]

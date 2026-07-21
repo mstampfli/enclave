@@ -2463,3 +2463,77 @@ async fn a_burst_of_structural_ops_all_land_via_the_queue() {
             .collect()
     );
 }
+
+/// M3: a private channel is readable only by its members. A workspace member who
+/// is not in the private channel receives none of its traffic (the relay routes
+/// to the channel's subset) and holds no key for it (it has its own MLS group).
+#[tokio::test]
+async fn a_private_channel_is_readable_only_by_its_members() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let mut bob = account(&url, "bob").await;
+    let mut carol = account(&url, "carol").await;
+    let bob_h = bob.name().to_string();
+    let carol_h = carol.name().to_string();
+
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+    owner.workspace_add_member(&ws, &bob_h).await.unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
+    })
+    .await;
+    owner.workspace_add_member(&ws, &carol_h).await.unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 3)
+    })
+    .await;
+    // Both catch up so their WG is current.
+    pump_until(&mut bob, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 3)
+    })
+    .await;
+    pump_until(&mut carol, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 3)
+    })
+    .await;
+
+    // Owner creates a PRIVATE channel and adds only Bob to it.
+    let chan = owner.create_private_channel(&ws, "staff").unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
+    })
+    .await;
+    owner.add_channel_member(&ws, &chan, &bob_h).await.unwrap();
+    // Owner sees Bob as a channel member (op applied).
+    let chan_id = {
+        let mut b = [0u8; 16];
+        for (i, byte) in b.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&chan[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        b
+    };
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws)
+            .is_some_and(|s| s.is_channel_member(&chan_id, &bob_h))
+    })
+    .await;
+    // Let Bob process the channel Welcome + key share.
+    for _ in 0..60 {
+        let _ = tokio::time::timeout(Duration::from_millis(20), bob.next_event()).await;
+    }
+
+    owner.send_channel_post(&ws, &chan, "top secret").unwrap();
+    pump_until(&mut bob, |c| !c.channel_history(&ws, &chan).is_empty()).await;
+    assert_eq!(bob.channel_history(&ws, &chan)[0].text, "top secret");
+
+    // Carol -- a workspace member, but NOT in this private channel -- gets nothing.
+    for _ in 0..40 {
+        let _ = tokio::time::timeout(Duration::from_millis(20), carol.next_event()).await;
+    }
+    assert!(
+        carol.channel_history(&ws, &chan).is_empty(),
+        "a non-channel-member of the workspace sees no private-channel traffic"
+    );
+}

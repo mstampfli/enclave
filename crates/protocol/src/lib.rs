@@ -305,18 +305,23 @@ pub enum ClientMsg {
     /// List the workspaces this account is a member of, replied to with
     /// [`ServerMsg::Workspaces`].
     WorkspaceListMine,
-    /// Deliver a workspace-group (WG) MLS Welcome to a member the owner/admin just
-    /// added, so they can join the WG that keys the public channels. `to` must be
-    /// a current member (the AddMember op is submitted first). Opaque.
+    /// Deliver an MLS Welcome for a workspace group to a member just added.
+    /// `channel = None` targets the workspace group (WG, keys public channels);
+    /// `channel = Some(id)` targets that **private channel's** own group. `to`
+    /// must already be a member of the relevant set (its Add op is submitted
+    /// first). Opaque.
     WorkspaceWelcome {
         workspace: WorkspaceId,
+        channel: Option<ChannelId>,
         to: String,
         welcome: Sealed,
     },
-    /// Broadcast a WG MLS commit (from an add/remove) to the workspace's members
-    /// so they advance to the new epoch. Opaque.
+    /// Broadcast an MLS commit (add/remove) to the members of a workspace group
+    /// so they advance to the new epoch. `channel` scopes it to the WG (`None`)
+    /// or a private channel's group. Opaque.
     WorkspaceCommit {
         workspace: WorkspaceId,
+        channel: Option<ChannelId>,
         commit: Sealed,
     },
     /// Post a message to a channel. The payload is sealed under the channel's
@@ -330,12 +335,14 @@ pub enum ClientMsg {
         epoch: u64,
         message: Sealed,
     },
-    /// Distribute channel history key(s), sealed under the WG so only members can
-    /// open them. `to = None` broadcasts a new channel's key to all members;
-    /// `to = Some(handle)` sends a newly-added member the full bundle so they can
-    /// read history from before they joined.
+    /// Distribute channel history key(s). `group_channel = None` means the bundle
+    /// is sealed under the WG (public-channel keys); `Some(id)` means it is sealed
+    /// under that private channel's own group (so only its members can open it,
+    /// even if the relay misroutes). `to = None` broadcasts to members; `to =
+    /// Some(handle)` is directed to one.
     ChannelKeyShare {
         workspace: WorkspaceId,
+        group_channel: Option<ChannelId>,
         to: Option<String>,
         message: Sealed,
     },
@@ -433,6 +440,12 @@ pub enum WorkspaceOp {
     RenameChannel { channel: ChannelId, name: String },
     /// Delete a channel.
     DeleteChannel { channel: ChannelId },
+    /// Add a workspace member to a **private** channel's member set (they can then
+    /// receive its key and traffic). Admin only; the member must be in the
+    /// workspace. No effect on a public channel (all members are in it).
+    AddChannelMember { channel: ChannelId, member: String },
+    /// Remove a member from a private channel (its key rotates for the rest).
+    RemoveChannelMember { channel: ChannelId, member: String },
 }
 
 /// An op-log entry: one [`WorkspaceOp`] made attributable and tamper-evident.
@@ -662,16 +675,20 @@ pub enum ServerMsg {
     Workspaces {
         workspaces: Vec<WorkspaceSummary>,
     },
-    /// A WG MLS Welcome for a workspace we were just added to: join the WG to
-    /// read its public channels. `from` is the adder.
+    /// An MLS Welcome for a workspace group we were just added to (`channel =
+    /// None` = the WG; `Some(id)` = that private channel's group). `from` is the
+    /// adder.
     WorkspaceWelcome {
         workspace: WorkspaceId,
+        channel: Option<ChannelId>,
         from: String,
         welcome: Sealed,
     },
-    /// A WG MLS commit to apply (advance the WG epoch). `from` is its author.
+    /// An MLS commit to apply to a workspace group (`channel` scopes it). `from`
+    /// is its author.
     WorkspaceCommit {
         workspace: WorkspaceId,
+        channel: Option<ChannelId>,
         from: String,
         commit: Sealed,
     },
@@ -684,9 +701,12 @@ pub enum ServerMsg {
         from: String,
         message: Sealed,
     },
-    /// Channel history key(s) shared with us (WG-sealed). `from` is the sharer.
+    /// Channel history key(s) shared with us. `group_channel` says which group
+    /// sealed them (WG if `None`, else that private channel's group). `from` is
+    /// the sharer.
     ChannelKeyShare {
         workspace: WorkspaceId,
+        group_channel: Option<ChannelId>,
         from: String,
         message: Sealed,
     },

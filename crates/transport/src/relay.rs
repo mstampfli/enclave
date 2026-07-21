@@ -1063,43 +1063,63 @@ impl Relay {
 
             ClientMsg::WorkspaceWelcome {
                 workspace,
+                channel,
                 to,
                 welcome,
             } => {
                 let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
                     return vec![];
                 };
-                // Both sides must be members: the sender to send, the recipient
-                // because the AddMember op is submitted before the Welcome.
-                if !self.workspaces.is_member(&workspace, &me)
-                    || !self.workspaces.is_member(&workspace, &to)
-                {
+                // Sender must be in the relevant set; recipient must be too (their
+                // Add op is submitted first). For a private channel that is the
+                // channel's member set; for the WG, the whole workspace.
+                let ok = match channel {
+                    Some(ch) => {
+                        self.workspaces.is_channel_member(&workspace, &ch, &me)
+                            && self.workspaces.is_channel_member(&workspace, &ch, &to)
+                    }
+                    None => {
+                        self.workspaces.is_member(&workspace, &me)
+                            && self.workspaces.is_member(&workspace, &to)
+                    }
+                };
+                if !ok {
                     return vec![];
                 }
                 let msg = ServerMsg::WorkspaceWelcome {
                     workspace,
+                    channel,
                     from: me,
                     welcome,
                 };
                 match self.device_conn.get(&DeviceId(to)) {
                     Some(&conn) => vec![Outgoing { to: conn, msg }],
-                    None => vec![], // offline: they resync the WG on next login (M1: via re-add)
+                    None => vec![], // offline: resync on next login
                 }
             }
 
-            ClientMsg::WorkspaceCommit { workspace, commit } => {
+            ClientMsg::WorkspaceCommit {
+                workspace,
+                channel,
+                commit,
+            } => {
                 let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
                     return vec![];
                 };
                 if !self.workspaces.is_member(&workspace, &me) {
                     return vec![];
                 }
-                let members = self.workspaces.members(&workspace);
+                // Deliver to the relevant group's members (channel subset or WG).
+                let members = match channel {
+                    Some(ch) => self.workspaces.channel_members(&workspace, &ch),
+                    None => self.workspaces.members(&workspace),
+                };
                 self.deliver_to_members_except(
                     &members,
                     &me,
                     ServerMsg::WorkspaceCommit {
                         workspace,
+                        channel,
                         from: me.clone(),
                         commit,
                     },
@@ -1118,10 +1138,15 @@ impl Relay {
                 if !self.workspaces.is_member(&workspace, &me) {
                     return vec![];
                 }
-                // Store for scrollback (relay holds no key), then fan out live.
+                // Only a member of THIS channel may post (private channels have a
+                // subset). Store for scrollback, then fan out to the channel's
+                // members (the whole workspace for a public channel).
+                if !self.workspaces.is_channel_member(&workspace, &channel, &me) {
+                    return vec![];
+                }
                 self.workspaces
                     .store_message(workspace, channel, epoch, message.clone());
-                let members = self.workspaces.members(&workspace);
+                let members = self.workspaces.channel_members(&workspace, &channel);
                 self.deliver_to_members_except(
                     &members,
                     &me,
@@ -1137,6 +1162,7 @@ impl Relay {
 
             ClientMsg::ChannelKeyShare {
                 workspace,
+                group_channel,
                 to,
                 message,
             } => {
@@ -1148,6 +1174,7 @@ impl Relay {
                 }
                 let out = ServerMsg::ChannelKeyShare {
                     workspace,
+                    group_channel,
                     from: me.clone(),
                     message,
                 };
@@ -1172,7 +1199,8 @@ impl Relay {
                 let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
                     return vec![];
                 };
-                if !self.workspaces.is_member(&workspace, &me) {
+                // Only a channel member may fetch its history (private subset).
+                if !self.workspaces.is_channel_member(&workspace, &channel, &me) {
                     return vec![];
                 }
                 vec![Outgoing {

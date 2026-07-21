@@ -150,6 +150,22 @@ impl WorkspaceStore {
             .unwrap_or_default()
     }
 
+    /// The effective members of a channel (a private channel's subset, or the
+    /// whole workspace for a public one) -- who its traffic fans out to.
+    pub fn channel_members(&self, ws: &WorkspaceId, channel: &ChannelId) -> Vec<String> {
+        self.states
+            .get(ws)
+            .map(|s| s.channel_members(channel))
+            .unwrap_or_default()
+    }
+
+    /// Whether `handle` may see `channel` in `ws`.
+    pub fn is_channel_member(&self, ws: &WorkspaceId, channel: &ChannelId, handle: &str) -> bool {
+        self.states
+            .get(ws)
+            .is_some_and(|s| s.is_channel_member(channel, handle))
+    }
+
     /// Store one sealed channel message for scrollback, evicting the oldest past
     /// the per-channel cap so history stays bounded.
     pub fn store_message(
