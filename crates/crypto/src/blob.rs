@@ -108,19 +108,14 @@ pub fn open_chunk(
         .map_err(|_| CryptoError::Blob("chunk authentication failed".into()))
 }
 
-/// Seal a poll ballot under the poll's shared `ballot_key`. That key is reused
-/// across every ballot in the poll (so any member can open any ballot at reveal),
-/// so the 96-bit nonce MUST be fresh per ballot: a random nonce is generated and
-/// prepended (`nonce(12) || ciphertext`). The AAD binds the ballot to its poll id,
-/// so it cannot be replayed into another poll. The (untrusted) server, which
-/// buffers ballots until the poll's release time, holds only this ciphertext -- it
-/// has no key and cannot read the vote. Epoch-independent (off the MLS ratchet),
-/// so a ballot held for days still opens even if the group re-keyed meanwhile.
-pub fn seal_ballot(
-    key: &[u8; 32],
-    poll_id: &[u8; 16],
-    plaintext: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
+/// Seal `plaintext` under a shared symmetric `key` with a fresh random 96-bit
+/// nonce prepended (`nonce(12) || ciphertext`) and `aad` authenticated but not
+/// encrypted. The shared primitive behind [`seal_ballot`] and [`seal_channel`]:
+/// the key is reused across many messages, so the nonce MUST be fresh each time
+/// (it is, from the CSPRNG), and the AAD domain-separates uses so a ciphertext
+/// cannot be replayed into a different context. Epoch-independent (off the MLS
+/// ratchet), so the (untrusted) server can store it and it still opens later.
+fn seal_aead(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let cipher = ChaCha20Poly1305::new(&Key::from(*key));
     let mut nonce = [0u8; 12];
     getrandom::getrandom(&mut nonce).map_err(|e| CryptoError::Blob(format!("rng: {e}")))?;
@@ -129,25 +124,21 @@ pub fn seal_ballot(
             &Nonce::from(nonce),
             Payload {
                 msg: plaintext,
-                aad: poll_id,
+                aad,
             },
         )
-        .map_err(|_| CryptoError::Blob("ballot seal failed".into()))?;
+        .map_err(|_| CryptoError::Blob("seal failed".into()))?;
     let mut out = Vec::with_capacity(12 + ct.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ct);
     Ok(out)
 }
 
-/// Open a ballot sealed by [`seal_ballot`]. Rejects a wrong key, a tampered
-/// ballot, or one bound to a different poll (the AAD authentication fails).
-pub fn open_ballot(
-    key: &[u8; 32],
-    poll_id: &[u8; 16],
-    bytes: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
+/// Open bytes sealed by [`seal_aead`]. Rejects a wrong key, tampering, or a
+/// different AAD (the authentication fails).
+fn open_aead(key: &[u8; 32], aad: &[u8], bytes: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if bytes.len() < 12 {
-        return Err(CryptoError::Blob("ballot too short".into()));
+        return Err(CryptoError::Blob("sealed blob too short".into()));
     }
     let cipher = ChaCha20Poly1305::new(&Key::from(*key));
     let nonce: [u8; 12] = bytes[0..12].try_into().expect("12 bytes");
@@ -156,10 +147,63 @@ pub fn open_ballot(
             &Nonce::from(nonce),
             Payload {
                 msg: &bytes[12..],
-                aad: poll_id,
+                aad,
             },
         )
-        .map_err(|_| CryptoError::Blob("ballot authentication failed".into()))
+        .map_err(|_| CryptoError::Blob("authentication failed".into()))
+}
+
+/// Seal a poll ballot under the poll's shared `ballot_key`, bound to its poll id
+/// (AAD) so it cannot be replayed into another poll. See [`seal_aead`]. The
+/// server, which buffers ballots until release, holds only this ciphertext.
+pub fn seal_ballot(
+    key: &[u8; 32],
+    poll_id: &[u8; 16],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    seal_aead(key, poll_id, plaintext)
+}
+
+/// Open a ballot sealed by [`seal_ballot`].
+pub fn open_ballot(
+    key: &[u8; 32],
+    poll_id: &[u8; 16],
+    bytes: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    open_aead(key, poll_id, bytes)
+}
+
+/// AAD for a channel message: the channel id then the history-key epoch, so a
+/// message sealed under epoch E's key cannot be presented as belonging to a
+/// different channel or a different epoch.
+fn channel_aad(channel: &[u8; 16], epoch: u64) -> [u8; 24] {
+    let mut aad = [0u8; 24];
+    aad[..16].copy_from_slice(channel);
+    aad[16..].copy_from_slice(&epoch.to_le_bytes());
+    aad
+}
+
+/// Seal a channel message under the channel's epoch **history key**. The same key
+/// seals every message in an epoch (so a new member given the key reads the whole
+/// epoch -- the scrollback tradeoff), with a fresh nonce per message. The server
+/// stores this ciphertext and fans it out; it holds no key. See [`seal_aead`].
+pub fn seal_channel(
+    key: &[u8; 32],
+    channel: &[u8; 16],
+    epoch: u64,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    seal_aead(key, &channel_aad(channel, epoch), plaintext)
+}
+
+/// Open a channel message sealed by [`seal_channel`].
+pub fn open_channel(
+    key: &[u8; 32],
+    channel: &[u8; 16],
+    epoch: u64,
+    bytes: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    open_aead(key, &channel_aad(channel, epoch), bytes)
 }
 
 /// A freshly sealed blob. `ciphertext` is what the (untrusted) server stores;
@@ -221,6 +265,26 @@ pub fn open_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_channel_message_opens_only_for_its_channel_epoch_and_key() {
+        let key = [7u8; 32];
+        let chan = [3u8; 16];
+        let sealed = seal_channel(&key, &chan, 2, b"hello channel").unwrap();
+        assert_eq!(
+            open_channel(&key, &chan, 2, &sealed).unwrap(),
+            b"hello channel"
+        );
+        // Wrong epoch, wrong channel, wrong key all fail (AAD / key mismatch).
+        assert!(open_channel(&key, &chan, 3, &sealed).is_err());
+        assert!(open_channel(&key, &[9u8; 16], 2, &sealed).is_err());
+        assert!(open_channel(&[0u8; 32], &chan, 2, &sealed).is_err());
+        // A flipped byte fails authentication.
+        let mut bad = sealed.clone();
+        let n = bad.len() - 1;
+        bad[n] ^= 1;
+        assert!(open_channel(&key, &chan, 2, &bad).is_err());
+    }
 
     #[test]
     fn round_trips() {

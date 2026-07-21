@@ -26,8 +26,8 @@ pub mod sign;
 pub mod workspace;
 
 pub use blob::{
-    blob_addr, open_ballot, open_blob, open_chunk, seal_ballot, seal_blob, seal_chunk, SealedBlob,
-    CHUNK_OVERHEAD,
+    blob_addr, open_ballot, open_blob, open_channel, open_chunk, seal_ballot, seal_blob,
+    seal_channel, seal_chunk, SealedBlob, CHUNK_OVERHEAD,
 };
 pub use error::CryptoError;
 pub use group::{Group, MemberAdd, SafetyNumber, TextMessage};
