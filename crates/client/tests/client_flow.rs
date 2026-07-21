@@ -2283,3 +2283,146 @@ async fn a_non_member_never_sees_a_workspaces_channel_traffic() {
     );
 }
 // appended diagnostic
+
+/// M2 scrollback: a member added *after* messages were posted can read that
+/// history. On join they receive the channel history keys (sealed under the WG)
+/// and backfill from the relay's stored, sealed history -- the Discord-style
+/// scrollback that pure MLS forbids.
+#[tokio::test]
+async fn a_late_joiner_reads_channel_history_from_before_they_joined() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let mut bob = account(&url, "bob").await;
+    let mut carol = account(&url, "carol").await;
+    let bob_h = bob.name().to_string();
+    let carol_h = carol.name().to_string();
+
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+    owner.workspace_add_member(&ws, &bob_h).await.unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
+    })
+    .await;
+    let chan = owner.create_channel(&ws, "general").unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
+    })
+    .await;
+    pump_until(&mut bob, |c| {
+        c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
+    })
+    .await;
+
+    // Post history BEFORE Carol exists in the workspace.
+    owner.send_channel_post(&ws, &chan, "first").unwrap();
+    owner.send_channel_post(&ws, &chan, "second").unwrap();
+    pump_until(&mut bob, |c| c.channel_history(&ws, &chan).len() == 2).await;
+
+    // Now add Carol; she must be able to read the two earlier messages.
+    owner.workspace_add_member(&ws, &carol_h).await.unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 3)
+    })
+    .await;
+    pump_until(&mut carol, |c| c.channel_history(&ws, &chan).len() == 2).await;
+
+    let texts: Vec<String> = carol
+        .channel_history(&ws, &chan)
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    assert!(
+        texts.contains(&"first".to_string()) && texts.contains(&"second".to_string()),
+        "late joiner backfilled pre-join history: {texts:?}"
+    );
+}
+
+/// M2 rotation: removing a member rotates every channel's history key, so the
+/// removed member cannot read anything posted after their removal, while
+/// remaining members can. History-key forward secrecy across a removal.
+#[tokio::test]
+async fn a_removed_member_cannot_read_messages_posted_after_removal() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let mut bob = account(&url, "bob").await;
+    let mut carol = account(&url, "carol").await;
+    let bob_h = bob.name().to_string();
+    let carol_h = carol.name().to_string();
+
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+    owner.workspace_add_member(&ws, &bob_h).await.unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
+    })
+    .await;
+    owner.workspace_add_member(&ws, &carol_h).await.unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 3)
+    })
+    .await;
+    let chan = owner.create_channel(&ws, "general").unwrap();
+    // Sequence past the owner's own CreateChannel echo before the next structural
+    // op, and let Bob apply every WG commit in order (add-carol before remove).
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
+    })
+    .await;
+    pump_until(&mut bob, |c| {
+        c.workspace(&ws)
+            .is_some_and(|s| s.members.len() == 3 && !s.channels.is_empty())
+    })
+    .await;
+    pump_until(&mut carol, |c| {
+        c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
+    })
+    .await;
+
+    // Carol reads a pre-removal message.
+    owner.send_channel_post(&ws, &chan, "before").unwrap();
+    pump_until(&mut carol, |c| !c.channel_history(&ws, &chan).is_empty()).await;
+
+    // Remove Carol; the key rotates to a new epoch shared only with Bob.
+    owner.workspace_remove_member(&ws, &carol_h).unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
+    })
+    .await;
+    // Let Bob apply the removal commit + receive the rotated key.
+    for _ in 0..40 {
+        let _ = tokio::time::timeout(Duration::from_millis(20), bob.next_event()).await;
+    }
+
+    // Post AFTER removal (under the new epoch key).
+    owner
+        .send_channel_post(&ws, &chan, "after removal")
+        .unwrap();
+    // Bob (remaining) reads it.
+    pump_until(&mut bob, |c| {
+        c.channel_history(&ws, &chan)
+            .iter()
+            .any(|m| m.text == "after removal")
+    })
+    .await;
+
+    // Carol gets no chance to read the post-removal message.
+    for _ in 0..40 {
+        let _ = tokio::time::timeout(Duration::from_millis(20), carol.next_event()).await;
+    }
+    let carol_texts: Vec<String> = carol
+        .channel_history(&ws, &chan)
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    assert!(
+        carol_texts.contains(&"before".to_string()),
+        "removed member keeps pre-removal history"
+    );
+    assert!(
+        !carol_texts.contains(&"after removal".to_string()),
+        "removed member cannot read post-removal messages: {carol_texts:?}"
+    );
+}

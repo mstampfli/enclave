@@ -16,7 +16,13 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use enclave_crypto::workspace::{OpError, WorkspaceState};
-use enclave_protocol::{SignedOp, WorkspaceId, WorkspaceSummary};
+use enclave_protocol::{ChannelId, Sealed, SignedOp, WorkspaceId, WorkspaceSummary};
+
+/// Most stored messages kept per channel for scrollback. Beyond this the oldest
+/// is evicted, so history is bounded (a late joiner still gets a deep backlog).
+/// In memory: a server restart loses stored history (a documented limitation,
+/// like the ballot buffer); the op-log itself is persisted.
+const MAX_HISTORY_PER_CHANNEL: usize = 5000;
 
 /// Why a submitted op was refused.
 #[derive(Debug, PartialEq, Eq)]
@@ -54,6 +60,9 @@ pub struct WorkspaceStore {
     logs: BTreeMap<WorkspaceId, Vec<SignedOp>>,
     /// Cached replay of each log; never serialized (rebuilt from `logs`).
     states: BTreeMap<WorkspaceId, WorkspaceState>,
+    /// Stored channel messages for scrollback: `(epoch, sealed)` per channel,
+    /// oldest first. In memory; sealed (the relay holds no key).
+    history: BTreeMap<(WorkspaceId, ChannelId), Vec<(u64, Sealed)>>,
     path: Option<PathBuf>,
 }
 
@@ -138,6 +147,31 @@ impl WorkspaceStore {
         self.states
             .get(ws)
             .map(|s| s.members.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Store one sealed channel message for scrollback, evicting the oldest past
+    /// the per-channel cap so history stays bounded.
+    pub fn store_message(
+        &mut self,
+        ws: WorkspaceId,
+        channel: ChannelId,
+        epoch: u64,
+        sealed: Sealed,
+    ) {
+        let log = self.history.entry((ws, channel)).or_default();
+        log.push((epoch, sealed));
+        if log.len() > MAX_HISTORY_PER_CHANNEL {
+            let overflow = log.len() - MAX_HISTORY_PER_CHANNEL;
+            log.drain(0..overflow);
+        }
+    }
+
+    /// A channel's stored history (`(epoch, sealed)` oldest first) for backfill.
+    pub fn channel_history(&self, ws: &WorkspaceId, channel: &ChannelId) -> Vec<(u64, Sealed)> {
+        self.history
+            .get(&(*ws, *channel))
+            .cloned()
             .unwrap_or_default()
     }
 

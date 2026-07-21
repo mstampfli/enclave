@@ -133,15 +133,41 @@ pub struct ChannelLine {
     pub mine: bool,
 }
 
-/// The sealed plaintext of a channel post, carried *inside* the WG ciphertext so
-/// the relay never sees which channel or what was said. The sender is
-/// MLS-authenticated by the WG, so it is not repeated here.
+/// The plaintext of a channel post, sealed under the channel's history key. The
+/// history key is symmetric (any member could seal), so the sender is
+/// authenticated by a signature over the body with their identity key, verified
+/// against the workspace op-log's record of their key -- confidentiality from the
+/// history key, authenticity from `sig`.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ChannelWire {
-    channel: [u8; 16],
     id: [u8; 16],
+    sender: String,
     text: String,
     ts: u64,
+    /// `sign_op(WS_CHANNEL_MSG_CONTEXT, body)` by `sender`'s identity key, where
+    /// body binds the channel too (so a message cannot be moved between channels).
+    sig: Vec<u8>,
+}
+
+/// A bundle of channel history keys, sealed under the WG when shared. One entry
+/// per `(channel, epoch)` a member is entitled to.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KeyBundle {
+    entries: Vec<([u8; 16], u64, [u8; 32])>,
+}
+
+/// Signing context for channel-message sender authentication.
+const WS_CHANNEL_MSG_CONTEXT: &[u8] = b"enclave/ws-channel-msg/v1";
+
+/// The signed body for a channel message: binds channel, id, sender, text, ts.
+fn channel_msg_body(
+    channel: &[u8; 16],
+    id: &[u8; 16],
+    sender: &str,
+    text: &str,
+    ts: u64,
+) -> Vec<u8> {
+    bincode::serialize(&(channel, id, sender, text, ts)).unwrap_or_default()
 }
 
 /// A file that arrived (or was sent) in a conversation. The bytes live on
@@ -771,9 +797,13 @@ pub struct Client {
     /// authoritative structure/membership we verify locally (never trusting the
     /// relay's copy). See `enclave_crypto::workspace`.
     workspaces: HashMap<[u8; 16], enclave_crypto::workspace::WorkspaceState>,
-    /// Per-workspace WG MLS group -- the shared key schedule that seals public
-    /// channel messages. Membership tracks the workspace's (public) membership.
+    /// Per-workspace WG MLS group -- used to seal the channel-key bundle to
+    /// members (membership tracks the workspace's public membership).
     workspace_groups: HashMap<[u8; 16], Group>,
+    /// Per-channel history keys, epoch-indexed: `channel_keys[(ws,ch)][epoch]`.
+    /// Seals channel messages and stored history; a new member is handed the
+    /// current set so they can read scrollback.
+    channel_keys: HashMap<([u8; 16], [u8; 16]), Vec<[u8; 32]>>,
     /// Channel message history, keyed by `(workspace, channel)`.
     channel_history: HashMap<([u8; 16], [u8; 16]), Vec<ChannelMsg>>,
     /// Handles that removed US (they initiated the un-friend). Only these auto-
@@ -882,6 +912,7 @@ impl Client {
             conversations: HashMap::new(),
             workspaces: HashMap::new(),
             workspace_groups: HashMap::new(),
+            channel_keys: HashMap::new(),
             channel_history: HashMap::new(),
             active: None,
             pending: VecDeque::new(),
@@ -1047,6 +1078,7 @@ impl Client {
         self.conversations.clear();
         self.workspaces.clear();
         self.workspace_groups.clear();
+        self.channel_keys.clear();
         self.channel_history.clear();
         self.active = None;
         self.export_key.clear();
@@ -4281,11 +4313,80 @@ impl Client {
             workspace: id,
             commit: Sealed(add.commit),
         });
+        // Hand the new member every channel history key we hold, sealed under the
+        // WG at the epoch they just joined, so they can read scrollback. Sent
+        // after the Welcome, which they process first.
+        let bundle = self.key_bundle_for(id);
+        if !bundle.entries.is_empty() {
+            self.share_key_bundle(id, Some(handle.to_string()), &bundle);
+        }
+        Ok(())
+    }
+
+    /// Remove `handle` from a workspace: remove them from the WG, record it in the
+    /// op-log, and **rotate every channel's history key** to a new epoch shared
+    /// only with remaining members -- so the removed member, who keeps only the
+    /// old keys, cannot read anything posted after their removal.
+    pub fn workspace_remove_member(
+        &mut self,
+        ws_hex: &str,
+        handle: &str,
+    ) -> Result<(), ClientError> {
+        let id = decode_offer_id(ws_hex)
+            .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
+        let target_key = self
+            .workspaces
+            .get(&id)
+            .and_then(|s| s.members.get(handle))
+            .cloned()
+            .ok_or_else(|| ClientError::Workspace("not a member".into()))?;
+        let commit = {
+            let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
+            let wg = self
+                .workspace_groups
+                .get_mut(&id)
+                .ok_or_else(|| ClientError::Workspace("workspace group missing".into()))?;
+            wg.remove_member(identity, &target_key)?
+        };
+        // Record the removal (op applied first, so the rotation key below is not
+        // routed to the now-removed member).
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::RemoveMember {
+                member: handle.to_string(),
+            },
+        )?;
+        self.conn.send(ClientMsg::WorkspaceCommit {
+            workspace: id,
+            commit: Sealed(commit),
+        });
+        // Rotate every channel to a fresh epoch and share the new keys with the
+        // remaining members (sealed under the post-removal WG epoch).
+        let channels: Vec<[u8; 16]> = self
+            .channel_keys
+            .keys()
+            .filter(|(w, _)| *w == id)
+            .map(|(_, c)| *c)
+            .collect();
+        let mut rotated = Vec::new();
+        for ch in channels {
+            let mut key = [0u8; 32];
+            let _ = getrandom::getrandom(&mut key);
+            let keys = self.channel_keys.entry((id, ch)).or_default();
+            let epoch = keys.len() as u64;
+            keys.push(key);
+            rotated.push((ch, epoch, key));
+        }
+        if !rotated.is_empty() {
+            self.share_key_bundle(id, None, &KeyBundle { entries: rotated });
+        }
         Ok(())
     }
 
     /// Create a public text channel in a workspace; returns its hex id.
     pub fn create_channel(&mut self, ws_hex: &str, name: &str) -> Result<String, ClientError> {
+        let ws = decode_offer_id(ws_hex)
+            .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
         let channel = new_transfer_id();
         self.workspace_submit(
             ws_hex,
@@ -4297,12 +4398,27 @@ impl Client {
                 category: None,
             },
         )?;
+        // Mint the channel's first history key (epoch 0) and share it with the
+        // current members, sealed under the WG so only they can open it.
+        let mut key = [0u8; 32];
+        let _ = getrandom::getrandom(&mut key);
+        self.channel_keys
+            .entry((ws, channel))
+            .or_default()
+            .push(key);
+        self.share_key_bundle(
+            ws,
+            None,
+            &KeyBundle {
+                entries: vec![(channel, 0, key)],
+            },
+        );
         Ok(hex::encode(channel))
     }
 
-    /// Post a text message to a channel: seal `(channel, id, text, ts)` under the
-    /// WG group (so the relay sees neither the channel nor the text) and fan it to
-    /// members. Records it locally and emits our own [`Event::ChannelMessage`].
+    /// Post a text message to a channel: sign it with our identity key (sender
+    /// authenticity), seal under the channel's current history key (confidentiality),
+    /// and send it. The relay stores it for scrollback and fans it to members.
     pub fn send_channel_post(
         &mut self,
         ws_hex: &str,
@@ -4316,21 +4432,28 @@ impl Client {
             .ok_or_else(|| ClientError::Workspace("bad channel id".into()))?;
         let msg_id = new_transfer_id();
         let ts = now_ms();
+        // Newest history-key epoch for this channel.
+        let keys = self
+            .channel_keys
+            .get(&(ws, channel))
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| ClientError::Workspace("no channel key yet".into()))?;
+        let epoch = (keys.len() - 1) as u64;
+        let key = keys[epoch as usize];
+        let body = channel_msg_body(&channel, &msg_id, &me, text, ts);
+        let sig = {
+            let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
+            identity.sign_op(WS_CHANNEL_MSG_CONTEXT, &body)?
+        };
         let wire = ChannelWire {
-            channel,
             id: msg_id,
+            sender: me.clone(),
             text: text.to_string(),
             ts,
+            sig,
         };
         let plaintext = bincode::serialize(&wire).unwrap_or_default();
-        let sealed = {
-            let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
-            let wg = self
-                .workspace_groups
-                .get_mut(&ws)
-                .ok_or_else(|| ClientError::Workspace("workspace group missing".into()))?;
-            wg.encrypt_text(identity, &plaintext)?
-        };
+        let sealed = enclave_crypto::seal_channel(&key, &channel, epoch, &plaintext)?;
         self.channel_history
             .entry((ws, channel))
             .or_default()
@@ -4343,6 +4466,8 @@ impl Client {
             });
         self.conn.send(ClientMsg::ChannelPost {
             workspace: ws,
+            channel,
+            epoch,
             message: Sealed(sealed),
         });
         self.pending.push_back(Event::ChannelMessage {
@@ -4397,34 +4522,141 @@ impl Client {
         }
     }
 
-    /// Decrypt an incoming channel post via the WG and record it.
-    fn receive_channel_post(&mut self, ws: [u8; 16], message: &[u8]) -> Option<Event> {
-        let decoded = match (self.identity.as_ref(), self.workspace_groups.get_mut(&ws)) {
-            (Some(id), Some(wg)) => wg.decrypt_text(id, message).ok(),
-            _ => None,
-        }?;
-        let wire: ChannelWire = bincode::deserialize(&decoded.plaintext).ok()?;
-        // Attribute to the MLS-authenticated sender, not the relay's `from`.
-        let user = String::from_utf8_lossy(&decoded.sender).into_owned();
-        self.channel_history
-            .entry((ws, wire.channel))
-            .or_default()
-            .push(ChannelMsg {
-                id: wire.id,
-                user: user.clone(),
-                text: wire.text.clone(),
-                ts: wire.ts,
-                mine: false,
-            });
+    /// Open one incoming channel post: unseal with the channel's epoch history
+    /// key, verify the sender's signature against the op-log's record of their
+    /// identity key, dedup, record. Returns the event on a genuinely new message.
+    fn receive_channel_post(
+        &mut self,
+        ws: [u8; 16],
+        channel: [u8; 16],
+        epoch: u64,
+        message: &[u8],
+    ) -> Option<Event> {
+        let key = *self.channel_keys.get(&(ws, channel))?.get(epoch as usize)?;
+        let plaintext = enclave_crypto::open_channel(&key, &channel, epoch, message).ok()?;
+        let wire: ChannelWire = bincode::deserialize(&plaintext).ok()?;
+        // Sender authenticity: verify the signature against the identity key the
+        // op-log recorded for `wire.sender`. A member could seal (they hold the
+        // key) but cannot forge another member's signature.
+        let sender_key = self
+            .workspaces
+            .get(&ws)
+            .and_then(|st| st.members.get(&wire.sender))?
+            .clone();
+        let body = channel_msg_body(&channel, &wire.id, &wire.sender, &wire.text, wire.ts);
+        if !enclave_crypto::verify_op(&sender_key, WS_CHANNEL_MSG_CONTEXT, &body, &wire.sig) {
+            return None; // forged or corrupt: drop
+        }
+        let history = self.channel_history.entry((ws, channel)).or_default();
+        // Dedup: a message may arrive both live and via a backfill fetch.
+        if history.iter().any(|m| m.id == wire.id) {
+            return None;
+        }
+        let mine = Some(&wire.sender) == self.username.as_ref();
+        history.push(ChannelMsg {
+            id: wire.id,
+            user: wire.sender.clone(),
+            text: wire.text.clone(),
+            ts: wire.ts,
+            mine,
+        });
         Some(Event::ChannelMessage {
             workspace: hex::encode(ws),
-            channel: hex::encode(wire.channel),
+            channel: hex::encode(channel),
             id: hex::encode(wire.id),
-            user,
+            user: wire.sender,
             text: wire.text,
             ts: wire.ts,
-            mine: false,
+            mine,
         })
+    }
+
+    /// Seal a key bundle under the WG and send it (broadcast if `to` is None, else
+    /// directed to one member) as a `ChannelKeyShare`.
+    fn share_key_bundle(&mut self, ws: [u8; 16], to: Option<String>, bundle: &KeyBundle) {
+        let plaintext = bincode::serialize(bundle).unwrap_or_default();
+        let sealed = match (self.identity.as_ref(), self.workspace_groups.get_mut(&ws)) {
+            (Some(id), Some(wg)) => wg.encrypt_text(id, &plaintext).ok(),
+            _ => None,
+        };
+        if let Some(sealed) = sealed {
+            self.conn.send(ClientMsg::ChannelKeyShare {
+                workspace: ws,
+                to,
+                message: Sealed(sealed),
+            });
+        }
+    }
+
+    /// The full set of channel keys we hold for a workspace, for handing to a new
+    /// member (so they can read all scrollback).
+    fn key_bundle_for(&self, ws: [u8; 16]) -> KeyBundle {
+        let mut entries = Vec::new();
+        for ((w, ch), keys) in &self.channel_keys {
+            if *w == ws {
+                for (epoch, key) in keys.iter().enumerate() {
+                    entries.push((*ch, epoch as u64, *key));
+                }
+            }
+        }
+        KeyBundle { entries }
+    }
+
+    /// Receive shared channel key(s), sealed under the WG. Stores any new keys and,
+    /// for each channel we just learned about, fetches its stored history.
+    fn receive_key_share(&mut self, ws: [u8; 16], message: &[u8]) {
+        let plaintext = match (self.identity.as_ref(), self.workspace_groups.get_mut(&ws)) {
+            (Some(id), Some(wg)) => match wg.decrypt_text(id, message) {
+                Ok(tm) => tm.plaintext,
+                Err(_) => return,
+            },
+            _ => return,
+        };
+        let Ok(bundle) = bincode::deserialize::<KeyBundle>(&plaintext) else {
+            return;
+        };
+        let mut new_channels: Vec<[u8; 16]> = Vec::new();
+        for (channel, epoch, key) in bundle.entries {
+            let keys = self.channel_keys.entry((ws, channel)).or_default();
+            let e = epoch as usize;
+            if e == keys.len() {
+                keys.push(key);
+                if e == 0 {
+                    new_channels.push(channel);
+                }
+            } else if e < keys.len() {
+                keys[e] = key; // idempotent re-share
+            }
+            // A gap (epoch > len) is ignored; a later full bundle fills it.
+        }
+        // Backfill any channel we just learned the first key for.
+        for channel in new_channels {
+            self.conn.send(ClientMsg::ChannelHistoryFetch {
+                workspace: ws,
+                channel,
+            });
+        }
+    }
+
+    /// Apply a fetched channel-history page: open each stored message like a live
+    /// one (dedup handles overlap with live delivery). Emits a `WorkspacesChanged`
+    /// so the UI re-reads the (now backfilled) channel.
+    fn receive_channel_history(
+        &mut self,
+        ws: [u8; 16],
+        channel: [u8; 16],
+        messages: Vec<(u64, Sealed)>,
+    ) -> Option<Event> {
+        let mut any = false;
+        for (epoch, sealed) in messages {
+            if self
+                .receive_channel_post(ws, channel, epoch, &sealed.0)
+                .is_some()
+            {
+                any = true;
+            }
+        }
+        any.then_some(Event::WorkspacesChanged)
     }
 
     /// Sign and submit one structural op (add/remove member, role, channel, ...)
@@ -5539,8 +5771,23 @@ impl Client {
                 None
             }
             ServerMsg::ChannelPost {
+                workspace,
+                channel,
+                epoch,
+                message,
+                ..
+            } => self.receive_channel_post(workspace, channel, epoch, &message.0),
+            ServerMsg::ChannelKeyShare {
                 workspace, message, ..
-            } => self.receive_channel_post(workspace, &message.0),
+            } => {
+                self.receive_key_share(workspace, &message.0);
+                None
+            }
+            ServerMsg::ChannelHistory {
+                workspace,
+                channel,
+                messages,
+            } => self.receive_channel_history(workspace, channel, messages),
             ServerMsg::Workspaces { workspaces } => {
                 // Fetch the full log for any workspace we do not yet hold, so a
                 // fresh login / new device catches up. Known ones are already live.

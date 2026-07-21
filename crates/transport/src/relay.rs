@@ -1106,23 +1106,83 @@ impl Relay {
                 )
             }
 
-            ClientMsg::ChannelPost { workspace, message } => {
+            ClientMsg::ChannelPost {
+                workspace,
+                channel,
+                epoch,
+                message,
+            } => {
                 let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
                     return vec![];
                 };
                 if !self.workspaces.is_member(&workspace, &me) {
                     return vec![];
                 }
+                // Store for scrollback (relay holds no key), then fan out live.
+                self.workspaces
+                    .store_message(workspace, channel, epoch, message.clone());
                 let members = self.workspaces.members(&workspace);
                 self.deliver_to_members_except(
                     &members,
                     &me,
                     ServerMsg::ChannelPost {
                         workspace,
+                        channel,
+                        epoch,
                         from: me.clone(),
                         message,
                     },
                 )
+            }
+
+            ClientMsg::ChannelKeyShare {
+                workspace,
+                to,
+                message,
+            } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                if !self.workspaces.is_member(&workspace, &me) {
+                    return vec![];
+                }
+                let out = ServerMsg::ChannelKeyShare {
+                    workspace,
+                    from: me.clone(),
+                    message,
+                };
+                match to {
+                    // A directed bundle to one (member) recipient.
+                    Some(handle) if self.workspaces.is_member(&workspace, &handle) => {
+                        match self.device_conn.get(&DeviceId(handle)) {
+                            Some(&conn) => vec![Outgoing { to: conn, msg: out }],
+                            None => vec![],
+                        }
+                    }
+                    Some(_) => vec![], // not a member
+                    // A broadcast (new channel key) to all members but the sender.
+                    None => {
+                        let members = self.workspaces.members(&workspace);
+                        self.deliver_to_members_except(&members, &me, out)
+                    }
+                }
+            }
+
+            ClientMsg::ChannelHistoryFetch { workspace, channel } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                if !self.workspaces.is_member(&workspace, &me) {
+                    return vec![];
+                }
+                vec![Outgoing {
+                    to: from,
+                    msg: ServerMsg::ChannelHistory {
+                        workspace,
+                        channel,
+                        messages: self.workspaces.channel_history(&workspace, &channel),
+                    },
+                }]
             }
 
             ClientMsg::RequestDm { to } => {

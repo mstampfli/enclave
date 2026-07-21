@@ -319,13 +319,31 @@ pub enum ClientMsg {
         workspace: WorkspaceId,
         commit: Sealed,
     },
-    /// Post a message to a channel. The sealed payload is a WG-encrypted
-    /// `(channel_id, text)` -- the channel is *inside* the ciphertext, so the
-    /// relay sees only "a message in this workspace", not which channel. Fanned
-    /// to the workspace's members.
+    /// Post a message to a channel. The payload is sealed under the channel's
+    /// epoch **history key** (`crypto::seal_channel`); the relay both fans it to
+    /// members and stores it for scrollback. `channel`/`epoch` are metadata the
+    /// relay already knows (the op-log carries channels), needed to store and to
+    /// pick the opening key; the text stays sealed.
     ChannelPost {
         workspace: WorkspaceId,
+        channel: ChannelId,
+        epoch: u64,
         message: Sealed,
+    },
+    /// Distribute channel history key(s), sealed under the WG so only members can
+    /// open them. `to = None` broadcasts a new channel's key to all members;
+    /// `to = Some(handle)` sends a newly-added member the full bundle so they can
+    /// read history from before they joined.
+    ChannelKeyShare {
+        workspace: WorkspaceId,
+        to: Option<String>,
+        message: Sealed,
+    },
+    /// Fetch a channel's stored history for backfill, replied to with
+    /// [`ServerMsg::ChannelHistory`]. Members only.
+    ChannelHistoryFetch {
+        workspace: WorkspaceId,
+        channel: ChannelId,
     },
 }
 
@@ -657,12 +675,27 @@ pub enum ServerMsg {
         from: String,
         commit: Sealed,
     },
-    /// A channel message: the WG-encrypted `(channel_id, text)`. `from` is the
-    /// MLS-authenticated sender (re-checked on decrypt).
+    /// A channel message sealed under the channel's epoch history key. `from` is
+    /// the sender; the payload is opened with `crypto::open_channel`.
     ChannelPost {
+        workspace: WorkspaceId,
+        channel: ChannelId,
+        epoch: u64,
+        from: String,
+        message: Sealed,
+    },
+    /// Channel history key(s) shared with us (WG-sealed). `from` is the sharer.
+    ChannelKeyShare {
         workspace: WorkspaceId,
         from: String,
         message: Sealed,
+    },
+    /// A channel's stored history for backfill: `(epoch, sealed)` oldest first
+    /// (reply to [`ClientMsg::ChannelHistoryFetch`]).
+    ChannelHistory {
+        workspace: WorkspaceId,
+        channel: ChannelId,
+        messages: Vec<(u64, Sealed)>,
     },
 }
 
