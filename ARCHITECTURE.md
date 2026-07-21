@@ -190,19 +190,24 @@ window by default and only add the WASM/browser target when we choose to.
    codec, and proven by
    `transfer::tests::a_sealed_ballot_is_the_same_size_whatever_it_says` and
    `the_anonymous_ballot_the_relay_stores_is_size_invariant`.
-8. Workspace authority is a signed, append-only op-log, not the server. Every
-   structural change (create, add/remove member, grant/revoke role, create/
-   rename/delete channel, move a channel or nest a category) is an identity-signed
-   `SignedOp` chained by sequence number + SHA-256 `prev_hash`; clients replay the
-   log and authorize each op locally -- genesis fixes the owner, only the owner
-   grants admin, a remove requires the actor to outrank a non-owner target, and a
-   category move that would form a cycle or exceed `MAX_CATEGORY_DEPTH` is refused
-   -- so the relay, holding no signing key, cannot forge membership or roles or
-   splice the chain undetected. Enforced by `crypto::workspace::WorkspaceState::apply`
-   (rejecting `BadSeq` / `BadChain` / `BadSignature` / `Unauthorized` / `BadTarget`)
-   and `crypto::sign`, re-validated at the relay's ingress (`transport::workspaces`),
-   and proven by the crypto workspace tests (`genesis_establishes_owner_and_roles`,
-   `only_the_owner_grants_admin_and_only_higher_roles_remove`,
+8. Workspace authority is a signed, append-only op-log, not the server, and it is
+   permission-based (RBAC), deny-by-default. Every structural change is an
+   identity-signed `SignedOp` chained by sequence number + SHA-256 `prev_hash`;
+   clients replay the log and authorize each op against the author's **effective
+   permissions** -- the union of the roles assigned to them. A member with no role
+   can do nothing; the owner's power is a protected built-in `Owner` role assigned
+   at genesis (not a special case: `permissions_of` grants nothing without an
+   assignment, so a bypassed check fails closed). No one may create or assign a
+   role carrying a permission they do not themselves hold (no privilege
+   escalation), the Owner role and owner are tamper-protected, and a category move
+   that would cycle or exceed `MAX_CATEGORY_DEPTH` is refused. So the relay,
+   holding no signing key, cannot forge membership, roles, or what a role permits.
+   Enforced by `crypto::workspace::WorkspaceState::apply` (rejecting `BadSeq` /
+   `BadChain` / `BadSignature` / `Unauthorized` / `BadTarget`) and `crypto::sign`,
+   re-validated at the relay's ingress (`transport::workspaces`), and proven by the
+   crypto workspace tests (`genesis_establishes_owner_and_roles`,
+   `role_ops_prevent_privilege_escalation_and_protect_the_owner_role`,
+   `a_bare_member_cannot_touch_roles_and_the_owner_is_unremovable`,
    `a_forged_or_reordered_entry_is_rejected`, `a_tampered_op_body_breaks_the_signature`,
    `a_category_move_is_rejected_when_it_would_cycle_or_target_is_missing`,
    `category_nesting_is_depth_bounded`).

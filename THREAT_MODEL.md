@@ -807,9 +807,20 @@ op cannot brick a log's chain for everyone. Proven by the crypto workspace tests
 - **Denial of service -- relay censors (drops ops or messages).** *Accept.* A
   liveness limit inherent to depending on a server you host; it can withhold but
   cannot forge or read.
-- **Elevation of privilege -- a member performs an admin action.** *Mitigate.*
-  Authorization is the owner-chained signed grant; a client rejects any op whose
-  signer lacks the role. The server cannot elevate.
+- **Elevation of privilege -- a member performs an action they lack.** *Mitigate.*
+  Authorization is permission-based (RBAC) and deny-by-default: each op requires a
+  specific permission, and a member's permissions are only the union of their
+  assigned roles. A member with no role can do nothing, and the server cannot
+  elevate (it holds no signing key). The design is **fail closed** -- the owner's
+  all-permissions come from a protected built-in role assigned at genesis, not a
+  special case, so a bypassed authorization check grants nothing rather than
+  everything. Proven by `a_bare_member_cannot_touch_roles_and_the_owner_is_unremovable`.
+- **Elevation of privilege -- privilege escalation via role management.**
+  *Mitigate.* Someone who can manage roles still cannot mint or assign a role
+  carrying a permission they do not themselves hold, and the built-in Owner role
+  cannot be edited, deleted, assigned, or unassigned, so no one can bootstrap
+  themselves (or another member) past their own authority or seize the owner's.
+  Proven by `role_ops_prevent_privilege_escalation_and_protect_the_owner_role`.
 - **Elevation of privilege -- a removed member keeps reading.** *Mitigate.*
   Removal drives an MLS commit (public channels rekey in one commit; each private
   channel rekeys its own group) **and** rotates every channel's history-key epoch,

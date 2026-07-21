@@ -436,15 +436,54 @@ pub enum ChannelKind {
     Voice,
 }
 
-/// A member's standing in a workspace. `Owner` is the creator (exactly one, set
-/// in the genesis op); `Admin` is granted by the owner and may manage channels
-/// and members; `Member` is the default and may participate but not manage.
+/// A workspace capability. Roles are named bundles of these; a member's effective
+/// permissions are the union of their assigned roles' permissions, and the owner
+/// (the genesis creator, exactly one) implicitly holds every permission. A member
+/// with no roles can participate (read/post) but not manage anything -- authority
+/// is deny-by-default. Adding a capability later is just a new variant here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum Role {
-    Member,
-    Admin,
-    Owner,
+pub enum Permission {
+    /// Create/rename/delete channels and categories, and move/nest them.
+    ManageChannels,
+    /// Add or remove workspace members, and mint invite codes.
+    ManageMembers,
+    /// Add or remove members of private channels.
+    ManageChannelMembers,
+    /// Create, edit, delete roles and assign them to members.
+    ManageRoles,
+    /// Move members between voice channels.
+    MoveVoiceMembers,
 }
+
+impl Permission {
+    /// Every capability, for the owner and for a role editor's checklist.
+    pub const ALL: [Permission; 5] = [
+        Permission::ManageChannels,
+        Permission::ManageMembers,
+        Permission::ManageChannelMembers,
+        Permission::ManageRoles,
+        Permission::MoveVoiceMembers,
+    ];
+
+    /// A stable snake_case token for the wire to the UI and back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Permission::ManageChannels => "manage_channels",
+            Permission::ManageMembers => "manage_members",
+            Permission::ManageChannelMembers => "manage_channel_members",
+            Permission::ManageRoles => "manage_roles",
+            Permission::MoveVoiceMembers => "move_voice_members",
+        }
+    }
+
+    /// Parse the token produced by [`Permission::as_str`].
+    pub fn from_str(s: &str) -> Option<Permission> {
+        Permission::ALL.into_iter().find(|p| p.as_str() == s)
+    }
+}
+
+/// Identifier for a workspace role definition.
+pub type RoleId = [u8; 16];
 
 /// One structural change to a workspace. The op-log is a sequence of these, each
 /// wrapped in a signed, chained [`SignedOp`]. Content (messages) is NOT here --
@@ -459,14 +498,32 @@ pub enum WorkspaceOp {
         owner_key: Vec<u8>,
     },
     /// Add a member, recording the identity key their future ops are verified
-    /// against. Authorized for owner/admin.
+    /// against. Needs `ManageMembers`.
     AddMember { member: String, member_key: Vec<u8> },
-    /// Remove a member (they lose access; channels they were in rekey).
+    /// Remove a member (they lose access; channels they were in rekey). Needs
+    /// `ManageMembers`; the owner cannot be removed.
     RemoveMember { member: String },
-    /// Grant a role. Only the owner may grant `Admin`.
-    GrantRole { member: String, role: Role },
-    /// Revoke a role, dropping the member back to `Member`.
-    RevokeRole { member: String, role: Role },
+    /// Define a new role. Needs `ManageRoles`, and a non-owner may only put
+    /// permissions they themselves hold into it (no privilege escalation).
+    CreateRole {
+        role: RoleId,
+        name: String,
+        permissions: Vec<Permission>,
+    },
+    /// Change a role's name and permission set (same escalation rule as create).
+    EditRole {
+        role: RoleId,
+        name: String,
+        permissions: Vec<Permission>,
+    },
+    /// Delete a role (it is removed from every member who had it). Needs `ManageRoles`.
+    DeleteRole { role: RoleId },
+    /// Assign a role to a member. Needs `ManageRoles`, and a non-owner may only
+    /// assign a role whose permissions they themselves hold. The owner is not a
+    /// role target.
+    AssignRole { member: String, role: RoleId },
+    /// Remove a role from a member. Needs `ManageRoles`.
+    UnassignRole { member: String, role: RoleId },
     /// Create a category (a channel group in the sidebar).
     CreateCategory { category: CategoryId, name: String },
     /// Create a channel. `private` channels have their own subset membership

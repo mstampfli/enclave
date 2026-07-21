@@ -392,10 +392,34 @@ enum UiCommand {
         channel: String,
         handle: String,
     },
-    SetWorkspaceRole {
+    /// Create a custom role with the given permission tokens.
+    CreateRole {
+        workspace: String,
+        name: String,
+        permissions: Vec<String>,
+    },
+    /// Change a role's name and permission set.
+    EditRole {
+        workspace: String,
+        role: String,
+        name: String,
+        permissions: Vec<String>,
+    },
+    /// Delete a role (removed from everyone who had it).
+    DeleteRole {
+        workspace: String,
+        role: String,
+    },
+    /// Assign a role to a member.
+    AssignRole {
         workspace: String,
         handle: String,
-        /// "admin" grants Admin; "member" revokes it.
+        role: String,
+    },
+    /// Remove a role from a member.
+    UnassignRole {
+        workspace: String,
+        handle: String,
         role: String,
     },
     CreateCategory {
@@ -560,11 +584,26 @@ impl From<enclave_client::PollView> for PollViewOut {
 struct WorkspaceOut {
     id: String,
     name: String,
-    /// Our role: "owner" | "admin" | "member".
-    my_role: String,
+    /// Whether we are the owner (holds every permission, untouchable).
+    am_owner: bool,
+    /// Our effective permission tokens (e.g. "manage_channels"), for gating UI.
+    my_permissions: Vec<String>,
+    /// The workspace's role definitions (the built-in Owner role included, flagged).
+    roles: Vec<RoleOut>,
     categories: Vec<CategoryOut>,
     channels: Vec<ChannelOut>,
     members: Vec<MemberOut>,
+}
+
+/// A role definition for the UI's role editor.
+#[derive(serde::Serialize, Clone)]
+struct RoleOut {
+    id: String,
+    name: String,
+    /// Permission tokens this role grants.
+    permissions: Vec<String>,
+    /// True for the built-in Owner role (shown but not editable/deletable).
+    builtin: bool,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -590,7 +629,10 @@ struct ChannelOut {
 #[derive(serde::Serialize, Clone)]
 struct MemberOut {
     handle: String,
-    role: String,
+    /// Whether this member is the owner.
+    is_owner: bool,
+    /// The role ids (hex) assigned to this member (empty for a bare member).
+    roles: Vec<String>,
 }
 
 /// One channel message for the UI's channel view.
@@ -632,11 +674,6 @@ fn workspace_views(c: &enclave_client::Client) -> Vec<WorkspaceOut> {
         let Some(state) = c.workspace(&id_hex) else {
             continue;
         };
-        let role_str = |r: enclave_protocol::Role| match r {
-            enclave_protocol::Role::Owner => "owner",
-            enclave_protocol::Role::Admin => "admin",
-            enclave_protocol::Role::Member => "member",
-        };
         let categories = state
             .categories
             .iter()
@@ -667,15 +704,40 @@ fn workspace_views(c: &enclave_client::Client) -> Vec<WorkspaceOut> {
             .keys()
             .map(|h| MemberOut {
                 handle: h.clone(),
-                role: role_str(state.role_of(h).unwrap_or(enclave_protocol::Role::Member))
-                    .to_string(),
+                is_owner: state.is_owner(h),
+                roles: state
+                    .member_roles
+                    .get(h)
+                    .map(|ids| {
+                        ids.iter()
+                            .filter(|rid| **rid != enclave_crypto::workspace::OWNER_ROLE_ID)
+                            .map(hex::encode)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             })
+            .collect();
+        let roles = state
+            .roles
+            .iter()
+            .map(|(rid, def)| RoleOut {
+                id: hex::encode(rid),
+                name: def.name.clone(),
+                permissions: def.permissions.iter().map(|p| p.as_str().to_string()).collect(),
+                builtin: *rid == enclave_crypto::workspace::OWNER_ROLE_ID,
+            })
+            .collect();
+        let my_permissions = state
+            .permissions_of(&me)
+            .iter()
+            .map(|p| p.as_str().to_string())
             .collect();
         out.push(WorkspaceOut {
             id: id_hex,
             name: state.name.clone(),
-            my_role: role_str(state.role_of(&me).unwrap_or(enclave_protocol::Role::Member))
-                .to_string(),
+            am_owner: state.is_owner(&me),
+            my_permissions,
+            roles,
             categories,
             channels,
             members,
@@ -2851,25 +2913,55 @@ async fn handle_command(
                 }
             }
         }
-        UiCommand::SetWorkspaceRole {
+        UiCommand::CreateRole {
+            workspace,
+            name,
+            permissions,
+        } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.create_role(&workspace, &name, &permissions) {
+                    error_status(proxy, format!("Could not create role: {e}"));
+                }
+            }
+        }
+        UiCommand::EditRole {
+            workspace,
+            role,
+            name,
+            permissions,
+        } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.edit_role(&workspace, &role, &name, &permissions) {
+                    error_status(proxy, format!("Could not edit role: {e}"));
+                }
+            }
+        }
+        UiCommand::DeleteRole { workspace, role } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.delete_role(&workspace, &role) {
+                    error_status(proxy, format!("Could not delete role: {e}"));
+                }
+            }
+        }
+        UiCommand::AssignRole {
             workspace,
             handle,
             role,
         } => {
             if let Some(c) = client.as_mut() {
-                let op = if role == "admin" {
-                    enclave_protocol::WorkspaceOp::GrantRole {
-                        member: handle,
-                        role: enclave_protocol::Role::Admin,
-                    }
-                } else {
-                    enclave_protocol::WorkspaceOp::RevokeRole {
-                        member: handle,
-                        role: enclave_protocol::Role::Admin,
-                    }
-                };
-                if let Err(e) = c.workspace_submit(&workspace, op) {
-                    error_status(proxy, format!("Could not change role: {e}"));
+                if let Err(e) = c.assign_role(&workspace, &handle, &role) {
+                    error_status(proxy, format!("Could not assign role: {e}"));
+                }
+            }
+        }
+        UiCommand::UnassignRole {
+            workspace,
+            handle,
+            role,
+        } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.unassign_role(&workspace, &handle, &role) {
+                    error_status(proxy, format!("Could not remove role: {e}"));
                 }
             }
         }

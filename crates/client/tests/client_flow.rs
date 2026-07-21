@@ -2131,7 +2131,7 @@ async fn a_closed_chat_is_not_reopened_by_a_friend_change() {
 /// plumbing all agree.
 #[tokio::test]
 async fn a_workspace_is_created_and_a_member_is_added_end_to_end() {
-    use enclave_protocol::{Role, WorkspaceOp};
+    use enclave_protocol::WorkspaceOp;
 
     let handle = serve("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", handle.addr);
@@ -2144,10 +2144,7 @@ async fn a_workspace_is_created_and_a_member_is_added_end_to_end() {
     // Owner creates the workspace; state arrives on the server echo.
     let ws = owner.create_workspace("Team").unwrap();
     pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
-    assert_eq!(
-        owner.workspace(&ws).unwrap().role_of(&owner_h),
-        Some(Role::Owner)
-    );
+    assert!(owner.workspace(&ws).unwrap().is_owner(&owner_h));
 
     // Owner adds Bob (needs Bob's identity key, as a real invite flow would carry).
     owner
@@ -2168,7 +2165,7 @@ async fn a_workspace_is_created_and_a_member_is_added_end_to_end() {
     .await;
     pump_until(&mut bob, |c| {
         c.workspace(&ws)
-            .is_some_and(|s| s.role_of(&bob_h) == Some(Role::Member))
+            .is_some_and(|s| s.members.contains_key(&bob_h))
     })
     .await;
 
@@ -2176,9 +2173,9 @@ async fn a_workspace_is_created_and_a_member_is_added_end_to_end() {
     let bob_view = bob.workspace(&ws).unwrap();
     assert_eq!(owner_view.name, "Team");
     assert_eq!(bob_view.name, "Team");
-    assert_eq!(owner_view.role_of(&owner_h), Some(Role::Owner));
-    assert_eq!(bob_view.role_of(&owner_h), Some(Role::Owner));
-    assert_eq!(bob_view.role_of(&bob_h), Some(Role::Member));
+    assert!(owner_view.is_owner(&owner_h));
+    assert!(bob_view.is_owner(&owner_h));
+    assert!(bob_view.members.contains_key(&bob_h));
     // Same chain head -> identical, verified history on both sides.
     assert_eq!(owner_view.head_hash(), bob_view.head_hash());
 }
@@ -2189,7 +2186,6 @@ async fn a_workspace_is_created_and_a_member_is_added_end_to_end() {
 /// username. Proves the create -> redeem -> route-to-admin -> admit path.
 #[tokio::test]
 async fn an_invite_code_admits_a_redeemer() {
-    use enclave_protocol::Role;
 
     let handle = serve("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", handle.addr);
@@ -2234,15 +2230,14 @@ async fn an_invite_code_admits_a_redeemer() {
         let _ = tokio::time::timeout(Duration::from_millis(50), carol.next_event()).await;
         if carol
             .workspace(&ws)
-            .is_some_and(|s| s.role_of(&carol_h) == Some(Role::Member))
+            .is_some_and(|s| s.members.contains_key(&carol_h))
         {
             break;
         }
     }
     assert!(admitted, "owner never received the join request");
-    assert_eq!(
-        carol.workspace(&ws).and_then(|s| s.role_of(&carol_h)),
-        Some(Role::Member),
+    assert!(
+        carol.workspace(&ws).is_some_and(|s| s.members.contains_key(&carol_h)),
         "redeemer did not become a member"
     );
     pump_until(&mut owner, |c| {
@@ -2257,7 +2252,6 @@ async fn an_invite_code_admits_a_redeemer() {
 /// authorization and directive path end to end.
 #[tokio::test]
 async fn an_admin_moves_a_member_between_voice_channels() {
-    use enclave_protocol::Role;
 
     let handle = serve("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", handle.addr);
@@ -2269,7 +2263,7 @@ async fn an_admin_moves_a_member_between_voice_channels() {
     pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
     owner.workspace_add_member(&ws, &bob_h).await.unwrap();
     pump2(&mut owner, &mut bob, |_, b| {
-        b.workspace(&ws).is_some_and(|s| s.role_of(&bob_h) == Some(Role::Member))
+        b.workspace(&ws).is_some_and(|s| s.members.contains_key(&bob_h))
     })
     .await;
 
@@ -2363,7 +2357,6 @@ async fn a_channel_can_be_created_inside_a_category() {
 /// the MLS commit and dropping all but the first (the old busy-check behavior).
 #[tokio::test]
 async fn a_burst_of_invite_redemptions_all_get_admitted() {
-    use enclave_protocol::Role;
 
     let handle = serve("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", handle.addr);
@@ -2431,17 +2424,17 @@ async fn a_burst_of_invite_redemptions_all_get_admitted() {
     }
     pump_until(&mut r1, |c| {
         c.workspace(&ws)
-            .is_some_and(|st| st.role_of(&names[0]) == Some(Role::Member))
+            .is_some_and(|st| st.members.contains_key(&names[0]))
     })
     .await;
     pump_until(&mut r2, |c| {
         c.workspace(&ws)
-            .is_some_and(|st| st.role_of(&names[1]) == Some(Role::Member))
+            .is_some_and(|st| st.members.contains_key(&names[1]))
     })
     .await;
     pump_until(&mut r3, |c| {
         c.workspace(&ws)
-            .is_some_and(|st| st.role_of(&names[2]) == Some(Role::Member))
+            .is_some_and(|st| st.members.contains_key(&names[2]))
     })
     .await;
 }

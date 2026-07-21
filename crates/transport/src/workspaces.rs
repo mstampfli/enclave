@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use enclave_crypto::workspace::{OpError, WorkspaceState};
-use enclave_protocol::{ChannelId, Role, Sealed, SignedOp, WorkspaceId, WorkspaceSummary};
+use enclave_protocol::{ChannelId, Permission, Sealed, SignedOp, WorkspaceId, WorkspaceSummary};
 
 /// Most stored messages kept per channel for scrollback. Beyond this the oldest
 /// is evicted, so history is bounded (a late joiner still gets a deep backlog).
@@ -333,24 +333,24 @@ impl WorkspaceStore {
         (page, start > 0)
     }
 
-    /// Whether `handle` is an admin (or owner) of `ws` -- who may mint invites
-    /// and admit redeemers.
-    pub fn is_admin(&self, ws: &WorkspaceId, handle: &str) -> bool {
+    /// Whether `handle` holds `perm` in `ws` (defense-in-depth for relay-side
+    /// actions; the op-log replay is still the authority).
+    pub fn has_permission(&self, ws: &WorkspaceId, handle: &str, perm: Permission) -> bool {
         self.states
             .get(ws)
-            .and_then(|s| s.role_of(handle))
-            .is_some_and(|r| r >= Role::Admin)
+            .is_some_and(|s| s.has_permission(handle, perm))
     }
 
-    /// The current admins/owner of `ws` (for routing a join request).
-    pub fn admins(&self, ws: &WorkspaceId) -> Vec<String> {
+    /// The current members of `ws` who hold `perm` -- e.g. those who can admit a
+    /// join request (`ManageMembers`).
+    pub fn members_with(&self, ws: &WorkspaceId, perm: Permission) -> Vec<String> {
         self.states
             .get(ws)
             .map(|s| {
-                s.roles
-                    .iter()
-                    .filter(|(_, r)| **r >= Role::Admin)
-                    .map(|(h, _)| h.clone())
+                s.members
+                    .keys()
+                    .filter(|h| s.has_permission(h, perm))
+                    .cloned()
                     .collect()
             })
             .unwrap_or_default()
@@ -639,8 +639,8 @@ mod tests {
         store
             .submit(ws, sign_genesis(&owner, "owner#1", "Team", 100).unwrap())
             .unwrap();
-        assert!(store.is_admin(&ws, "owner#1"));
-        assert!(!store.is_admin(&ws, "bob#2"));
+        assert!(store.has_permission(&ws, "owner#1", Permission::ManageMembers));
+        assert!(!store.has_permission(&ws, "bob#2", Permission::ManageMembers));
 
         // A single-use code expiring at t=1000.
         store.create_invite(ws, "code1".into(), 1000, 1);

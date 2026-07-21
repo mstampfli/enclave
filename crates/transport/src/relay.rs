@@ -17,7 +17,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use enclave_protocol::{ClientMsg, DeviceId, Friend, GroupId, Presence, Sealed, ServerMsg, UserId};
+use enclave_protocol::{
+    ClientMsg, DeviceId, Friend, GroupId, Permission, Presence, Sealed, ServerMsg, UserId,
+};
 
 use crate::accounts::{AccountStore, AuthOutcome};
 use crate::avatarstore::AvatarStore;
@@ -1263,11 +1265,14 @@ impl Relay {
                 let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
                     return vec![];
                 };
-                // Only an admin/owner may mint an invite (the redeemer is admitted
-                // by an admin's signed op, but minting is gated too so a plain
-                // member cannot hand out join links).
-                if !self.workspaces.is_admin(&workspace, &me) {
-                    return workspace_error(from, "only an admin can create an invite");
+                // Only someone who can manage members may mint an invite (the
+                // redeemer is admitted by such a member's signed op, but minting is
+                // gated too so a plain member cannot hand out join links).
+                if !self
+                    .workspaces
+                    .has_permission(&workspace, &me, Permission::ManageMembers)
+                {
+                    return workspace_error(from, "you do not have permission to create an invite");
                 }
                 let code = {
                     use rand::RngCore as _;
@@ -1300,17 +1305,18 @@ impl Relay {
                 if self.workspaces.is_member(&ws, &me) {
                     return workspace_error(from, "you are already in that workspace");
                 }
-                // Route to one online admin, whose client performs the signed add.
-                // Spend a use only once we know a request will actually be routed.
+                // Route to one online member who can admit (holds ManageMembers),
+                // whose client performs the signed add. Spend a use only once we
+                // know a request will actually be routed.
                 let admin_conn = self
                     .workspaces
-                    .admins(&ws)
+                    .members_with(&ws, Permission::ManageMembers)
                     .into_iter()
                     .find_map(|h| self.device_conn.get(&DeviceId(h)).copied());
                 let Some(admin_conn) = admin_conn else {
                     return workspace_error(
                         from,
-                        "no admin is online to admit you; try again later",
+                        "no one who can admit you is online; try again later",
                     );
                 };
                 self.workspaces.consume_invite(&code, now);
@@ -1331,9 +1337,15 @@ impl Relay {
                 let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
                     return vec![];
                 };
-                // Only an admin may move others between voice channels.
-                if !self.workspaces.is_admin(&workspace, &me) {
-                    return workspace_error(from, "only an admin can move members between voice channels");
+                // Only someone with the move-voice permission may move others.
+                if !self
+                    .workspaces
+                    .has_permission(&workspace, &me, Permission::MoveVoiceMembers)
+                {
+                    return workspace_error(
+                        from,
+                        "you do not have permission to move members between voice channels",
+                    );
                 }
                 // The target must be a voice channel the member is allowed into.
                 if !self.workspaces.is_voice_channel(&workspace, &channel)

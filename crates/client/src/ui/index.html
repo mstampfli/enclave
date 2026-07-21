@@ -2197,7 +2197,15 @@ label.member-row:hover { background: var(--raised); }
       <div id="ws-mem-list"></div>
       <div class="pick-empty" id="ws-mem-none" hidden>No member matches that.</div>
     </div>
-    <div class="m-section">
+    <div class="m-section" id="ws-roles-section">
+      <div class="s-head">Roles</div>
+      <div id="ws-roles-list"></div>
+      <button class="btn" id="ws-role-new" style="align-self:flex-start">New role</button>
+      <span class="hint" style="font-size:12.5px;color:var(--muted)">
+        A role is a named set of permissions. Assign roles to members above. The
+        owner holds every permission and can't be changed.</span>
+    </div>
+    <div class="m-section" id="ws-add-section">
       <div class="s-head">Add someone</div>
       <div class="add-friend" style="padding:0">
         <input placeholder="username" spellcheck="false" id="ws-mem-add-input">
@@ -2206,7 +2214,7 @@ label.member-row:hover { background: var(--raised); }
       <span class="hint" style="font-size:12.5px;color:var(--muted)">
         New members can read every public channel's history. Private channels stay invite-only.</span>
     </div>
-    <div class="m-section">
+    <div class="m-section" id="ws-invite-section">
       <div class="s-head">Invite link</div>
       <div class="add-friend" style="padding:0" id="ws-invite-row" hidden>
         <input id="ws-invite-code" readonly spellcheck="false">
@@ -2214,7 +2222,30 @@ label.member-row:hover { background: var(--raised); }
       </div>
       <button class="btn" id="ws-invite-make">Create an invite code</button>
       <span class="hint" style="font-size:12.5px;color:var(--muted)">
-        Anyone with the code can request to join. It works for 7 days while an admin is online to admit them.</span>
+        Anyone with the code can request to join. It works for 7 days while someone who can admit them is online.</span>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="modal-role" hidden>
+  <div class="modal">
+    <div class="m-head">
+      <h2 id="role-title">New role</h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="field">
+      <label for="role-name">Name</label>
+      <input id="role-name" maxlength="40" placeholder="e.g. Moderator" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="m-section">
+      <div class="s-head">Permissions</div>
+      <div id="role-perms"></div>
+      <span class="hint" style="font-size:12.5px;color:var(--muted)">
+        You can only grant permissions you hold yourself.</span>
+    </div>
+    <div class="m-actions" style="justify-content:space-between">
+      <button class="btn danger" id="role-delete" hidden>Delete role</button>
+      <button class="btn primary" id="role-save">Save role</button>
     </div>
   </div>
 </div>
@@ -5745,7 +5776,7 @@ function onWorkspaces(list) {
   if (activeWs) renderWsPanel();
   // Keep the open manage dialog in step with role/member ops as they echo back.
   if (!$("modal-ws").hidden) {
-    if (activeWsObj()) renderWsMembers(); else closeModals();
+    if (activeWsObj()) { renderWsMembers(); renderWsRoles(); } else closeModals();
   }
 }
 
@@ -5792,9 +5823,12 @@ function renderWsPanel() {
   const ws = activeWsObj();
   if (!ws) return;
   $("ws-title").textContent = ws.name;
-  const canManage = ws.my_role === "owner" || ws.my_role === "admin";
-  $("ws-manage").hidden = !canManage;
-  $("ws-add-item").hidden = !canManage;
+  // Channel-tree management (create/drag/nest) needs manage_channels; the gear
+  // opens the manage dialog for anyone holding any permission (or the owner).
+  const canManageChannels = can(ws, "manage_channels");
+  const canManageAnything = ws.am_owner || (ws.my_permissions || []).length > 0;
+  $("ws-manage").hidden = !canManageAnything;
+  $("ws-add-item").hidden = !canManageChannels;
   const tree = $("ws-tree");
   tree.innerHTML = "";
 
@@ -5803,8 +5837,14 @@ function renderWsPanel() {
 
   // Top-level channels (no category) first, then each top-level category and its
   // nested subtree -- the expandable, draggable hierarchy.
-  for (const ch of chansIn(null)) tree.appendChild(channelRow(ws, ch, 0, canManage));
-  for (const cat of subsOf(null)) renderCategory(ws, cat, 0, canManage, chansIn, subsOf, tree);
+  for (const ch of chansIn(null)) tree.appendChild(channelRow(ws, ch, 0, canManageChannels));
+  for (const cat of subsOf(null)) renderCategory(ws, cat, 0, canManageChannels, chansIn, subsOf, tree);
+}
+
+// Whether the current user holds a permission in this workspace (the owner's
+// permission set already contains every token, so no special case is needed).
+function can(ws, perm) {
+  return !!ws && (ws.my_permissions || []).includes(perm);
 }
 
 // Render one category header and, unless collapsed, its channels then its child
@@ -5886,10 +5926,11 @@ function channelRow(ws, ch, depth, canManage) {
   }
   const wrap = document.createElement("div");
   wrap.appendChild(row);
-  // Voice occupants under a voice channel. A manager can drag a person from one
-  // voice channel onto another (the voice row is a drop target for a person).
+  // Voice occupants under a voice channel. Someone with move_voice_members can
+  // drag a person from one voice channel onto another (the row is a drop target).
   if (ch.kind === "voice") {
-    if (canManage) makeVoiceDropTarget(row, ws, ch.id);
+    const canMoveVoice = can(ws, "move_voice_members");
+    if (canMoveVoice) makeVoiceDropTarget(row, ws, ch.id);
     const here = voicePresence[ch.id] || [];
     if (here.length) {
       const box = document.createElement("div");
@@ -5900,7 +5941,7 @@ function channelRow(ws, ch, depth, canManage) {
         v.className = "vh";
         v.innerHTML = '<span class="dot"></span><span></span>';
         v.querySelector("span:last-child").textContent = displayOf(h);
-        if (canManage) {
+        if (canMoveVoice) {
           v.draggable = true;
           makeDraggable(v, { type: "voice-member", id: h, channel: ch.id });
         }
@@ -6212,11 +6253,20 @@ $("ws-add-join").addEventListener("click", () => {
 $("rail-home").addEventListener("click", selectHome);
 $("ws-manage").addEventListener("click", openWorkspaceManage);
 
-// Manage-workspace dialog: the same member-row list the group members modal
-// uses, plus role changes and add-by-username. Owner grants/revokes admin; you
-// can only remove someone your role outranks (never the owner or yourself).
-function roleLabel(r) { return r === "owner" ? "Owner" : r === "admin" ? "Admin" : "Member"; }
-const ROLE_RANK = { owner: 0, admin: 1, member: 2 };
+// Manage-workspace dialog (RBAC): members with their roles, a role editor, and
+// permission-gated add / invite. The owner holds every permission and can't be
+// changed; everyone else's power is exactly the roles assigned to them.
+const WS_PERMISSIONS = [
+  { token: "manage_channels", label: "Manage channels", desc: "Create, rename, delete, and move channels and categories" },
+  { token: "manage_members", label: "Manage members", desc: "Add or remove members and create invite links" },
+  { token: "manage_channel_members", label: "Private-channel members", desc: "Add or remove members of private channels" },
+  { token: "manage_roles", label: "Manage roles", desc: "Create, edit, delete, and assign roles" },
+  { token: "move_voice_members", label: "Move voice members", desc: "Drag members between voice channels" },
+];
+function roleName(ws, id) {
+  const r = (ws.roles || []).find((x) => x.id === id);
+  return r ? r.name : "role";
+}
 function openWorkspaceManage() {
   const ws = activeWsObj();
   if (!ws) return;
@@ -6225,17 +6275,23 @@ function openWorkspaceManage() {
   $("ws-mem-add-input").value = "";
   $("ws-invite-row").hidden = true;
   $("ws-invite-code").value = "";
+  // Show only the sections the user's permissions unlock.
+  $("ws-roles-section").hidden = !can(ws, "manage_roles");
+  $("ws-add-section").hidden = !can(ws, "manage_members");
+  $("ws-invite-section").hidden = !can(ws, "manage_members");
   renderWsMembers();
+  renderWsRoles();
   openModal("modal-ws");
 }
 function renderWsMembers() {
   const ws = activeWsObj();
   if (!ws) return;
-  const mine = ws.my_role;
+  const canRoles = can(ws, "manage_roles");
+  const canMembers = can(ws, "manage_members");
   const list = $("ws-mem-list");
   list.innerHTML = "";
   const members = (ws.members || []).slice().sort((a, b) =>
-    (ROLE_RANK[a.role] - ROLE_RANK[b.role]) ||
+    (Number(b.is_owner) - Number(a.is_owner)) ||
     displayOf(a.handle).localeCompare(displayOf(b.handle)));
   for (const mem of members) {
     const u = mem.handle;
@@ -6251,32 +6307,38 @@ function renderWsMembers() {
     meta.querySelector(".display").textContent = displayOf(u) + (u === myUsername ? " (you)" : "");
     meta.querySelector(".handle").textContent = u;
     row.appendChild(meta);
-    // Clicking the person (not a trailing control) opens their card.
     for (const t of [av, meta]) {
       t.style.cursor = "pointer";
       t.addEventListener("click", () => { closeModals(); openProfile(u); });
     }
-    // Role marker for owner/admin (identity, no box); members stay unmarked.
-    if (mem.role !== "member") {
-      const tag = document.createElement("span");
-      tag.textContent = roleLabel(mem.role);
-      tag.style.cssText = "font-size:11.5px;color:var(--faint);flex:none";
-      row.appendChild(tag);
+    // Assigned roles as chips (owner shows a single "Owner" chip); a select adds
+    // a role when the current user can manage roles.
+    const rolesWrap = document.createElement("div");
+    rolesWrap.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;align-items:center;justify-content:flex-end;flex:none;max-width:56%";
+    if (mem.is_owner) {
+      rolesWrap.appendChild(roleChip("Owner", null));
+    } else {
+      for (const rid of mem.roles || []) {
+        rolesWrap.appendChild(roleChip(roleName(ws, rid),
+          canRoles ? () => send({ type: "UnassignRole", workspace: ws.id, handle: u, role: rid }) : null));
+      }
+      if (canRoles) {
+        const assignable = (ws.roles || []).filter((r) => !r.builtin && !(mem.roles || []).includes(r.id));
+        if (assignable.length) {
+          const sel = document.createElement("select");
+          sel.style.cssText = "font-size:12px;padding:2px 4px";
+          sel.appendChild(new Option("+ role", ""));
+          for (const r of assignable) sel.appendChild(new Option(r.name, r.id));
+          sel.addEventListener("change", () => {
+            if (sel.value) send({ type: "AssignRole", workspace: ws.id, handle: u, role: sel.value });
+          });
+          rolesWrap.appendChild(sel);
+        }
+      }
     }
-    // Only the owner promotes/demotes, and never themselves or the owner seat.
-    if (mine === "owner" && u !== myUsername && mem.role !== "owner") {
-      const toggle = document.createElement("button");
-      toggle.className = "btn ghost";
-      toggle.style.cssText = "padding:4px 9px;font-size:12px;flex:none";
-      toggle.textContent = mem.role === "admin" ? "Remove admin" : "Make admin";
-      toggle.addEventListener("click", () => send({
-        type: "SetWorkspaceRole", workspace: ws.id, handle: u,
-        role: mem.role === "admin" ? "member" : "admin",
-      }));
-      row.appendChild(toggle);
-    }
-    // Remove: your role must outrank theirs; never the owner or yourself.
-    if (u !== myUsername && mem.role !== "owner" && ROLE_RANK[mine] < ROLE_RANK[mem.role]) {
+    row.appendChild(rolesWrap);
+    // Remove member (needs manage_members; never the owner or yourself).
+    if (canMembers && u !== myUsername && !mem.is_owner) {
       const kick = actionBtn("kick", "Remove from workspace", SVG_X);
       kick.addEventListener("click", () => askConfirm(
         "Remove from workspace",
@@ -6290,6 +6352,98 @@ function renderWsMembers() {
   }
   filterWsMembers();
 }
+function roleChip(name, onRemove) {
+  const chip = document.createElement("span");
+  chip.style.cssText = "display:inline-flex;align-items:center;gap:3px;font-size:11px;padding:2px 7px;border-radius:999px;background:var(--raised);color:var(--muted)";
+  const t = document.createElement("span"); t.textContent = name; chip.appendChild(t);
+  if (onRemove) {
+    const x = document.createElement("button");
+    x.textContent = "×"; x.title = "Remove role";
+    x.style.cssText = "color:var(--faint);font-size:13px;line-height:1;cursor:pointer";
+    x.addEventListener("click", onRemove);
+    chip.appendChild(x);
+  }
+  return chip;
+}
+function renderWsRoles() {
+  const ws = activeWsObj();
+  if (!ws || !can(ws, "manage_roles")) return;
+  const box = $("ws-roles-list");
+  box.innerHTML = "";
+  const custom = (ws.roles || []).filter((r) => !r.builtin);
+  if (!custom.length) {
+    const d = document.createElement("div");
+    d.className = "pick-empty"; d.textContent = "No roles yet. Create one to grant permissions.";
+    box.appendChild(d);
+  }
+  for (const r of custom) {
+    const row = document.createElement("div");
+    row.className = "member-row";
+    const meta = document.createElement("div"); meta.className = "meta";
+    meta.innerHTML = '<div class="display"></div><div class="handle"></div>';
+    meta.querySelector(".display").textContent = r.name;
+    meta.querySelector(".handle").textContent =
+      r.permissions.length + (r.permissions.length === 1 ? " permission" : " permissions");
+    row.appendChild(meta);
+    const edit = document.createElement("button");
+    edit.className = "btn ghost"; edit.style.cssText = "padding:4px 9px;font-size:12px;flex:none";
+    edit.textContent = "Edit";
+    edit.addEventListener("click", () => openRoleEditor(r.id));
+    row.appendChild(edit);
+    box.appendChild(row);
+  }
+}
+// Role editor: create or edit a role. You can only tick permissions you hold
+// (mirrors the op-log's no-escalation rule; the server enforces it regardless).
+let editingRole = null;
+function openRoleEditor(roleId) {
+  const ws = activeWsObj();
+  if (!ws) return;
+  editingRole = roleId || null;
+  const role = roleId ? (ws.roles || []).find((r) => r.id === roleId) : null;
+  $("role-title").textContent = role ? "Edit role" : "New role";
+  $("role-name").value = role ? role.name : "";
+  $("role-delete").hidden = !role;
+  const held = ws.my_permissions || [];
+  const box = $("role-perms");
+  box.innerHTML = "";
+  for (const p of WS_PERMISSIONS) {
+    const has = held.includes(p.token);
+    const label = document.createElement("label");
+    label.className = "poll-check";
+    label.style.cssText = "align-items:flex-start;margin:6px 0";
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.value = p.token;
+    cb.checked = role ? role.permissions.includes(p.token) : false;
+    cb.disabled = !has;
+    const text = document.createElement("div");
+    text.innerHTML = '<div style="font-size:13px;color:var(--ink)"></div><div style="font-size:11.5px;color:var(--faint)"></div>';
+    text.firstChild.textContent = p.label + (has ? "" : " (you don't have this)");
+    text.lastChild.textContent = p.desc;
+    label.append(cb, text);
+    box.appendChild(label);
+  }
+  openModal("modal-role");
+  setTimeout(() => $("role-name").focus(), 0);
+}
+$("ws-role-new").addEventListener("click", () => openRoleEditor(null));
+$("role-save").addEventListener("click", () => {
+  const ws = activeWsObj();
+  if (!ws) return;
+  const name = $("role-name").value.trim();
+  if (!name) return;
+  const permissions = [...$("role-perms").querySelectorAll("input:checked")].map((c) => c.value);
+  if (editingRole) send({ type: "EditRole", workspace: ws.id, role: editingRole, name, permissions });
+  else send({ type: "CreateRole", workspace: ws.id, name, permissions });
+  closeModals();
+});
+$("role-delete").addEventListener("click", () => {
+  const ws = activeWsObj();
+  if (!ws || !editingRole) return;
+  const rid = editingRole;
+  askConfirm("Delete role", "Delete this role? It is removed from everyone who had it.", "Delete",
+    () => { send({ type: "DeleteRole", workspace: ws.id, role: rid }); closeModals(); });
+});
 function filterWsMembers() {
   const q = $("ws-mem-search").value.trim().toLowerCase();
   let any = false;

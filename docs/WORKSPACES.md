@@ -99,21 +99,27 @@ of "new members can scroll up," chosen deliberately.
 
 ---
 
-## 4. Roles & permissions
+## 4. Roles & permissions (RBAC -- see M8)
 
-Roles: **Owner** (one, created the workspace), **Admin** (manage channels,
-members, roles), **Member** (participate), plus per-channel post/read grants for
-private channels. The hard part is enforcing this under an **untrusted relay**.
+The original Owner/Admin/Member tiers became a permission-based system (M8): a
+fixed set of `Permission`s, custom named roles that bundle them, and per-member
+role assignment. **Owner** (one, created the workspace) holds every permission via
+a protected built-in role; everyone else's power is exactly the union of the roles
+assigned to them (deny by default). The hard part is enforcing this under an
+**untrusted relay**.
 
 Design principle: **authorization is cryptographic, not server-asserted.**
 
-- Every admin action -- create/delete channel, add/remove member, grant/revoke a
-  role, change a permission -- is a **signed, timestamped operation** in an
-  append-only **workspace op-log**, signed by the actor's identity key.
-- A role grant **chains to the Owner**: Owner signs Admin grants; an Admin action
-  is valid iff its signer holds an unrevoked grant tracing to the Owner. Clients
-  verify the chain; **the server cannot forge a role** because it holds no signing
-  key.
+- Every management action -- create/delete channel, add/remove member, create/
+  edit/delete/assign a role, move a channel or member -- is a **signed, timestamped
+  operation** in an append-only **workspace op-log**, signed by the actor's
+  identity key, and checked against the actor's replayed permissions.
+- Authority **traces to genesis**: the genesis op fixes the owner and their
+  protected Owner role; every later op is valid iff its signer holds the required
+  permission at that point in the replayed log, and no one may grant a permission
+  they lack. Clients verify by replay; **the server cannot forge a role or a
+  permission** because it holds no signing key (fail closed: no assignment means no
+  permission).
 - Membership that governs **content access** is the **MLS group roster** (who was
   actually added via a signed commit / holds the keys), not the server's metadata
   roster. Clients treat MLS membership as authoritative and reconcile the
@@ -281,11 +287,31 @@ Target: up to a few hundred members, tens of channels. Costs:
     `channels_and_categories_can_be_reparented`, `a_channel_can_be_created_inside_a_category`,
     `a_category_move_is_rejected_when_it_would_cycle_or_target_is_missing`,
     `category_nesting_is_depth_bounded`.
-  - **Admin voice moves.** An admin drags a member from one voice channel onto
-    another; the relay (checking the admin role and that the target is a voice
-    channel the member may enter) directs the member's client to switch, so
-    presence flows through the member's own join/leave and is never double
-    counted. Test: `an_admin_moves_a_member_between_voice_channels`.
+  - **Admin voice moves.** Someone with the move-voice permission drags a member
+    from one voice channel onto another; the relay (checking the permission and
+    that the target is a voice channel the member may enter) directs the member's
+    client to switch, so presence flows through the member's own join/leave and is
+    never double counted. Test: `an_admin_moves_a_member_between_voice_channels`.
+- **M8 [DONE] -- role-based access control.** The fixed Owner/Admin/Member tiers
+  became a modular permission system: a fixed set of `Permission`s
+  (`manage_channels`, `manage_members`, `manage_channel_members`, `manage_roles`,
+  `move_voice_members`), custom named roles that bundle them, and per-member role
+  assignment. Every op now checks the specific permission it needs against the
+  author's effective permissions (the union of their roles). Key properties, all
+  enforced in the op-log and mirrored in the UI:
+  - **Deny by default, fail closed.** A member with no role has no permissions.
+    The owner's all-permissions come from a protected built-in Owner role assigned
+    at genesis (`OWNER_ROLE_ID`), *not* a special case -- so a bypassed check
+    grants nothing, not everything.
+  - **No privilege escalation.** A non-owner may only create or assign a role
+    whose every permission they already hold; the Owner role is immutable and
+    unassignable, and the owner is never a role target.
+  - **UI.** A role editor (name + permission checkboxes, disabled for permissions
+    you lack) and per-member role chips in the manage dialog; every management
+    affordance in the sidebar and dialog is gated on the specific permission.
+  Tests: `genesis_establishes_owner_and_roles`,
+  `role_ops_prevent_privilege_escalation_and_protect_the_owner_role`,
+  `a_bare_member_cannot_touch_roles_and_the_owner_is_unremovable`.
 
 Each milestone landed with its tests and a THREAT_MODEL update.
 

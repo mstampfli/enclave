@@ -7,12 +7,16 @@
 //!   entry's body, so a reordered, dropped, or forked log is detected;
 //! - **signature** -- the entry is signed by `author`'s identity key (verified via
 //!   [`crate::verify_op`]), so the relay cannot forge an entry;
-//! - **authorization** -- the author must hold the role the op requires *at that
-//!   point in the log*, so a member cannot perform admin actions.
+//! - **authorization** -- the author must hold the *permission* the op requires
+//!   *at that point in the log*, so a member cannot perform actions they lack.
+//!   Permissions come only from assigned roles (deny by default, fail closed):
+//!   the owner's authority is a protected built-in role, and no one may grant a
+//!   permission they do not themselves hold.
 //!
 //! Because authorization is decided by replay, not asserted by the server, the
-//! untrusted relay can store and route the log but never forge who is a member or
-//! an admin. This is the trust anchor for the whole workspace feature.
+//! untrusted relay can store and route the log but never forge who is a member,
+//! what roles they hold, or what those roles permit. This is the trust anchor for
+//! the whole workspace feature.
 //!
 //! PRIMITIVE: the single source of truth for workspace membership and roles.
 //! Both the client (authoritative) and the relay (ingress validation) replay
@@ -23,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use sha2::{Digest, Sha256};
 
 use enclave_protocol::{
-    CategoryId, ChannelId, ChannelKind, Role, SignedOp, WorkspaceOp, WS_OP_CONTEXT,
+    CategoryId, ChannelId, ChannelKind, Permission, RoleId, SignedOp, WorkspaceOp, WS_OP_CONTEXT,
 };
 
 use crate::{CryptoError, Identity};
@@ -68,9 +72,24 @@ pub struct CategoryInfo {
     pub parent: Option<CategoryId>,
 }
 
+/// One role definition: a named bundle of permissions. Members are assigned roles;
+/// their effective permissions are the union across their roles (the owner holds
+/// all permissions implicitly, without a role).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleDef {
+    pub name: String,
+    pub permissions: BTreeSet<Permission>,
+}
+
 /// How deep categories may nest (root is depth 0). Bounds the sidebar tree so a
 /// pathological chain of parents cannot be built.
 pub const MAX_CATEGORY_DEPTH: usize = 6;
+
+/// The reserved id of the built-in **Owner** role (all permissions), created and
+/// assigned to the owner at genesis. It is protected: it cannot be created again,
+/// edited, deleted, or assigned/unassigned, and the owner cannot be a role target,
+/// so the owner can never be stripped of authority and no one else can obtain it.
+pub const OWNER_ROLE_ID: RoleId = [0u8; 16];
 
 /// The state produced by replaying a workspace's op-log. Authoritative for who
 /// is a member, their roles and identity keys, and the channel/category tree.
@@ -81,8 +100,11 @@ pub struct WorkspaceState {
     owner_key: Vec<u8>,
     /// Members -> their identity public key (what their future ops verify against).
     pub members: BTreeMap<String, Vec<u8>>,
-    /// Members -> role. Every member has an entry; absent means `Member`.
-    pub roles: BTreeMap<String, Role>,
+    /// The workspace's role definitions (name + permission set), by id.
+    pub roles: BTreeMap<RoleId, RoleDef>,
+    /// Members -> the roles assigned to them. Absent/empty means no permissions
+    /// (deny by default); the owner is never listed here (it holds all implicitly).
+    pub member_roles: BTreeMap<String, BTreeSet<RoleId>>,
     pub categories: BTreeMap<CategoryId, CategoryInfo>,
     pub channels: BTreeMap<ChannelId, ChannelInfo>,
     /// Explicit member set of each **private** channel. Public channels are not
@@ -134,11 +156,48 @@ impl WorkspaceState {
         self.head_hash
     }
 
-    /// A member's effective role (`Member` if unspecified, nothing if not a member).
-    pub fn role_of(&self, handle: &str) -> Option<Role> {
-        self.members
-            .contains_key(handle)
-            .then(|| self.roles.get(handle).copied().unwrap_or(Role::Member))
+    /// Whether `handle` is the workspace owner. Used for protection rules (the
+    /// owner and their built-in role cannot be stripped) and for UI labelling --
+    /// NOT for granting permissions, which flow only through role assignment.
+    pub fn is_owner(&self, handle: &str) -> bool {
+        handle == self.owner
+    }
+
+    /// A member's effective permissions: strictly the union of the permissions of
+    /// the roles assigned to them. A member with no roles has none (deny by
+    /// default -- fail closed). The owner's permissions come from the built-in
+    /// Owner role assigned at genesis, not a special case here, so no code path
+    /// grants a permission without an explicit, tamper-protected assignment.
+    pub fn permissions_of(&self, handle: &str) -> BTreeSet<Permission> {
+        let mut perms = BTreeSet::new();
+        if !self.members.contains_key(handle) {
+            return perms;
+        }
+        if let Some(role_ids) = self.member_roles.get(handle) {
+            for rid in role_ids {
+                if let Some(def) = self.roles.get(rid) {
+                    perms.extend(def.permissions.iter().copied());
+                }
+            }
+        }
+        perms
+    }
+
+    /// Whether `handle` holds `perm` -- true only if some assigned role grants it.
+    pub fn has_permission(&self, handle: &str, perm: Permission) -> bool {
+        self.permissions_of(handle).contains(&perm)
+    }
+
+    /// No privilege escalation: `author` may only create/assign a role whose every
+    /// permission they already hold. The owner passes automatically because their
+    /// Owner role grants all -- there is no special case, just the subset check.
+    fn require_grantable(&self, author: &str, perms: &BTreeSet<Permission>) -> Result<(), OpError> {
+        let mine = self.permissions_of(author);
+        if perms.iter().all(|p| mine.contains(p)) {
+            Ok(())
+        } else {
+            Err(OpError::Unauthorized)
+        }
     }
 
     /// Verify and apply one entry, advancing the state. On any failure the state
@@ -189,7 +248,18 @@ impl WorkspaceState {
         self.owner = owner.clone();
         self.owner_key = owner_key.clone();
         self.members.insert(owner.clone(), owner_key.clone());
-        self.roles.insert(owner.clone(), Role::Owner);
+        // The owner's authority is a real, protected role assignment (fail closed:
+        // no assignment means no permissions, so a bypassed assignment grants
+        // nothing rather than everything).
+        self.roles.insert(
+            OWNER_ROLE_ID,
+            RoleDef {
+                name: "Owner".into(),
+                permissions: Permission::ALL.into_iter().collect(),
+            },
+        );
+        self.member_roles
+            .insert(owner.clone(), [OWNER_ROLE_ID].into_iter().collect());
         Ok(())
     }
 
@@ -204,54 +274,122 @@ impl WorkspaceState {
             Some(_) => return Err(OpError::BadSignature), // key changed under us
             None => return Err(OpError::UnknownAuthor),
         }
-        let actor = self.role_of(&entry.author).ok_or(OpError::UnknownAuthor)?;
+        let author = entry.author.clone();
 
         match &entry.op {
             WorkspaceOp::Create { .. } => unreachable!("handled above"),
 
             WorkspaceOp::AddMember { member, member_key } => {
-                require(actor >= Role::Admin)?;
+                require(self.has_permission(&author, Permission::ManageMembers))?;
                 if self.members.contains_key(member) {
                     return Err(OpError::BadTarget);
                 }
                 self.members.insert(member.clone(), member_key.clone());
-                self.roles.insert(member.clone(), Role::Member);
             }
 
             WorkspaceOp::RemoveMember { member } => {
-                let target = self.role_of(member).ok_or(OpError::BadTarget)?;
-                // You may remove someone strictly below you; nobody removes the
-                // owner. (Owner > Admin > Member.)
-                require(actor > target && target != Role::Owner)?;
+                require(self.has_permission(&author, Permission::ManageMembers))?;
+                // The owner is never removable; the target must be a member.
+                if member == &self.owner || !self.members.contains_key(member) {
+                    return Err(OpError::BadTarget);
+                }
                 self.members.remove(member);
-                self.roles.remove(member);
+                self.member_roles.remove(member);
                 // Drop them from every private channel too.
                 for set in self.private_members.values_mut() {
                     set.remove(member);
                 }
             }
 
-            WorkspaceOp::GrantRole { member, role } => {
-                // Only the owner grants Admin; Owner is never granted this way.
-                require(*role == Role::Admin && actor == Role::Owner)?;
-                if !self.members.contains_key(member) {
+            WorkspaceOp::CreateRole {
+                role,
+                name,
+                permissions,
+            } => {
+                require(self.has_permission(&author, Permission::ManageRoles))?;
+                if self.roles.contains_key(role) {
                     return Err(OpError::BadTarget);
                 }
-                self.roles.insert(member.clone(), Role::Admin);
+                let perms: BTreeSet<Permission> = permissions.iter().copied().collect();
+                self.require_grantable(&author, &perms)?;
+                self.roles.insert(
+                    *role,
+                    RoleDef {
+                        name: name.clone(),
+                        permissions: perms,
+                    },
+                );
             }
 
-            WorkspaceOp::RevokeRole { member, role } => {
-                require(*role == Role::Admin && actor == Role::Owner)?;
-                match self.role_of(member) {
-                    Some(Role::Admin) => {
-                        self.roles.insert(member.clone(), Role::Member);
-                    }
-                    _ => return Err(OpError::BadTarget),
+            WorkspaceOp::EditRole {
+                role,
+                name,
+                permissions,
+            } => {
+                require(self.has_permission(&author, Permission::ManageRoles))?;
+                // The built-in Owner role is immutable.
+                if *role == OWNER_ROLE_ID || !self.roles.contains_key(role) {
+                    return Err(OpError::BadTarget);
+                }
+                let perms: BTreeSet<Permission> = permissions.iter().copied().collect();
+                self.require_grantable(&author, &perms)?;
+                let def = self.roles.get_mut(role).expect("role exists");
+                def.name = name.clone();
+                def.permissions = perms;
+            }
+
+            WorkspaceOp::DeleteRole { role } => {
+                require(self.has_permission(&author, Permission::ManageRoles))?;
+                // The built-in Owner role cannot be deleted.
+                if *role == OWNER_ROLE_ID || self.roles.remove(role).is_none() {
+                    return Err(OpError::BadTarget);
+                }
+                for set in self.member_roles.values_mut() {
+                    set.remove(role);
+                }
+            }
+
+            WorkspaceOp::AssignRole { member, role } => {
+                require(self.has_permission(&author, Permission::ManageRoles))?;
+                // The Owner role is the owner's alone; the owner is not a target.
+                if *role == OWNER_ROLE_ID
+                    || member == &self.owner
+                    || !self.members.contains_key(member)
+                {
+                    return Err(OpError::BadTarget);
+                }
+                let perms = self
+                    .roles
+                    .get(role)
+                    .ok_or(OpError::BadTarget)?
+                    .permissions
+                    .clone();
+                // No escalation: a non-owner may only hand out a role whose every
+                // permission they already hold.
+                self.require_grantable(&author, &perms)?;
+                self.member_roles
+                    .entry(member.clone())
+                    .or_default()
+                    .insert(*role);
+            }
+
+            WorkspaceOp::UnassignRole { member, role } => {
+                require(self.has_permission(&author, Permission::ManageRoles))?;
+                // The Owner role cannot be unassigned (the owner stays all-powerful).
+                if *role == OWNER_ROLE_ID {
+                    return Err(OpError::BadTarget);
+                }
+                let removed = self
+                    .member_roles
+                    .get_mut(member)
+                    .is_some_and(|s| s.remove(role));
+                if !removed {
+                    return Err(OpError::BadTarget);
                 }
             }
 
             WorkspaceOp::CreateCategory { category, name } => {
-                require(actor >= Role::Admin)?;
+                require(self.has_permission(&author, Permission::ManageChannels))?;
                 if self.categories.contains_key(category) {
                     return Err(OpError::BadTarget);
                 }
@@ -271,7 +409,7 @@ impl WorkspaceState {
                 private,
                 category,
             } => {
-                require(actor >= Role::Admin)?;
+                require(self.has_permission(&author, Permission::ManageChannels))?;
                 if self.channels.contains_key(channel) {
                     return Err(OpError::BadTarget);
                 }
@@ -299,13 +437,13 @@ impl WorkspaceState {
             }
 
             WorkspaceOp::RenameChannel { channel, name } => {
-                require(actor >= Role::Admin)?;
+                require(self.has_permission(&author, Permission::ManageChannels))?;
                 let ch = self.channels.get_mut(channel).ok_or(OpError::BadTarget)?;
                 ch.name = name.clone();
             }
 
             WorkspaceOp::DeleteChannel { channel } => {
-                require(actor >= Role::Admin)?;
+                require(self.has_permission(&author, Permission::ManageChannels))?;
                 if self.channels.remove(channel).is_none() {
                     return Err(OpError::BadTarget);
                 }
@@ -313,7 +451,7 @@ impl WorkspaceState {
             }
 
             WorkspaceOp::AddChannelMember { channel, member } => {
-                require(actor >= Role::Admin)?;
+                require(self.has_permission(&author, Permission::ManageChannelMembers))?;
                 // The channel must exist and be private, and the target must be a
                 // workspace member.
                 match self.channels.get(channel) {
@@ -330,7 +468,7 @@ impl WorkspaceState {
             }
 
             WorkspaceOp::RemoveChannelMember { channel, member } => {
-                require(actor >= Role::Admin)?;
+                require(self.has_permission(&author, Permission::ManageChannelMembers))?;
                 let removed = self
                     .private_members
                     .get_mut(channel)
@@ -341,7 +479,7 @@ impl WorkspaceState {
             }
 
             WorkspaceOp::SetChannelCategory { channel, category } => {
-                require(actor >= Role::Admin)?;
+                require(self.has_permission(&author, Permission::ManageChannels))?;
                 if let Some(cat) = category {
                     if !self.categories.contains_key(cat) {
                         return Err(OpError::BadTarget);
@@ -352,7 +490,7 @@ impl WorkspaceState {
             }
 
             WorkspaceOp::SetCategoryParent { category, parent } => {
-                require(actor >= Role::Admin)?;
+                require(self.has_permission(&author, Permission::ManageChannels))?;
                 if !self.categories.contains_key(category) {
                     return Err(OpError::BadTarget);
                 }
@@ -530,18 +668,41 @@ mod tests {
             log.push(op);
         }
 
-        let promote = sign_op(
+        // A "Manager" role (everything except moving voice members) assigned to
+        // admin#2 -- the RBAC stand-in for the old "admin".
+        let mgr = [5u8; 16];
+        let create = sign_op(
             &owner,
             "owner#1",
             &st,
             102,
-            WorkspaceOp::GrantRole {
-                member: "admin#2".into(),
-                role: Role::Admin,
+            WorkspaceOp::CreateRole {
+                role: mgr,
+                name: "Manager".into(),
+                permissions: vec![
+                    Permission::ManageChannels,
+                    Permission::ManageChannelMembers,
+                    Permission::ManageMembers,
+                    Permission::ManageRoles,
+                ],
             },
         )
         .unwrap();
-        st.apply(&promote).unwrap();
+        st.apply(&create).unwrap();
+        log.push(create);
+        let assign = sign_op(
+            &owner,
+            "owner#1",
+            &st,
+            103,
+            WorkspaceOp::AssignRole {
+                member: "admin#2".into(),
+                role: mgr,
+            },
+        )
+        .unwrap();
+        st.apply(&assign).unwrap();
+        log.push(assign);
 
         // Full replay must match the incremental state.
         assert_eq!(replay(&log).unwrap().members.len(), st.members.len());
@@ -552,10 +713,19 @@ mod tests {
     fn genesis_establishes_owner_and_roles() {
         let (st, ..) = seed();
         assert_eq!(st.owner, "owner#1");
-        assert_eq!(st.role_of("owner#1"), Some(Role::Owner));
-        assert_eq!(st.role_of("admin#2"), Some(Role::Admin));
-        assert_eq!(st.role_of("member#3"), Some(Role::Member));
-        assert_eq!(st.role_of("nobody"), None);
+        assert!(st.is_owner("owner#1"));
+        // The owner holds every permission -- via the built-in, protected Owner
+        // role, not a special case.
+        for p in Permission::ALL {
+            assert!(st.has_permission("owner#1", p));
+        }
+        // The Manager role gives admin#2 most powers but not moving voice members.
+        assert!(st.has_permission("admin#2", Permission::ManageChannels));
+        assert!(st.has_permission("admin#2", Permission::ManageRoles));
+        assert!(!st.has_permission("admin#2", Permission::MoveVoiceMembers));
+        // A bare member (and a non-member) has nothing: deny by default.
+        assert!(st.permissions_of("member#3").is_empty());
+        assert!(st.permissions_of("nobody").is_empty());
     }
 
     #[test]
@@ -710,24 +880,25 @@ mod tests {
     }
 
     #[test]
-    fn only_the_owner_grants_admin_and_only_higher_roles_remove() {
-        let (mut st, _owner, admin, _member) = seed();
-        // An admin cannot promote the member to admin (owner-only).
-        let bad_grant = sign_op(
-            &admin,
-            "admin#2",
+    fn a_bare_member_cannot_touch_roles_and_the_owner_is_unremovable() {
+        let (mut st, _owner, admin, member) = seed();
+        // member#3 holds no permissions: any role op is refused.
+        let bad = sign_op(
+            &member,
+            "member#3",
             &st,
             300,
-            WorkspaceOp::GrantRole {
-                member: "member#3".into(),
-                role: Role::Admin,
+            WorkspaceOp::CreateRole {
+                role: [6u8; 16],
+                name: "x".into(),
+                permissions: vec![Permission::ManageChannels],
             },
         )
         .unwrap();
-        assert_eq!(st.apply(&bad_grant), Err(OpError::Unauthorized));
+        assert_eq!(st.apply(&bad), Err(OpError::Unauthorized));
 
-        // An admin cannot remove another admin or the owner...
-        let bad_rm = sign_op(
+        // Even admin#2 (holds ManageMembers) cannot remove the owner.
+        let rm_owner = sign_op(
             &admin,
             "admin#2",
             &st,
@@ -737,20 +908,83 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(st.apply(&bad_rm), Err(OpError::Unauthorized));
-        // ...but can remove a plain member.
-        let ok_rm = sign_op(
+        assert_eq!(st.apply(&rm_owner), Err(OpError::BadTarget));
+    }
+
+    #[test]
+    fn role_ops_prevent_privilege_escalation_and_protect_the_owner_role() {
+        let (mut st, _owner, admin, _member) = seed();
+        // admin#2 (Manager: everything except MoveVoiceMembers) has ManageRoles, so
+        // it CAN create a role -- but only out of permissions it holds. A role that
+        // includes MoveVoiceMembers (which admin#2 lacks) is refused.
+        let escalate = sign_op(
             &admin,
             "admin#2",
             &st,
             300,
-            WorkspaceOp::RemoveMember {
-                member: "member#3".into(),
+            WorkspaceOp::CreateRole {
+                role: [10u8; 16],
+                name: "Sneaky".into(),
+                permissions: vec![Permission::MoveVoiceMembers],
             },
         )
         .unwrap();
-        st.apply(&ok_rm).unwrap();
-        assert_eq!(st.role_of("member#3"), None);
+        assert_eq!(st.apply(&escalate), Err(OpError::Unauthorized));
+
+        // A role built from permissions admin#2 DOES hold is fine, and can be
+        // assigned to the bare member.
+        let ok = sign_op(
+            &admin,
+            "admin#2",
+            &st,
+            300,
+            WorkspaceOp::CreateRole {
+                role: [11u8; 16],
+                name: "Helper".into(),
+                permissions: vec![Permission::ManageChannels],
+            },
+        )
+        .unwrap();
+        st.apply(&ok).unwrap();
+        let assign = sign_op(
+            &admin,
+            "admin#2",
+            &st,
+            301,
+            WorkspaceOp::AssignRole {
+                member: "member#3".into(),
+                role: [11u8; 16],
+            },
+        )
+        .unwrap();
+        st.apply(&assign).unwrap();
+        assert!(st.has_permission("member#3", Permission::ManageChannels));
+
+        // The built-in Owner role cannot be deleted, edited, or assigned, and the
+        // owner is never a role target.
+        let del = sign_op(
+            &admin,
+            "admin#2",
+            &st,
+            302,
+            WorkspaceOp::DeleteRole {
+                role: OWNER_ROLE_ID,
+            },
+        )
+        .unwrap();
+        assert_eq!(st.apply(&del), Err(OpError::BadTarget));
+        let grab = sign_op(
+            &admin,
+            "admin#2",
+            &st,
+            302,
+            WorkspaceOp::AssignRole {
+                member: "member#3".into(),
+                role: OWNER_ROLE_ID,
+            },
+        )
+        .unwrap();
+        assert_eq!(st.apply(&grab), Err(OpError::BadTarget));
     }
 
     #[test]

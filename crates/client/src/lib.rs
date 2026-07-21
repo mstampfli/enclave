@@ -163,6 +163,15 @@ const WS_CHANNEL_MSG_CONTEXT: &[u8] = b"enclave/ws-channel-msg/v1";
 /// pages on demand), so opening a busy channel never pulls its whole backlog.
 const CHANNEL_PAGE: u32 = 100;
 
+/// Map UI permission tokens (`"manage_channels"`, ...) to `Permission`s, dropping
+/// any token the protocol does not recognize.
+fn parse_permissions(tokens: &[String]) -> Vec<enclave_protocol::Permission> {
+    tokens
+        .iter()
+        .filter_map(|s| enclave_protocol::Permission::from_str(s))
+        .collect()
+}
+
 /// The signed body for a channel message: binds channel, id, sender, text, ts.
 fn channel_msg_body(
     channel: &[u8; 16],
@@ -4666,6 +4675,89 @@ impl Client {
             enclave_protocol::WorkspaceOp::SetCategoryParent {
                 category,
                 parent: parent_hex.and_then(decode_offer_id),
+            },
+        )
+    }
+
+    /// Create a custom role from permission tokens (unknown tokens are ignored).
+    /// Needs `ManageRoles`, and the op-log refuses permissions the author lacks.
+    pub fn create_role(
+        &mut self,
+        ws_hex: &str,
+        name: &str,
+        permissions: &[String],
+    ) -> Result<(), ClientError> {
+        let mut role = [0u8; 16];
+        let _ = getrandom::getrandom(&mut role);
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::CreateRole {
+                role,
+                name: name.to_string(),
+                permissions: parse_permissions(permissions),
+            },
+        )
+    }
+
+    /// Change a role's name and permission set.
+    pub fn edit_role(
+        &mut self,
+        ws_hex: &str,
+        role_hex: &str,
+        name: &str,
+        permissions: &[String],
+    ) -> Result<(), ClientError> {
+        let role = decode_offer_id(role_hex)
+            .ok_or_else(|| ClientError::Workspace("bad role id".into()))?;
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::EditRole {
+                role,
+                name: name.to_string(),
+                permissions: parse_permissions(permissions),
+            },
+        )
+    }
+
+    /// Delete a role (removed from everyone who had it).
+    pub fn delete_role(&mut self, ws_hex: &str, role_hex: &str) -> Result<(), ClientError> {
+        let role = decode_offer_id(role_hex)
+            .ok_or_else(|| ClientError::Workspace("bad role id".into()))?;
+        self.workspace_submit(ws_hex, enclave_protocol::WorkspaceOp::DeleteRole { role })
+    }
+
+    /// Assign a role to a member.
+    pub fn assign_role(
+        &mut self,
+        ws_hex: &str,
+        handle: &str,
+        role_hex: &str,
+    ) -> Result<(), ClientError> {
+        let role = decode_offer_id(role_hex)
+            .ok_or_else(|| ClientError::Workspace("bad role id".into()))?;
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::AssignRole {
+                member: handle.to_string(),
+                role,
+            },
+        )
+    }
+
+    /// Remove a role from a member.
+    pub fn unassign_role(
+        &mut self,
+        ws_hex: &str,
+        handle: &str,
+        role_hex: &str,
+    ) -> Result<(), ClientError> {
+        let role = decode_offer_id(role_hex)
+            .ok_or_else(|| ClientError::Workspace("bad role id".into()))?;
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::UnassignRole {
+                member: handle.to_string(),
+                role,
             },
         )
     }
