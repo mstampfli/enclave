@@ -2238,6 +2238,48 @@ async fn an_invite_code_admits_a_redeemer() {
     .await;
 }
 
+/// A channel can be created inside a category, so the sidebar hierarchy (the
+/// expandable category groups) has real membership behind it, not just a flat
+/// list. Proves the category id threads from create_channel through the op-log.
+#[tokio::test]
+async fn a_channel_can_be_created_inside_a_category() {
+    use enclave_protocol::WorkspaceOp;
+
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+
+    // Create a category, then a channel inside it.
+    let cat = [9u8; 16];
+    owner
+        .workspace_submit(
+            &ws,
+            WorkspaceOp::CreateCategory {
+                category: cat,
+                name: "Rooms".into(),
+            },
+        )
+        .unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws)
+            .is_some_and(|s| s.categories.contains_key(&cat))
+    })
+    .await;
+    let cat_hex: String = cat.iter().map(|b| format!("{b:02x}")).collect();
+    owner.create_channel(&ws, "lounge", Some(&cat_hex)).unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws)
+            .is_some_and(|s| s.channels.values().any(|ch| ch.name == "lounge"))
+    })
+    .await;
+
+    let s = owner.workspace(&ws).unwrap();
+    let ch = s.channels.values().find(|c| c.name == "lounge").unwrap();
+    assert_eq!(ch.category, Some(cat), "channel landed in the category");
+}
+
 /// A shared invite link redeemed by several people at once must admit ALL of
 /// them: the adds queue and drain one per freed op-log slot rather than racing
 /// the MLS commit and dropping all but the first (the old busy-check behavior).
@@ -2355,7 +2397,7 @@ async fn members_exchange_messages_in_a_workspace_channel() {
     .await;
 
     // Owner creates a public text channel; both see it in the op-log.
-    let chan = owner.create_channel(&ws, "general").unwrap();
+    let chan = owner.create_channel(&ws, "general", None).unwrap();
     pump_until(&mut owner, |c| {
         c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
     })
@@ -2415,7 +2457,7 @@ async fn a_non_member_never_sees_a_workspaces_channel_traffic() {
         c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
     })
     .await;
-    let chan = owner.create_channel(&ws, "general").unwrap();
+    let chan = owner.create_channel(&ws, "general", None).unwrap();
     pump_until(&mut bob, |c| {
         c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
     })
@@ -2461,7 +2503,7 @@ async fn a_late_joiner_reads_channel_history_from_before_they_joined() {
         c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
     })
     .await;
-    let chan = owner.create_channel(&ws, "general").unwrap();
+    let chan = owner.create_channel(&ws, "general", None).unwrap();
     pump_until(&mut owner, |c| {
         c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
     })
@@ -2520,7 +2562,7 @@ async fn a_removed_member_cannot_read_messages_posted_after_removal() {
         c.workspace(&ws).is_some_and(|s| s.members.len() == 3)
     })
     .await;
-    let chan = owner.create_channel(&ws, "general").unwrap();
+    let chan = owner.create_channel(&ws, "general", None).unwrap();
     // Sequence past the owner's own CreateChannel echo before the next structural
     // op, and let Bob apply every WG commit in order (add-carol before remove).
     pump_until(&mut owner, |c| {
@@ -2595,9 +2637,9 @@ async fn a_burst_of_structural_ops_all_land_via_the_queue() {
     pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
 
     // Fire three creates with no pumping between them.
-    owner.create_channel(&ws, "general").unwrap();
-    owner.create_channel(&ws, "random").unwrap();
-    owner.create_channel(&ws, "dev").unwrap();
+    owner.create_channel(&ws, "general", None).unwrap();
+    owner.create_channel(&ws, "random", None).unwrap();
+    owner.create_channel(&ws, "dev", None).unwrap();
 
     // All three land, in order, on the single linear log.
     pump_until(&mut owner, |c| {
@@ -2656,7 +2698,7 @@ async fn a_private_channel_is_readable_only_by_its_members() {
     .await;
 
     // Owner creates a PRIVATE channel and adds only Bob to it.
-    let chan = owner.create_private_channel(&ws, "staff").unwrap();
+    let chan = owner.create_private_channel(&ws, "staff", None).unwrap();
     pump_until(&mut owner, |c| {
         c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
     })
@@ -2714,7 +2756,7 @@ async fn voice_channel_presence_tracks_who_is_connected() {
         c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
     })
     .await;
-    let chan = owner.create_voice_channel(&ws, "Lounge").unwrap();
+    let chan = owner.create_voice_channel(&ws, "Lounge", None).unwrap();
     pump_until(&mut owner, |c| {
         c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
     })

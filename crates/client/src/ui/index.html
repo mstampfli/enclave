@@ -402,16 +402,31 @@ input[type="checkbox"], select { cursor: pointer; }
 .ws-gear:hover { background: var(--raised); color: var(--ink); }
 .ws-gear .icon { width: 16px; height: 16px; }
 #ws-tree { padding: 8px 8px 20px; }
-.ws-cat { display: flex; align-items: center; gap: 4px; padding: 12px 6px 4px; font-size: 11px;
-  font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--faint); }
-.ws-cat .ws-cat-add { margin-left: auto; width: 18px; height: 18px; display: grid; place-items: center;
-  color: var(--faint); border-radius: 3px; }
+.ws-cat { display: flex; align-items: center; gap: 2px; padding: 12px 6px 4px; }
+/* A collapsible category heading: chevron + name toggles its channels. */
+.ws-cat-toggle { flex: 1; min-width: 0; display: flex; align-items: center; gap: 4px;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--faint); text-align: left; cursor: pointer; }
+.ws-cat-toggle:hover { color: var(--muted); }
+.ws-cat-chev { width: 11px; height: 11px; flex: none; }
+.ws-cat:not(.collapsed) .ws-cat-chev { transform: rotate(90deg); }
+.ws-cat-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-cat .ws-cat-add { flex: none; width: 18px; height: 18px; display: grid; place-items: center;
+  color: var(--faint); border-radius: 3px; cursor: pointer; }
 .ws-cat .ws-cat-add:hover { color: var(--ink); background: var(--raised); }
 .ws-chan { display: flex; align-items: center; gap: 7px; width: 100%; text-align: left;
   padding: 6px 8px; border-radius: var(--radius); color: var(--muted); font-size: 14px; cursor: pointer; }
 .ws-chan:hover { background: var(--raised); color: var(--ink); }
 .ws-chan.active { background: var(--accent-bg); color: var(--accent-ink); }
 .ws-chan .ws-chan-ico { width: 16px; height: 16px; flex: none; color: var(--faint); }
+/* Match the app's icon convention (stroke, currentColor) so the one-off channel
+   glyphs are visible on the dark rail instead of defaulting to a black fill. */
+.ws-chan svg.ws-chan-ico, .ws-chan .ws-lock { fill: none; stroke: currentColor;
+  stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+/* The # is text, not an SVG: center it in the same 16px box the icons occupy so
+   channel names line up whether the row is text or voice. */
+.ws-chan span.ws-chan-ico { display: grid; place-items: center; font-weight: 700;
+  font-size: 15px; line-height: 1; }
 .ws-chan .ws-chan-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ws-chan .ws-lock { width: 12px; height: 12px; color: var(--faint); flex: none; }
 .ws-voice-here { padding: 2px 8px 6px 30px; display: flex; flex-direction: column; gap: 3px; }
@@ -2127,6 +2142,10 @@ label.member-row:hover { background: var(--raised); }
         <option value="text">Text channel</option>
         <option value="voice">Voice channel</option>
       </select>
+    </div>
+    <div class="field">
+      <label for="ch-category">Category</label>
+      <select id="ch-category"><option value="">No category</option></select>
     </div>
     <label class="poll-check" id="ch-private-wrap">
       <input type="checkbox" id="ch-private"> Private, only members you add can see it
@@ -5755,31 +5774,86 @@ function renderWsPanel() {
   const tree = $("ws-tree");
   tree.innerHTML = "";
 
-  // Group channels by category (uncategorized first).
+  // Uncategorized channels first (no header), then each category as a collapsible
+  // group of its channels -- the expandable hierarchy.
   const cats = [{ id: null, name: null }].concat(ws.categories || []);
   for (const cat of cats) {
     const chans = (ws.channels || []).filter((c) => (c.category || null) === (cat.id || null));
-    if (!chans.length && cat.id) continue;
-    if (cat.id) {
-      const head = document.createElement("div");
-      head.className = "ws-cat";
-      const label = document.createElement("span");
-      label.textContent = cat.name;
-      head.appendChild(label);
-      tree.appendChild(head);
+    if (!cat.id) {
+      for (const ch of chans) tree.appendChild(channelRow(ws, ch));
+      continue;
     }
+    // Hide an empty category from members; managers keep it so they can fill it.
+    if (!chans.length && !canManage) continue;
+    const collapsed = collapsedCats.has(cat.id);
+    tree.appendChild(categoryHeader(ws, cat, collapsed, canManage));
     for (const ch of chans) {
-      tree.appendChild(channelRow(ws, ch));
+      // Collapsed hides the group, but the channel you're in stays visible so it
+      // never vanishes from under you.
+      if (!collapsed || ch.id === activeChannel) tree.appendChild(channelRow(ws, ch));
     }
   }
 
   if (canManage) {
-    const add = document.createElement("button");
-    add.className = "ws-sec-add";
-    add.innerHTML = '<svg class="icon sm" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg><span>Add channel</span>';
-    add.addEventListener("click", () => openChannelCreator(ws.id));
-    tree.appendChild(add);
+    tree.appendChild(sectionAdd("Add channel", () => openChannelCreator(ws.id, null)));
+    tree.appendChild(
+      sectionAdd("New category", () =>
+        askInput("New category", "Group channels under a heading.", "Category name", "Create",
+          (name) => send({ type: "CreateCategory", workspace: ws.id, name }))));
   }
+}
+
+// Local, persisted collapse state for category headers (per category id).
+const collapsedCats = new Set(loadCollapsedCats());
+function loadCollapsedCats() {
+  try { return JSON.parse(localStorage.getItem("enclave.collapsedCats") || "[]"); }
+  catch (_) { return []; }
+}
+function saveCollapsedCats() {
+  try { localStorage.setItem("enclave.collapsedCats", JSON.stringify([...collapsedCats])); }
+  catch (_) {}
+}
+function toggleCategory(catId) {
+  if (collapsedCats.has(catId)) collapsedCats.delete(catId);
+  else collapsedCats.add(catId);
+  saveCollapsedCats();
+  renderWsPanel();
+}
+
+// A category heading: a chevron+name toggle that expands/collapses its channels,
+// plus (for managers) a + that creates a channel straight into this category.
+function categoryHeader(ws, cat, collapsed, canManage) {
+  const head = document.createElement("div");
+  head.className = "ws-cat" + (collapsed ? " collapsed" : "");
+  const toggle = document.createElement("button");
+  toggle.className = "ws-cat-toggle";
+  toggle.innerHTML =
+    '<svg class="ws-cat-chev icon sm" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>' +
+    '<span class="ws-cat-label"></span>';
+  toggle.querySelector(".ws-cat-label").textContent = cat.name;
+  toggle.setAttribute("aria-expanded", String(!collapsed));
+  toggle.addEventListener("click", () => toggleCategory(cat.id));
+  head.appendChild(toggle);
+  if (canManage) {
+    const add = document.createElement("button");
+    add.className = "ws-cat-add";
+    add.title = "Create a channel in " + cat.name;
+    add.setAttribute("aria-label", add.title);
+    add.innerHTML = '<svg class="icon sm" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>';
+    add.addEventListener("click", () => openChannelCreator(ws.id, cat.id));
+    head.appendChild(add);
+  }
+  return head;
+}
+
+// The "Add channel" / "New category" rows at the bottom of the tree.
+function sectionAdd(label, fn) {
+  const b = document.createElement("button");
+  b.className = "ws-sec-add";
+  b.innerHTML = '<svg class="icon sm" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg><span></span>';
+  b.querySelector("span").textContent = label;
+  b.addEventListener("click", fn);
+  return b;
 }
 
 function channelRow(ws, ch) {
@@ -5787,7 +5861,7 @@ function channelRow(ws, ch) {
   row.className = "ws-chan" + (ch.id === activeChannel ? " active" : "");
   const ico = ch.kind === "voice"
     ? '<svg class="ws-chan-ico" viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>'
-    : '<span class="ws-chan-ico" style="font-weight:700;text-align:center">#</span>';
+    : '<span class="ws-chan-ico">#</span>';
   const lock = ch.private
     ? '<svg class="ws-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="1.5"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>'
     : "";
@@ -5977,11 +6051,23 @@ function renderVoiceStage(ws, ch) {
 // Channel creator: one dialog that names the channel, picks text/voice, and
 // (text only) makes it private, instead of a stack of native prompts.
 let channelCreateWs = null;
-function openChannelCreator(wsId) {
+function openChannelCreator(wsId, catId) {
   channelCreateWs = wsId;
   $("ch-name").value = "";
   $("ch-kind").value = "text";
   $("ch-private").checked = false;
+  // Fill the category picker from the workspace, preselecting catId if given
+  // (e.g. the + on a category header creates straight into it).
+  const ws = wsById(wsId);
+  const sel = $("ch-category");
+  sel.innerHTML = '<option value="">No category</option>';
+  for (const cat of (ws && ws.categories) || []) {
+    const o = document.createElement("option");
+    o.value = cat.id;
+    o.textContent = cat.name;
+    sel.appendChild(o);
+  }
+  sel.value = catId || "";
   syncChannelKind();
   openModal("modal-channel");
   setTimeout(() => $("ch-name").focus(), 0);
@@ -5999,9 +6085,10 @@ $("ch-create").addEventListener("click", () => {
   const name = $("ch-name").value.trim();
   if (!name || !channelCreateWs) return;
   const kind = $("ch-kind").value;
-  if (kind === "voice") send({ type: "CreateVoiceChannel", workspace: channelCreateWs, name });
-  else if ($("ch-private").checked) send({ type: "CreatePrivateChannel", workspace: channelCreateWs, name });
-  else send({ type: "CreateChannel", workspace: channelCreateWs, name });
+  const category = $("ch-category").value || null;
+  if (kind === "voice") send({ type: "CreateVoiceChannel", workspace: channelCreateWs, name, category });
+  else if ($("ch-private").checked) send({ type: "CreatePrivateChannel", workspace: channelCreateWs, name, category });
+  else send({ type: "CreateChannel", workspace: channelCreateWs, name, category });
   closeModals();
 });
 

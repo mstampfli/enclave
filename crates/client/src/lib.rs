@@ -4565,7 +4565,12 @@ impl Client {
     }
 
     /// Create a public text channel in a workspace; returns its hex id.
-    pub fn create_channel(&mut self, ws_hex: &str, name: &str) -> Result<String, ClientError> {
+    pub fn create_channel(
+        &mut self,
+        ws_hex: &str,
+        name: &str,
+        category: Option<&str>,
+    ) -> Result<String, ClientError> {
         let ws = decode_offer_id(ws_hex)
             .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
         let channel = new_transfer_id();
@@ -4576,7 +4581,7 @@ impl Client {
                 name: name.to_string(),
                 kind: enclave_protocol::ChannelKind::Text,
                 private: false,
-                category: None,
+                category: category.and_then(decode_offer_id),
             },
         )?;
         // Mint the channel's first history key (epoch 0) and share it with the
@@ -4604,6 +4609,7 @@ impl Client {
         &mut self,
         ws_hex: &str,
         name: &str,
+        category: Option<&str>,
     ) -> Result<String, ClientError> {
         let channel = new_transfer_id();
         self.workspace_submit(
@@ -4613,7 +4619,7 @@ impl Client {
                 name: name.to_string(),
                 kind: enclave_protocol::ChannelKind::Voice,
                 private: false,
-                category: None,
+                category: category.and_then(decode_offer_id),
             },
         )?;
         Ok(hex::encode(channel))
@@ -4627,6 +4633,7 @@ impl Client {
         &mut self,
         ws_hex: &str,
         name: &str,
+        category: Option<&str>,
     ) -> Result<String, ClientError> {
         let ws = decode_offer_id(ws_hex)
             .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
@@ -4638,7 +4645,7 @@ impl Client {
                 name: name.to_string(),
                 kind: enclave_protocol::ChannelKind::Text,
                 private: true,
-                category: None,
+                category: category.and_then(decode_offer_id),
             },
         )?;
         // The channel's own MLS group (creator only, for now) and first history key.

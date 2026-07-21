@@ -364,14 +364,20 @@ enum UiCommand {
     CreateChannel {
         workspace: String,
         name: String,
+        #[serde(default)]
+        category: Option<String>,
     },
     CreateVoiceChannel {
         workspace: String,
         name: String,
+        #[serde(default)]
+        category: Option<String>,
     },
     CreatePrivateChannel {
         workspace: String,
         name: String,
+        #[serde(default)]
+        category: Option<String>,
     },
     AddWorkspaceMember {
         workspace: String,
@@ -2746,23 +2752,35 @@ async fn handle_command(
                 }
             }
         }
-        UiCommand::CreateChannel { workspace, name } => {
+        UiCommand::CreateChannel {
+            workspace,
+            name,
+            category,
+        } => {
             if let Some(c) = client.as_mut() {
-                if let Err(e) = c.create_channel(&workspace, &name) {
+                if let Err(e) = c.create_channel(&workspace, &name, category.as_deref()) {
                     error_status(proxy, format!("Could not create channel: {e}"));
                 }
             }
         }
-        UiCommand::CreateVoiceChannel { workspace, name } => {
+        UiCommand::CreateVoiceChannel {
+            workspace,
+            name,
+            category,
+        } => {
             if let Some(c) = client.as_mut() {
-                if let Err(e) = c.create_voice_channel(&workspace, &name) {
+                if let Err(e) = c.create_voice_channel(&workspace, &name, category.as_deref()) {
                     error_status(proxy, format!("Could not create channel: {e}"));
                 }
             }
         }
-        UiCommand::CreatePrivateChannel { workspace, name } => {
+        UiCommand::CreatePrivateChannel {
+            workspace,
+            name,
+            category,
+        } => {
             if let Some(c) = client.as_mut() {
-                if let Err(e) = c.create_private_channel(&workspace, &name) {
+                if let Err(e) = c.create_private_channel(&workspace, &name, category.as_deref()) {
                     error_status(proxy, format!("Could not create channel: {e}"));
                 }
             }
