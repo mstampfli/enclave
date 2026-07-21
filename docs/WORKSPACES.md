@@ -1,13 +1,12 @@
 # Workspaces -- design & plan
 
-Status: **IMPLEMENTED** (M0-M5, 2026-07). This document is now the design record;
+Status: **IMPLEMENTED** (M0-M6, 2026-07). This document is now the design record;
 the shipped feature follows the phased roadmap in section 10, and each milestone's
 tests are cited in ARCHITECTURE.md roadmap item 8 and THREAT_MODEL.md "Workspaces".
-The remaining scale items (rekey batching, history paging, a durable server
-history store, a dedicated invite flow) are called out in sections 10 and 11.
-Decisions locked with the user: **scrollback history**, **full structure** (roles
-+ private channels + categories), **medium-community scale** (up to a few hundred
-members).
+The scale items once listed as future (durable + paginated history, invite codes,
+concurrent-add robustness) all shipped in M6. Decisions locked with the user:
+**scrollback history**, **full structure** (roles + private channels +
+categories), **medium-community scale** (up to a few hundred members).
 
 A workspace is a Discord/Slack-style container: named text and voice channels,
 grouped into categories, with members, roles, and invites. It is E2E encrypted
@@ -191,8 +190,9 @@ model and section 2 of THREAT_MODEL). Threats at the boundary and their controls
 | **I** Info disclosure | Backfill history key exposure | **Accept (documented).** Scrollback = symmetric epoch key shared with members; not per-message FS. Section 3. Server never holds it. |
 | **I** Info disclosure | Non-members learn a private channel's name/members | **Mitigate (from peers).** Private-channel metadata sealed to its members; the client shows only channels it holds keys for. The **relay** still sees the channel exists to route it -- accepted metadata tier. |
 | **I** Info disclosure | Workspace membership / channel tree / voice presence | **Accept.** Metadata inherent to a self-hosted relay (THREAT_MODEL). |
-| **D** DoS | Message / channel-creation / invite spam; rekey storms; unbounded history store | **Mitigate.** Per-member rate limits; per-workspace quotas (max channels, max history bytes, evictable) reusing the filestore/ballot quota patterns; batched rekeys (section 10). Every refusal returns a clear error. |
+| **D** DoS | Message / channel-creation spam; add bursts; unbounded history | **Mitigate.** Per-workspace history bounded on disk (capped, oldest-evicted, `MAX_HISTORY_PER_CHANNEL`); a burst of member adds queues and drains one per freed op-log slot instead of dropping redeemers (M6). Every refusal returns a clear error. |
 | **D** DoS | Relay censors (drops ops/messages) | **Accept (self-hosted).** Cannot be prevented against a server you rely on; noted as liveness, not confidentiality/integrity. |
+| **S/E** Spoofing / Elevation | Invite code abused to self-join or elevate | **Mitigate.** An invite is a bearer code an **admin** mints (relay checks the role) and can only *request* admission; the actual add is a signed AddMember op by an online admin, so redemption never bypasses role authority or the op-log record. |
 | **E** Elevation | Member performs admin action without the role | **Mitigate.** Authorization is the signed Owner-chained grant; clients reject ops whose signer lacks the role. Server cannot elevate. |
 | **E** Elevation | Removed member keeps reading | **Mitigate.** Removal triggers a WG commit (public) / group commit (private) **and** a history-epoch rotation; they hold no post-removal key. |
 
@@ -246,15 +246,32 @@ Target: up to a few hundred members, tens of channels. Costs:
 - **M4 [DONE] -- voice channels.** Persistent call per channel; join/leave;
   voice-presence panel; reuse media/screenshare/video. Test:
   `voice_channel_presence_tracks_who_is_connected`.
-- **M5 [DONE, minus the scale items below] -- UI & op serialization.** The
-  workspace UI (rail, channel tree, channel view, voice stage) built by reusing
-  the direct-message message renderer (`appendInto`) and the app's modal system,
-  not a parallel one; back-to-back structural ops serialized through a
-  per-workspace op-submission queue that re-signs on a sequence conflict. **Still
-  open:** rekey batching (one WG commit per tick under churn), history paging
-  (backfill is sent whole today), a durable server history store (in memory
-  today), and a dedicated invite flow (add-by-username via the manage dialog for
-  now).
+- **M5 [DONE] -- UI & op serialization.** The workspace UI (rail, channel tree,
+  channel view, voice stage) built by reusing the direct-message message renderer
+  (`appendInto`) and the app's modal system, not a parallel one; back-to-back
+  structural ops serialized through a per-workspace op-submission queue that
+  re-signs on a sequence conflict.
+- **M6 [DONE] -- scale & robustness.** The items once listed here as future:
+  - **Durable, paginated history.** Channel scrollback persists to disk (an
+    append-only framed log per channel with a stable per-channel seq and
+    slack-window compaction), so a relay restart keeps the backlog. Fetches are
+    paged by seq (newest page, then older on scroll-up) instead of dumping the
+    whole backlog, and the client catches up on channel open (channel posts are
+    fan-out, not the reliable queue). Tests:
+    `history_pages_newest_first_and_walks_older_by_cursor`,
+    `history_survives_a_restart`.
+  - **Invite codes.** An admin mints a bearer code (relay-enforced role,
+    persisted, with expiry/use limits); redeeming routes a join request to one
+    online admin whose client admits the redeemer through the normal signed
+    AddMember op. Tests: `invites_validate_expiry_and_use_limits`,
+    `an_invite_code_admits_a_redeemer`.
+  - **Concurrent-add robustness.** A burst of adds (several redemptions of one
+    invite link at once) queues per workspace and drains one per freed op-log
+    slot rather than failing on a busy log, so no redeemer is dropped. Test:
+    `a_burst_of_invite_redemptions_all_get_admitted`. (Collapsing a burst into a
+    single multi-member MLS commit would trim commits under churn; at
+    medium-community scale the serial queue is correct and sufficient, so that
+    micro-optimization is intentionally not built.)
 
 Each milestone landed with its tests and a THREAT_MODEL update.
 
@@ -269,9 +286,9 @@ Each milestone landed with its tests and a THREAT_MODEL update.
   self-hosted async delivery, not a gap).
 - **The relay can censor** (drop ops/messages) though it cannot forge or read --
   a liveness limit inherent to depending on a server.
-- **The server history store is in memory** -- a server restart drops stored
-  backfill (the same limitation as buffered ballots); a durable store is future
-  work.
+- **Invite codes are bearer secrets** -- anyone who obtains a code can request to
+  join until it expires or is used up; admission still requires an online admin
+  and is recorded (signed) in the op-log.
 - **Scale ceiling ~ a few hundred**; this is not a 50k-member public-server design.
 - **Big build**: M0-M5 is the largest feature since calls. It is additive -- DMs,
   groups, and the home screen are untouched.

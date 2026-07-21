@@ -789,12 +789,21 @@ op cannot brick a log's chain for everyone. Proven by the crypto workspace tests
   the rest of the app; see "Metadata the server sees, and what hides it". Hiding
   the roster by broadcasting to everyone is the same non-viable tradeoff rejected
   there.
-- **Denial of service -- op / message / rekey spam, unbounded history.**
+- **Denial of service -- op / message spam, add bursts, unbounded history.**
   *Mitigate.* The client serializes structural ops through a per-workspace
-  submission queue (re-signing on a sequence conflict) instead of racing the log,
-  and channel history is bounded per channel with oldest-first eviction
-  (`transport::workspaces`, `MAX_HISTORY_PER_CHANNEL`). Rekey batching and history
-  paging are the remaining scale items (docs/WORKSPACES.md section 10).
+  submission queue (re-signing on a sequence conflict) instead of racing the log;
+  a burst of member adds (several redemptions of one invite link at once) queues
+  and drains one per freed op-log slot rather than dropping all but the first; and
+  channel history is bounded per channel on disk with oldest-first eviction
+  (`transport::workspaces`, `MAX_HISTORY_PER_CHANNEL`) and served in bounded pages
+  rather than one unbounded dump.
+- **Spoofing / Elevation -- an invite code used to bypass role authority.**
+  *Mitigate.* An invite is a bearer code an admin mints (the relay checks the
+  minter's role and validates the code's expiry / use limit) that only lets its
+  holder *request* admission; the admission itself is a signed AddMember op by an
+  online admin, so a redeemer never joins without an admin's authority and never
+  escapes the op-log's record of who added them. The code is a bearer secret
+  (residual risk below).
 - **Denial of service -- relay censors (drops ops or messages).** *Accept.* A
   liveness limit inherent to depending on a server you host; it can withhold but
   cannot forge or read.
@@ -814,6 +823,8 @@ op cannot brick a log's chain for everyone. Proven by the crypto workspace tests
   Discord-style history (docs/WORKSPACES.md section 3). The server never holds it.
 - **Workspace structure is visible to the relay you host** -- forced by
   self-hosted async delivery, not a gap (the metadata theorem above).
-- **The server-side history store is in memory** today, so a server restart drops
-  stored backfill (the same limitation as buffered ballots). A durable store is
-  future work (`transport::workspaces`).
+- **An invite code is a bearer secret** -- anyone who obtains a live code can
+  request to join until it expires or its uses run out. Admission still needs an
+  online admin and is recorded in the op-log, so the blast radius is a join
+  request, not silent membership. Codes are admin-minted, expiry/use-bounded, and
+  deleted once spent (`transport::workspaces`).

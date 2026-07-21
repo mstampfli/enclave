@@ -99,11 +99,14 @@ crypto  media  transport
   types (`WorkspaceOp`, the identity-signed `SignedOp`, the ids); `crypto::sign`
   signs/verifies ops over identity Ed25519 keys and `crypto::workspace` is the
   op-log state machine (`WorkspaceState::apply`); `transport::workspaces`
-  (`WorkspaceStore`) stores the signed logs plus the `HK`-sealed channel history
+  (`WorkspaceStore`) stores the signed logs, the durable per-channel `HK`-sealed
+  history (append-only, capped, paged by seq), and the admin-minted invite codes,
   and re-validates every op at ingress; `client` coordinates the one workspace
   MLS group (keys all public channels), a separate MLS group per private channel,
-  the per-channel history-key epochs, and a serialized op-submission queue. Design
-  and keying: docs/WORKSPACES.md; threat posture: THREAT_MODEL.md "Workspaces".
+  the per-channel history-key epochs, a serialized op-submission queue, and a
+  per-workspace add queue that drains member-add bursts without dropping any.
+  Design and keying: docs/WORKSPACES.md; threat posture: THREAT_MODEL.md
+  "Workspaces".
 
 ## UI (self-contained window -- hard requirement)
 
@@ -289,19 +292,20 @@ window by default and only add the WASM/browser target when we choose to.
    (RUSTSEC-2026-0124) is waived as verified
    non-exploitable and tracked.
 8. [DONE] Workspaces (text + voice channels, roles, categories, private
-   channels). Milestones M0-M5 per docs/WORKSPACES.md: the signed op-log and
+   channels). Milestones M0-M6 per docs/WORKSPACES.md: the signed op-log and
    role-chain (`crypto::workspace`, `crypto::sign`); public text channels keyed
-   off the workspace MLS group; server-stored scrollback under rotating
-   per-channel history-key epochs (`transport::workspaces`); private channels
-   each in their own MLS group; persistent per-channel voice with presence; and
-   the workspace UI (rail, channel tree, channel view, voice stage), which reuses
-   the direct-message message renderer and the app's modal system rather than a
-   parallel one. Proven by `crates/crypto` workspace/sign tests and the
+   off the workspace MLS group; scrollback under rotating per-channel history-key
+   epochs, persisted to disk and served in bounded pages (`transport::workspaces`);
+   private channels each in their own MLS group; persistent per-channel voice with
+   presence; the workspace UI (rail, channel tree, channel view, voice stage),
+   which reuses the direct-message message renderer and the app's modal system
+   rather than a parallel one; and admin-minted invite codes with a
+   concurrent-add queue so a burst of redemptions is admitted without drops.
+   Proven by `crates/crypto` workspace/sign tests, the `transport::workspaces`
+   store tests (history paging, restart durability, invite validation), and the
    `crates/client/tests/client_flow.rs` workspace tests (create + add member,
    members exchange in a channel, a non-member sees nothing, a late joiner reads
    pre-join history, a private channel is readable only by its members, voice
-   presence tracks who is connected). Remaining scale items, deferred and stated
-   in docs/WORKSPACES.md section 10/11: rekey batching, history paging, a durable
-   (not in-memory) server history store, and a dedicated invite flow.
+   presence, an invite admits a redeemer, and a burst of redemptions all get in).
 
 Each phase ends compiling and tested; no half-done work carried forward.
