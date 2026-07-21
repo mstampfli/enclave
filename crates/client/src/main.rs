@@ -418,6 +418,16 @@ enum UiCommand {
         channel: String,
     },
     LeaveVoice,
+    /// Mint a shareable invite code for a workspace (admins only).
+    CreateInvite {
+        workspace: String,
+        ttl_secs: u64,
+        max_uses: u32,
+    },
+    /// Redeem an invite code to join its workspace.
+    RedeemInvite {
+        code: String,
+    },
 }
 
 /// A message line for the UI.
@@ -1023,6 +1033,11 @@ enum UiEvent {
     SharedGroups {
         handle: String,
         groups: Vec<(String, String)>,
+    },
+    /// A workspace invite code we just minted, for the UI to show and copy.
+    InviteCreated {
+        workspace: String,
+        code: String,
     },
     Status {
         message: String,
@@ -1739,6 +1754,30 @@ async fn run_client(
                 } => {
                     if let Some(c) = client.as_ref() {
                         emit(&proxy, channel_history_event(c, &workspace, &channel));
+                    }
+                }
+                Event::InviteCreated { workspace, code } => {
+                    emit(&proxy, UiEvent::InviteCreated { workspace, code });
+                }
+                Event::JoinRequested {
+                    workspace,
+                    requester,
+                } => {
+                    // An online admin admits an invite redeemer via the normal
+                    // signed add flow (the op-log records us as the adder).
+                    if let Some(c) = client.as_mut() {
+                        match c.workspace_add_member(&workspace, &requester).await {
+                            Ok(()) => emit(
+                                &proxy,
+                                UiEvent::Status {
+                                    message: format!("Admitted {requester} via invite."),
+                                    error: false,
+                                },
+                            ),
+                            Err(e) => {
+                                error_status(&proxy, format!("Could not admit {requester}: {e}"))
+                            }
+                        }
                     }
                 }
                 Event::VoicePresence {
@@ -2808,6 +2847,20 @@ async fn handle_command(
         UiCommand::LoadOlderChannel { workspace, channel } => {
             if let Some(c) = client.as_mut() {
                 c.fetch_channel_history_older(&workspace, &channel);
+            }
+        }
+        UiCommand::CreateInvite {
+            workspace,
+            ttl_secs,
+            max_uses,
+        } => {
+            if let Some(c) = client.as_mut() {
+                c.create_invite(&workspace, ttl_secs, max_uses);
+            }
+        }
+        UiCommand::RedeemInvite { code } => {
+            if let Some(c) = client.as_mut() {
+                c.redeem_invite(&code);
             }
         }
         UiCommand::JoinVoice { workspace, channel } => {

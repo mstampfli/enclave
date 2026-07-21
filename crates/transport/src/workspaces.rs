@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use enclave_crypto::workspace::{OpError, WorkspaceState};
-use enclave_protocol::{ChannelId, Sealed, SignedOp, WorkspaceId, WorkspaceSummary};
+use enclave_protocol::{ChannelId, Role, Sealed, SignedOp, WorkspaceId, WorkspaceSummary};
 
 /// Most stored messages kept per channel for scrollback. Beyond this the oldest
 /// is evicted, so history is bounded (a late joiner still gets a deep backlog).
@@ -61,6 +61,38 @@ struct PersistedLog {
     ops: Vec<SignedOp>,
 }
 
+/// A shareable workspace invite: a bearer code an admin mints and hands out,
+/// which a user redeems to request admission. Persisted so a restart keeps live
+/// invites.
+#[derive(Clone, Serialize, Deserialize)]
+struct InviteMeta {
+    workspace: WorkspaceId,
+    /// Unix seconds after which the code is dead (0 = never expires).
+    expires_at: u64,
+    /// Total redemptions allowed (0 = unlimited).
+    max_uses: u32,
+    uses: u32,
+}
+
+/// Why an invite redemption was refused. An exhausted or expired code is deleted
+/// on its last use, so a later redemption simply reads as `Unknown`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InviteError {
+    /// No such code (never existed, or used up / expired and cleaned away).
+    Unknown,
+    /// Still present but past its expiry.
+    Expired,
+}
+
+impl InviteError {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            InviteError::Unknown => "invite code not recognized",
+            InviteError::Expired => "invite code has expired",
+        }
+    }
+}
+
 /// One stored channel message. `seq` is a per-channel monotonic id assigned at
 /// store time; it is stable across eviction (evicting the front never renumbers
 /// what remains) and across restart, so a client can use it as a paging cursor.
@@ -89,11 +121,15 @@ pub struct WorkspaceStore {
     /// Retained sealed channel messages per channel (sealed; the relay holds no
     /// key). Mirrored to disk under `history_dir` when durable.
     history: BTreeMap<(WorkspaceId, ChannelId), ChannelLog>,
+    /// Live invite codes, keyed by code.
+    invites: BTreeMap<String, InviteMeta>,
     /// JSON path for the op-log (`None` = in-memory, e.g. tests).
     path: Option<PathBuf>,
     /// Directory holding one append-only log file per channel (`None` =
     /// in-memory: history is kept in RAM but never persisted).
     history_dir: Option<PathBuf>,
+    /// JSON path for the invite table (`None` = in-memory).
+    invites_path: Option<PathBuf>,
 }
 
 impl WorkspaceStore {
@@ -113,9 +149,16 @@ impl WorkspaceStore {
             .unwrap_or_default();
         let history_dir = history_dir_for(&path);
         let _ = std::fs::create_dir_all(&history_dir);
+        let invites_path = invites_path_for(&path);
+        let invites: BTreeMap<String, InviteMeta> = std::fs::read_to_string(&invites_path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
         let mut store = Self {
             path: Some(path),
             history_dir: Some(history_dir.clone()),
+            invites_path: Some(invites_path),
+            invites,
             ..Self::default()
         };
         for entry in persisted {
@@ -282,6 +325,72 @@ impl WorkspaceStore {
         (page, start > 0)
     }
 
+    /// Whether `handle` is an admin (or owner) of `ws` -- who may mint invites
+    /// and admit redeemers.
+    pub fn is_admin(&self, ws: &WorkspaceId, handle: &str) -> bool {
+        self.states
+            .get(ws)
+            .and_then(|s| s.role_of(handle))
+            .is_some_and(|r| r >= Role::Admin)
+    }
+
+    /// The current admins/owner of `ws` (for routing a join request).
+    pub fn admins(&self, ws: &WorkspaceId) -> Vec<String> {
+        self.states
+            .get(ws)
+            .map(|s| {
+                s.roles
+                    .iter()
+                    .filter(|(_, r)| **r >= Role::Admin)
+                    .map(|(h, _)| h.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Record a new invite code for `ws`.
+    pub fn create_invite(&mut self, ws: WorkspaceId, code: String, expires_at: u64, max_uses: u32) {
+        self.invites.insert(
+            code,
+            InviteMeta {
+                workspace: ws,
+                expires_at,
+                max_uses,
+                uses: 0,
+            },
+        );
+        self.save_invites();
+    }
+
+    /// Validate a code without consuming it, returning its workspace. Lets the
+    /// caller confirm an admin is reachable before spending a use.
+    pub fn peek_invite(&self, code: &str, now: u64) -> Result<WorkspaceId, InviteError> {
+        let inv = self.invites.get(code).ok_or(InviteError::Unknown)?;
+        if inv.expires_at != 0 && now >= inv.expires_at {
+            return Err(InviteError::Expired);
+        }
+        // Exhausted codes are removed on their last use, so this is a defensive
+        // guard (e.g. a code loaded from disk at its limit): treat it as gone.
+        if inv.max_uses != 0 && inv.uses >= inv.max_uses {
+            return Err(InviteError::Unknown);
+        }
+        Ok(inv.workspace)
+    }
+
+    /// Spend one use of a code (call after a join request was actually routed),
+    /// deleting it once exhausted or expired.
+    pub fn consume_invite(&mut self, code: &str, now: u64) {
+        if let Some(inv) = self.invites.get_mut(code) {
+            inv.uses += 1;
+            let dead = (inv.max_uses != 0 && inv.uses >= inv.max_uses)
+                || (inv.expires_at != 0 && now >= inv.expires_at);
+            if dead {
+                self.invites.remove(code);
+            }
+        }
+        self.save_invites();
+    }
+
     /// The workspaces `handle` currently belongs to, summarized for the sidebar.
     pub fn workspaces_of(&self, handle: &str) -> Vec<WorkspaceSummary> {
         self.states
@@ -310,6 +419,23 @@ impl WorkspaceStore {
             let _ = std::fs::write(path, text);
         }
     }
+
+    fn save_invites(&self) {
+        let Some(path) = &self.invites_path else {
+            return;
+        };
+        if let Ok(text) = serde_json::to_string_pretty(&self.invites) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+}
+
+/// The JSON file holding invite codes for an op-log at `path`:
+/// `<parent>/<stem>-invites.json`.
+fn invites_path_for(path: &Path) -> PathBuf {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("enclave-workspaces");
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("{stem}-invites.json"))
 }
 
 /// The directory that holds per-channel history logs for an op-log at `path`:
@@ -495,6 +621,35 @@ mod tests {
         assert_eq!(last.len(), 50);
         assert!(!more3, "reached the start");
         assert_eq!(last.first().unwrap().0, 0);
+    }
+
+    #[test]
+    fn invites_validate_expiry_and_use_limits() {
+        let owner = Identity::generate("owner").unwrap();
+        let mut store = WorkspaceStore::new();
+        let ws = [2u8; 16];
+        store
+            .submit(ws, sign_genesis(&owner, "owner#1", "Team", 100).unwrap())
+            .unwrap();
+        assert!(store.is_admin(&ws, "owner#1"));
+        assert!(!store.is_admin(&ws, "bob#2"));
+
+        // A single-use code expiring at t=1000.
+        store.create_invite(ws, "code1".into(), 1000, 1);
+        assert_eq!(store.peek_invite("code1", 500), Ok(ws));
+        assert_eq!(store.peek_invite("nope", 500), Err(InviteError::Unknown));
+        assert_eq!(store.peek_invite("code1", 1000), Err(InviteError::Expired));
+        // Spend its one use: an exhausted code is deleted, so it reads as unknown.
+        store.consume_invite("code1", 500);
+        assert_eq!(store.peek_invite("code1", 500), Err(InviteError::Unknown));
+
+        // An unlimited, never-expiring code stays valid across many uses.
+        store.create_invite(ws, "forever".into(), 0, 0);
+        for t in [0, 10_000, 999_999] {
+            assert_eq!(store.peek_invite("forever", t), Ok(ws));
+            store.consume_invite("forever", t);
+        }
+        assert_eq!(store.peek_invite("forever", 0), Ok(ws));
     }
 
     #[test]

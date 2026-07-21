@@ -1255,6 +1255,74 @@ impl Relay {
                 self.voice_broadcast(workspace, channel)
             }
 
+            ClientMsg::CreateInvite {
+                workspace,
+                ttl_secs,
+                max_uses,
+            } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                // Only an admin/owner may mint an invite (the redeemer is admitted
+                // by an admin's signed op, but minting is gated too so a plain
+                // member cannot hand out join links).
+                if !self.workspaces.is_admin(&workspace, &me) {
+                    return workspace_error(from, "only an admin can create an invite");
+                }
+                let code = {
+                    use rand::RngCore as _;
+                    let mut bytes = [0u8; 12];
+                    rand::rngs::OsRng.fill_bytes(&mut bytes);
+                    hex::encode(bytes)
+                };
+                let expires_at = if ttl_secs == 0 {
+                    0
+                } else {
+                    self.now_secs() + ttl_secs
+                };
+                self.workspaces
+                    .create_invite(workspace, code.clone(), expires_at, max_uses);
+                vec![Outgoing {
+                    to: from,
+                    msg: ServerMsg::InviteCreated { workspace, code },
+                }]
+            }
+
+            ClientMsg::RedeemInvite { code } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                let now = self.now_secs();
+                let ws = match self.workspaces.peek_invite(&code, now) {
+                    Ok(ws) => ws,
+                    Err(e) => return workspace_error(from, e.reason()),
+                };
+                if self.workspaces.is_member(&ws, &me) {
+                    return workspace_error(from, "you are already in that workspace");
+                }
+                // Route to one online admin, whose client performs the signed add.
+                // Spend a use only once we know a request will actually be routed.
+                let admin_conn = self
+                    .workspaces
+                    .admins(&ws)
+                    .into_iter()
+                    .find_map(|h| self.device_conn.get(&DeviceId(h)).copied());
+                let Some(admin_conn) = admin_conn else {
+                    return workspace_error(
+                        from,
+                        "no admin is online to admit you; try again later",
+                    );
+                };
+                self.workspaces.consume_invite(&code, now);
+                vec![Outgoing {
+                    to: admin_conn,
+                    msg: ServerMsg::JoinRequest {
+                        workspace: ws,
+                        requester: me,
+                    },
+                }]
+            }
+
             ClientMsg::RequestDm { to } => {
                 let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
                     return vec![];

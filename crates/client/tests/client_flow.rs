@@ -2170,6 +2170,74 @@ async fn a_workspace_is_created_and_a_member_is_added_end_to_end() {
     assert_eq!(owner_view.head_hash(), bob_view.head_hash());
 }
 
+/// End to end: an owner mints an invite code, a stranger redeems it, and the
+/// owner's client (as the online admin) admits them via the normal signed add,
+/// so the redeemer ends up a real member without the owner ever typing their
+/// username. Proves the create -> redeem -> route-to-admin -> admit path.
+#[tokio::test]
+async fn an_invite_code_admits_a_redeemer() {
+    use enclave_protocol::Role;
+
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let mut carol = account(&url, "carol").await;
+    let carol_h = carol.name().to_string();
+
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+
+    // Owner mints an invite; capture the code off the event.
+    owner.create_invite(&ws, 0, 0);
+    let mut code = String::new();
+    for _ in 0..100 {
+        if let Ok(Some(Event::InviteCreated { code: c, .. })) =
+            tokio::time::timeout(Duration::from_millis(50), owner.next_event()).await
+        {
+            code = c;
+            break;
+        }
+    }
+    assert!(!code.is_empty(), "no invite code arrived");
+
+    // Carol redeems it; the relay routes a JoinRequest to the owner. Interleave
+    // pumping both: the owner admits on JoinRequested (as main.rs does), and Carol
+    // converges to a member once the Welcome lands.
+    carol.redeem_invite(&code);
+    let mut admitted = false;
+    for _ in 0..200 {
+        if let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_millis(50), owner.next_event()).await
+        {
+            if let Event::JoinRequested {
+                workspace,
+                requester,
+            } = ev
+            {
+                owner.workspace_add_member(&workspace, &requester).await.unwrap();
+                admitted = true;
+            }
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(50), carol.next_event()).await;
+        if carol
+            .workspace(&ws)
+            .is_some_and(|s| s.role_of(&carol_h) == Some(Role::Member))
+        {
+            break;
+        }
+    }
+    assert!(admitted, "owner never received the join request");
+    assert_eq!(
+        carol.workspace(&ws).and_then(|s| s.role_of(&carol_h)),
+        Some(Role::Member),
+        "redeemer did not become a member"
+    );
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
+    })
+    .await;
+}
+
 /// M1 end to end: an owner creates a workspace, adds a member, creates a public
 /// text channel, and the two exchange messages sealed under the workspace MLS
 /// group -- proving the WG lifecycle (create / Welcome-join / commit) and

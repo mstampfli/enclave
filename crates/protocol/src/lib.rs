@@ -370,6 +370,22 @@ pub enum ClientMsg {
         workspace: WorkspaceId,
         channel: ChannelId,
     },
+    /// Create a shareable invite code for a workspace (admins/owner only). The
+    /// relay verifies the requester's role, mints a code, and replies with
+    /// [`ServerMsg::InviteCreated`]. `ttl_secs = 0` never expires; `max_uses = 0`
+    /// is unlimited.
+    CreateInvite {
+        workspace: WorkspaceId,
+        ttl_secs: u64,
+        max_uses: u32,
+    },
+    /// Redeem an invite code to request admission to its workspace. The relay
+    /// validates the code and routes a [`ServerMsg::JoinRequest`] to an online
+    /// admin, whose client performs the (signed, op-logged) add. A dead code or
+    /// no online admin comes back as [`ServerMsg::Error`].
+    RedeemInvite {
+        code: String,
+    },
 }
 
 /// A person in the friend graph: the unique `username` (login/add id) plus the
@@ -746,6 +762,19 @@ pub enum ServerMsg {
         workspace: WorkspaceId,
         channel: ChannelId,
         members: Vec<String>,
+    },
+    /// A freshly minted invite code (reply to [`ClientMsg::CreateInvite`]), for
+    /// the creator to copy and share.
+    InviteCreated {
+        workspace: WorkspaceId,
+        code: String,
+    },
+    /// Someone redeemed an invite and is asking to join. Delivered to one online
+    /// admin, whose client admits them via the normal signed add flow. `requester`
+    /// is the redeemer's handle.
+    JoinRequest {
+        workspace: WorkspaceId,
+        requester: String,
     },
 }
 

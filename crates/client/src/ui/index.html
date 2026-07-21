@@ -2164,6 +2164,29 @@ label.member-row:hover { background: var(--raised); }
       <span class="hint" style="font-size:12.5px;color:var(--muted)">
         New members can read every public channel's history. Private channels stay invite-only.</span>
     </div>
+    <div class="m-section">
+      <div class="s-head">Invite link</div>
+      <div class="add-friend" style="padding:0" id="ws-invite-row" hidden>
+        <input id="ws-invite-code" readonly spellcheck="false">
+        <button class="btn" style="padding:7px 12px" id="ws-invite-copy">Copy</button>
+      </div>
+      <button class="btn" id="ws-invite-make">Create an invite code</button>
+      <span class="hint" style="font-size:12.5px;color:var(--muted)">
+        Anyone with the code can request to join. It works for 7 days while an admin is online to admit them.</span>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="modal-ws-add" hidden>
+  <div class="modal modal-narrow">
+    <div class="m-head">
+      <h2>Add a workspace</h2>
+      <button data-close aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="m-section">
+      <button class="btn primary" id="ws-add-create" style="width:100%">Create a workspace</button>
+      <button class="btn" id="ws-add-join" style="width:100%">Join with an invite code</button>
+    </div>
   </div>
 </div>
 
@@ -5982,10 +6005,18 @@ $("ch-create").addEventListener("click", () => {
   closeModals();
 });
 
-$("ws-create").addEventListener("click", () => {
+$("ws-create").addEventListener("click", () => openModal("modal-ws-add"));
+$("ws-add-create").addEventListener("click", () => {
+  closeModals();
   askInput("New workspace", "Name your workspace. You will be its owner.",
     "Workspace name", "Create",
     (name) => send({ type: "CreateWorkspace", name }));
+});
+$("ws-add-join").addEventListener("click", () => {
+  closeModals();
+  askInput("Join a workspace", "Paste an invite code. An admin admits you once you redeem it.",
+    "Invite code", "Join",
+    (code) => send({ type: "RedeemInvite", code }));
 });
 $("rail-home").addEventListener("click", selectHome);
 $("ws-manage").addEventListener("click", openWorkspaceManage);
@@ -6001,6 +6032,8 @@ function openWorkspaceManage() {
   $("ws-manage-title").textContent = "Manage " + ws.name;
   $("ws-mem-search").value = "";
   $("ws-mem-add-input").value = "";
+  $("ws-invite-row").hidden = true;
+  $("ws-invite-code").value = "";
   renderWsMembers();
   openModal("modal-ws");
 }
@@ -6085,6 +6118,24 @@ $("ws-mem-add-btn").addEventListener("click", () => {
 $("ws-mem-add-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); $("ws-mem-add-btn").click(); }
 });
+// Invite link: a 7-day, unlimited-use code (admin-only; the relay enforces it).
+$("ws-invite-make").addEventListener("click", () => {
+  const ws = activeWsObj();
+  if (ws) send({ type: "CreateInvite", workspace: ws.id, ttl_secs: 604800, max_uses: 0 });
+});
+$("ws-invite-copy").addEventListener("click", () => {
+  const code = $("ws-invite-code").value;
+  if (code) copyText(code);
+});
+// The minted code lands here; show it in the manage dialog's invite row.
+function onInviteCreated(ev) {
+  if (!activeWs || ev.workspace !== activeWs) return;
+  $("ws-invite-code").value = ev.code;
+  $("ws-invite-row").hidden = false;
+  if ($("modal-ws").hidden) openWorkspaceManage();
+  $("ws-invite-code").focus();
+  $("ws-invite-code").select();
+}
 
 // Composer routing: when a channel is open, the composer posts to it.
 const _wsOrigSend = null;
@@ -6430,6 +6481,9 @@ window.onEnclaveEvent = (ev) => {
       break;
     case "VoicePresence":
       onVoicePresence(ev);
+      break;
+    case "InviteCreated":
+      onInviteCreated(ev);
       break;
     case "SharedGroups":
       renderSharedGroups(ev.handle, ev.groups);

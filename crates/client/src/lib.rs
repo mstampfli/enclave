@@ -401,6 +401,17 @@ pub enum Event {
         channel: String,
         has_more: bool,
     },
+    /// A workspace invite code we just minted, for the UI to show and copy.
+    InviteCreated {
+        workspace: String,
+        code: String,
+    },
+    /// Someone redeemed one of our workspace's invites and is asking to join;
+    /// as an online admin our client admits them. `requester` is their handle.
+    JoinRequested {
+        workspace: String,
+        requester: String,
+    },
     Error(String),
 }
 
@@ -4309,6 +4320,29 @@ impl Client {
         list
     }
 
+    /// Mint a shareable invite code for a workspace (admins only; the relay
+    /// enforces the role). The code comes back as [`Event::InviteCreated`].
+    /// `ttl_secs = 0` never expires; `max_uses = 0` is unlimited.
+    pub fn create_invite(&mut self, ws_hex: &str, ttl_secs: u64, max_uses: u32) {
+        let Some(workspace) = decode_offer_id(ws_hex) else {
+            return;
+        };
+        self.conn.send(ClientMsg::CreateInvite {
+            workspace,
+            ttl_secs,
+            max_uses,
+        });
+    }
+
+    /// Redeem an invite code to request admission to its workspace. An online
+    /// admin's client admits us; we then receive the workspace's Welcome and it
+    /// appears in our sidebar.
+    pub fn redeem_invite(&mut self, code: &str) {
+        self.conn.send(ClientMsg::RedeemInvite {
+            code: code.trim().to_string(),
+        });
+    }
+
     /// Create a workspace owned by us. Mints a random id, signs the genesis op,
     /// and submits it. State is populated when the server echoes the op back
     /// (surfaced as [`Event::WorkspacesChanged`]); the hex id is returned now so
@@ -6304,6 +6338,17 @@ impl Client {
                     members,
                 })
             }
+            ServerMsg::InviteCreated { workspace, code } => Some(Event::InviteCreated {
+                workspace: hex::encode(workspace),
+                code,
+            }),
+            ServerMsg::JoinRequest {
+                workspace,
+                requester,
+            } => Some(Event::JoinRequested {
+                workspace: hex::encode(workspace),
+                requester,
+            }),
             ServerMsg::Workspaces { workspaces } => {
                 // Fetch the full log for any workspace we do not yet hold, so a
                 // fresh login / new device catches up. Known ones are already live.
