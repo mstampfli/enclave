@@ -293,14 +293,11 @@ impl Call {
         self.screen.is_some()
     }
 
-    /// Mute or unmute the microphone (stops/resumes transmitting our voice).
+    /// Mute or unmute the microphone (stops/resumes transmitting our voice). The
+    /// current state lives on the `Client` (announced to peers); the audio thread
+    /// reads this atomic to decide whether to transmit.
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::Relaxed);
-    }
-
-    /// Whether the microphone is currently muted.
-    pub fn is_muted(&self) -> bool {
-        self.muted.load(Ordering::Relaxed)
     }
 
     /// Deafen or undeafen (stop/resume playing incoming audio).

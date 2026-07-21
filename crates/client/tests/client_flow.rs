@@ -2967,3 +2967,67 @@ async fn voice_channel_presence_tracks_who_is_connected() {
     .await;
     assert_eq!(bob.voice_members(&ws, &chan), vec![bob_h]);
 }
+
+/// M4: voice mute/deafen state propagates to co-occupants. When a member mutes or
+/// deafens, the relay folds it into the roster it broadcasts, so everyone in the
+/// channel can badge them. The relay attributes state to the authenticated sender
+/// and only for the channel they are in.
+#[tokio::test]
+async fn voice_mute_and_deafen_state_reaches_co_occupants() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let mut bob = account(&url, "bob").await;
+    let owner_h = owner.name().to_string();
+    let bob_h = bob.name().to_string();
+
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+    owner.workspace_add_member(&ws, &bob_h).await.unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
+    })
+    .await;
+    let chan = owner.create_voice_channel(&ws, "Lounge", None).unwrap();
+    pump_until(&mut bob, |c| {
+        c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
+    })
+    .await;
+
+    // Both join; each starts fully live (unmuted, undeafened).
+    owner.join_voice_channel(&ws, &chan).unwrap();
+    bob.join_voice_channel(&ws, &chan).unwrap();
+    pump_until(&mut owner, |c| c.voice_members(&ws, &chan).len() == 2).await;
+    let is = |c: &Client, muted: bool, deaf: bool| {
+        c.voice_roster(&ws, &chan)
+            .iter()
+            .any(|m| m.handle == bob_h && m.muted == muted && m.deafened == deaf)
+    };
+    assert!(is(&owner, false, false), "bob starts live");
+
+    // Bob mutes: owner sees muted (not deafened).
+    bob.set_muted(true);
+    pump_until(&mut owner, |c| is(c, true, false)).await;
+
+    // Bob deafens: owner sees deafened too.
+    bob.set_deafened(true);
+    pump_until(&mut owner, |c| is(c, true, true)).await;
+
+    // Bob undeafens then unmutes: owner sees them go fully live again.
+    bob.set_deafened(false);
+    pump_until(&mut owner, |c| is(c, true, false)).await;
+    bob.set_muted(false);
+    pump_until(&mut owner, |c| is(c, false, false)).await;
+
+    // Leaving voice resets the announced intent: a re-join is live, not stale-muted.
+    bob.set_muted(true);
+    pump_until(&mut owner, |c| is(c, true, false)).await;
+    bob.leave_voice_channel();
+    pump_until(&mut owner, |c| {
+        c.voice_members(&ws, &chan) == vec![owner_h.clone()]
+    })
+    .await;
+    bob.join_voice_channel(&ws, &chan).unwrap();
+    pump_until(&mut owner, |c| c.voice_members(&ws, &chan).len() == 2).await;
+    assert!(is(&owner, false, false), "re-join is live, not stale-muted");
+}

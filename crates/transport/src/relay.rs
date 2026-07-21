@@ -19,7 +19,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use enclave_protocol::{
     ClientMsg, DeviceId, Friend, GroupId, Permission, Presence, Sealed, ServerMsg, UserId,
+    VoiceMember,
 };
+
+/// A voice occupant's announced mute/deafen state, tracked per member alongside
+/// presence. Defaults to fully unmuted for a fresh join.
+#[derive(Clone, Copy, Default)]
+struct VoiceFlags {
+    muted: bool,
+    deafened: bool,
+}
 
 use crate::accounts::{AccountStore, AuthOutcome};
 use crate::avatarstore::AvatarStore;
@@ -141,8 +150,9 @@ pub struct Relay {
     /// Workspace op-logs + membership index (metadata; content stays E2E).
     workspaces: WorkspaceStore,
     /// Who is currently connected to each voice channel, `(workspace, channel) ->
-    /// handles`. In memory; cleared for a handle on disconnect.
-    voice_presence: HashMap<([u8; 16], [u8; 16]), HashSet<String>>,
+    /// {handle -> mute/deafen flags}`. In memory; cleared for a handle on
+    /// disconnect.
+    voice_presence: HashMap<([u8; 16], [u8; 16]), HashMap<String, VoiceFlags>>,
     /// The server's long-term OPAQUE state (OPRF seed + static keypair).
     opaque: OpaqueServer,
     /// In-flight OPAQUE logins, keyed by connection, between the two round-trips.
@@ -1328,10 +1338,12 @@ impl Relay {
                 if !self.workspaces.is_channel_member(&workspace, &channel, &me) {
                     return vec![];
                 }
+                // A fresh join starts unmuted; re-joining resets the flags, which
+                // is correct because the client's call restarts unmuted too.
                 self.voice_presence
                     .entry((workspace, channel))
                     .or_default()
-                    .insert(me);
+                    .insert(me, VoiceFlags::default());
                 self.voice_broadcast(workspace, channel)
             }
 
@@ -1345,6 +1357,34 @@ impl Relay {
                         self.voice_presence.remove(&(workspace, channel));
                     }
                 }
+                self.voice_broadcast(workspace, channel)
+            }
+
+            ClientMsg::VoiceState {
+                workspace,
+                channel,
+                muted,
+                deafened,
+            } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                // Only update (and rebroadcast) if the sender is actually in this
+                // channel and the state changed. Attribution is the authenticated
+                // sender, never a client-supplied handle, so no one can announce
+                // another member's state. Deduping unchanged states keeps a client
+                // from amplifying broadcasts by resending the same flags.
+                let Some(set) = self.voice_presence.get_mut(&(workspace, channel)) else {
+                    return vec![];
+                };
+                let Some(flags) = set.get_mut(&me) else {
+                    return vec![];
+                };
+                if flags.muted == muted && flags.deafened == deafened {
+                    return vec![];
+                }
+                flags.muted = muted;
+                flags.deafened = deafened;
                 self.voice_broadcast(workspace, channel)
             }
 
@@ -1448,7 +1488,7 @@ impl Relay {
                 }
                 // The member must currently be in some OTHER voice channel here.
                 let in_other_voice = self.voice_presence.iter().any(|((ws, ch), set)| {
-                    *ws == workspace && *ch != channel && set.contains(&member)
+                    *ws == workspace && *ch != channel && set.contains_key(&member)
                 });
                 if !in_other_voice {
                     return workspace_error(
@@ -2325,12 +2365,20 @@ impl Relay {
     /// Broadcast a voice channel's current roster to the channel's members (so
     /// everyone sees who is in voice, joined or not).
     fn voice_broadcast(&self, ws: [u8; 16], channel: [u8; 16]) -> Vec<Outgoing> {
-        let mut members: Vec<String> = self
+        let mut members: Vec<VoiceMember> = self
             .voice_presence
             .get(&(ws, channel))
-            .map(|s| s.iter().cloned().collect())
+            .map(|s| {
+                s.iter()
+                    .map(|(handle, flags)| VoiceMember {
+                        handle: handle.clone(),
+                        muted: flags.muted,
+                        deafened: flags.deafened,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
-        members.sort();
+        members.sort_by(|a, b| a.handle.cmp(&b.handle));
         let channel_members = self.workspaces.channel_members(&ws, &channel);
         self.deliver_to_members(
             &channel_members,
@@ -2348,7 +2396,7 @@ impl Relay {
         let affected: Vec<([u8; 16], [u8; 16])> = self
             .voice_presence
             .iter()
-            .filter(|(_, set)| set.contains(handle))
+            .filter(|(_, set)| set.contains_key(handle))
             .map(|(k, _)| *k)
             .collect();
         let mut out = Vec::new();

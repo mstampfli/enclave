@@ -455,8 +455,15 @@ input[type="checkbox"], select { cursor: pointer; }
    would cancel the drag). */
 .ws-head.drag-over { background: var(--raised); box-shadow: inset 0 0 0 1px var(--accent-ink); border-radius: var(--radius); }
 .ws-voice-here { padding: 2px 8px 6px 30px; display: flex; flex-direction: column; gap: 3px; }
-.ws-voice-here .vh { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
+.ws-voice-here .vh { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted);
+  cursor: pointer; border-radius: 5px; padding: 1px 4px; margin-left: -4px; }
+.ws-voice-here .vh:hover { background: var(--hover); color: var(--text); }
 .ws-voice-here .vh .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+.ws-voice-here .vh .vh-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Mute/deafen glyph trails the name, pushed to the right; danger-tinted so a
+   muted/deafened occupant reads at a glance. */
+.ws-voice-here .vh .vh-status { margin-left: auto; flex: none; display: inline-flex; color: var(--danger); }
+.ws-voice-here .vh .vh-status svg { width: 13px; height: 13px; }
 .ws-sec-add { display: flex; align-items: center; gap: 7px; width: 100%; text-align: left;
   padding: 6px 8px; border-radius: var(--radius); color: var(--faint); font-size: 13px; cursor: pointer; }
 .ws-sec-add:hover { background: var(--raised); color: var(--ink); }
@@ -466,10 +473,17 @@ input[type="checkbox"], select { cursor: pointer; }
 .voice-stage .vs-title { font-size: 18px; font-weight: 650; color: var(--ink-strong); margin-bottom: 6px; }
 .voice-stage .vs-sub { font-size: 13.5px; color: var(--muted); margin-bottom: 22px; }
 .voice-roster { display: flex; flex-wrap: wrap; gap: 16px; justify-content: center; margin-bottom: 26px; }
-.voice-face { display: flex; flex-direction: column; align-items: center; gap: 7px; }
+.voice-face { position: relative; display: flex; flex-direction: column; align-items: center; gap: 7px; }
 .voice-face .avatar { width: 64px; height: 64px; font-size: 22px; }
 .voice-face .vf-name { font-size: 12.5px; color: var(--ink); max-width: 90px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A muted/deafened badge biting the avatar's lower-right, ringed in the surface
+   color so it reads as sitting on top (the sticker pattern used elsewhere). */
+.voice-face .vf-status:empty { display: none; }
+.voice-face .vf-status { position: absolute; top: 46px; right: calc(50% - 34px);
+  display: inline-flex; padding: 2px; border-radius: 50%;
+  background: var(--danger); color: #fff; box-shadow: 0 0 0 2px var(--bg); }
+.voice-face .vf-status svg { width: 12px; height: 12px; }
 .voice-empty { color: var(--faint); font-size: 13px; margin-bottom: 22px; }
 
 /* ---------- sidebar ---------- */
@@ -2845,6 +2859,16 @@ function amInThisCall() {
 }
 
 const MUTE_ICON = ' <svg class="icon" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v4"/><path d="M4 4l16 16"/></svg>';
+// A muted mic (with a slash) or a deafened headset (headphones with a slash),
+// for a voice occupant. Deafened wins (a deafened client is muted too), matching
+// the control that sets both. Empty string when the person is fully live.
+const ICON_MUTED = '<svg class="icon" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v4"/><path d="M3 3l18 18"/></svg>';
+const ICON_DEAFENED = '<svg class="icon" viewBox="0 0 24 24"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/><path d="M2 2l20 20"/></svg>';
+function voiceStatusIcon(m) {
+  if (m && m.deafened) return ICON_DEAFENED;
+  if (m && m.muted) return ICON_MUTED;
+  return "";
+}
 const SVG_MAX = '<svg class="icon" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>';
 const SVG_MONITOR = '<svg class="icon" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>';
 
@@ -2928,7 +2952,9 @@ function viewingMyVoice() {
 // The participants shown as tiles on the docked stage, from whichever call the
 // active view belongs to (a voice channel roster or a DM call).
 function stageParts() {
-  return viewingMyVoice() ? (voicePresence[myVoiceCh] || []) : (callPart[activeConv] || []);
+  return viewingMyVoice()
+    ? (voicePresence[myVoiceCh] || []).map((m) => m.handle)
+    : (callPart[activeConv] || []);
 }
 
 // Either render one share maximized (filling the stage, people hidden) or the
@@ -6015,14 +6041,19 @@ function channelRow(ws, ch, depth, canManage) {
       const box = document.createElement("div");
       box.className = "ws-voice-here";
       box.style.paddingLeft = 30 + depth * 12 + "px";
-      for (const h of here) {
+      for (const m of here) {
         const v = document.createElement("div");
         v.className = "vh";
-        v.innerHTML = '<span class="dot"></span><span></span>';
-        v.querySelector("span:last-child").textContent = displayOf(h);
+        v.innerHTML = '<span class="dot"></span><span class="vh-name"></span>' +
+          '<span class="vh-status">' + voiceStatusIcon(m) + '</span>';
+        v.querySelector(".vh-name").textContent = displayOf(m.handle);
+        v.title = "View " + displayOf(m.handle) + "'s profile";
+        // The occupant row opens the person's profile. It is also a drag handle
+        // for admins; a plain click (no drag) still fires this.
+        v.addEventListener("click", () => openProfile(m.handle));
         if (canMoveVoice) {
           v.draggable = true;
-          makeDraggable(v, { type: "voice-member", id: h, channel: ch.id });
+          makeDraggable(v, { type: "voice-member", id: m.handle, channel: ch.id });
         }
         box.appendChild(v);
       }
@@ -6042,7 +6073,7 @@ function fillDragGhost(el) {
   ghost.textContent = "";
   const ico = el.querySelector(".ws-chan-ico, .ws-cat-chev, .ws-lock, svg");
   if (ico) ghost.appendChild(ico.cloneNode(true));
-  const lab = el.querySelector(".ws-chan-name, .ws-cat-label, .vh span:last-child");
+  const lab = el.querySelector(".ws-chan-name, .ws-cat-label, .vh-name");
   const span = document.createElement("span");
   span.textContent = ((lab ? lab.textContent : el.textContent) || "").trim().slice(0, 48);
   ghost.appendChild(span);
@@ -6347,7 +6378,7 @@ function onVoicePresence(ev) {
   voicePresence[ev.channel] = ev.members || [];
   // The server roster is authoritative for "am I connected here": reconcile the
   // optimistic myVoiceCh set on Join with what the server actually reports.
-  const iAmHere = (ev.members || []).includes(myUsername);
+  const iAmHere = (ev.members || []).some((m) => m.handle === myUsername);
   if (iAmHere) {
     myVoiceCh = ev.channel; myVoiceWs = ev.workspace; inCall = true;
   } else if (myVoiceCh === ev.channel) {
@@ -6391,9 +6422,10 @@ function renderVoiceStage(ws, ch) {
   $("stage").hidden = true;
   const stage = document.createElement("div"); stage.className = "voice-stage";
   const roster = here.length
-    ? '<div class="voice-roster">' + here.map((h) =>
-        '<div class="voice-face"><div class="avatar" data-u="' + h + '"></div><div class="vf-name">' +
-        displayOf(h).replace(/</g, "&lt;") + '</div></div>').join("") + '</div>'
+    ? '<div class="voice-roster">' + here.map((m) =>
+        '<div class="voice-face" data-open="' + m.handle + '"><div class="avatar" data-u="' + m.handle + '"></div>' +
+        '<div class="vf-name">' + displayOf(m.handle).replace(/</g, "&lt;") + '</div>' +
+        '<span class="vf-status">' + voiceStatusIcon(m) + '</span></div>').join("") + '</div>'
     : '<div class="voice-empty">No one is here yet.</div>';
   stage.innerHTML =
     '<div class="vs-title">' + ch.name.replace(/</g, "&lt;") + '</div>' +
@@ -6403,6 +6435,11 @@ function renderVoiceStage(ws, ch) {
   col.appendChild(stage);
   stage.querySelectorAll(".avatar[data-u]").forEach((el) =>
     paintAvatar(el, el.dataset.u, displayOf(el.dataset.u)));
+  stage.querySelectorAll(".voice-face[data-open]").forEach((el) => {
+    el.style.cursor = "pointer";
+    el.title = "View " + displayOf(el.dataset.open) + "'s profile";
+    el.addEventListener("click", () => openProfile(el.dataset.open));
+  });
   $("voice-toggle").addEventListener("click", () => {
     // Optimistically mark connected so the stage + controls appear at once; the
     // server roster confirms (or clears) it via onVoicePresence.

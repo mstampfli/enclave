@@ -48,7 +48,7 @@ fn image_mime(bytes: &[u8]) -> Option<&'static str> {
 }
 
 use enclave_client::{Client, Event, Reaction};
-use enclave_protocol::{Friend, Presence};
+use enclave_protocol::{Friend, Presence, VoiceMember};
 use std::borrow::Cow;
 
 use tao::event::{Event as TaoEvent, WindowEvent};
@@ -1143,11 +1143,12 @@ enum UiEvent {
         ts: u64,
         mine: bool,
     },
-    /// A voice channel's occupants changed.
+    /// A voice channel's occupants changed. Each member carries their mute/deafen
+    /// state so the UI can badge them.
     VoicePresence {
         workspace: String,
         channel: String,
-        members: Vec<String>,
+        members: Vec<VoiceMember>,
     },
     /// A channel's message history, loaded when the channel is opened or when a
     /// fetched page (newest catch-up or older backfill) lands. `has_more` says
@@ -2414,12 +2415,12 @@ async fn handle_command(
             }
         }
         UiCommand::SetMuted { muted } => {
-            if let Some(c) = client.as_ref() {
+            if let Some(c) = client.as_mut() {
                 c.set_muted(muted);
             }
         }
         UiCommand::SetDeafened { deafened } => {
-            if let Some(c) = client.as_ref() {
+            if let Some(c) = client.as_mut() {
                 c.set_deafened(deafened);
             }
         }

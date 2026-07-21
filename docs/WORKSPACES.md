@@ -141,7 +141,12 @@ A voice channel is a channel-group with an **always-joinable persistent call**:
   its MLS/derived secret (reuses `start_call`, the media-key schedule, sealed
   `Media` fan-out, screenshare, video).
 - **Voice presence** (who is connected) is metadata the SFU already sees; shown
-  live in the channel. Speaking/mute state rides the existing media path.
+  live in the channel, and each occupant is clickable (opens their profile).
+- **Mute/deafen state** is announced by each client with `ClientMsg::VoiceState`
+  (a boolean pair) and folded by the relay into the roster it broadcasts, so every
+  occupant is badged muted/deafened. The relay attributes state to the
+  authenticated sender only, and only while that sender is present in the channel.
+  Audio itself still stops locally; this is purely the visible indicator.
 - No new crypto -- it is the existing call, scoped to a channel and left open.
 
 ---

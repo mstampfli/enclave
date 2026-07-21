@@ -876,6 +876,14 @@ op cannot brick a log's chain for everyone. Proven by the crypto workspace tests
   join/leave (`ClientMsg::VoiceMoveMember` -> `ServerMsg::VoiceMoved`). A
   non-admin's attempt is refused; proven by
   `an_admin_moves_a_member_between_voice_channels`.
+- **Spoofing / DoS -- announcing voice mute/deafen state.** *Mitigate.* A client
+  announces only its *own* mute/deafen via `ClientMsg::VoiceState`; the relay
+  attributes it to the authenticated sender (never a handle in the message) and
+  drops it unless that sender is currently present in the named channel, so no one
+  can forge another member's indicator. Rebroadcast is suppressed when the flags
+  are unchanged, so a client cannot amplify by resending. The state is broadcast
+  to co-occupants (an accepted, cosmetic disclosure, same tier as presence).
+  Proven by `voice_mute_and_deafen_state_reaches_co_occupants`.
 
 ### Residual / accepted risks
 

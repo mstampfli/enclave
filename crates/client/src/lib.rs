@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use crate::transfer::{FileManifest, FileSink, Reassembler, TransferMeta};
 use enclave_crypto::{Group, Identity};
-use enclave_protocol::{ClientMsg, DeviceId, Friend, GroupId, Presence, Sealed, ServerMsg, UserId};
+use enclave_protocol::{
+    ClientMsg, DeviceId, Friend, GroupId, Presence, Sealed, ServerMsg, UserId, VoiceMember,
+};
 use enclave_transport::accounts::MIN_PASSWORD_LEN;
 use enclave_transport::{opaque, Connection};
 use sha2::{Digest, Sha256};
@@ -384,11 +386,12 @@ pub enum Event {
     /// (membership, roles, categories, or channels). The UI re-reads workspace
     /// state from the client.
     WorkspacesChanged,
-    /// A voice channel's occupants changed. `members` is the current roster.
+    /// A voice channel's occupants changed. `members` is the current roster with
+    /// each occupant's mute/deafen state.
     VoicePresence {
         workspace: String,
         channel: String,
-        members: Vec<String>,
+        members: Vec<VoiceMember>,
     },
     /// A message arrived (or was sent by us) in a workspace channel.
     ChannelMessage {
@@ -897,11 +900,17 @@ pub struct Client {
     /// Whether the relay reported still-older retained messages before our oldest
     /// held page, i.e. whether "load older" has anything to load.
     channel_hist_more: HashMap<([u8; 16], [u8; 16]), bool>,
-    /// Who is currently in each voice channel, `(workspace, channel) -> handles`,
+    /// Who is currently in each voice channel with their mute/deafen state,
     /// mirrored from the relay so the UI shows voice occupancy.
-    voice_presence: HashMap<([u8; 16], [u8; 16]), Vec<String>>,
+    voice_presence: HashMap<([u8; 16], [u8; 16]), Vec<VoiceMember>>,
     /// The voice channel we are connected to, if any (its media rides the call).
     voice_channel: Option<([u8; 16], [u8; 16])>,
+    /// Our own mute/deafen intent for the current call, announced to the relay via
+    /// [`ClientMsg::VoiceState`] so voice co-occupants see it. Tracked here (not
+    /// only in the ephemeral call) so it can be announced and reset independent of
+    /// the audio pipeline. Reset to unmuted when a call ends.
+    voice_muted: bool,
+    voice_deafened: bool,
     /// Handles that removed US (they initiated the un-friend). Only these auto-
     /// reconnect when they re-add us; a person WE removed does not. Cleared once
     /// we are friends again. Persisted so the direction survives a restart.
@@ -1018,6 +1027,8 @@ impl Client {
             channel_hist_more: HashMap::new(),
             voice_presence: HashMap::new(),
             voice_channel: None,
+            voice_muted: false,
+            voice_deafened: false,
             active: None,
             pending: VecDeque::new(),
             export_key: Vec::new(),
@@ -4142,6 +4153,10 @@ impl Client {
     pub fn leave_call(&mut self) {
         self.call = None;
         self.screen_rx = None;
+        // A fresh call always starts unmuted; drop our announced intent so a later
+        // join does not inherit a stale mute/deafen.
+        self.voice_muted = false;
+        self.voice_deafened = false;
         if let Some(group) = self.call_group.take() {
             self.conn.send(ClientMsg::LeaveCall { group });
         }
@@ -4271,22 +4286,26 @@ impl Client {
     }
 
     /// Mute or unmute our microphone for the current call.
-    pub fn set_muted(&self, muted: bool) {
+    pub fn set_muted(&mut self, muted: bool) {
+        self.voice_muted = muted;
         if let Some(call) = self.call.as_ref() {
             call.set_muted(muted);
         }
+        self.announce_voice_state();
     }
 
     /// Whether our microphone is currently muted.
     pub fn is_muted(&self) -> bool {
-        self.call.as_ref().is_some_and(|c| c.is_muted())
+        self.voice_muted
     }
 
     /// Deafen or undeafen (mute/unmute incoming audio) for the current call.
-    pub fn set_deafened(&self, deafened: bool) {
+    pub fn set_deafened(&mut self, deafened: bool) {
+        self.voice_deafened = deafened;
         if let Some(call) = self.call.as_ref() {
             call.set_deafened(deafened);
         }
+        self.announce_voice_state();
     }
 
     /// Decline an incoming call in conversation `conv_hex` (we were rung but will
@@ -5097,9 +5116,35 @@ impl Client {
             (Some(ws), Some(ch)) => self
                 .voice_presence
                 .get(&(ws, ch))
+                .map(|m| m.iter().map(|v| v.handle.clone()).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The current occupants of a voice channel with their mute/deafen state.
+    pub fn voice_roster(&self, ws_hex: &str, channel_hex: &str) -> Vec<VoiceMember> {
+        match (decode_offer_id(ws_hex), decode_offer_id(channel_hex)) {
+            (Some(ws), Some(ch)) => self
+                .voice_presence
+                .get(&(ws, ch))
                 .cloned()
                 .unwrap_or_default(),
             _ => Vec::new(),
+        }
+    }
+
+    /// Announce our current mute/deafen state to the relay so co-occupants of our
+    /// voice channel see it. A no-op outside a voice channel (DM calls do not
+    /// broadcast per-peer mute state).
+    fn announce_voice_state(&self) {
+        if let Some((workspace, channel)) = self.voice_channel {
+            self.conn.send(ClientMsg::VoiceState {
+                workspace,
+                channel,
+                muted: self.voice_muted,
+                deafened: self.voice_deafened,
+            });
         }
     }
 

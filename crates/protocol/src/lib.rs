@@ -67,6 +67,17 @@ impl<'de> Deserialize<'de> for Sealed {
     }
 }
 
+/// One occupant of a voice channel, as broadcast in [`ServerMsg::VoicePresence`]:
+/// their handle plus the mute/deafen state they announced via
+/// [`ClientMsg::VoiceState`]. `deafened` implies `muted` (a deafened client also
+/// stops transmitting), but both are carried so the UI can show the right glyph.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct VoiceMember {
+    pub handle: String,
+    pub muted: bool,
+    pub deafened: bool,
+}
+
 /// Kind of real-time media a frame carries. Drives jitter-buffer/codec routing
 /// only; the payload is always [`Sealed`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -394,6 +405,16 @@ pub enum ClientMsg {
     VoiceLeave {
         workspace: WorkspaceId,
         channel: ChannelId,
+    },
+    /// Announce our own mute/deafen state in the voice channel we are in, so the
+    /// relay can fold it into the roster it broadcasts. The relay attributes this
+    /// to the authenticated sender (never a client-supplied handle) and ignores it
+    /// unless the sender is currently present in that channel.
+    VoiceState {
+        workspace: WorkspaceId,
+        channel: ChannelId,
+        muted: bool,
+        deafened: bool,
     },
     /// Create a shareable invite code for a workspace (admins/owner only). The
     /// relay verifies the requester's role, mints a code, and replies with
@@ -879,12 +900,13 @@ pub enum ServerMsg {
         messages: Vec<(u64, u64, Sealed)>,
         has_more: bool,
     },
-    /// The current occupants of a voice channel (handles), broadcast to the
-    /// channel's members whenever someone joins or leaves.
+    /// The current occupants of a voice channel with their mute/deafen state,
+    /// broadcast to the channel's members whenever someone joins, leaves, or
+    /// changes their voice state.
     VoicePresence {
         workspace: WorkspaceId,
         channel: ChannelId,
-        members: Vec<String>,
+        members: Vec<VoiceMember>,
     },
     /// A freshly minted invite code (reply to [`ClientMsg::CreateInvite`]), for
     /// the creator to copy and share.
