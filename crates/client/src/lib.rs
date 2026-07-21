@@ -804,6 +804,11 @@ pub struct Client {
     /// Seals channel messages and stored history; a new member is handed the
     /// current set so they can read scrollback.
     channel_keys: HashMap<([u8; 16], [u8; 16]), Vec<[u8; 32]>>,
+    /// Queued structural ops per workspace, submitted one at a time against the
+    /// advancing op-log head so back-to-back ops never collide on a seq.
+    workspace_op_queue: HashMap<[u8; 16], VecDeque<enclave_protocol::WorkspaceOp>>,
+    /// The op currently sent and awaiting its echo, per workspace.
+    workspace_op_inflight: HashMap<[u8; 16], enclave_protocol::WorkspaceOp>,
     /// Channel message history, keyed by `(workspace, channel)`.
     channel_history: HashMap<([u8; 16], [u8; 16]), Vec<ChannelMsg>>,
     /// Handles that removed US (they initiated the un-friend). Only these auto-
@@ -913,6 +918,8 @@ impl Client {
             workspaces: HashMap::new(),
             workspace_groups: HashMap::new(),
             channel_keys: HashMap::new(),
+            workspace_op_queue: HashMap::new(),
+            workspace_op_inflight: HashMap::new(),
             channel_history: HashMap::new(),
             active: None,
             pending: VecDeque::new(),
@@ -1079,6 +1086,8 @@ impl Client {
         self.workspaces.clear();
         self.workspace_groups.clear();
         self.channel_keys.clear();
+        self.workspace_op_queue.clear();
+        self.workspace_op_inflight.clear();
         self.channel_history.clear();
         self.active = None;
         self.export_key.clear();
@@ -4287,6 +4296,11 @@ impl Client {
     ) -> Result<(), ClientError> {
         let id = decode_offer_id(ws_hex)
             .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
+        if self.workspace_busy(&id) {
+            return Err(ClientError::Workspace(
+                "a workspace change is in progress; try again".into(),
+            ));
+        }
         let kp = self.fetch_key_package(handle).await?;
         let (add, member_key) = {
             let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
@@ -4334,6 +4348,11 @@ impl Client {
     ) -> Result<(), ClientError> {
         let id = decode_offer_id(ws_hex)
             .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
+        if self.workspace_busy(&id) {
+            return Err(ClientError::Workspace(
+                "a workspace change is in progress; try again".into(),
+            ));
+        }
         let target_key = self
             .workspaces
             .get(&id)
@@ -4668,20 +4687,83 @@ impl Client {
         ws_hex: &str,
         op: enclave_protocol::WorkspaceOp,
     ) -> Result<(), ClientError> {
-        let me = self.me()?;
         let id = decode_offer_id(ws_hex)
             .ok_or_else(|| ClientError::Workspace("bad workspace id".into()))?;
-        let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
-        let state = self
-            .workspaces
-            .get(&id)
-            .ok_or_else(|| ClientError::Workspace("unknown workspace".into()))?;
-        let signed = enclave_crypto::workspace::sign_op(identity, &me, state, now_secs(), op)?;
-        self.conn.send(ClientMsg::WorkspaceSubmitOp {
-            workspace: id,
-            op: signed,
-        });
+        if !self.workspaces.contains_key(&id) {
+            return Err(ClientError::Workspace("unknown workspace".into()));
+        }
+        // Queue and drive: ops go out one at a time, each signed against the head
+        // as it advances, so a burst of structural ops cannot collide on a seq.
+        self.workspace_op_queue.entry(id).or_default().push_back(op);
+        self.pump_workspace_queue(id);
         Ok(())
+    }
+
+    /// Whether a structural op is in flight or queued for this workspace. Member
+    /// add/remove -- whose MLS Welcome/rotation must be ordered right after their
+    /// op -- refuse while busy rather than race behind a queued op.
+    fn workspace_busy(&self, ws: &[u8; 16]) -> bool {
+        self.workspace_op_inflight.contains_key(ws)
+            || self
+                .workspace_op_queue
+                .get(ws)
+                .is_some_and(|q| !q.is_empty())
+    }
+
+    /// Send the next queued op for a workspace if none is in flight, signing it
+    /// against the current head.
+    fn pump_workspace_queue(&mut self, ws: [u8; 16]) {
+        if self.workspace_op_inflight.contains_key(&ws) {
+            return;
+        }
+        let Some(op) = self
+            .workspace_op_queue
+            .get(&ws)
+            .and_then(|q| q.front().cloned())
+        else {
+            return;
+        };
+        let Ok(me) = self.me() else { return };
+        let signed = match (self.identity.as_ref(), self.workspaces.get(&ws)) {
+            (Some(identity), Some(state)) => {
+                enclave_crypto::workspace::sign_op(identity, &me, state, now_secs(), op.clone())
+                    .ok()
+            }
+            _ => None,
+        };
+        if let Some(signed) = signed {
+            self.conn.send(ClientMsg::WorkspaceSubmitOp {
+                workspace: ws,
+                op: signed,
+            });
+            self.workspace_op_inflight.insert(ws, op);
+        }
+    }
+
+    /// Reconcile the in-flight op after the log advanced: if our op was the one
+    /// that landed, drop it and send the next; if someone else's op landed first,
+    /// our in-flight is stale -- re-sign the same op against the new head.
+    fn reconcile_workspace_queue(
+        &mut self,
+        ws: [u8; 16],
+        applied: &[enclave_protocol::WorkspaceOp],
+    ) {
+        let Some(inflight) = self.workspace_op_inflight.get(&ws).cloned() else {
+            self.pump_workspace_queue(ws);
+            return;
+        };
+        if applied.contains(&inflight) {
+            // Confirmed: our op landed. Drop it from the queue and advance.
+            self.workspace_op_inflight.remove(&ws);
+            if let Some(q) = self.workspace_op_queue.get_mut(&ws) {
+                q.pop_front();
+            }
+        } else if !applied.is_empty() {
+            // Someone else advanced the log; our in-flight op is stale. Clear it
+            // and re-send (pump re-signs the front against the new head).
+            self.workspace_op_inflight.remove(&ws);
+        }
+        self.pump_workspace_queue(ws);
     }
 
     /// Apply op-log entries from the server -- the single place workspace state
@@ -4694,12 +4776,14 @@ impl Client {
     ) -> Option<Event> {
         let state = self.workspaces.entry(ws).or_default();
         let mut changed = false;
+        let mut applied: Vec<enclave_protocol::WorkspaceOp> = Vec::new();
         for op in ops {
             match op.seq.cmp(&state.next_seq()) {
                 std::cmp::Ordering::Less => {} // already applied (echo / dup)
                 std::cmp::Ordering::Equal => {
                     if state.apply(&op).is_ok() {
                         changed = true;
+                        applied.push(op.op.clone());
                     }
                     // A verification failure here means the relay accepted an op
                     // we reject; we simply do not advance, keeping our view sound.
@@ -4715,7 +4799,13 @@ impl Client {
         // Drop a workspace that ended up empty (e.g. a stray fetch of nothing).
         if self.workspaces.get(&ws).is_some_and(|s| s.owner.is_empty()) {
             self.workspaces.remove(&ws);
+            self.workspace_op_queue.remove(&ws);
+            self.workspace_op_inflight.remove(&ws);
             return None;
+        }
+        // Drive the submission queue against the new head.
+        if changed {
+            self.reconcile_workspace_queue(ws, &applied);
         }
         changed.then_some(Event::WorkspacesChanged)
     }

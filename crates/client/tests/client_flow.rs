@@ -2426,3 +2426,40 @@ async fn a_removed_member_cannot_read_messages_posted_after_removal() {
         "removed member cannot read post-removal messages: {carol_texts:?}"
     );
 }
+
+/// The op-submission queue: a burst of structural ops submitted back-to-back
+/// (three channels at once, no waiting between) all land, because each is signed
+/// against the head as it advances instead of colliding on a seq.
+#[tokio::test]
+async fn a_burst_of_structural_ops_all_land_via_the_queue() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+
+    // Fire three creates with no pumping between them.
+    owner.create_channel(&ws, "general").unwrap();
+    owner.create_channel(&ws, "random").unwrap();
+    owner.create_channel(&ws, "dev").unwrap();
+
+    // All three land, in order, on the single linear log.
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.channels.len() == 3)
+    })
+    .await;
+    let names: std::collections::BTreeSet<String> = owner
+        .workspace(&ws)
+        .unwrap()
+        .channels
+        .values()
+        .map(|ch| ch.name.clone())
+        .collect();
+    assert_eq!(
+        names,
+        ["dev", "general", "random"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    );
+}
