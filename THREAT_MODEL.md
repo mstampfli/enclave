@@ -27,7 +27,7 @@ scope: 1:1 and small-group calls, E2E text DMs, presence, friends list.
 | **T** Tampering | Server/MITM alters media, text, or handshake | Mitigate | AEAD auth tag on every frame; MLS message integrity; TLS on signaling hop; reject on auth failure |
 | **R** Repudiation | No proof of who said what | Accept | Private-comms product; no audit log by design. MLS still authenticates sender within a group |
 | **I** Info disclosure (content) | Server reads media/text | Mitigate | E2E encryption; keys never leave client; server sees only `Sealed` bytes |
-| **I** Info disclosure (metadata) | Server sees who/when/sizes | **Accept** | Inherent to self-hosted SFU; documented, chosen tradeoff. (Metadata resistance was explicitly out of scope for v1) |
+| **I** Info disclosure (metadata) | Server sees who/when/sizes | **Accept (forced)** | Not a deferred choice: async delivery to an offline peer needs a server to hold and route the mail, and that server is a single box you host, so it sees routing metadata by construction. Content stays E2E. See "Metadata the server sees". |
 | **D** Denial of service | Peer/server floods or drops traffic | Mitigate | Auth-required connections; rate limits; per-call resource caps; timeouts. Availability depends on your server (single point, self-owned) |
 | **E** Elevation | Participant/server gains rights or reads past traffic | Mitigate | MLS forward secrecy + post-compromise security (epoch ratchet) bounds compromise; deny-by-default authz; only signed Commits change membership |
 
@@ -53,7 +53,11 @@ Each mitigation gets a test as its phase lands (see ARCHITECTURE.md roadmap):
 
 ## Accepted risks (explicit)
 
-- **Metadata visible to the server** (who/when/sizes). Chosen for v1.
+- **Metadata visible to the server** (who/when/sizes). Not a deferred choice but
+  a consequence of the design: async delivery to an offline peer needs a server
+  to hold and route the mail, and Enclave's is a single box you host, so it sees
+  the routing metadata by construction. Content stays end-to-end encrypted
+  regardless. See "Metadata the server sees" for the full argument.
 - **Availability depends on the self-hosted server.** It is a single point, but
   it is yours; no third-party dependency.
 - **Repudiation** is not provided (no audit log), by design.
@@ -298,10 +302,40 @@ addressed at the wire:
     battery/bandwidth cost, i.e. it makes the accepted SFU tradeoff worse, not
     better.
 
-  The honest way to shrink recipient-set metadata is a different transport
-  (a mixnet, or sealed-sender with per-message tokens the server cannot link to
-  an account), which is a separate design, not a routing tweak. Recorded here as
-  a known, accepted limitation of the SFU model.
+  Hiding who-talks-to-whom is not a routing tweak bolted on later; it is a
+  different class of system, and it is **incompatible with two of Enclave's
+  requirements held at once**:
+
+  - **Async delivery.** You can text someone who is offline, so a server must
+    hold the ciphertext until they return. Holding and addressing mail *is*
+    seeing routing metadata: that a message exists, its size, its timing, and who
+    collects it.
+  - **A single self-hosted server.** Every metadata-hiding technique needs either
+    a crowd to hide in (a mixnet or constant cover traffic drowns your message
+    among many others) or several independent, non-colluding relays (Tor-style
+    onion routing). A box you run for yourself and a few friends is neither: with
+    a handful of users the anonymity set *is* those few people, and there is no
+    second operator to split trust across. Manufacturing a crowd means borrowing
+    other people's servers, which is no longer self-hosted.
+
+  The systems that genuinely hide the social graph (Tor hidden-service messengers
+  like Ricochet) get there by being **synchronous** -- both parties online on a
+  live circuit -- which trades away the async delivery above. The one
+  single-server exception, computational PIR (a recipient fetches mail without
+  the server learning which mailbox), costs the server work proportional to the
+  whole mailbox per fetch, hides only *which* mailbox is read rather than who
+  deposited into it or that the friendship exists, and is meaningless with a
+  handful of users.
+
+  So the server seeing routing metadata is **forced by the requirements, not a
+  tradeoff we settled for**: content is end-to-end encrypted and stays that way,
+  but the fact that two accounts correspond cannot be hidden from the single box
+  you deliberately chose to hold and route their mail. This includes the friend
+  graph and the account/friendship dates the profile shows -- social metadata the
+  same box already holds to route requests, never message content. Metadata
+  resistance is a goal for a different product (untrusted third-party servers, a
+  large user base, synchronous or high-latency delivery), not a missing feature
+  of this one.
 
 ## Polls and ballots (STRIDE + ASVS L2)
 
