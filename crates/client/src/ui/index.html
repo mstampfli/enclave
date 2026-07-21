@@ -2308,7 +2308,9 @@ let activeConv = null;
 let activeSafety = "";         // the active conversation's safety number
 const messages = {};           // conv id -> [{from, text, mine}]
 let inCall = false;            // am I in any call
-let myCallConv = null;         // conv id my call is in
+let myCallConv = null;         // conv id my call is in (DM call); null for a voice channel
+let myVoiceCh = null;          // voice channel hex my call is in; null for a DM call
+let myVoiceWs = null;          // workspace hex of that voice channel
 const callPart = {};           // conv id -> [participant display names]
 let ringConv = null;           // conv id currently ringing (incoming)
 const unread = {};             // conv id -> unread message count
@@ -2801,7 +2803,10 @@ function dismissRing() { stopRing(); ringConv = null; $("banner-ring").hidden = 
 // ---- call control ----
 function joinCall(convId) {
   if (!convId) return;
-  if (inCall && myCallConv !== convId) send({ type: "LeaveCall" });
+  // Only one call at a time (one media session): leaving a voice channel is a
+  // different message than leaving a DM call, so pick the right one.
+  if (myVoiceCh) { send({ type: "LeaveVoice" }); myVoiceCh = null; myVoiceWs = null; }
+  else if (inCall && myCallConv !== convId) send({ type: "LeaveCall" });
   if (activeConv !== convId) send({ type: "SwitchConversation", conv: convId });
   myCallConv = convId; inCall = true;
   send({ type: "StartCall" });
@@ -2899,6 +2904,17 @@ function renderCallTiles(parts) {
   }
 }
 
+// Am I connected to a voice channel and looking at it? The docked #stage is then
+// this voice channel's call, drawn from the channel roster instead of a DM.
+function viewingMyVoice() {
+  return myVoiceCh && activeChannel === myVoiceCh && !activeConv;
+}
+// The participants shown as tiles on the docked stage, from whichever call the
+// active view belongs to (a voice channel roster or a DM call).
+function stageParts() {
+  return viewingMyVoice() ? (voicePresence[myVoiceCh] || []) : (callPart[activeConv] || []);
+}
+
 // Either render one share maximized (filling the stage, people hidden) or the
 // normal grid of tiles.
 function renderStage() {
@@ -2915,7 +2931,7 @@ function renderStage() {
     if (maxedShare) maxedShare = ""; // the maximized share ended
     $("stage-share").hidden = true;
     $("tiles").hidden = false;
-    renderCallTiles(callPart[activeConv] || []);
+    renderCallTiles(stageParts());
   }
 }
 
@@ -2926,8 +2942,25 @@ function setCtl(id, on, label, cls) {
   b.querySelector("span").textContent = label;
 }
 
+// Set the mute/deafen/camera/share control labels + engaged states on the docked
+// stage. Shared by DM calls and voice channels, which use the same controls.
+function renderStageControls() {
+  setCtl("ctl-mic", muted, muted ? "Unmute" : "Mute", "off");
+  setCtl("ctl-deafen", deafened, deafened ? "Undeafen" : "Deafen", "off");
+  setCtl("ctl-camera", cameraOn, cameraOn ? "Camera on" : "Camera", "engaged");
+  setCtl("ctl-share", sharing, sharing ? "Sharing" : "Share", "engaged");
+}
+
 // Drive the header affordance, the docked stage, the banners, and the mini bar.
 function renderCall() {
+  // A voice channel I am connected to and viewing owns the docked stage: draw its
+  // tiles + controls and skip the DM-specific header/banner/mini-bar logic.
+  if (viewingMyVoice()) {
+    $("stage").hidden = false;
+    renderStage();
+    renderStageControls();
+    return;
+  }
   const conv = convById(activeConv);
   const parts = callPart[activeConv] || [];
   const active = parts.length > 0;
@@ -2971,10 +3004,7 @@ function renderCall() {
   $("stage").hidden = !mineHere;
   if (mineHere) {
     renderStage();
-    setCtl("ctl-mic", muted, muted ? "Unmute" : "Mute", "off");
-    setCtl("ctl-deafen", deafened, deafened ? "Undeafen" : "Deafen", "off");
-    setCtl("ctl-camera", cameraOn, cameraOn ? "Camera on" : "Camera", "engaged");
-    setCtl("ctl-share", sharing, sharing ? "Sharing" : "Share", "engaged");
+    renderStageControls();
   }
 }
 
@@ -5589,7 +5619,7 @@ $("preview-discard").addEventListener("click", () => { send({ type: "CancelVoice
 // ---- calls: buttons ----
 $("btn-call").addEventListener("click", () => joinCall(activeConv));
 $("live-join").addEventListener("click", () => joinCall(activeConv));
-$("ctl-leave").addEventListener("click", leaveCall);
+$("ctl-leave").addEventListener("click", leaveActiveCall);
 $("callbar-leave").addEventListener("click", leaveCall);
 $("callbar-return").addEventListener("click", () => { if (myCallConv) send({ type: "SwitchConversation", conv: myCallConv }); });
 function setMuted(v) { if (muted === v) return; muted = v; send({ type: "SetMuted", muted }); }
@@ -5766,7 +5796,8 @@ function showLogin() {
   setTimeout(() => $("login-username").focus(), 0);
   myUsername = ""; myDisplay = ""; friends = []; incoming = []; outgoing = []; conversations = [];
   activeConv = null; activeSafety = ""; activeVerified = false;
-  inCall = false; myCallConv = null; sharing = false; muted = false; deafened = false; cameraOn = false;
+  inCall = false; myCallConv = null; myVoiceCh = null; myVoiceWs = null;
+  sharing = false; muted = false; deafened = false; cameraOn = false;
   watchingStream = false; maxedShare = ""; currentSharer = ""; lastSent = "";
   activeShareId = null; activeCameraId = null; shareAudioOn = false;
   dismissRing(); streamEnded(); clearAllCameras(); selfShareEnded(); closeModals();
@@ -6166,6 +6197,10 @@ function openChannel(wsId, chId) {
 function renderChannelView(ws, ch, opts) {
   opts = opts || {};
   activeConv = null; // channels are not conversations
+  // A text channel is not a call: hide the docked stage in case we arrived here
+  // from a voice channel we are still connected to (audio keeps running; the
+  // stage is just not shown while reading a text channel).
+  $("stage").hidden = true;
   $("home-view").hidden = true;
   $("msg-col").hidden = false;
   $("composer-bar").hidden = false;
@@ -6271,6 +6306,14 @@ function onChannelMessage(ev) {
 
 function onVoicePresence(ev) {
   voicePresence[ev.channel] = ev.members || [];
+  // The server roster is authoritative for "am I connected here": reconcile the
+  // optimistic myVoiceCh set on Join with what the server actually reports.
+  const iAmHere = (ev.members || []).includes(myUsername);
+  if (iAmHere) {
+    myVoiceCh = ev.channel; myVoiceWs = ev.workspace; inCall = true;
+  } else if (myVoiceCh === ev.channel) {
+    myVoiceCh = null; myVoiceWs = null; inCall = false;
+  }
   if (activeWs === ev.workspace) renderWsPanel();
   const ws = wsById(ev.workspace);
   const ch = channelById(ws, ev.channel);
@@ -6290,8 +6333,23 @@ function renderVoiceStage(ws, ch) {
   $("room-subtitle").textContent = "Voice channel";
   $("header-seal").innerHTML = "";
   const here = voicePresence[ch.id] || [];
-  const inHere = here.includes(myUsername);
+  // myVoiceCh is the single source of truth for "connected here" (set optimistically
+  // on Join, reconciled by the server roster), so the stage appears without waiting
+  // for the presence round-trip.
+  const inHere = myVoiceCh === ch.id;
   const col = $("msg-col"); col.innerHTML = "";
+
+  if (inHere) {
+    // Connected: the docked #stage (participant tiles + the shared mute/deafen/
+    // camera/share/leave controls) is the whole view, reusing the DM call stage so
+    // the two never drift. The message column stays empty below it.
+    renderCall();
+    return;
+  }
+
+  // A lobby: who is inside and a single Join button. The docked stage is hidden
+  // because a call I am not in must not show its controls.
+  $("stage").hidden = true;
   const stage = document.createElement("div"); stage.className = "voice-stage";
   const roster = here.length
     ? '<div class="voice-roster">' + here.map((h) =>
@@ -6302,15 +6360,38 @@ function renderVoiceStage(ws, ch) {
     '<div class="vs-title">' + ch.name.replace(/</g, "&lt;") + '</div>' +
     '<div class="vs-sub">Voice channel &middot; ' + here.length + ' connected</div>' +
     roster +
-    '<button class="btn ' + (inHere ? "" : "primary") + '" id="voice-toggle">' +
-    (inHere ? "Leave voice" : "Join voice") + '</button>';
+    '<button class="btn primary" id="voice-toggle">Join voice</button>';
   col.appendChild(stage);
   stage.querySelectorAll(".avatar[data-u]").forEach((el) =>
     paintAvatar(el, el.dataset.u, displayOf(el.dataset.u)));
   $("voice-toggle").addEventListener("click", () => {
-    if (inHere) { send({ type: "LeaveVoice" }); }
-    else { send({ type: "JoinVoice", workspace: ws.id, channel: ch.id }); }
+    // Optimistically mark connected so the stage + controls appear at once; the
+    // server roster confirms (or clears) it via onVoicePresence.
+    myVoiceCh = ch.id; myVoiceWs = ws.id; inCall = true;
+    send({ type: "JoinVoice", workspace: ws.id, channel: ch.id });
+    renderVoiceStage(ws, ch);
   });
+}
+
+// Leave the voice channel I am connected to: tell the core, reset local call
+// state, and drop back to the channel lobby if I am still viewing it.
+function leaveVoiceCall() {
+  const ch = myVoiceCh, wsId = myVoiceWs;
+  send({ type: "LeaveVoice" });
+  myVoiceCh = null; myVoiceWs = null; inCall = false;
+  sharing = false; muted = false; deafened = false; cameraOn = false;
+  watchingStream = false; maxedShare = "";
+  streamEnded(); clearAllCameras(); selfShareEnded();
+  $("stage").hidden = true;
+  if (activeChannel === ch) {
+    const ws = wsById(wsId), c = channelById(ws, ch);
+    if (ws && c) renderVoiceStage(ws, c);
+  }
+}
+
+// The stage Leave button serves whichever call is active: a voice channel or a DM.
+function leaveActiveCall() {
+  if (myVoiceCh) leaveVoiceCall(); else leaveCall();
 }
 
 // ---- creation / admin ----
