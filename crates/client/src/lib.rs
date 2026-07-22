@@ -5389,6 +5389,11 @@ impl Client {
         if let (Some(id), Some(g)) = self.ws_group_mut(ws, channel) {
             let _ = g.apply_commit(id, commit);
         }
+        // A WG epoch change in an open-join workspace: republish the group info so
+        // the next self-joiner commits against the current epoch, not a stale one.
+        if channel.is_none() {
+            self.publish_group_info(ws);
+        }
     }
 
     /// Open one incoming channel post: unseal with the channel's epoch history
@@ -5685,6 +5690,94 @@ impl Client {
         Ok(())
     }
 
+    /// Set a workspace's join policy: `open` = anyone with a valid invite may
+    /// self-join without an admin admitting them. Submits a signed SetJoinPolicy op
+    /// and, when turning open on, publishes the group info a self-joiner needs.
+    pub fn set_workspace_join_policy(
+        &mut self,
+        ws_hex: &str,
+        open: bool,
+    ) -> Result<(), ClientError> {
+        self.workspace_submit(
+            ws_hex,
+            enclave_protocol::WorkspaceOp::SetJoinPolicy { open },
+        )?;
+        if open {
+            if let Some(id) = decode_offer_id(ws_hex) {
+                self.publish_group_info(id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish the workspace group's public GroupInfo so an open-join newcomer can
+    /// external-commit against the current epoch. A no-op unless the workspace is
+    /// open-join and we hold its group. Public state only -- no secret leaves.
+    fn publish_group_info(&mut self, ws: [u8; 16]) {
+        if !self.workspaces.get(&ws).is_some_and(|s| s.open_join) {
+            return;
+        }
+        let info = match (self.workspace_groups.get(&ws), self.identity.as_ref()) {
+            (Some(g), Some(id)) => g.export_group_info(id).ok(),
+            _ => None,
+        };
+        if let Some(info) = info {
+            self.conn.send(ClientMsg::PublishGroupInfo {
+                workspace: ws,
+                info,
+            });
+        }
+    }
+
+    /// Self-join an open-join workspace, from the group info + op-log the relay
+    /// handed us ([`ServerMsg::OpenJoin`]). We external-commit into the group
+    /// (deriving the key with no member online), then submit a SelfJoin op signed
+    /// by us, carrying the commit for existing members to apply.
+    fn self_join_open(
+        &mut self,
+        ws: [u8; 16],
+        code: &str,
+        group_info: &[u8],
+        ops: Vec<enclave_protocol::SignedOp>,
+    ) -> Option<Event> {
+        // Build our local view of the workspace from the log we were handed.
+        self.apply_workspace_ops(ws, ops);
+        // External-commit into the group (needs our identity, then release it).
+        let joined = match self.identity.as_ref() {
+            Some(id) => Group::join_by_external_commit(id, group_info),
+            None => return None,
+        };
+        let (group, commit) = match joined {
+            Ok(v) => v,
+            Err(e) => return Some(Event::Error(format!("could not self-join: {e}"))),
+        };
+        self.workspace_groups.insert(ws, group);
+        // Sign our own SelfJoin op against the current log head.
+        let me = self.me().ok()?;
+        let signed = match (self.identity.as_ref(), self.workspaces.get(&ws)) {
+            (Some(id), Some(state)) => enclave_crypto::workspace::sign_op(
+                id,
+                &me,
+                state,
+                now_secs(),
+                enclave_protocol::WorkspaceOp::SelfJoin {
+                    member: me.clone(),
+                    member_key: id.identity_key(),
+                },
+            )
+            .ok(),
+            _ => None,
+        }?;
+        self.conn.send(ClientMsg::ExternalJoin {
+            workspace: ws,
+            code: code.to_string(),
+            commit,
+            self_join: signed,
+        });
+        self.save_session();
+        Some(Event::WorkspacesChanged)
+    }
+
     /// Whether a structural op is in flight or queued for this workspace. Member
     /// add/remove -- whose MLS Welcome/rotation must be ordered right after their
     /// op -- refuse while busy rather than race behind a queued op.
@@ -5792,6 +5885,24 @@ impl Client {
         // Drive the submission queue against the new head.
         if changed {
             self.reconcile_workspace_queue(ws, &applied);
+        }
+        // Open-join upkeep: after any membership change republish the group info so
+        // the next self-joiner commits against the current epoch; and hand each
+        // newly self-joined member our channel keys (sealed under the WG at the new
+        // epoch, so they can read scrollback -- the same bundle an admit sends).
+        if changed {
+            self.publish_group_info(ws);
+            let me = self.me().unwrap_or_default();
+            for op in &applied {
+                if let enclave_protocol::WorkspaceOp::SelfJoin { member, .. } = op {
+                    if member != &me && self.workspace_groups.contains_key(&ws) {
+                        let bundle = self.key_bundle_for(ws);
+                        if !bundle.entries.is_empty() {
+                            self.share_key_bundle(ws, None, Some(member.clone()), &bundle);
+                        }
+                    }
+                }
+            }
         }
         changed.then_some(Event::WorkspacesChanged)
     }
@@ -7156,6 +7267,19 @@ impl Client {
                 Some(Event::FriendsChanged)
             }
             ServerMsg::WorkspaceOps { workspace, ops } => self.apply_workspace_ops(workspace, ops),
+            ServerMsg::OpenJoin {
+                workspace,
+                code,
+                group_info,
+                ops,
+            } => self.self_join_open(workspace, &code, &group_info, ops),
+            ServerMsg::ExternalCommit { workspace, commit } => {
+                // An open-join newcomer joined: advance the workspace group to the
+                // new epoch. The following SelfJoin op then records them (and, if we
+                // hold the keys, we hand them channel scrollback keys at this epoch).
+                self.apply_workspace_commit(workspace, None, &commit);
+                None
+            }
             ServerMsg::WorkspaceWelcome {
                 workspace,
                 channel,

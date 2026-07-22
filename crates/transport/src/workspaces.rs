@@ -249,6 +249,11 @@ impl WorkspaceStore {
             .is_some_and(|s| s.members.contains_key(handle))
     }
 
+    /// Whether `ws` is open-join (anyone with a valid invite may self-join).
+    pub fn is_open_join(&self, ws: &WorkspaceId) -> bool {
+        self.states.get(ws).is_some_and(|s| s.open_join)
+    }
+
     /// The current member handles of `ws` (for routing).
     pub fn members(&self, ws: &WorkspaceId) -> Vec<String> {
         self.states

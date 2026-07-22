@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use enclave_protocol::{
     ClientMsg, DeviceId, Friend, GroupId, Permission, Presence, Sealed, ServerMsg, UserId,
-    VoiceMember,
+    VoiceMember, WorkspaceOp,
 };
 
 /// A voice occupant's announced mute/deafen state, tracked per member alongside
@@ -149,6 +149,10 @@ pub struct Relay {
     friends: FriendStore,
     /// Workspace op-logs + membership index (metadata; content stays E2E).
     workspaces: WorkspaceStore,
+    /// Latest public `GroupInfo` per open-join workspace, published by members so a
+    /// newcomer can external-commit against the current epoch. Public state only;
+    /// in memory, last-write-wins.
+    group_infos: HashMap<[u8; 16], Vec<u8>>,
     /// Who is currently connected to each voice channel, `(workspace, channel) ->
     /// {handle -> mute/deafen flags}`. In memory; cleared for a handle on
     /// disconnect.
@@ -258,6 +262,7 @@ impl Relay {
             accounts: AccountStore::default(),
             friends: FriendStore::default(),
             workspaces: WorkspaceStore::new(),
+            group_infos: HashMap::new(),
             voice_presence: HashMap::new(),
             opaque: OpaqueServer::default(),
             pending_login: HashMap::new(),
@@ -1439,9 +1444,30 @@ impl Relay {
                 if self.workspaces.is_member(&ws, &me) {
                     return workspace_error(from, "you are already in that workspace");
                 }
-                // Route to one online member who can admit (holds ManageMembers),
-                // whose client performs the signed add. Spend a use only once we
-                // know a request will actually be routed.
+                // Open-join: hand the redeemer the group's public info + op-log so
+                // they self-join with no one online. The invite is NOT consumed
+                // here -- it is spent when the actual ExternalJoin lands, so a
+                // dropped self-join does not burn a use.
+                if self.workspaces.is_open_join(&ws) {
+                    let Some(group_info) = self.group_infos.get(&ws).cloned() else {
+                        return workspace_error(
+                            from,
+                            "this workspace has no published join info yet; ask a member to open it",
+                        );
+                    };
+                    return vec![Outgoing {
+                        to: from,
+                        msg: ServerMsg::OpenJoin {
+                            workspace: ws,
+                            code,
+                            group_info,
+                            ops: self.workspaces.log(&ws).to_vec(),
+                        },
+                    }];
+                }
+                // Otherwise: route to one online member who can admit (holds
+                // ManageMembers), whose client performs the signed add. Spend a use
+                // only once we know a request will actually be routed.
                 let admin_conn = self
                     .workspaces
                     .members_with(&ws, Permission::ManageMembers)
@@ -1461,6 +1487,69 @@ impl Relay {
                         requester: me,
                     },
                 }]
+            }
+
+            ClientMsg::PublishGroupInfo { workspace, info } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                // Only a member may publish the group's info; it is public state,
+                // but a non-member has no business setting it.
+                if self.workspaces.is_member(&workspace, &me) {
+                    self.group_infos.insert(workspace, info);
+                }
+                vec![]
+            }
+
+            ClientMsg::ExternalJoin {
+                workspace,
+                code,
+                commit,
+                self_join,
+            } => {
+                let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
+                    return vec![];
+                };
+                let code = code.trim().to_ascii_lowercase();
+                let now = self.now_secs();
+                // Gate: a valid invite for THIS workspace, and open-join on. The
+                // op the sender submits must be their own SelfJoin.
+                let ws_of_code = match self.workspaces.peek_invite(&code, now) {
+                    Ok(ws) => ws,
+                    Err(e) => return workspace_error(from, e.reason()),
+                };
+                if ws_of_code != workspace || !self.workspaces.is_open_join(&workspace) {
+                    return workspace_error(from, "that workspace is not open to self-join");
+                }
+                if self_join.author != me || !matches!(self_join.op, WorkspaceOp::SelfJoin { .. }) {
+                    return workspace_error(from, "you can only self-join as yourself");
+                }
+                // Append the SelfJoin op (the store re-verifies chain, signature,
+                // and that the workspace is open-join). Only on success do we spend
+                // an invite use and fan the commit out.
+                match self.workspaces.submit(workspace, self_join.clone()) {
+                    Ok(members) => {
+                        self.workspaces.consume_invite(&code, now);
+                        // The commit goes out FIRST so each existing member advances
+                        // to the new epoch before they process the SelfJoin op and
+                        // seal the new member their channel keys at that epoch. The
+                        // joiner is skipped -- they already hold the new group.
+                        let mut out = self.deliver_to_members_except(
+                            &members,
+                            &me,
+                            ServerMsg::ExternalCommit { workspace, commit },
+                        );
+                        out.extend(self.deliver_to_members(
+                            &members,
+                            ServerMsg::WorkspaceOps {
+                                workspace,
+                                ops: vec![self_join],
+                            },
+                        ));
+                        out
+                    }
+                    Err(e) => workspace_error(from, e.reason()),
+                }
             }
 
             ClientMsg::VoiceMoveMember {

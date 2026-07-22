@@ -425,11 +425,31 @@ pub enum ClientMsg {
         ttl_secs: u64,
         max_uses: u32,
     },
-    /// Redeem an invite code to request admission to its workspace. The relay
-    /// validates the code and routes a [`ServerMsg::JoinRequest`] to an online
-    /// admin, whose client performs the (signed, op-logged) add. A dead code or
-    /// no online admin comes back as [`ServerMsg::Error`].
+    /// Redeem an invite code to request admission to its workspace. If the
+    /// workspace requires admin approval, the relay routes a
+    /// [`ServerMsg::JoinRequest`] to an online admin. If it is **open-join**, the
+    /// relay instead replies with [`ServerMsg::OpenJoin`] (the public group info
+    /// and op-log) so the redeemer can self-join with no one online. A dead code
+    /// comes back as [`ServerMsg::Error`].
     RedeemInvite { code: String },
+    /// A workspace member publishes the workspace group's public `GroupInfo` so an
+    /// open-join newcomer can external-commit against the current epoch. The relay
+    /// keeps the latest per workspace; ignored from non-members.
+    PublishGroupInfo {
+        workspace: WorkspaceId,
+        info: Vec<u8>,
+    },
+    /// Self-join an open-join workspace: `commit` is the MLS external commit that
+    /// adds the sender to the group, `self_join` is their signed `SelfJoin` op. The
+    /// relay validates the invite `code` + open-join, appends the op, fans the
+    /// commit to existing members ([`ServerMsg::ExternalCommit`]), and consumes an
+    /// invite use. Refused (Error) if the code is dead or the workspace is not open.
+    ExternalJoin {
+        workspace: WorkspaceId,
+        code: String,
+        commit: Vec<u8>,
+        self_join: SignedOp,
+    },
     /// Move another member from their current voice channel to `channel`. Admin
     /// only; the relay verifies the role and directs the member's client with
     /// [`ServerMsg::VoiceMoved`] (presence then flows via the member's normal
@@ -929,6 +949,22 @@ pub enum ServerMsg {
     JoinRequest {
         workspace: WorkspaceId,
         requester: String,
+    },
+    /// Reply to a [`ClientMsg::RedeemInvite`] for an **open-join** workspace: the
+    /// group's public `GroupInfo` (to external-commit against) and the current
+    /// op-log (to chain the `SelfJoin` op onto), so the redeemer self-joins with no
+    /// one online. `code` is echoed back so the client can complete the join.
+    OpenJoin {
+        workspace: WorkspaceId,
+        code: String,
+        group_info: Vec<u8>,
+        ops: Vec<SignedOp>,
+    },
+    /// An open-join newcomer's MLS external commit, fanned to every existing member
+    /// so they advance to the new epoch (applied like any commit).
+    ExternalCommit {
+        workspace: WorkspaceId,
+        commit: Vec<u8>,
     },
     /// An admin moved us to `channel`: our client joins that voice channel (which
     /// leaves the one we were in), so presence updates through the normal path.

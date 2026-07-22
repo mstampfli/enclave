@@ -2329,6 +2329,91 @@ async fn an_owner_can_admit_after_a_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Open-join end to end: with the workspace set to open-join, a stranger redeems
+/// an invite and self-joins by external commit -- no admin ever admits them (the
+/// owner never calls workspace_add_member). Both sides converge on the stranger
+/// as a real member, and a channel message the owner posts opens for the stranger,
+/// proving they share the group and got the channel key.
+#[tokio::test]
+async fn open_join_lets_a_stranger_self_join_without_an_admin() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let mut stranger = account(&url, "stranger").await;
+    let stranger_h = stranger.name().to_string();
+
+    let ws = owner.create_workspace("Open").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+    let chan = owner.create_channel(&ws, "general", None).unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
+    })
+    .await;
+
+    // Turn on open-join; wait until it is live (which also publishes the group info).
+    owner.set_workspace_join_policy(&ws, true).unwrap();
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.open_join)
+    })
+    .await;
+
+    owner.create_invite(&ws, 0, 0);
+    let mut code = String::new();
+    for _ in 0..100 {
+        if let Ok(Some(Event::InviteCreated { code: c, .. })) =
+            tokio::time::timeout(Duration::from_millis(50), owner.next_event()).await
+        {
+            code = c;
+            break;
+        }
+    }
+    assert!(!code.is_empty(), "no invite code");
+
+    // Stranger redeems + self-joins. The owner is pumped (to apply the commit and
+    // hand over the channel key) but NEVER admits -- no workspace_add_member call.
+    stranger.redeem_invite(&code);
+    for _ in 0..400 {
+        let _ = tokio::time::timeout(Duration::from_millis(20), owner.next_event()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(20), stranger.next_event()).await;
+        if stranger
+            .workspace(&ws)
+            .is_some_and(|s| s.members.contains_key(&stranger_h))
+        {
+            break;
+        }
+    }
+    assert!(
+        stranger
+            .workspace(&ws)
+            .is_some_and(|s| s.members.contains_key(&stranger_h)),
+        "stranger self-joined without an admin admitting"
+    );
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws)
+            .is_some_and(|s| s.members.contains_key(&stranger_h))
+    })
+    .await;
+
+    // The stranger shares the group + has the channel key: a post from the owner
+    // opens for them.
+    owner
+        .send_channel_post(&ws, &chan, "hello newcomer")
+        .unwrap();
+    let mut got = false;
+    for _ in 0..200 {
+        let _ = tokio::time::timeout(Duration::from_millis(20), owner.next_event()).await;
+        if let Ok(Some(Event::ChannelMessage { text, .. })) =
+            tokio::time::timeout(Duration::from_millis(20), stranger.next_event()).await
+        {
+            if text == "hello newcomer" {
+                got = true;
+                break;
+            }
+        }
+    }
+    assert!(got, "self-joined member could not read a channel post");
+}
+
 /// A private channel can be a voice channel too: it is created with kind Voice
 /// and its own membership (its own MLS group keys the call), so a non-member of
 /// the channel cannot join it.
