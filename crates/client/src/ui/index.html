@@ -30,10 +30,9 @@
   --muted: #909090;
   --faint: #6d6d6d;
 
-  --accent: #62ad6a;        /* true green: trust, presence, primary */
+  --accent: #62ad6a;        /* true green: trust, presence, active, primary */
   --accent-ink: #8ec793;
   --accent-border: #3e7145;
-  --speaking: #43d17a;      /* brighter green: an active speaker's ring */
   --accent-bg: #1e2a20;
   --accent-bg-hover: #253327;
   --danger: #cf5f4d;
@@ -120,13 +119,17 @@ input[type="checkbox"], select { cursor: pointer; }
 .field label { font-size: 12.5px; font-weight: 550; color: var(--muted); }
 /* Audio settings: a switch row, the mic input meter, and range sliders. */
 .audio-switch { flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; }
-.audio-switch input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); flex: none; }
-.field input[type="range"] { accent-color: var(--accent); width: 100%; cursor: pointer; }
+/* Reset the text-input frame `.field input` sets, so the checkbox and sliders
+   keep their native control shape rather than sitting in a bordered box. */
+.audio-switch input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent);
+  flex: none; cursor: pointer; padding: 0; margin: 0; border: none; background: none; }
+.field input[type="range"] { accent-color: var(--accent); width: 100%; cursor: pointer;
+  padding: 0; border: none; background: none; }
 .range-val { color: var(--ink); font-weight: 500; }
 .mic-meter { height: 8px; border-radius: 4px; background: var(--raised); overflow: hidden; }
 .mic-meter-fill { height: 100%; width: 0%; background: var(--muted); border-radius: 4px;
   transition: width 60ms linear; }
-.mic-meter.active .mic-meter-fill { background: var(--speaking); }
+.mic-meter.active .mic-meter-fill { background: var(--accent); }
 .field input, .field select, .field textarea {
   padding: 8px 10px; border-radius: var(--radius);
   background: var(--bg); border: 1px solid var(--border);
@@ -466,16 +469,16 @@ input[type="checkbox"], select { cursor: pointer; }
 .ws-head.drag-over { background: var(--raised); box-shadow: inset 0 0 0 1px var(--accent-ink); border-radius: var(--radius); }
 .ws-voice-here { padding: 2px 8px 6px 30px; display: flex; flex-direction: column; gap: 3px; }
 .ws-voice-here .vh { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--muted);
-  cursor: pointer; border-radius: 5px; padding: 2px 4px; margin-left: -4px; }
-.ws-voice-here .vh:hover { background: var(--hover); color: var(--text); }
-.ws-voice-here .vh .vh-av { width: 21px; height: 21px; font-size: 9px; border-radius: 50%; }
-/* An active speaker gets a green ring around their avatar, ringed in the panel
-   colour so it reads as sitting on the avatar (no glow: a solid 2px ring). */
-.ws-voice-here .vh.speaking .vh-av { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--speaking); }
-.ws-voice-here .vh .vh-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* Mute/deafen glyph trails the name, pushed to the right; danger-tinted so a
-   muted/deafened occupant reads at a glance. */
-.ws-voice-here .vh .vh-status { margin-left: auto; flex: none; display: inline-flex; color: var(--danger); }
+  cursor: pointer; border-radius: var(--radius); padding: 2px 4px; margin-left: -4px; }
+.ws-voice-here .vh:hover { background: var(--raised); color: var(--ink); }
+.ws-voice-here .vh .vh-av { width: 21px; height: 21px; font-size: 9px; }
+/* An active speaker's avatar gets a flat 2px accent ring (the app's one accent). */
+.ws-voice-here .vh.speaking .vh-av { box-shadow: 0 0 0 2px var(--accent); }
+.ws-voice-here .vh .vh-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Muted/deafened trails the name as a danger-tinted stroke icon, matching the
+   mute glyph on the call tiles. */
+.ws-voice-here .vh .vh-status { flex: none; display: inline-flex; color: var(--danger); }
+.ws-voice-here .vh .vh-status:empty { display: none; }
 .ws-voice-here .vh .vh-status svg { width: 13px; height: 13px; }
 .ws-sec-add { display: flex; align-items: center; gap: 7px; width: 100%; text-align: left;
   padding: 6px 8px; border-radius: var(--radius); color: var(--faint); font-size: 13px; cursor: pointer; }
@@ -486,17 +489,15 @@ input[type="checkbox"], select { cursor: pointer; }
 .voice-stage .vs-title { font-size: 18px; font-weight: 650; color: var(--ink-strong); margin-bottom: 6px; }
 .voice-stage .vs-sub { font-size: 13.5px; color: var(--muted); margin-bottom: 22px; }
 .voice-roster { display: flex; flex-wrap: wrap; gap: 16px; justify-content: center; margin-bottom: 26px; }
-.voice-face { position: relative; display: flex; flex-direction: column; align-items: center; gap: 7px; }
+.voice-face { display: flex; flex-direction: column; align-items: center; gap: 7px; }
 .voice-face .avatar { width: 64px; height: 64px; font-size: 22px; }
-.voice-face .vf-name { font-size: 12.5px; color: var(--ink); max-width: 90px;
+.voice-face .vf-label { display: flex; align-items: center; gap: 4px; max-width: 96px; }
+.voice-face .vf-name { font-size: 12.5px; color: var(--ink);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* A muted/deafened badge biting the avatar's lower-right, ringed in the surface
-   color so it reads as sitting on top (the sticker pattern used elsewhere). */
+/* Muted/deafened: the same danger stroke icon as everywhere else, inline. */
+.voice-face .vf-status { flex: none; display: inline-flex; color: var(--danger); }
 .voice-face .vf-status:empty { display: none; }
-.voice-face .vf-status { position: absolute; top: 46px; right: calc(50% - 34px);
-  display: inline-flex; padding: 2px; border-radius: 50%;
-  background: var(--danger); color: #fff; box-shadow: 0 0 0 2px var(--bg); }
-.voice-face .vf-status svg { width: 12px; height: 12px; }
+.voice-face .vf-status svg { width: 13px; height: 13px; }
 .voice-empty { color: var(--faint); font-size: 13px; margin-bottom: 22px; }
 
 /* ---------- sidebar ---------- */
@@ -829,7 +830,7 @@ input[type="checkbox"], select { cursor: pointer; }
 }
 /* An active speaker's tile gets a crisp green border (a 2px inset ring keeps it
    inside the tile with no layout shift, no glow). */
-.tile.speaking { border-color: var(--speaking); box-shadow: inset 0 0 0 2px var(--speaking); }
+.tile.speaking { border-color: var(--accent); box-shadow: inset 0 0 0 2px var(--accent); }
 /* The avatar scales with the tile (container units) so it is large at every
    window size, never a fixed dot in a big tile. */
 .tile .avatar { width: auto; height: 66cqh; max-height: 88%; aspect-ratio: 1;
@@ -2072,7 +2073,7 @@ label.member-row:hover { background: var(--raised); }
         <label for="audio-activation">Input sensitivity</label>
         <div class="mic-meter" id="mic-meter"><div class="mic-meter-fill" id="mic-meter-fill"></div></div>
         <input type="range" id="audio-activation" min="0" max="100" value="15">
-        <span class="hint">Your mic transmits only while the bar is past the slider. Drag left for a more open mic, right to require louder speech.</span>
+        <span class="hint">Your mic transmits only while the meter passes the slider. Lower it for a more open mic.</span>
       </div>
       <div class="field">
         <label for="audio-gain">Input volume <span id="audio-gain-val" class="range-val"></span></label>
@@ -2895,7 +2896,7 @@ const MUTE_ICON = ' <svg class="icon" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0
 // A muted mic (with a slash) or a deafened headset (headphones with a slash),
 // for a voice occupant. Deafened wins (a deafened client is muted too), matching
 // the control that sets both. Empty string when the person is fully live.
-const ICON_MUTED = '<svg class="icon" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v4"/><path d="M3 3l18 18"/></svg>';
+const ICON_MUTED = '<svg class="icon" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v4"/><path d="M4 4l16 16"/></svg>';
 const ICON_DEAFENED = '<svg class="icon" viewBox="0 0 24 24"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/><path d="M2 2l20 20"/></svg>';
 function voiceStatusIcon(m) {
   if (m && m.deafened) return ICON_DEAFENED;
@@ -6515,8 +6516,8 @@ function renderVoiceStage(ws, ch) {
   const roster = here.length
     ? '<div class="voice-roster">' + here.map((m) =>
         '<div class="voice-face" data-open="' + m.handle + '"><div class="avatar" data-u="' + m.handle + '"></div>' +
-        '<div class="vf-name">' + displayOf(m.handle).replace(/</g, "&lt;") + '</div>' +
-        '<span class="vf-status">' + voiceStatusIcon(m) + '</span></div>').join("") + '</div>'
+        '<div class="vf-label"><span class="vf-name">' + displayOf(m.handle).replace(/</g, "&lt;") + '</span>' +
+        '<span class="vf-status">' + voiceStatusIcon(m) + '</span></div></div>').join("") + '</div>'
     : '<div class="voice-empty">No one is here yet.</div>';
   stage.innerHTML =
     '<div class="vs-title">' + ch.name.replace(/</g, "&lt;") + '</div>' +
