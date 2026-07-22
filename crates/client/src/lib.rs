@@ -5743,10 +5743,7 @@ impl Client {
         // Build our local view of the workspace from the log we were handed.
         self.apply_workspace_ops(ws, ops);
         // External-commit into the group (needs our identity, then release it).
-        let joined = match self.identity.as_ref() {
-            Some(id) => Group::join_by_external_commit(id, group_info),
-            None => return None,
-        };
+        let joined = Group::join_by_external_commit(self.identity.as_ref()?, group_info);
         let (group, commit) = match joined {
             Ok(v) => v,
             Err(e) => return Some(Event::Error(format!("could not self-join: {e}"))),
