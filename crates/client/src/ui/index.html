@@ -117,20 +117,41 @@ input[type="checkbox"], select { cursor: pointer; }
 
 .field { display: flex; flex-direction: column; gap: 5px; }
 .field label { font-size: 12.5px; font-weight: 550; color: var(--muted); }
-/* Audio settings: a switch row, the mic input meter, and range sliders. */
+/* Form controls are drawn by us, not the engine: native checkboxes/sliders (and
+   accent-color) render inconsistently in WebKitGTK -- clipped checks, trackless
+   thumbs -- so appearance:none + explicit CSS gives one look everywhere. */
+input[type="checkbox"] {
+  appearance: none; -webkit-appearance: none; flex: none; margin: 0;
+  width: 16px; height: 16px; border: 1px solid var(--border-strong);
+  border-radius: var(--radius); background: var(--bg); cursor: pointer;
+  display: inline-grid; place-content: center;
+  transition: background 120ms ease-out, border-color 120ms ease-out; }
+input[type="checkbox"]:checked { background: var(--accent); border-color: var(--accent); }
+input[type="checkbox"]:checked::after { content: ""; width: 4px; height: 8px; margin-top: -1px;
+  border: solid var(--bg); border-width: 0 2px 2px 0; transform: rotate(45deg); }
+input[type="checkbox"]:focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 1px; }
+input[type="range"] {
+  appearance: none; -webkit-appearance: none; width: 100%; height: 16px;
+  background: none; border: none; padding: 0; margin: 0; cursor: pointer; }
+input[type="range"]::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: var(--raised); }
+input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; margin-top: -5px;
+  width: 14px; height: 14px; border-radius: 50%; background: var(--accent); border: 2px solid var(--panel); }
+
+/* Audio settings: the switch row, the mic meter, and the sensitivity control
+   (a slider riding on the meter so the thumb marks the level to transmit at). */
 .audio-switch { flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; }
-/* Reset the text-input frame `.field input` sets, so the checkbox and sliders
-   keep their native control shape rather than sitting in a bordered box. */
-.audio-switch input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent);
-  flex: none; cursor: pointer; padding: 0; margin: 0; border: none; background: none; }
-.field input[type="range"] { accent-color: var(--accent); width: 100%; cursor: pointer;
-  padding: 0; border: none; background: none; }
 .range-val { color: var(--ink); font-weight: 500; }
-.mic-meter { height: 8px; border-radius: 4px; background: var(--raised); overflow: hidden; }
-.mic-meter-fill { height: 100%; width: 0%; background: var(--muted); border-radius: 4px;
+.mic-meter { height: 6px; border-radius: 3px; background: var(--raised); overflow: hidden; }
+.mic-meter-fill { height: 100%; width: 0%; background: var(--muted); border-radius: 3px;
   transition: width 60ms linear; }
 .mic-meter.active .mic-meter-fill { background: var(--accent); }
-.field input, .field select, .field textarea {
+.sens-wrap { position: relative; height: 16px; }
+.sens-wrap .mic-meter { position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%); }
+.sens-wrap input[type="range"] { position: absolute; left: 0; right: 0; top: 0; }
+/* Transparent track so the meter shows through; the thumb centres on the 6px meter. */
+.sens-wrap input[type="range"]::-webkit-slider-runnable-track { height: 6px; background: transparent; }
+.sens-wrap input[type="range"]::-webkit-slider-thumb { margin-top: -4px; border-color: var(--bg); }
+.field input:not([type="checkbox"]):not([type="range"]), .field select, .field textarea {
   padding: 8px 10px; border-radius: var(--radius);
   background: var(--bg); border: 1px solid var(--border);
   color: var(--ink);
@@ -2057,6 +2078,7 @@ label.member-row:hover { background: var(--raised); }
       <div class="field">
         <label for="audio-input">Microphone</label>
         <select id="audio-input"></select>
+        <span class="hint">Follows your system's default input. Pick the physical mic in your operating system's sound settings; the meter below confirms it is picking up sound.</span>
       </div>
       <div class="field">
         <label for="audio-output">Speaker</label>
@@ -2071,8 +2093,10 @@ label.member-row:hover { background: var(--raised); }
       </div>
       <div class="field">
         <label for="audio-activation">Input sensitivity</label>
-        <div class="mic-meter" id="mic-meter"><div class="mic-meter-fill" id="mic-meter-fill"></div></div>
-        <input type="range" id="audio-activation" min="0" max="100" value="15">
+        <div class="sens-wrap">
+          <div class="mic-meter" id="mic-meter"><div class="mic-meter-fill" id="mic-meter-fill"></div></div>
+          <input type="range" id="audio-activation" min="0" max="100" value="15">
+        </div>
         <span class="hint">Your mic transmits only while the meter passes the slider. Lower it for a more open mic.</span>
       </div>
       <div class="field">
@@ -5246,6 +5270,7 @@ $("group-create").addEventListener("click", () => {
 
 // ---- settings modal ----
 let micMonitorOn = false;
+let devicePoll = null;
 function openSettings() {
   fillProfileEditor();
   $("s-username").value = myUsername;
@@ -5253,6 +5278,8 @@ function openSettings() {
   // Meter the mic live so the sensitivity slider can be set against real input.
   send({ type: "StartMicMonitor" });
   micMonitorOn = true;
+  // Re-enumerate periodically so a mic/speaker plugged in while this is open shows up.
+  devicePoll = setInterval(() => send({ type: "ListAudioDevices" }), 2000);
   openModal("modal-settings");
 }
 $("open-settings").addEventListener("click", openSettings);
@@ -5519,6 +5546,11 @@ $("self-display").addEventListener("click", () => {
 });
 
 function fillDevices(sel, names, current) {
+  // Skip the rebuild when nothing changed, so a 2s poll does not flicker the
+  // dropdown or fight the user's selection while it is open.
+  const want = ["System default", ...names].join(" ");
+  if (sel.dataset.sig === want) { sel.value = current || ""; return; }
+  sel.dataset.sig = want;
   sel.innerHTML = "";
   const def = document.createElement("option");
   def.value = ""; def.textContent = "System default";
@@ -5778,6 +5810,7 @@ function openModal(id) { closeModals(); $(id).hidden = false; }
 function closeModals() {
   document.querySelectorAll(".overlay").forEach((o) => { o.hidden = true; });
   if (micMonitorOn) { send({ type: "StopMicMonitor" }); micMonitorOn = false; setMicMeter(0); }
+  if (devicePoll) { clearInterval(devicePoll); devicePoll = null; }
   setTimeout(focusComposer, 0);
 }
 document.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", closeModals));
