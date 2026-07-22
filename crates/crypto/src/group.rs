@@ -284,6 +284,68 @@ impl Group {
         Ok(Self { inner })
     }
 
+    /// Export this group's public `GroupInfo` for the relay to publish, so a
+    /// newcomer can self-join by external commit with no member online. The
+    /// ratchet tree is bundled in, so the blob is self-contained. This is PUBLIC
+    /// group state (the tree of members' public keys); it carries no secret and
+    /// lets no one read messages -- it only *enables* an external join. WHETHER a
+    /// given newcomer is allowed to join is an application-layer decision enforced
+    /// above this primitive (a valid invite + the workspace's open-join policy);
+    /// the crypto here is only the mechanism.
+    pub fn export_group_info(&self, member: &Identity) -> Result<Vec<u8>, CryptoError> {
+        let info = self
+            .inner
+            .export_group_info(member.provider.crypto(), &member.signer, true)
+            .map_err(|e| CryptoError::GroupCreate(format!("export group info: {e}")))?;
+        info.tls_serialize_detached()
+            .map_err(|e| CryptoError::Serialize(format!("group info: {e}")))
+    }
+
+    /// Join a group by external commit, from its exported `GroupInfo` bytes
+    /// ([`export_group_info`](Self::export_group_info)). Returns the joined group
+    /// and the commit bytes to fan out to every existing member, each of whom
+    /// applies it with [`apply_commit`](Self::apply_commit) -- exactly like a
+    /// normal add. No member need be online: the joiner derives the group secret
+    /// from the commit itself. The `GroupInfo` signature is verified against the
+    /// group's signer inside openmls, so a forged or tampered blob is rejected
+    /// (`CryptoError::Join`). The joiner's own leaf carries their authenticated
+    /// credential, so existing members learn exactly who joined.
+    pub fn join_by_external_commit(
+        joiner: &Identity,
+        group_info_bytes: &[u8],
+    ) -> Result<(Self, Vec<u8>), CryptoError> {
+        let message = MlsMessageIn::tls_deserialize_exact(group_info_bytes)
+            .map_err(|e| CryptoError::Join(format!("group info deserialize: {e}")))?;
+        let verifiable_group_info = match message.extract() {
+            MlsMessageBodyIn::GroupInfo(info) => info,
+            _ => return Err(CryptoError::Join("message was not group info".into())),
+        };
+        let (inner, bundle) = MlsGroup::external_commit_builder()
+            .with_config(join_config())
+            .build_group(
+                &joiner.provider,
+                verifiable_group_info,
+                joiner.credential.clone(),
+            )
+            .map_err(|e| CryptoError::Join(format!("external commit build: {e}")))?
+            .load_psks(joiner.provider.storage())
+            .map_err(|e| CryptoError::Join(format!("external commit psks: {e}")))?
+            .build(
+                joiner.provider.rand(),
+                joiner.provider.crypto(),
+                &joiner.signer,
+                |_| true,
+            )
+            .map_err(|e| CryptoError::Join(format!("external commit sign: {e}")))?
+            .finalize(&joiner.provider)
+            .map_err(|e| CryptoError::Join(format!("external commit finalize: {e}")))?;
+        let commit_bytes = bundle
+            .into_commit()
+            .tls_serialize_detached()
+            .map_err(|e| CryptoError::Serialize(format!("external commit: {e}")))?;
+        Ok((Self { inner }, commit_bytes))
+    }
+
     /// This group's MLS-internal id, used to reload it from persisted storage.
     pub fn mls_group_id(&self) -> Vec<u8> {
         self.inner.group_id().as_slice().to_vec()

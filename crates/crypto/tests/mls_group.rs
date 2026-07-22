@@ -286,3 +286,69 @@ fn a_rekey_heals_a_desynced_conversation() {
     // And they still agree on the group (same epoch, same secret).
     assert_eq!(alice_group.safety_number(), bob_group.safety_number());
 }
+
+/// Open-join foundation: a newcomer self-joins by external commit using only the
+/// group's exported public GroupInfo -- no member online, no Welcome, no admin
+/// signing. Alice creates a group and publishes its GroupInfo; Charlie (a fresh
+/// identity Alice never added) self-joins; Alice applies Charlie's commit like
+/// any other; and they then exchange an end-to-end message, proving they share
+/// the same group secret.
+#[test]
+fn a_newcomer_self_joins_by_external_commit_and_shares_the_key() {
+    let alice = Identity::generate("alice").expect("alice");
+    let charlie = Identity::generate("charlie").expect("charlie");
+
+    let mut alice_group = Group::create(&alice).expect("create");
+    assert_eq!(alice_group.member_count(), 1);
+
+    // Alice publishes the group's public state (as the relay would store it).
+    let group_info = alice_group.export_group_info(&alice).expect("export info");
+
+    // Charlie self-joins from the bytes alone -- Alice is not involved yet.
+    let (mut charlie_group, commit) =
+        Group::join_by_external_commit(&charlie, &group_info).expect("external join");
+
+    // Alice catches up by applying Charlie's external commit (same path as an add).
+    alice_group
+        .apply_commit(&alice, &commit)
+        .expect("apply external commit");
+
+    assert_eq!(alice_group.member_count(), 2);
+    assert_eq!(charlie_group.member_count(), 2);
+
+    // The real proof they share the key: a message each way opens on the other side.
+    let sealed = alice_group
+        .encrypt_text(&alice, b"welcome, charlie")
+        .expect("encrypt");
+    assert_eq!(
+        charlie_group
+            .decrypt_text(&charlie, &sealed)
+            .expect("decrypt")
+            .plaintext,
+        b"welcome, charlie"
+    );
+    let back = charlie_group
+        .encrypt_text(&charlie, b"thanks")
+        .expect("encrypt back");
+    assert_eq!(
+        alice_group
+            .decrypt_text(&alice, &back)
+            .expect("decrypt back")
+            .plaintext,
+        b"thanks"
+    );
+}
+
+/// A tampered GroupInfo blob is rejected -- an external join cannot be bootstrapped
+/// from forged public state.
+#[test]
+fn external_join_rejects_a_tampered_group_info() {
+    let alice = Identity::generate("alice").expect("alice");
+    let mallory = Identity::generate("mallory").expect("mallory");
+    let alice_group = Group::create(&alice).expect("create");
+    let mut info = alice_group.export_group_info(&alice).expect("export");
+    // Flip bytes in the middle (the signed body), not the length prefix.
+    let mid = info.len() / 2;
+    info[mid] ^= 0xff;
+    assert!(Group::join_by_external_commit(&mallory, &info).is_err());
+}
