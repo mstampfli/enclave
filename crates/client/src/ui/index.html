@@ -1050,6 +1050,10 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance
 .voice-btn { width: 32px; height: 32px; display: grid; place-items: center; flex: none;
   border-radius: var(--radius); color: var(--muted); background: none; border: none; cursor: pointer; }
 .voice-btn:hover { background: var(--raised); color: var(--ink); }
+/* Channels are text-only for now: hide the file/poll and voice-message controls
+   there rather than show buttons that cannot work. */
+#composer-bar.channel-mode .attach-wrap,
+#composer-bar.channel-mode .voice-btn { display: none; }
 .voice-rec { display: flex; align-items: center; gap: 10px; }
 .voice-rec .vr-x { width: 32px; height: 32px; display: grid; place-items: center; flex: none;
   border-radius: var(--radius); color: var(--muted); background: none; border: none; cursor: pointer; }
@@ -5033,6 +5037,7 @@ function renderChat() {
   col.innerHTML = "";
   lastGroup = null;
   $("composer-bar").hidden = !conv;
+  $("composer-bar").classList.remove("channel-mode"); // DMs keep files/polls/voice
   // No chat open: show the "Your people" home view instead of the message column.
   $("home-view").hidden = !!conv;
   $("msg-col").hidden = !conv;
@@ -6410,6 +6415,8 @@ function renderChannelView(ws, ch, opts) {
   $("msg-col").hidden = false;
   $("composer-bar").hidden = false;
   $("composer").hidden = false; $("composer-locked").hidden = true; $("composer-hint").hidden = true;
+  // Channels post text only (files/polls/voice messages are DM-only for now).
+  $("composer-bar").classList.add("channel-mode");
   $("btn-home").hidden = false;
   $("btn-members").hidden = true; $("btn-call").hidden = true; $("btn-convmenu").hidden = true;
   // A rename button in the header for managers, mirroring the right-click menu.
