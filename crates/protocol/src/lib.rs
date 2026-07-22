@@ -547,6 +547,15 @@ pub enum WorkspaceOp {
     /// Remove a member (they lose access; channels they were in rekey). Needs
     /// `ManageMembers`; the owner cannot be removed.
     RemoveMember { member: String },
+    /// Set the workspace's join policy. `open` = anyone holding a valid invite may
+    /// self-join without an admin admitting them. Needs `ManageMembers`.
+    SetJoinPolicy { open: bool },
+    /// A newcomer records their own admission under the open-join policy. Signed by
+    /// the JOINER (their `member_key`), and accepted by `apply` ONLY when the
+    /// workspace is currently open-join. The relay refuses to route it unless the
+    /// invite is valid, so the invite code is the gate; the member lands with no
+    /// roles (fail-closed), an owner grants roles afterward.
+    SelfJoin { member: String, member_key: Vec<u8> },
     /// Define a new role. Needs `ManageRoles`, and a non-owner may only put
     /// permissions they themselves hold into it (no privilege escalation).
     CreateRole {

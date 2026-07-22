@@ -110,6 +110,9 @@ pub struct WorkspaceState {
     /// Explicit member set of each **private** channel. Public channels are not
     /// tracked here -- their members are the whole workspace ([`channel_members`]).
     private_members: BTreeMap<ChannelId, BTreeSet<String>>,
+    /// Whether anyone holding a valid invite may self-join without an admin
+    /// admitting them (default false = admin approval required).
+    pub open_join: bool,
     /// Next expected `seq`.
     next_seq: u64,
     /// SHA-256 of the last applied entry's body (chain head); all-zero at genesis.
@@ -269,6 +272,24 @@ impl WorkspaceState {
         if matches!(entry.op, WorkspaceOp::Create { .. }) {
             return Err(OpError::MisplacedGenesis);
         }
+        // SelfJoin is the SOLE op whose author is not yet a member: the joiner signs
+        // their own admission (the signature over `author_key` was already verified
+        // in `apply`). It is valid only while the workspace is open-join, and only
+        // for the author themselves -- you cannot self-join as someone else. The
+        // relay refuses to route it unless the invite is valid, so the invite code
+        // is the real gate; the member lands with no roles (fail-closed).
+        if let WorkspaceOp::SelfJoin { member, member_key } = &entry.op {
+            require(self.open_join)?;
+            if member != &entry.author
+                || member_key != &entry.author_key
+                || member == &self.owner
+                || self.members.contains_key(member)
+            {
+                return Err(OpError::BadTarget);
+            }
+            self.members.insert(member.clone(), member_key.clone());
+            return Ok(());
+        }
         match self.members.get(&entry.author) {
             Some(k) if k == &entry.author_key => {}
             Some(_) => return Err(OpError::BadSignature), // key changed under us
@@ -300,6 +321,13 @@ impl WorkspaceState {
                     set.remove(member);
                 }
             }
+
+            WorkspaceOp::SetJoinPolicy { open } => {
+                require(self.has_permission(&author, Permission::ManageMembers))?;
+                self.open_join = *open;
+            }
+
+            WorkspaceOp::SelfJoin { .. } => unreachable!("handled before the member check"),
 
             WorkspaceOp::CreateRole {
                 role,
@@ -729,6 +757,88 @@ mod tests {
         // Full replay must match the incremental state.
         assert_eq!(replay(&log).unwrap().members.len(), st.members.len());
         (st, owner, admin, member)
+    }
+
+    #[test]
+    fn open_join_lets_a_stranger_self_join_only_when_enabled_and_only_as_themselves() {
+        let (mut st, owner, _admin, member) = seed();
+        let stranger = Identity::generate("stranger").unwrap();
+        let s_key = stranger.identity_key();
+
+        // Default is admin-approval: a SelfJoin is refused before open-join is on.
+        let early = sign_op(
+            &stranger,
+            "stranger#9",
+            &st,
+            200,
+            WorkspaceOp::SelfJoin {
+                member: "stranger#9".into(),
+                member_key: s_key.clone(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(st.apply(&early), Err(OpError::Unauthorized)));
+        assert!(!st.members.contains_key("stranger#9"));
+
+        // A bare member cannot flip the policy (needs ManageMembers).
+        let by_member = sign_op(
+            &member,
+            "member#3",
+            &st,
+            201,
+            WorkspaceOp::SetJoinPolicy { open: true },
+        )
+        .unwrap();
+        assert!(matches!(st.apply(&by_member), Err(OpError::Unauthorized)));
+        assert!(!st.open_join);
+
+        // The owner turns open-join on.
+        let policy = sign_op(
+            &owner,
+            "owner#1",
+            &st,
+            202,
+            WorkspaceOp::SetJoinPolicy { open: true },
+        )
+        .unwrap();
+        st.apply(&policy).unwrap();
+        assert!(st.open_join);
+
+        // Now the stranger self-joins, signed by themselves, and lands with NO
+        // permissions (fail closed).
+        let join = sign_op(
+            &stranger,
+            "stranger#9",
+            &st,
+            203,
+            WorkspaceOp::SelfJoin {
+                member: "stranger#9".into(),
+                member_key: s_key.clone(),
+            },
+        )
+        .unwrap();
+        st.apply(&join).unwrap();
+        assert!(st.members.contains_key("stranger#9"));
+        assert!(
+            st.permissions_of("stranger#9").is_empty(),
+            "a self-joiner starts with no permissions"
+        );
+
+        // You cannot self-join AS someone else: the op's member must equal the
+        // signing author, so a forged target is rejected.
+        let evil = Identity::generate("evil").unwrap();
+        let spoof = sign_op(
+            &evil,
+            "evil#7",
+            &st,
+            204,
+            WorkspaceOp::SelfJoin {
+                member: "owner#1".into(),
+                member_key: evil.identity_key(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(st.apply(&spoof), Err(OpError::BadTarget)));
     }
 
     #[test]
