@@ -420,7 +420,7 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance
   background: var(--danger); border-radius: 999px; }
 
 /* ---------- workspace panel (channel tree) ---------- */
-#ws-panel { padding: 0; }
+#ws-panel { padding: 0; display: flex; flex-direction: column; }
 .ws-head { display: flex; align-items: center; gap: 8px; padding: 14px 16px 12px;
   border-bottom: 1px solid var(--border); }
 .ws-title { flex: 1; font-size: 15px; font-weight: 650; color: var(--ink-strong);
@@ -429,7 +429,9 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance
   border-radius: var(--radius); color: var(--muted); }
 .ws-gear:hover { background: var(--raised); color: var(--ink); }
 .ws-gear .icon { width: 16px; height: 16px; }
-#ws-tree { padding: 8px 8px 20px; }
+/* Grow to fill the panel so the empty space below the last row is still part of
+   the tree -- droppable (drop-to-root) and right-clickable (Add new). */
+#ws-tree { padding: 8px 8px 20px; flex: 1 0 auto; }
 /* A collapsible category heading: the whole row is the click-to-collapse target
    (an inner <button> gets its click swallowed under the draggable parent in
    WebKit, which is why collapsing silently did nothing). */
@@ -462,21 +464,22 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance
    target, and a dimmed source while dragging. */
 .ws-chan[draggable="true"], .ws-cat[draggable="true"] { cursor: grab; }
 .ws-chan.dragging, .ws-cat.dragging { opacity: 0.45; }
-/* A compact drag image: the browser's default is a full-width snapshot of the
-   row, which renders large. We hand it this small chip instead. It lives
-   off-screen (fixed, negative offset) so it renders for setDragImage but is
-   never seen in place. Populated on pointerdown so dragstart mutates nothing
-   (mutating layout inside dragstart cancels the drag in WebKit). */
-#drag-ghost {
-  position: fixed; top: -9999px; left: -9999px; z-index: -1;
+/* The drag image: rather than the browser's native ghost (which WebKitGTK draws
+   large and inconsistently), we hide the native one and float our own small chip
+   that tracks the cursor via `dragover`, so it is always small and always shows
+   the row being dragged. */
+#drag-follower {
+  position: fixed; z-index: 300; pointer-events: none;
   display: inline-flex; align-items: center; gap: 6px;
-  padding: 4px 9px; border-radius: 6px;
-  background: var(--raised); border: 1px solid var(--border);
-  color: var(--text); font-size: 13px; font-weight: 500;
-  white-space: nowrap; pointer-events: none;
+  max-width: 220px; padding: 3px 8px; border-radius: 6px;
+  background: var(--raised); border: 1px solid var(--border-strong);
+  color: var(--ink); font-size: 12.5px; font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
 }
-#drag-ghost svg { width: 14px; height: 14px; flex: none; }
-#drag-ghost .ws-chan-ico { width: auto; height: auto; }
+#drag-follower svg { width: 14px; height: 14px; flex: none; }
+#drag-follower .ws-chan-ico { width: auto; height: auto; font-size: 13px; }
+#drag-follower span { overflow: hidden; text-overflow: ellipsis; }
 .ws-chan.drag-over, .ws-cat.drag-over { background: var(--raised); border-radius: var(--radius); }
 /* Drop a channel/category on the workspace header to move it to the top level.
    The header is always present, so highlighting it never reflows the tree (which
@@ -1413,7 +1416,7 @@ label.member-row:hover { background: var(--raised); }
 <!-- Right-click message menu. Rows are built per message in openMessageMenu. -->
 <div id="msg-menu" hidden></div>
 <div id="ws-menu" hidden></div>
-<div id="drag-ghost" aria-hidden="true"></div>
+<div id="drag-follower" aria-hidden="true" hidden></div>
 <!-- Full emoji grid (the built-in default picker), opened from the react "+". -->
 <div id="emoji-menu" hidden></div>
 <div class="conv-menu" id="row-menu" hidden role="menu" style="position:fixed">
@@ -6166,33 +6169,49 @@ let dragItem = null; // {type, id, ...}
 // Fill the shared off-screen drag chip with this row's icon + label, so the drag
 // image is a small chip rather than the browser's full-width row snapshot. Done
 // on pointerdown (before the drag starts) so dragstart itself mutates nothing.
-function fillDragGhost(el) {
-  const ghost = $("drag-ghost");
-  ghost.textContent = "";
+// A 1x1 transparent image used to suppress the native drag ghost, so only our
+// own #drag-follower chip is seen.
+const BLANK_DRAG_IMG = new Image();
+BLANK_DRAG_IMG.src =
+  "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+// Fill the follower chip with this row's icon + label (done on pointerdown so
+// dragstart mutates no layout, which would cancel the drag in WebKit).
+function fillDragFollower(el) {
+  const f = $("drag-follower");
+  f.textContent = "";
   const ico = el.querySelector(".ws-chan-ico, .ws-cat-chev, .ws-lock, svg");
-  if (ico) ghost.appendChild(ico.cloneNode(true));
+  if (ico) f.appendChild(ico.cloneNode(true));
   const lab = el.querySelector(".ws-chan-name, .ws-cat-label, .vh-name");
   const span = document.createElement("span");
   span.textContent = ((lab ? lab.textContent : el.textContent) || "").trim().slice(0, 48);
-  ghost.appendChild(span);
+  f.appendChild(span);
 }
+// Track the cursor with the follower while any of our drags is in flight.
+document.addEventListener("dragover", (e) => {
+  if (!dragItem) return;
+  const f = $("drag-follower");
+  f.hidden = false;
+  f.style.left = e.clientX + 14 + "px";
+  f.style.top = e.clientY + 6 + "px";
+});
 function makeDraggable(el, item) {
-  el.addEventListener("pointerdown", () => fillDragGhost(el));
+  el.addEventListener("pointerdown", () => fillDragFollower(el));
   el.addEventListener("dragstart", (e) => {
     dragItem = item;
-    // Mutating layout inside dragstart (revealing/reflowing an element) cancels the
-    // drag in WebKit; only set the transfer data + drag image here (the image was
-    // built on pointerdown), and dim the source next tick.
+    // Only set transfer data + hide the native ghost here; mutating layout in
+    // dragstart cancels the drag in WebKit, and the follower was built on
+    // pointerdown. Dim the source next tick so you can see what you grabbed.
     if (e.dataTransfer) {
       e.dataTransfer.effectAllowed = "move";
       e.dataTransfer.setData("text/plain", item.type + ":" + item.id);
-      if (e.dataTransfer.setDragImage) e.dataTransfer.setDragImage($("drag-ghost"), 12, 12);
+      if (e.dataTransfer.setDragImage) e.dataTransfer.setDragImage(BLANK_DRAG_IMG, 0, 0);
     }
     setTimeout(() => el.classList.add("dragging"), 0);
   });
   el.addEventListener("dragend", () => {
     el.classList.remove("dragging");
     dragItem = null;
+    $("drag-follower").hidden = true;
     document.querySelectorAll(".drag-over").forEach((x) => x.classList.remove("drag-over"));
   });
 }
@@ -6234,17 +6253,36 @@ function makeVoiceDropTarget(row, ws, channelId) {
 }
 
 // The single "+" in the header: choose whether to add a channel or a category.
-$("ws-add-item").addEventListener("click", () => { if (activeWs) openModal("modal-add-item"); });
+// The add chooser (channel or category). `addItemParent` is the category the new
+// item nests under (null = top level); the top "+", the empty-area menu, and a
+// category's "Add new" all funnel through here so there is one add flow.
+let addItemParent = null;
+function openAddItem(parent) {
+  if (!activeWs) return;
+  addItemParent = parent || null;
+  openModal("modal-add-item");
+}
+$("ws-add-item").addEventListener("click", () => openAddItem(null));
 $("add-channel-btn").addEventListener("click", () => {
+  const parent = addItemParent;
   closeModals();
-  if (activeWs) openChannelCreator(activeWs, null);
+  if (activeWs) openChannelCreator(activeWs, parent);
 });
 $("add-category-btn").addEventListener("click", () => {
+  const parent = addItemParent;
   closeModals();
   if (!activeWs) return;
   askInput("New category", "Group channels under a heading. Drag channels or categories onto it to nest them.",
     "Category name", "Create",
-    (name) => send({ type: "CreateCategory", workspace: activeWs, name }));
+    (name) => send({ type: "CreateCategory", workspace: activeWs, name, parent: parent || undefined }));
+});
+// Right-clicking the tree's empty area (not a row) offers "Add new" at the top
+// level -- the same chooser as the header "+". Rows keep their own menus.
+$("ws-tree").addEventListener("contextmenu", (e) => {
+  if (e.target.closest(".ws-chan, .ws-cat, .vh")) return; // rows have their own menus
+  const ws = wsById(activeWs);
+  if (!ws || !can(ws, "manage_channels")) return;
+  openWsMenu(e, [{ label: "Add new", icon: WS_ICON.add, fn: () => openAddItem(null) }]);
 });
 // Dropping a channel or category in the tree's empty area moves it to the top
 // level (a category header's own drop handler stops propagation before this).
@@ -6312,9 +6350,8 @@ document.addEventListener("scroll", () => closeWsMenu(), true);
 
 function openCategoryMenu(e, ws, cat) {
   openWsMenu(e, [
-    { label: "New category here", icon: WS_ICON.add, fn: () =>
-      askInput("New subcategory", "A category nested under " + cat.name + ".", "Category name", "Create",
-        (name) => send({ type: "CreateCategory", workspace: ws.id, name, parent: cat.id })) },
+    // The same chooser as the header "+", but nested under this category.
+    { label: "Add new", icon: WS_ICON.add, fn: () => openAddItem(cat.id) },
     { label: "Rename category", icon: WS_ICON.edit, fn: () =>
       askInput("Rename category", "", "New name", "Rename",
         (name) => send({ type: "RenameCategory", workspace: ws.id, category: cat.id, name }), cat.name) },
