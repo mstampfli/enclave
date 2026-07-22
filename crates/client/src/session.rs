@@ -176,7 +176,22 @@ pub struct SessionData {
     /// removal direction, and thus auto-reconnect eligibility, survives a restart.
     #[serde(default)]
     pub removed_me: Vec<String>,
+    /// Each workspace's MLS group id `(workspace id, mls group id)`. The workspace
+    /// metadata is rebuilt from the server op-log on login, but its MLS group must
+    /// be reloaded from the restored MLS store, and that needs its id. Without
+    /// this, an owner cannot admit members after a restart ("workspace group
+    /// missing"). Old sessions default to empty and rehydrate on next save.
+    #[serde(default)]
+    pub workspace_groups: Vec<([u8; 16], Vec<u8>)>,
+    /// Each private channel's own MLS group id `((workspace id, channel id), mls
+    /// group id)`, reloaded the same way.
+    #[serde(default)]
+    pub channel_groups: Vec<PersistChannelGroup>,
 }
+
+/// A private channel's persisted MLS group id: its `(workspace id, channel id)`
+/// key paired with the MLS group id to reload it by.
+pub type PersistChannelGroup = (([u8; 16], [u8; 16]), Vec<u8>);
 
 /// Derive the 32-byte at-rest key from the OPAQUE export key (domain-separated).
 fn derive_key(export_key: &[u8]) -> [u8; 32] {
@@ -261,6 +276,8 @@ mod tests {
                 },
             )],
             removed_me: vec!["carol#0003".into()],
+            workspace_groups: Vec::new(),
+            channel_groups: Vec::new(),
         };
         save(&path, key, &data);
 

@@ -2246,6 +2246,89 @@ async fn an_invite_code_admits_a_redeemer() {
     .await;
 }
 
+/// Regression: a workspace's MLS group is reloaded from the session after a
+/// restart, so the owner can still admit members. Previously the group map was
+/// empty on restart (only the metadata was rebuilt from the op-log), so admitting
+/// failed with "workspace group missing" and an invite redeemer never joined.
+#[tokio::test]
+async fn an_owner_can_admit_after_a_restart() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let dir = std::env::temp_dir().join(format!("enclave-ws-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    async fn account_in(url: &str, dir: &std::path::Path, name: &str) -> Client {
+        let mut c = Client::connect(url).await.expect("connect");
+        c.set_keystore_dir(dir);
+        c.create_account(name, "", "test-password-1234")
+            .await
+            .expect("create");
+        c
+    }
+
+    let mut owner = account_in(&url, &dir, "owner").await;
+    let mut carol = account(&url, "carol").await;
+    let owner_user = owner.name().to_string();
+    let carol_h = carol.name().to_string();
+
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+
+    // Restart the owner: drop the client, then log back in on the same device.
+    drop(owner);
+    let mut owner = Client::connect(&url).await.unwrap();
+    owner.set_keystore_dir(&dir);
+    owner
+        .login(&owner_user, "test-password-1234")
+        .await
+        .unwrap();
+    // The workspace metadata is refetched from the op-log after login; the WG is
+    // reloaded from the session. Only then can the owner admit.
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+
+    owner.create_invite(&ws, 0, 0);
+    let mut code = String::new();
+    for _ in 0..100 {
+        if let Ok(Some(Event::InviteCreated { code: c, .. })) =
+            tokio::time::timeout(Duration::from_millis(50), owner.next_event()).await
+        {
+            code = c;
+            break;
+        }
+    }
+    assert!(!code.is_empty(), "no invite code after restart");
+
+    carol.redeem_invite(&code);
+    for _ in 0..200 {
+        if let Ok(Some(Event::JoinRequested {
+            workspace,
+            requester,
+        })) = tokio::time::timeout(Duration::from_millis(50), owner.next_event()).await
+        {
+            owner
+                .workspace_add_member(&workspace, &requester)
+                .await
+                .unwrap();
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(50), carol.next_event()).await;
+        if carol
+            .workspace(&ws)
+            .is_some_and(|s| s.members.contains_key(&carol_h))
+        {
+            break;
+        }
+    }
+    assert!(
+        carol
+            .workspace(&ws)
+            .is_some_and(|s| s.members.contains_key(&carol_h)),
+        "redeemer never joined after the owner restarted (workspace group not reloaded)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A private channel can be a voice channel too: it is created with kind Voice
 /// and its own membership (its own MLS group keys the call), so a non-member of
 /// the channel cannot join it.

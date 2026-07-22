@@ -4564,6 +4564,10 @@ impl Client {
         self.workspace_groups.insert(id, wg);
         self.conn
             .send(ClientMsg::WorkspaceSubmitOp { workspace: id, op });
+        // Persist now so the new WG's MLS group id survives a restart even if the
+        // app closes before any other save; without it an owner cannot admit
+        // members after restarting ("workspace group missing").
+        self.save_session();
         Ok(hex::encode(id))
     }
 
@@ -5058,6 +5062,8 @@ impl Client {
             .entry((ws, channel))
             .or_default()
             .push(key);
+        // Persist the private channel's own MLS group id so it reloads on restart.
+        self.save_session();
         Ok(hex::encode(channel))
     }
 
@@ -5373,6 +5379,8 @@ impl Client {
                     self.workspace_groups.insert(ws, g);
                 }
             }
+            // Persist the newly joined group's id so it reloads after a restart.
+            self.save_session();
         }
     }
 
@@ -6138,6 +6146,19 @@ impl Client {
                 .map(|(u, p)| (u.clone(), p.clone()))
                 .collect(),
             removed_me: self.removed_me.iter().cloned().collect(),
+            // The MLS group id for each workspace / private channel, so the
+            // in-memory group maps can be rebuilt after a restart (the op-log
+            // restores only the metadata).
+            workspace_groups: self
+                .workspace_groups
+                .iter()
+                .map(|(id, g)| (*id, g.mls_group_id()))
+                .collect(),
+            channel_groups: self
+                .channel_groups
+                .iter()
+                .map(|(key, g)| (*key, g.mls_group_id()))
+                .collect(),
         };
         session::save(&self.session_path(), &self.export_key, &data);
     }
@@ -6177,13 +6198,34 @@ impl Client {
         }
         self.profiles = data.peer_profiles.into_iter().collect();
         self.removed_me = data.removed_me.into_iter().collect();
-        if data.conversations.is_empty() {
+        // Nothing to reload only if there are no conversations AND no workspace or
+        // channel groups; a fresh account whose only asset is a workspace it just
+        // created still needs its MLS store restored so the group reloads.
+        if data.conversations.is_empty()
+            && data.workspace_groups.is_empty()
+            && data.channel_groups.is_empty()
+        {
             return;
         }
         let Some(identity) = self.identity.as_ref() else {
             return;
         };
         identity.restore_storage(data.mls);
+        // Rebuild the workspace + private-channel MLS group maps from the restored
+        // store (the op-log restores only the metadata). Collected here under the
+        // `identity` borrow, inserted into `self` after the borrow ends below.
+        let mut ws_groups = Vec::new();
+        for (id, gid) in data.workspace_groups {
+            if let Ok(g) = Group::load(identity, &gid) {
+                ws_groups.push((id, g));
+            }
+        }
+        let mut ch_groups = Vec::new();
+        for (key, gid) in data.channel_groups {
+            if let Ok(g) = Group::load(identity, &gid) {
+                ch_groups.push((key, g));
+            }
+        }
         let mut loaded: Vec<(GroupId, Conversation)> = Vec::new();
         for pc in data.conversations {
             // A Left conversation has no MLS group to reload, only the retained
@@ -6273,6 +6315,14 @@ impl Client {
                 }
             }
             self.conversations.insert(gid, conv);
+        }
+        // The `identity` borrow has ended: install the reloaded workspace and
+        // private-channel groups so admits/decrypts work right after a restart.
+        for (id, g) in ws_groups {
+            self.workspace_groups.insert(id, g);
+        }
+        for (key, g) in ch_groups {
+            self.channel_groups.insert(key, g);
         }
     }
 
