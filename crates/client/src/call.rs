@@ -17,13 +17,16 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use enclave_crypto::{MediaOpener, MediaSealer, MediaSigner};
-use enclave_media::{AudioCapture, AudioDecoder, AudioEncoder, AudioPlayback, PlaybackSink};
+use enclave_media::{
+    apply_gain, frame_level_pct, AudioCapture, AudioDecoder, AudioEncoder, AudioPlayback,
+    NoiseSuppressor, PlaybackSink,
+};
 use enclave_protocol::{DeviceId, GroupId, MediaFrame, MediaKind};
 use enclave_transport::MediaSocket;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -57,23 +60,13 @@ pub struct SpeakingUpdate {
     pub speaking: bool,
 }
 
-/// Voice-activity threshold on a 20 ms PCM frame, expressed as the mean of the
-/// squared i16 samples (so we never take a sqrt). ~700 RMS is clearly speech and
-/// rejects room noise; tune if mics read hot or quiet.
-const SPEAK_MEAN_SQUARE: i64 = 700 * 700;
+/// A peer counts as talking when their decoded frame is at least this loud on the
+/// 0..=100 [`frame_level_pct`] scale. Fixed (our own transmit gate is what the
+/// activation slider tunes); a peer only reaches us when their own gate passed.
+const SPEAK_LEVEL_PCT: u32 = 12;
 /// Keep a participant "talking" for this long after their last loud frame, so the
 /// ring does not flicker between words or on short pauses.
 const SPEAK_HOLD: Duration = Duration::from_millis(350);
-
-/// Whether a mono i16 frame is loud enough to count as speech: its mean square
-/// beats the threshold. An empty frame is silence.
-fn frame_is_loud(pcm: &[i16]) -> bool {
-    if pcm.is_empty() {
-        return false;
-    }
-    let sum_sq: i64 = pcm.iter().map(|&s| (s as i64) * (s as i64)).sum();
-    sum_sq / (pcm.len() as i64) > SPEAK_MEAN_SQUARE
-}
 
 /// Everything a media session needs, gathered from the live conversation before
 /// the (non-`Send`) audio parts are spun up. All fields are plain `Send` bytes.
@@ -89,6 +82,13 @@ pub struct CallParams {
     pub member_keys: HashMap<String, Vec<u8>>,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
+    /// Live-shared mic-processing settings (see [`crate::Client`]): noise
+    /// suppression on/off, the voice-activation level (0..=100; 0 = open mic), and
+    /// input gain in percent. The mic thread reads them every frame so the UI can
+    /// change them mid-call.
+    pub noise_suppress: Arc<AtomicBool>,
+    pub activation_pct: Arc<AtomicU32>,
+    pub input_gain_pct: Arc<AtomicU32>,
 }
 
 /// A running video sender (screen share or camera). Dropping it stops the
@@ -197,22 +197,36 @@ impl Call {
         let audio_mix = mix.clone();
         let mic_speak_tx = speak_tx.clone();
         let mic_me = p.me.clone();
+        let mic_ns = p.noise_suppress.clone();
+        let mic_activation = p.activation_pct.clone();
+        let mic_gain = p.input_gain_pct.clone();
         std::thread::spawn(move || {
             let mut encoder = match AudioEncoder::new() {
                 Ok(e) => e,
                 Err(_) => return,
             };
-            // Own voice activity: track the last loud frame, hold briefly.
+            let mut suppressor = NoiseSuppressor::new();
+            // Own voice activity: track the last active frame, hold briefly.
             let mut me_last_loud: Option<Instant> = None;
             let mut me_speaking = false;
             while let Ok(mut pcm) = mic_rx.recv() {
                 let is_muted = audio_muted.load(Ordering::Relaxed);
-                // Measure the raw mic (before mix_into may zero it) and count it
-                // only when unmuted, so a muted mic never shows as speaking.
-                if !is_muted && frame_is_loud(&pcm) {
+                // Clean the raw mic first, then boost, before anything measures or
+                // transmits it -- so suppression and gain shape both the meter and
+                // the activation decision.
+                if mic_ns.load(Ordering::Relaxed) {
+                    suppressor.process(&mut pcm);
+                }
+                apply_gain(&mut pcm, mic_gain.load(Ordering::Relaxed));
+                // Voice activation: the mic counts as active while it stays above
+                // the (adjustable) level; below it we do not transmit. Measured
+                // only when unmuted so a muted mic never registers.
+                let level = frame_level_pct(&pcm) as u32;
+                if !is_muted && level > mic_activation.load(Ordering::Relaxed) {
                     me_last_loud = Some(Instant::now());
                 }
-                let now_speaking = me_last_loud.is_some_and(|t| t.elapsed() < SPEAK_HOLD);
+                let active = me_last_loud.is_some_and(|t| t.elapsed() < SPEAK_HOLD);
+                let now_speaking = active && !is_muted;
                 if now_speaking != me_speaking {
                     me_speaking = now_speaking;
                     let _ = mic_speak_tx.send(SpeakingUpdate {
@@ -220,10 +234,12 @@ impl Call {
                         speaking: now_speaking,
                     });
                 }
-                // Muting silences the mic but NOT shared system audio; sum any
-                // shared audio in. When muted with nothing shared, send nothing.
-                let mixed = mix_into(&audio_mix, &mut pcm, is_muted);
-                if is_muted && !mixed {
+                // Transmit the mic only while active; muting or falling below the
+                // activation level gates it, but shared system audio still rides
+                // out. When there is nothing to send, send nothing.
+                let gate_mic = is_muted || !active;
+                let mixed = mix_into(&audio_mix, &mut pcm, gate_mic);
+                if gate_mic && !mixed {
                     continue;
                 }
                 let Ok(packet) = encoder.encode(&pcm) else {
@@ -303,7 +319,7 @@ impl Call {
                                 if let Ok(pcm) = decoder.decode(&packet) {
                                     // Measure speech even while deafened (so we can
                                     // still show who talks); just do not play it.
-                                    if frame_is_loud(&pcm) {
+                                    if frame_level_pct(&pcm) as u32 > SPEAK_LEVEL_PCT {
                                         last_loud.insert(sender.clone(), Instant::now());
                                     }
                                     if !decode_deafened.load(Ordering::Relaxed) {
@@ -727,24 +743,6 @@ mod tests {
 
     fn ring(samples: &[i16]) -> MixRing {
         Arc::new(Mutex::new(samples.iter().copied().collect()))
-    }
-
-    #[test]
-    fn silence_and_room_noise_are_not_speech() {
-        assert!(!frame_is_loud(&[])); // no samples
-        assert!(!frame_is_loud(&[0i16; 960])); // digital silence
-        assert!(!frame_is_loud(&[300i16; 960])); // low-level noise, below threshold
-        assert!(!frame_is_loud(&[700i16; 960])); // exactly at the threshold, not over
-    }
-
-    #[test]
-    fn speech_level_frames_are_loud() {
-        assert!(frame_is_loud(&[1500i16; 960])); // clear speech
-        assert!(frame_is_loud(&[-2000i16; 960])); // negative swing counts the same
-                                                  // A half-silent frame whose active half is loud enough still averages over.
-        let mut frame = [0i16; 960];
-        frame[..480].fill(2000);
-        assert!(frame_is_loud(&frame));
     }
 
     #[test]

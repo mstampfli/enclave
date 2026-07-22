@@ -12,6 +12,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::transfer::{FileManifest, FileSink, Reassembler, TransferMeta};
@@ -33,6 +35,11 @@ mod transfer;
 /// (both parties online, nothing stored). Kept in sync with the server by hand;
 /// the server is the authority and rejects an over-size stored offer anyway.
 pub const STORE_FILE_MAX: u64 = 250 * 1024 * 1024;
+
+/// Default voice-activation level (0..=100 on the [`enclave_media::frame_level_pct`]
+/// scale). Low enough to pass ordinary speech while gating dead air / faint noise;
+/// the user tunes it with the input meter. 0 would mean an always-open mic.
+pub const DEFAULT_ACTIVATION_PCT: u32 = 15;
 
 /// How long an un-acked reliable message waits before it is retransmitted. On a
 /// healthy connection the server acks in well under this, so a retransmit only
@@ -309,6 +316,11 @@ pub enum Event {
     Speaking {
         from: String,
         speaking: bool,
+    },
+    /// The current microphone input level (0..=100), while the settings mic
+    /// monitor is running, to drive the input meter.
+    MicLevel {
+        level: u8,
     },
     /// A user's end-to-end profile (display name, status, accent, avatar)
     /// changed or first arrived; the UI re-reads it via `profile_of`. `user` is
@@ -940,6 +952,17 @@ pub struct Client {
     input_device: Option<String>,
     /// Selected speaker (output) device name; `None` = host default.
     output_device: Option<String>,
+    /// Mic-processing settings, shared live with the active call's mic thread and
+    /// the settings mic monitor (so a change takes effect without a restart):
+    /// noise suppression on/off, the voice-activation level (0..=100; 0 = open
+    /// mic), and input gain in percent (100 = unity). Persisted in `AudioPrefs`.
+    audio_ns: Arc<AtomicBool>,
+    audio_activation: Arc<AtomicU32>,
+    audio_gain: Arc<AtomicU32>,
+    /// A running mic level monitor that feeds the settings input meter, if open.
+    mic_monitor: Option<enclave_media::AudioCapture>,
+    /// Sends mic levels (0..=100) from the monitor thread to `next_event`.
+    mic_level_rx: Option<tokio::sync::mpsc::UnboundedReceiver<u8>>,
     /// The server URL, retained so a dropped socket can be reconnected.
     server_url: String,
     /// The login password, kept in memory (zeroized) only for the session so a
@@ -1055,6 +1078,11 @@ impl Client {
             call_group: None,
             input_device: None,
             output_device: None,
+            audio_ns: Arc::new(AtomicBool::new(false)),
+            audio_activation: Arc::new(AtomicU32::new(DEFAULT_ACTIVATION_PCT)),
+            audio_gain: Arc::new(AtomicU32::new(100)),
+            mic_monitor: None,
+            mic_level_rx: None,
             server_url: server_url.to_string(),
             password: Zeroizing::new(String::new()),
             outgoing_files: HashMap::new(),
@@ -1105,6 +1133,11 @@ impl Client {
         let prefs = AudioPrefs::load(&self.audio_prefs_path());
         self.input_device = prefs.input;
         self.output_device = prefs.output;
+        self.audio_ns.store(prefs.noise_suppress, Ordering::Relaxed);
+        self.audio_activation
+            .store(prefs.activation_pct.min(100), Ordering::Relaxed);
+        self.audio_gain
+            .store(prefs.input_gain_pct.clamp(0, 400), Ordering::Relaxed);
     }
 
     /// Create a new account from a display `name` and log in via OPAQUE: the
@@ -4148,6 +4181,9 @@ impl Client {
                 member_keys: group.member_keys().into_iter().collect(),
                 input_device: self.input_device.clone(),
                 output_device: self.output_device.clone(),
+                noise_suppress: self.audio_ns.clone(),
+                activation_pct: self.audio_activation.clone(),
+                input_gain_pct: self.audio_gain.clone(),
             }
         };
         let (call, screen_rx, speak_rx) = call::Call::start(params).await?;
@@ -4346,7 +4382,82 @@ impl Client {
             outputs: enclave_media::output_device_names(),
             input: self.input_device.clone(),
             output: self.output_device.clone(),
+            noise_suppress: self.audio_ns.load(Ordering::Relaxed),
+            activation_pct: self.audio_activation.load(Ordering::Relaxed),
+            input_gain_pct: self.audio_gain.load(Ordering::Relaxed),
         }
+    }
+
+    /// Toggle microphone noise suppression. Takes effect live on any running call
+    /// and the settings mic monitor, and is persisted.
+    pub fn set_noise_suppression(&mut self, on: bool) {
+        self.audio_ns.store(on, Ordering::Relaxed);
+        self.save_audio_prefs();
+    }
+
+    /// Set the voice-activation level (0..=100; 0 = always-open mic). Below it the
+    /// mic does not transmit. Live + persisted.
+    pub fn set_activation_pct(&mut self, pct: u32) {
+        self.audio_activation.store(pct.min(100), Ordering::Relaxed);
+        self.save_audio_prefs();
+    }
+
+    /// Set the mic input gain in percent (100 = unity, capped at 400). Live +
+    /// persisted.
+    pub fn set_input_gain_pct(&mut self, pct: u32) {
+        self.audio_gain.store(pct.min(400), Ordering::Relaxed);
+        self.save_audio_prefs();
+    }
+
+    /// Start metering the mic for the settings input meter: capture from the
+    /// selected input, run the same suppression + gain a call would, and stream
+    /// the 0..=100 level out as [`Event::MicLevel`]. Idempotent; if the mic is
+    /// missing or busy the meter simply stays flat. Stop it with
+    /// [`stop_mic_monitor`](Self::stop_mic_monitor).
+    pub fn start_mic_monitor(&mut self) {
+        if self.mic_monitor.is_some() {
+            return;
+        }
+        let (frame_tx, frame_rx) = std::sync::mpsc::channel::<Vec<i16>>();
+        let capture = match enclave_media::AudioCapture::start_on_into(
+            self.input_device.as_deref(),
+            frame_tx,
+        ) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let (level_tx, level_rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+        let ns = self.audio_ns.clone();
+        let gain = self.audio_gain.clone();
+        std::thread::spawn(move || {
+            let mut suppressor = enclave_media::NoiseSuppressor::new();
+            // Peak-hold across each ~50 ms send window so the meter reads steadily
+            // rather than flickering on the 20 ms frame rate.
+            let mut window_peak = 0u8;
+            let mut last_sent = Instant::now();
+            while let Ok(mut pcm) = frame_rx.recv() {
+                if ns.load(Ordering::Relaxed) {
+                    suppressor.process(&mut pcm);
+                }
+                enclave_media::apply_gain(&mut pcm, gain.load(Ordering::Relaxed));
+                window_peak = window_peak.max(enclave_media::frame_level_pct(&pcm));
+                if last_sent.elapsed() >= Duration::from_millis(50) {
+                    last_sent = Instant::now();
+                    if level_tx.send(window_peak).is_err() {
+                        break; // the receiver was dropped (monitor stopped)
+                    }
+                    window_peak = 0;
+                }
+            }
+        });
+        self.mic_monitor = Some(capture);
+        self.mic_level_rx = Some(level_rx);
+    }
+
+    /// Stop the settings mic monitor (drops the capture, which ends its thread).
+    pub fn stop_mic_monitor(&mut self) {
+        self.mic_monitor = None;
+        self.mic_level_rx = None;
     }
 
     /// Choose the microphone. `None` restores the host default. Persisted to the
@@ -4379,6 +4490,9 @@ impl Client {
         AudioPrefs {
             input: self.input_device.clone(),
             output: self.output_device.clone(),
+            noise_suppress: self.audio_ns.load(Ordering::Relaxed),
+            activation_pct: self.audio_activation.load(Ordering::Relaxed),
+            input_gain_pct: self.audio_gain.load(Ordering::Relaxed),
         }
         .save(&self.audio_prefs_path());
     }
@@ -5196,6 +5310,9 @@ impl Client {
                 member_keys: group.member_keys().into_iter().collect(),
                 input_device: self.input_device.clone(),
                 output_device: self.output_device.clone(),
+                noise_suppress: self.audio_ns.clone(),
+                activation_pct: self.audio_activation.clone(),
+                input_gain_pct: self.audio_gain.clone(),
             }
         };
         let (call, screen_rx, speak_rx) = call::Call::start(params).await?;
@@ -6176,35 +6293,38 @@ impl Client {
             Msg(ServerMsg),
             Screen(call::ScreenFrameOut),
             Speak(call::SpeakingUpdate),
+            MicLevel(u8),
         }
         loop {
             if let Some(event) = self.pending.pop_front() {
                 return Some(event);
             }
-            // Wait for a server message, or an incoming screen frame / speaking
-            // change from the active call. The two call receivers are set and
-            // cleared together, so both are present exactly when a call is live.
-            // Disjoint field borrows so all can be selected on.
+            // Wait for a server message, an incoming screen frame / speaking change
+            // from the active call, or a mic level from the settings monitor. The
+            // three call/monitor receivers are optional (present only when live);
+            // an absent one parks forever so it never fires. Disjoint field borrows.
             let src = {
                 let Self {
                     conn,
                     screen_rx,
                     speak_rx,
+                    mic_level_rx,
                     ..
                 } = &mut *self;
-                match (screen_rx.as_mut(), speak_rx.as_mut()) {
-                    (Some(srx), Some(spx)) => tokio::select! {
-                        m = conn.recv() => Src::Msg(m?),
-                        sf = srx.recv() => match sf {
-                            Some(sf) => Src::Screen(sf),
-                            None => continue, // screen channel closed with the call
-                        },
-                        su = spx.recv() => match su {
-                            Some(su) => Src::Speak(su),
-                            None => continue, // speaking channel closed with the call
-                        },
+                tokio::select! {
+                    m = conn.recv() => Src::Msg(m?),
+                    sf = recv_opt(screen_rx) => match sf {
+                        Some(sf) => Src::Screen(sf),
+                        None => continue, // screen channel closed with the call
                     },
-                    _ => Src::Msg(conn.recv().await?),
+                    su = recv_opt(speak_rx) => match su {
+                        Some(su) => Src::Speak(su),
+                        None => continue, // speaking channel closed with the call
+                    },
+                    lv = recv_opt(mic_level_rx) => match lv {
+                        Some(lv) => Src::MicLevel(lv),
+                        None => continue, // monitor channel closed
+                    },
                 }
             };
             match src {
@@ -6225,6 +6345,7 @@ impl Client {
                         speaking: su.speaking,
                     });
                 }
+                Src::MicLevel(level) => return Some(Event::MicLevel { level }),
                 Src::Msg(msg) => {
                     // `DmRequested` is obsolete: DMs are now created directly by
                     // whoever opens one (see `open_dm`). We deliberately do NOT
@@ -7333,6 +7454,11 @@ pub struct AudioDeviceInfo {
     pub outputs: Vec<String>,
     pub input: Option<String>,
     pub output: Option<String>,
+    /// Mic-processing settings (persisted machine-local): noise suppression
+    /// on/off, the voice-activation level (0..=100), and input gain in percent.
+    pub noise_suppress: bool,
+    pub activation_pct: u32,
+    pub input_gain_pct: u32,
 }
 
 /// Machine-local audio device preferences: which mic and speaker to use for
@@ -7340,12 +7466,39 @@ pub struct AudioDeviceInfo {
 /// same regardless of which account logs in here, and never leaves the machine,
 /// so it is stored as plain JSON next to the keystore rather than in the
 /// encrypted session.
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct AudioPrefs {
     #[serde(default)]
     input: Option<String>,
     #[serde(default)]
     output: Option<String>,
+    #[serde(default)]
+    noise_suppress: bool,
+    #[serde(default = "default_activation_pref")]
+    activation_pct: u32,
+    #[serde(default = "default_gain_pref")]
+    input_gain_pct: u32,
+}
+
+fn default_activation_pref() -> u32 {
+    DEFAULT_ACTIVATION_PCT
+}
+fn default_gain_pref() -> u32 {
+    100
+}
+
+impl Default for AudioPrefs {
+    // Hand-written (not derived) so the no-prefs-file case gets the real audio
+    // defaults, not u32 zero, exactly as the serde field defaults would give.
+    fn default() -> Self {
+        Self {
+            input: None,
+            output: None,
+            noise_suppress: false,
+            activation_pct: DEFAULT_ACTIVATION_PCT,
+            input_gain_pct: 100,
+        }
+    }
 }
 
 impl AudioPrefs {
@@ -7360,6 +7513,15 @@ impl AudioPrefs {
         if let Ok(json) = serde_json::to_vec_pretty(self) {
             let _ = std::fs::write(path, json);
         }
+    }
+}
+
+/// Await an optional channel: yield its next item, or park forever when the
+/// channel is absent, so an idle receiver can sit in a `select!` without firing.
+async fn recv_opt<T>(rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<T>>) -> Option<T> {
+    match rx.as_mut() {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
     }
 }
 

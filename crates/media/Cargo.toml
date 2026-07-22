@@ -10,6 +10,9 @@ license.workspace = true
 audiopus = "0.2.0"
 cpal = "0.18.1"
 enclave-protocol = { path = "../protocol" }
+# RNNoise (Xiph) reimplemented in pure Rust with the model weights embedded, for
+# the optional microphone noise suppressor. No C toolchain, builds everywhere.
+nnnoiseless = { version = "0.5.2", default-features = false }
 nokhwa = { version = "0.10", default-features = false, features = ["input-native"] }
 openh264 = "0.9"
 thiserror.workspace = true

@@ -55,10 +55,12 @@ crypto  media  transport
   identity key, so a ring is assembled from local group state with no key
   distribution and nobody needing to be reachable -- and the self-update `rekey`
   that heals a desynced group.
-- `enclave-media` -- the audio/video pipeline: Opus codec (`audio`), tested
-  framing/format helpers (`frame`), cpal mic/speaker device I/O (`device`),
-  H.264 encode (`video`), webcam capture (`camera`), and the per-platform
-  capture backends (`screen`, `system_audio`) behind one platform-neutral API:
+- `enclave-media` -- the audio/video pipeline: Opus codec (`audio`, plus the
+  `apply_gain` / `frame_level_pct` mic-DSP helpers), RNNoise noise suppression
+  (`denoise`, via pure-Rust `nnnoiseless`), tested framing/format helpers
+  (`frame`), cpal mic/speaker device I/O (`device`), H.264 encode (`video`),
+  webcam capture (`camera`), and the per-platform capture backends (`screen`,
+  `system_audio`) behind one platform-neutral API:
 
   | Capability | Windows | Linux (Wayland) | Linux (X11) |
   |---|---|---|---|

@@ -14,6 +14,8 @@
 
 pub mod audio;
 pub mod camera;
+/// Optional RNNoise microphone noise suppression (pure-Rust `nnnoiseless`).
+pub mod denoise;
 pub mod device;
 pub mod error;
 pub mod frame;
@@ -27,8 +29,9 @@ pub mod screen;
 pub mod system_audio;
 pub mod video;
 
-pub use audio::{AudioDecoder, AudioEncoder};
+pub use audio::{apply_gain, frame_level_pct, AudioDecoder, AudioEncoder};
 pub use camera::{camera_sources, CameraCapture, CameraSource};
+pub use denoise::NoiseSuppressor;
 pub use device::{
     input_device_names, output_device_names, AudioCapture, AudioPlayback, PlaybackSink,
 };

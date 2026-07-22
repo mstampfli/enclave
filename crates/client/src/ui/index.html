@@ -118,6 +118,15 @@ input[type="checkbox"], select { cursor: pointer; }
 
 .field { display: flex; flex-direction: column; gap: 5px; }
 .field label { font-size: 12.5px; font-weight: 550; color: var(--muted); }
+/* Audio settings: a switch row, the mic input meter, and range sliders. */
+.audio-switch { flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; }
+.audio-switch input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); flex: none; }
+.field input[type="range"] { accent-color: var(--accent); width: 100%; cursor: pointer; }
+.range-val { color: var(--ink); font-weight: 500; }
+.mic-meter { height: 8px; border-radius: 4px; background: var(--raised); overflow: hidden; }
+.mic-meter-fill { height: 100%; width: 0%; background: var(--muted); border-radius: 4px;
+  transition: width 60ms linear; }
+.mic-meter.active .mic-meter-fill { background: var(--speaking); }
 .field input, .field select, .field textarea {
   padding: 8px 10px; border-radius: var(--radius);
   background: var(--bg); border: 1px solid var(--border);
@@ -2051,6 +2060,23 @@ label.member-row:hover { background: var(--raised); }
       <div class="field">
         <label for="audio-output">Speaker</label>
         <select id="audio-output"></select>
+      </div>
+      <div class="field audio-switch">
+        <div>
+          <label for="audio-ns">Noise suppression</label>
+          <span class="hint">Removes steady background noise (fans, hum, hiss) from your microphone.</span>
+        </div>
+        <input type="checkbox" id="audio-ns">
+      </div>
+      <div class="field">
+        <label for="audio-activation">Input sensitivity</label>
+        <div class="mic-meter" id="mic-meter"><div class="mic-meter-fill" id="mic-meter-fill"></div></div>
+        <input type="range" id="audio-activation" min="0" max="100" value="15">
+        <span class="hint">Your mic transmits only while the bar is past the slider. Drag left for a more open mic, right to require louder speech.</span>
+      </div>
+      <div class="field">
+        <label for="audio-gain">Input volume <span id="audio-gain-val" class="range-val"></span></label>
+        <input type="range" id="audio-gain" min="0" max="200" value="100">
       </div>
     </div>
     <div class="divider"></div>
@@ -5218,10 +5244,14 @@ $("group-create").addEventListener("click", () => {
 });
 
 // ---- settings modal ----
+let micMonitorOn = false;
 function openSettings() {
   fillProfileEditor();
   $("s-username").value = myUsername;
   send({ type: "ListAudioDevices" });
+  // Meter the mic live so the sensitivity slider can be set against real input.
+  send({ type: "StartMicMonitor" });
+  micMonitorOn = true;
   openModal("modal-settings");
 }
 $("open-settings").addEventListener("click", openSettings);
@@ -5442,8 +5472,30 @@ $("avatar-file").addEventListener("change", (e) => {
 });
 
 $("copy-username").addEventListener("click", () => { copyText(myUsername); toast("Copied your username: " + myUsername); });
-$("audio-input").addEventListener("change", (e) => send({ type: "SetInputDevice", name: e.target.value }));
+$("audio-input").addEventListener("change", (e) => {
+  send({ type: "SetInputDevice", name: e.target.value });
+  // Re-point the live meter at the newly chosen microphone.
+  if (micMonitorOn) { send({ type: "StopMicMonitor" }); send({ type: "StartMicMonitor" }); }
+});
 $("audio-output").addEventListener("change", (e) => send({ type: "SetOutputDevice", name: e.target.value }));
+$("audio-ns").addEventListener("change", (e) => send({ type: "SetNoiseSuppression", on: e.target.checked }));
+$("audio-activation").addEventListener("input", (e) => {
+  send({ type: "SetActivation", pct: Number(e.target.value) });
+  setMicMeter(lastMicLevel); // re-evaluate the active tint against the new threshold
+});
+$("audio-gain").addEventListener("input", (e) => {
+  $("audio-gain-val").textContent = e.target.value + "%";
+  send({ type: "SetInputGain", pct: Number(e.target.value) });
+});
+// Paint the mic meter to `level` (0..100) and tint it green while the input is
+// past the activation threshold (i.e. it would transmit).
+let lastMicLevel = 0;
+function setMicMeter(level) {
+  lastMicLevel = level;
+  $("mic-meter-fill").style.width = level + "%";
+  const thresh = Number($("audio-activation").value);
+  $("mic-meter").classList.toggle("active", level > thresh);
+}
 $("export-btn").addEventListener("click", () => send({ type: "ExportSession" }));
 $("import-btn").addEventListener("click", () => {
   askInput(
@@ -5724,6 +5776,7 @@ $("ring-decline").addEventListener("click", () => {
 function openModal(id) { closeModals(); $(id).hidden = false; }
 function closeModals() {
   document.querySelectorAll(".overlay").forEach((o) => { o.hidden = true; });
+  if (micMonitorOn) { send({ type: "StopMicMonitor" }); micMonitorOn = false; setMicMeter(0); }
   setTimeout(focusComposer, 0);
 }
 document.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", closeModals));
@@ -7102,6 +7155,14 @@ window.onEnclaveEvent = (ev) => {
     case "AudioDevices":
       fillDevices($("audio-input"), ev.inputs, ev.input);
       fillDevices($("audio-output"), ev.outputs, ev.output);
+      $("audio-ns").checked = ev.noise_suppress;
+      $("audio-activation").value = ev.activation_pct;
+      $("audio-gain").value = ev.input_gain_pct;
+      $("audio-gain-val").textContent = ev.input_gain_pct + "%";
+      setMicMeter(0);
+      break;
+    case "MicLevel":
+      setMicMeter(ev.level);
       break;
     case "Presence":
       presence[ev.user] = ev.status; renderConvoList(); renderPeople();

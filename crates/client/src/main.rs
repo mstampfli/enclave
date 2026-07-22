@@ -159,6 +159,21 @@ enum UiCommand {
     SetOutputDevice {
         name: String,
     },
+    /// Toggle microphone noise suppression.
+    SetNoiseSuppression {
+        on: bool,
+    },
+    /// Set the voice-activation level (0..=100; 0 = open mic).
+    SetActivation {
+        pct: u32,
+    },
+    /// Set the mic input gain in percent (100 = unity).
+    SetInputGain {
+        pct: u32,
+    },
+    /// Begin/stop metering the mic for the settings input meter.
+    StartMicMonitor,
+    StopMicMonitor,
     /// Open (or focus) a 1:1 DM with a friend handle.
     OpenDm {
         handle: String,
@@ -1069,12 +1084,20 @@ enum UiEvent {
     CallState {
         in_call: bool,
     },
-    /// The available audio devices and current selection for the settings modal.
+    /// The available audio devices and current selection for the settings modal,
+    /// with the mic-processing settings (noise suppression, activation, gain).
     AudioDevices {
         inputs: Vec<String>,
         outputs: Vec<String>,
         input: Option<String>,
         output: Option<String>,
+        noise_suppress: bool,
+        activation_pct: u32,
+        input_gain_pct: u32,
+    },
+    /// The live microphone level (0..=100) while the settings meter is open.
+    MicLevel {
+        level: u8,
     },
     /// An incoming call started in `conv`, from display name `from`: ring.
     CallOffer {
@@ -1641,6 +1664,9 @@ fn emit_audio_devices(proxy: &EventLoopProxy<UiEvent>, c: &Client) {
             outputs: info.outputs,
             input: info.input,
             output: info.output,
+            noise_suppress: info.noise_suppress,
+            activation_pct: info.activation_pct,
+            input_gain_pct: info.input_gain_pct,
         },
     );
 }
@@ -1871,6 +1897,7 @@ async fn run_client(
                 Event::Speaking { from, speaking } => {
                     emit(&proxy, UiEvent::Speaking { from, speaking })
                 }
+                Event::MicLevel { level } => emit(&proxy, UiEvent::MicLevel { level }),
                 Event::WorkspacesChanged => {
                     if let Some(c) = client.as_ref() {
                         emit(
@@ -2452,6 +2479,31 @@ async fn handle_command(
                     error_status(proxy, format!("Could not switch speaker: {e}"));
                 }
                 emit_audio_devices(proxy, c);
+            }
+        }
+        UiCommand::SetNoiseSuppression { on } => {
+            if let Some(c) = client.as_mut() {
+                c.set_noise_suppression(on);
+            }
+        }
+        UiCommand::SetActivation { pct } => {
+            if let Some(c) = client.as_mut() {
+                c.set_activation_pct(pct);
+            }
+        }
+        UiCommand::SetInputGain { pct } => {
+            if let Some(c) = client.as_mut() {
+                c.set_input_gain_pct(pct);
+            }
+        }
+        UiCommand::StartMicMonitor => {
+            if let Some(c) = client.as_mut() {
+                c.start_mic_monitor();
+            }
+        }
+        UiCommand::StopMicMonitor => {
+            if let Some(c) = client.as_mut() {
+                c.stop_mic_monitor();
             }
         }
         UiCommand::OpenDm { handle } => {
