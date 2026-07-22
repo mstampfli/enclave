@@ -6200,12 +6200,13 @@ document.addEventListener("dragover", (e) => {
   f.style.top = e.clientY + 6 + "px";
 });
 function makeDraggable(el, item) {
-  el.addEventListener("pointerdown", () => fillDragFollower(el));
   el.addEventListener("dragstart", (e) => {
     dragItem = item;
-    // Only set transfer data + hide the native ghost here; mutating layout in
-    // dragstart cancels the drag in WebKit, and the follower was built on
-    // pointerdown. Dim the source next tick so you can see what you grabbed.
+    // Build the follower from THIS element (the one actually being dragged) so it
+    // always shows the right row. Safe in dragstart: the follower is hidden, so
+    // filling it reflows nothing visible (which is what cancels a WebKit drag).
+    fillDragFollower(el);
+    // Set transfer data + hide the native ghost. Dim the source next tick.
     if (e.dataTransfer) {
       e.dataTransfer.effectAllowed = "move";
       e.dataTransfer.setData("text/plain", item.type + ":" + item.id);
