@@ -4411,21 +4411,18 @@ impl Client {
 
     /// Start metering the mic for the settings input meter: capture from the
     /// selected input, run the same suppression + gain a call would, and stream
-    /// the 0..=100 level out as [`Event::MicLevel`]. Idempotent; if the mic is
-    /// missing or busy the meter simply stays flat. Stop it with
+    /// the 0..=100 level out as [`Event::MicLevel`]. Idempotent. Returns the
+    /// capture error if the microphone cannot be opened, so the UI can say so
+    /// instead of showing a silently flat meter. Stop it with
     /// [`stop_mic_monitor`](Self::stop_mic_monitor).
-    pub fn start_mic_monitor(&mut self) {
+    pub fn start_mic_monitor(&mut self) -> Result<(), ClientError> {
         if self.mic_monitor.is_some() {
-            return;
+            return Ok(());
         }
         let (frame_tx, frame_rx) = std::sync::mpsc::channel::<Vec<i16>>();
-        let capture = match enclave_media::AudioCapture::start_on_into(
-            self.input_device.as_deref(),
-            frame_tx,
-        ) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
+        let capture =
+            enclave_media::AudioCapture::start_on_into(self.input_device.as_deref(), frame_tx)
+                .map_err(|e| ClientError::Audio(e.to_string()))?;
         let (level_tx, level_rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
         let ns = self.audio_ns.clone();
         let gain = self.audio_gain.clone();
@@ -4452,6 +4449,7 @@ impl Client {
         });
         self.mic_monitor = Some(capture);
         self.mic_level_rx = Some(level_rx);
+        Ok(())
     }
 
     /// Stop the settings mic monitor (drops the capture, which ends its thread).

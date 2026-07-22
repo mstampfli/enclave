@@ -2498,7 +2498,9 @@ async fn handle_command(
         }
         UiCommand::StartMicMonitor => {
             if let Some(c) = client.as_mut() {
-                c.start_mic_monitor();
+                if let Err(e) = c.start_mic_monitor() {
+                    error_status(proxy, format!("Could not open the microphone: {e}"));
+                }
             }
         }
         UiCommand::StopMicMonitor => {

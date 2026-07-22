@@ -148,9 +148,10 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance
 .sens-wrap { position: relative; height: 16px; }
 .sens-wrap .mic-meter { position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%); }
 .sens-wrap input[type="range"] { position: absolute; left: 0; right: 0; top: 0; }
-/* Transparent track so the meter shows through; the thumb centres on the 6px meter. */
+/* Transparent track so the meter shows through; the thumb centres on the 6px meter
+   and keeps the same panel-coloured ring as the volume slider, so the two match. */
 .sens-wrap input[type="range"]::-webkit-slider-runnable-track { height: 6px; background: transparent; }
-.sens-wrap input[type="range"]::-webkit-slider-thumb { margin-top: -4px; border-color: var(--bg); }
+.sens-wrap input[type="range"]::-webkit-slider-thumb { margin-top: -4px; }
 .field input:not([type="checkbox"]):not([type="range"]), .field select, .field textarea {
   padding: 8px 10px; border-radius: var(--radius);
   background: var(--bg); border: 1px solid var(--border);
@@ -327,7 +328,7 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance
 .swatches { display: flex; flex-wrap: wrap; gap: 8px; }
 .swatch { width: 24px; height: 24px; border-radius: var(--radius); cursor: pointer;
   border: 1px solid var(--border); padding: 0; }
-.swatch.sel { box-shadow: 0 0 0 2px var(--panel), 0 0 0 3px var(--ink); }
+.swatch.sel { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent); }
 .swatch.none { display: grid; place-items: center; background: var(--raised); color: var(--muted); }
 /* Profile card: an accent banner, the avatar overlapping it, then a left-aligned
    identity block, badges, and a details card (status / about / shared groups). */
@@ -5320,6 +5321,10 @@ function setAccent(color) {
   if (!profiles[myUsername]) profiles[myUsername] = {};
   profiles[myUsername].accent = color;
   renderAccentSwatches(color);
+  // Apply it at once (the avatar preview + every avatar of ours), rather than
+  // waiting for the server to echo the change back.
+  paintAvatar($("edit-avatar"), myUsername, myDisplay || myUsername);
+  queueProfileRender();
   send({ type: "SetAccent", accent: color });
 }
 
