@@ -133,6 +133,42 @@ accepted posture; it is called out explicitly rather than hidden.
 
 ---
 
+## 4b. Channel attachments (files & voice messages)
+
+A channel post is not text-only: it carries an optional embedded **file or voice
+clip**, so a text channel behaves like a group chat minus calls. The plaintext is
+`ChannelWire { id, sender, text, ts, sig, attach: Option<ChannelAttach> }`
+(`client::lib`); `ChannelAttach { name, bytes, voice_ms, waveform }` holds the media
+inline (channels have no separate transfer path). Rules:
+
+- **Bounded.** An attachment is capped at `CHANNEL_ATTACH_MAX` (8 MB); the sender
+  refuses a larger file up front and a receiver drops an over-cap one (defense in
+  depth against a hostile peer).
+- **Authenticated end to end.** The signed body binds `channel_attach_hash(attach)`
+  -- a SHA-256 over *every* attachment field (name, `voice_ms`, waveform, bytes),
+  length-prefixed. Because the history key is symmetric (any co-member could
+  re-seal a post), binding only the bytes would let a member swap the displayed
+  filename or voice duration under the original signature; hashing the whole
+  attachment closes that. A mismatch fails `verify_op` and the post is dropped.
+- **Backward compatible.** Posts sealed before attachments existed decode via
+  `ChannelWireV1` (the old 5-field wire) and verify against the pre-attachment body
+  (`channel_msg_body_v1`); new posts always use `ChannelWire`. bincode's missing
+  trailing `Option` byte is what distinguishes the two on the wire.
+- **Same store paths as DMs.** A received file lands in the download cache
+  (`store_channel_file_at`, path-sanitized); a voice clip lands in the voice cache
+  (`store_voice_at`). The UI renders both with the shared message renderer, so file
+  rows and the voice player look identical to a conversation.
+
+Still DM-only (not yet on the channel path): polls, reactions, replies, pins. These
+need the full group-message-path unification; the composer hides the poll option in
+a channel rather than offer a control that does nothing.
+
+Tests: `a_file_round_trips_through_a_workspace_channel` (end-to-end through the
+relay, plus the over-cap refusal), `channel_wire_tests` (format discrimination and
+the every-field hash binding).
+
+---
+
 ## 5. Voice channels
 
 A voice channel is a channel-group with an **always-joinable persistent call**:
@@ -184,8 +220,9 @@ per-channel key.
 - **Workspace rail**: a left strip of workspace icons (like Discord), above/left
   of the existing conversation sidebar. Selecting a workspace swaps the sidebar to
   its **category -> channel tree**; DMs/home stay reachable.
-- **Channel view** reuses the current chat surface wholesale (composer, messages,
-  polls, files). A voice channel shows a connected-members panel + join button.
+- **Channel view** reuses the current chat surface (composer, message renderer,
+  files and voice messages; polls are still DM-only, see section 4b). A voice
+  channel shows a connected-members panel + join button.
 - **Management** (create channel, roles, invites, private-channel membership)
   behind an admin panel gated by the client-verified role.
 - Reuses: the whole message renderer, the call UI, the profile card, search

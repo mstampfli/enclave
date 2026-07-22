@@ -119,6 +119,8 @@ pub enum ClientError {
     Profile(String),
     #[error("workspace: {0}")]
     Workspace(String),
+    #[error("file: {0}")]
+    File(String),
 }
 
 /// One channel message in local history (the decrypted, authenticated form).
@@ -130,6 +132,11 @@ struct ChannelMsg {
     text: String,
     ts: u64,
     mine: bool,
+    /// An attached file (or voice clip, when `voice_ms > 0`), written to the local
+    /// cache; `None` for a plain text post.
+    file: Option<FileRef>,
+    voice_ms: u32,
+    waveform: Vec<u8>,
 }
 
 /// A channel message as the UI reads it (hex ids, resolved fields).
@@ -140,6 +147,9 @@ pub struct ChannelLine {
     pub text: String,
     pub ts: u64,
     pub mine: bool,
+    pub file: Option<FileRef>,
+    pub voice_ms: u32,
+    pub waveform: Vec<u8>,
 }
 
 /// The plaintext of a channel post, sealed under the channel's history key. The
@@ -153,10 +163,69 @@ struct ChannelWire {
     sender: String,
     text: String,
     ts: u64,
-    /// `sign_op(WS_CHANNEL_MSG_CONTEXT, body)` by `sender`'s identity key, where
-    /// body binds the channel too (so a message cannot be moved between channels).
+    /// `sign_op(WS_CHANNEL_MSG_CONTEXT, body)` by `sender`'s identity key, where the
+    /// body binds the channel, text, AND the attachment (via its hash), so a post
+    /// cannot be moved between channels or have its file swapped.
+    sig: Vec<u8>,
+    /// An embedded file or voice clip, or `None` for a plain text post. Carried in
+    /// the sealed post itself (channels have no separate transfer path), bounded to
+    /// [`CHANNEL_ATTACH_MAX`].
+    #[serde(default)]
+    attach: Option<ChannelAttach>,
+}
+
+/// The old text-only channel post (before attachments), so posts sealed in the
+/// previous format still deserialize -- new posts always use [`ChannelWire`].
+#[derive(serde::Deserialize)]
+struct ChannelWireV1 {
+    id: [u8; 16],
+    sender: String,
+    text: String,
+    ts: u64,
     sig: Vec<u8>,
 }
+
+/// A file or voice clip embedded in a channel post.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct ChannelAttach {
+    /// File name, or "Voice message" for a voice clip.
+    name: String,
+    /// The media bytes, embedded directly in the (already-sealed) post.
+    bytes: Vec<u8>,
+    /// Voice clip duration in ms (0 for a plain file).
+    voice_ms: u32,
+    /// Voice waveform samples (empty for a plain file).
+    waveform: Vec<u8>,
+}
+
+/// SHA-256 over the WHOLE attachment (name, voice duration, waveform, and bytes),
+/// all-zero when there is none. Bound into the signed body so no field of the
+/// attachment can be altered under the same signature -- not just the media, but
+/// the displayed name and voice metadata too. Any co-member holds the channel key
+/// and could re-seal a post, so every attachment field must be authenticated, not
+/// only the bytes. Fields are length-prefixed so distinct attachments cannot
+/// collide by shifting a boundary.
+fn channel_attach_hash(attach: &Option<ChannelAttach>) -> [u8; 32] {
+    match attach {
+        Some(a) => {
+            let mut h = Sha256::new();
+            h.update((a.name.len() as u64).to_le_bytes());
+            h.update(a.name.as_bytes());
+            h.update(a.voice_ms.to_le_bytes());
+            h.update((a.waveform.len() as u64).to_le_bytes());
+            h.update(&a.waveform);
+            h.update((a.bytes.len() as u64).to_le_bytes());
+            h.update(&a.bytes);
+            h.finalize().into()
+        }
+        None => [0u8; 32],
+    }
+}
+
+/// Largest attachment embeddable in one channel post. Channels have no chunked
+/// transfer, so the media rides inside the sealed message; this keeps a post well
+/// under the signaling frame limit. Voice clips and typical images fit.
+const CHANNEL_ATTACH_MAX: usize = 8 * 1024 * 1024;
 
 /// A bundle of channel history keys, sealed under the WG when shared. One entry
 /// per `(channel, epoch)` a member is entitled to.
@@ -181,8 +250,23 @@ fn parse_permissions(tokens: &[String]) -> Vec<enclave_protocol::Permission> {
         .collect()
 }
 
-/// The signed body for a channel message: binds channel, id, sender, text, ts.
+/// The signed body of a channel message: binds channel, id, sender, text, ts, and
+/// the attachment hash (all-zero for none), so none of these can be altered under
+/// the same signature.
 fn channel_msg_body(
+    channel: &[u8; 16],
+    id: &[u8; 16],
+    sender: &str,
+    text: &str,
+    ts: u64,
+    attach_hash: &[u8; 32],
+) -> Vec<u8> {
+    bincode::serialize(&(channel, id, sender, text, ts, attach_hash)).unwrap_or_default()
+}
+
+/// The pre-attachment signed body (no attachment hash), for verifying posts sealed
+/// in the old [`ChannelWireV1`] format.
+fn channel_msg_body_v1(
     channel: &[u8; 16],
     id: &[u8; 16],
     sender: &str,
@@ -422,6 +506,10 @@ pub enum Event {
         text: String,
         ts: u64,
         mine: bool,
+        /// An attached file/voice clip written to the local cache, if any.
+        file: Option<FileRef>,
+        voice_ms: u32,
+        waveform: Vec<u8>,
     },
     /// A channel's stored history changed (a fetched page landed: newest catch-up
     /// or older backfill). The UI re-reads the channel's messages from the client.
@@ -1022,20 +1110,22 @@ pub struct Client {
 }
 
 /// A recorded-and-encoded voice message waiting for the user to send or discard.
+/// `group` is the conversation it will seal to, or `None` when it was recorded
+/// for a workspace channel (which seals under the channel key, not a group).
 struct PendingVoice {
     bytes: Vec<u8>,
     duration_ms: u32,
     waveform: Vec<u8>,
-    group: GroupId,
+    group: Option<GroupId>,
 }
 
 /// A voice message being recorded: the live mic capture (kept alive so the stream
-/// keeps running), the frame channel it feeds, when it began, and which
-/// conversation it is for.
+/// keeps running), the frame channel it feeds, and which conversation it is for
+/// (`None` for a workspace channel, which has no active MLS group).
 struct VoiceRec {
     _capture: enclave_media::AudioCapture,
     rx: std::sync::mpsc::Receiver<Vec<i16>>,
-    group: GroupId,
+    group: Option<GroupId>,
 }
 
 impl Client {
@@ -2114,7 +2204,9 @@ impl Client {
                 "can't record a voice message during a call".into(),
             ));
         }
-        let group = self.active.clone().ok_or(ClientError::NoGroup)?;
+        // The group is only needed by the conversation send path; a channel
+        // recording has no active group and seals under the channel key instead.
+        let group = self.active.clone();
         let (capture, rx) =
             enclave_media::AudioCapture::start().map_err(|e| ClientError::Audio(e.to_string()))?;
         self.voice_rec = Some(VoiceRec {
@@ -2195,6 +2287,9 @@ impl Client {
             waveform,
             group,
         } = pending;
+        // A conversation voice message needs its group; a channel recording is
+        // sent via send_channel_voice instead, never here.
+        let group = group.ok_or(ClientError::NoGroup)?;
         // "Notes to self" is local-only: cache the clip and record it with a
         // fresh local id, but never seal or send it. Everything else is identical.
         let id = if self.is_local_only(&group) {
@@ -5117,14 +5212,87 @@ impl Client {
         Ok(())
     }
 
-    /// Post a text message to a channel: sign it with our identity key (sender
-    /// authenticity), seal under the channel's current history key (confidentiality),
-    /// and send it. The relay stores it for scrollback and fans it to members.
+    /// Post a text message to a channel. See [`post_channel`](Self::post_channel).
     pub fn send_channel_post(
         &mut self,
         ws_hex: &str,
         channel_hex: &str,
         text: &str,
+    ) -> Result<(), ClientError> {
+        self.post_channel(ws_hex, channel_hex, text, None)
+    }
+
+    /// Post a file to a channel: the bytes are read, size-checked, and embedded in
+    /// the sealed post (channels have no chunked transfer). Reuses the DM file cache
+    /// so the sender's own copy renders immediately.
+    pub fn send_channel_file(
+        &mut self,
+        ws_hex: &str,
+        channel_hex: &str,
+        path: &str,
+    ) -> Result<(), ClientError> {
+        let bytes = std::fs::read(path).map_err(|e| ClientError::File(e.to_string()))?;
+        if bytes.len() > CHANNEL_ATTACH_MAX {
+            return Err(ClientError::Workspace(format!(
+                "files in channels are limited to {} MB",
+                CHANNEL_ATTACH_MAX / (1024 * 1024)
+            )));
+        }
+        let name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        self.post_channel(
+            ws_hex,
+            channel_hex,
+            "",
+            Some(ChannelAttach {
+                name,
+                bytes,
+                voice_ms: 0,
+                waveform: Vec::new(),
+            }),
+        )
+    }
+
+    /// Post the recorded voice message ([`start_voice`]/[`stop_voice`]) to a channel.
+    pub fn send_channel_voice(
+        &mut self,
+        ws_hex: &str,
+        channel_hex: &str,
+    ) -> Result<(), ClientError> {
+        let pending = self
+            .voice_pending
+            .take()
+            .ok_or_else(|| ClientError::Audio("no voice message to send".into()))?;
+        if pending.bytes.len() > CHANNEL_ATTACH_MAX {
+            return Err(ClientError::Audio("voice message too large".into()));
+        }
+        self.post_channel(
+            ws_hex,
+            channel_hex,
+            "",
+            Some(ChannelAttach {
+                name: "Voice message".into(),
+                bytes: pending.bytes,
+                voice_ms: pending.duration_ms,
+                waveform: pending.waveform,
+            }),
+        )
+    }
+
+    /// Post to a channel: sign with our identity key (sender authenticity, binding
+    /// the attachment hash too), seal under the channel's current history key
+    /// (confidentiality), and send. The relay stores it for scrollback and fans it
+    /// to members. A file/voice attachment is written to the local cache so our own
+    /// echo renders it.
+    fn post_channel(
+        &mut self,
+        ws_hex: &str,
+        channel_hex: &str,
+        text: &str,
+        attach: Option<ChannelAttach>,
     ) -> Result<(), ClientError> {
         let me = self.me()?;
         let ws = decode_offer_id(ws_hex)
@@ -5141,7 +5309,14 @@ impl Client {
             .ok_or_else(|| ClientError::Workspace("no channel key yet".into()))?;
         let epoch = (keys.len() - 1) as u64;
         let key = keys[epoch as usize];
-        let body = channel_msg_body(&channel, &msg_id, &me, text, ts);
+        let body = channel_msg_body(
+            &channel,
+            &msg_id,
+            &me,
+            text,
+            ts,
+            &channel_attach_hash(&attach),
+        );
         let sig = {
             let identity = self.identity.as_ref().ok_or(ClientError::NotLoggedIn)?;
             identity.sign_op(WS_CHANNEL_MSG_CONTEXT, &body)?
@@ -5152,9 +5327,13 @@ impl Client {
             text: text.to_string(),
             ts,
             sig,
+            attach: attach.clone(),
         };
         let plaintext = bincode::serialize(&wire).unwrap_or_default();
         let sealed = enclave_crypto::seal_channel(&key, &channel, epoch, &plaintext)?;
+        // Our own copy of any attachment, written to the same cache received files
+        // use, so our echo renders the file/voice player immediately.
+        let (file, voice_ms, waveform) = self.store_channel_attach(msg_id, &attach);
         self.channel_history
             .entry((ws, channel))
             .or_default()
@@ -5164,6 +5343,9 @@ impl Client {
                 text: text.to_string(),
                 ts,
                 mine: true,
+                file: file.clone(),
+                voice_ms,
+                waveform: waveform.clone(),
             });
         self.conn.send(ClientMsg::ChannelPost {
             workspace: ws,
@@ -5179,8 +5361,46 @@ impl Client {
             text: text.to_string(),
             ts,
             mine: true,
+            file,
+            voice_ms,
+            waveform,
         });
         Ok(())
+    }
+
+    /// Write a channel attachment's bytes to the local cache, returning the
+    /// resulting [`FileRef`] + voice metadata for the message record. `None` in ->
+    /// `(None, 0, [])`.
+    fn store_channel_attach(
+        &self,
+        msg_id: [u8; 16],
+        attach: &Option<ChannelAttach>,
+    ) -> (Option<FileRef>, u32, Vec<u8>) {
+        let Some(a) = attach else {
+            return (None, 0, Vec::new());
+        };
+        let path = if a.voice_ms > 0 {
+            self.store_voice_at(&hex::encode(msg_id), &a.bytes)
+        } else {
+            self.store_channel_file_at(&hex::encode(msg_id), &a.name, &a.bytes)
+        };
+        let file = path.map(|p| FileRef {
+            name: a.name.clone(),
+            size: a.bytes.len() as u64,
+            path: p,
+        });
+        (file, a.voice_ms, a.waveform.clone())
+    }
+
+    /// Write a received channel file to the downloads dir under a safe name, keyed
+    /// by the message id so re-receipt is idempotent. Returns its path.
+    fn store_channel_file_at(&self, msg_id_hex: &str, name: &str, bytes: &[u8]) -> Option<String> {
+        let dir = self.downloads_dir();
+        std::fs::create_dir_all(&dir).ok()?;
+        let safe = safe_file_name(name);
+        let path = dir.join(format!("{msg_id_hex}-{safe}"));
+        std::fs::write(&path, bytes).ok()?;
+        Some(path.to_string_lossy().into_owned())
     }
 
     /// Join a voice channel's presence so its members see us in voice. The audio
@@ -5354,6 +5574,9 @@ impl Client {
                             text: m.text.clone(),
                             ts: m.ts,
                             mine: m.mine,
+                            file: m.file.clone(),
+                            voice_ms: m.voice_ms,
+                            waveform: m.waveform.clone(),
                         })
                         .collect();
                     lines.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
@@ -5408,40 +5631,83 @@ impl Client {
     ) -> Option<Event> {
         let key = *self.channel_keys.get(&(ws, channel))?.get(epoch as usize)?;
         let plaintext = enclave_crypto::open_channel(&key, &channel, epoch, message).ok()?;
-        let wire: ChannelWire = bincode::deserialize(&plaintext).ok()?;
+        // New posts carry an optional attachment; fall back to the old text-only
+        // format for posts sealed before attachments existed.
+        let (id, sender, text, ts, sig, attach, v1) =
+            match bincode::deserialize::<ChannelWire>(&plaintext) {
+                Ok(w) => (w.id, w.sender, w.text, w.ts, w.sig, w.attach, false),
+                Err(_) => {
+                    let o: ChannelWireV1 = bincode::deserialize(&plaintext).ok()?;
+                    (o.id, o.sender, o.text, o.ts, o.sig, None, true)
+                }
+            };
+        // Defense in depth: reject an over-cap attachment from a hostile sender.
+        if attach
+            .as_ref()
+            .is_some_and(|a| a.bytes.len() > CHANNEL_ATTACH_MAX)
+        {
+            return None;
+        }
         // Sender authenticity: verify the signature against the identity key the
-        // op-log recorded for `wire.sender`. A member could seal (they hold the
-        // key) but cannot forge another member's signature.
+        // op-log recorded for `sender`. A member could seal (they hold the key) but
+        // cannot forge another member's signature, and the signed body binds the
+        // attachment hash, so the file cannot be swapped.
         let sender_key = self
             .workspaces
             .get(&ws)
-            .and_then(|st| st.members.get(&wire.sender))?
+            .and_then(|st| st.members.get(&sender))?
             .clone();
-        let body = channel_msg_body(&channel, &wire.id, &wire.sender, &wire.text, wire.ts);
-        if !enclave_crypto::verify_op(&sender_key, WS_CHANNEL_MSG_CONTEXT, &body, &wire.sig) {
+        let body = if v1 {
+            channel_msg_body_v1(&channel, &id, &sender, &text, ts)
+        } else {
+            channel_msg_body(
+                &channel,
+                &id,
+                &sender,
+                &text,
+                ts,
+                &channel_attach_hash(&attach),
+            )
+        };
+        if !enclave_crypto::verify_op(&sender_key, WS_CHANNEL_MSG_CONTEXT, &body, &sig) {
             return None; // forged or corrupt: drop
         }
-        let history = self.channel_history.entry((ws, channel)).or_default();
         // Dedup: a message may arrive both live and via a backfill fetch.
-        if history.iter().any(|m| m.id == wire.id) {
+        if self
+            .channel_history
+            .get(&(ws, channel))
+            .is_some_and(|h| h.iter().any(|m| m.id == id))
+        {
             return None;
         }
-        let mine = Some(&wire.sender) == self.username.as_ref();
-        history.push(ChannelMsg {
-            id: wire.id,
-            user: wire.sender.clone(),
-            text: wire.text.clone(),
-            ts: wire.ts,
-            mine,
-        });
+        let mine = Some(&sender) == self.username.as_ref();
+        // Write any attachment to the local cache (immutable borrow) before taking
+        // the history's &mut.
+        let (file, voice_ms, waveform) = self.store_channel_attach(id, &attach);
+        self.channel_history
+            .entry((ws, channel))
+            .or_default()
+            .push(ChannelMsg {
+                id,
+                user: sender.clone(),
+                text: text.clone(),
+                ts,
+                mine,
+                file: file.clone(),
+                voice_ms,
+                waveform: waveform.clone(),
+            });
         Some(Event::ChannelMessage {
             workspace: hex::encode(ws),
             channel: hex::encode(channel),
-            id: hex::encode(wire.id),
-            user: wire.sender,
-            text: wire.text,
-            ts: wire.ts,
+            id: hex::encode(id),
+            user: sender,
+            text,
+            ts,
             mine,
+            file,
+            voice_ms,
+            waveform,
         })
     }
 
@@ -6027,7 +6293,8 @@ impl Client {
         let sid = group_hist_id(group);
         let sig = match self.identity.as_ref() {
             Some(idn) => {
-                let body = channel_msg_body(&sid, &id, sender, text, ts);
+                // Group history is text-only (no attachment), so a zero attach hash.
+                let body = channel_msg_body(&sid, &id, sender, text, ts, &[0u8; 32]);
                 match idn.sign_op(WS_CHANNEL_MSG_CONTEXT, &body) {
                     Ok(s) => s,
                     Err(_) => return,
@@ -6041,6 +6308,7 @@ impl Client {
             text: text.to_string(),
             ts,
             sig,
+            attach: None,
         };
         let plaintext = bincode::serialize(&wire).unwrap_or_default();
         if let Ok(sealed) = enclave_crypto::seal_channel(&key, &sid, epoch, &plaintext) {
@@ -6131,8 +6399,24 @@ impl Client {
             let Ok(pt) = enclave_crypto::open_channel(&key, &sid, epoch, &sealed.0) else {
                 continue;
             };
-            let Ok(wire) = bincode::deserialize::<ChannelWire>(&pt) else {
-                continue;
+            // Group history is text-only; accept both the current and the old
+            // (pre-attachment) wire formats so scrollback sealed either way opens.
+            let (wire, v1) = match bincode::deserialize::<ChannelWire>(&pt) {
+                Ok(w) => (w, false),
+                Err(_) => match bincode::deserialize::<ChannelWireV1>(&pt) {
+                    Ok(o) => (
+                        ChannelWire {
+                            id: o.id,
+                            sender: o.sender,
+                            text: o.text,
+                            ts: o.ts,
+                            sig: o.sig,
+                            attach: None,
+                        },
+                        true,
+                    ),
+                    Err(_) => continue,
+                },
             };
             let sender_key = self
                 .conversations
@@ -6147,7 +6431,18 @@ impl Client {
             let Some(sender_key) = sender_key else {
                 continue;
             };
-            let body = channel_msg_body(&sid, &wire.id, &wire.sender, &wire.text, wire.ts);
+            let body = if v1 {
+                channel_msg_body_v1(&sid, &wire.id, &wire.sender, &wire.text, wire.ts)
+            } else {
+                channel_msg_body(
+                    &sid,
+                    &wire.id,
+                    &wire.sender,
+                    &wire.text,
+                    wire.ts,
+                    &[0u8; 32],
+                )
+            };
             if !enclave_crypto::verify_op(&sender_key, WS_CHANNEL_MSG_CONTEXT, &body, &wire.sig) {
                 continue;
             }
@@ -7799,5 +8094,103 @@ mod file_security_tests {
         assert!(p2.to_string_lossy().contains("(1)"), "got {p2:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod channel_wire_tests {
+    use super::{channel_attach_hash, ChannelAttach, ChannelWire, ChannelWireV1};
+
+    fn attach(name: &str, bytes: &[u8], voice_ms: u32, wf: &[u8]) -> ChannelAttach {
+        ChannelAttach {
+            name: name.to_string(),
+            bytes: bytes.to_vec(),
+            voice_ms,
+            waveform: wf.to_vec(),
+        }
+    }
+
+    // A post sealed in the OLD text-only format (5 fields) must NOT deserialize as
+    // the new ChannelWire (its trailing Option byte is missing) so the receiver
+    // falls back to ChannelWireV1 -- and a new post (with attach=None) MUST take
+    // the ChannelWire path. This discrimination is what keeps old scrollback
+    // readable while new posts verify against the attachment-hashing body.
+    #[test]
+    fn old_and_new_channel_wire_formats_are_distinguished() {
+        // bincode encodes a struct identically to a tuple of its fields in order,
+        // so this is byte-for-byte an old ChannelWireV1 without giving the prod
+        // struct a Serialize impl it never needs.
+        let v1_bytes = bincode::serialize(&(
+            [1u8; 16],
+            "alice#0001".to_string(),
+            "hi".to_string(),
+            42u64,
+            vec![9u8; 8],
+        ))
+        .unwrap();
+        // Old blob: new struct fails, old struct succeeds.
+        assert!(
+            bincode::deserialize::<ChannelWire>(&v1_bytes).is_err(),
+            "an old 5-field post must not masquerade as the new format"
+        );
+        assert!(bincode::deserialize::<ChannelWireV1>(&v1_bytes).is_ok());
+
+        let v2 = ChannelWire {
+            id: [1u8; 16],
+            sender: "alice#0001".into(),
+            text: "hi".into(),
+            ts: 42,
+            sig: vec![9u8; 8],
+            attach: None,
+        };
+        let v2_bytes = bincode::serialize(&v2).unwrap();
+        // New blob (even with no attachment) takes the new path.
+        let round = bincode::deserialize::<ChannelWire>(&v2_bytes).unwrap();
+        assert_eq!(round.text, "hi");
+        assert!(round.attach.is_none());
+    }
+
+    // The attachment hash bound into the signature must cover EVERY field, so a
+    // co-member (who holds the channel key and could re-seal) cannot alter the
+    // name, voice duration, waveform, or bytes under the original signature.
+    #[test]
+    fn attach_hash_binds_every_field() {
+        let base = Some(attach("invoice.pdf", b"PDF-DATA", 0, &[]));
+        let h = channel_attach_hash(&base);
+
+        // None hashes to the zero sentinel, distinct from any real attachment.
+        assert_eq!(channel_attach_hash(&None), [0u8; 32]);
+        assert_ne!(h, [0u8; 32]);
+
+        // Changing any single field changes the hash.
+        assert_ne!(
+            h,
+            channel_attach_hash(&Some(attach("cat.jpg", b"PDF-DATA", 0, &[])))
+        );
+        assert_ne!(
+            h,
+            channel_attach_hash(&Some(attach("invoice.pdf", b"EVIL", 0, &[])))
+        );
+        assert_ne!(
+            h,
+            channel_attach_hash(&Some(attach("invoice.pdf", b"PDF-DATA", 1, &[])))
+        );
+        assert_ne!(
+            h,
+            channel_attach_hash(&Some(attach("invoice.pdf", b"PDF-DATA", 0, &[7])))
+        );
+
+        // Length-prefixing stops a boundary shift from colliding (name "ab"+bytes
+        // "c" vs name "a"+bytes "bc").
+        assert_ne!(
+            channel_attach_hash(&Some(attach("ab", b"c", 0, &[]))),
+            channel_attach_hash(&Some(attach("a", b"bc", 0, &[])))
+        );
+
+        // Same content hashes the same (deterministic).
+        assert_eq!(
+            h,
+            channel_attach_hash(&Some(attach("invoice.pdf", b"PDF-DATA", 0, &[])))
+        );
     }
 }

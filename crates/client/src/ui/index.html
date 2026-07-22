@@ -1050,10 +1050,6 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance
 .voice-btn { width: 32px; height: 32px; display: grid; place-items: center; flex: none;
   border-radius: var(--radius); color: var(--muted); background: none; border: none; cursor: pointer; }
 .voice-btn:hover { background: var(--raised); color: var(--ink); }
-/* Channels are text-only for now: hide the file/poll and voice-message controls
-   there rather than show buttons that cannot work. */
-#composer-bar.channel-mode .attach-wrap,
-#composer-bar.channel-mode .voice-btn { display: none; }
 .voice-rec { display: flex; align-items: center; gap: 10px; }
 .voice-rec .vr-x { width: 32px; height: 32px; display: grid; place-items: center; flex: none;
   border-radius: var(--radius); color: var(--muted); background: none; border: none; cursor: pointer; }
@@ -4440,7 +4436,11 @@ function toggleAttachMenu(force) {
 }
 $("plus-btn").addEventListener("click", (e) => {
   e.stopPropagation();
-  if (!activeConv) { toast("Open a conversation first"); return; }
+  const inChannel = activeChannel && !activeConv;
+  if (!activeConv && !inChannel) { toast("Open a conversation first"); return; }
+  // Channels take files (and voice, via the mic button) but not polls yet, so
+  // only offer what actually works here rather than a dead menu item.
+  $("am-poll").hidden = inChannel;
   toggleAttachMenu();
 });
 $("am-file").addEventListener("click", () => { toggleAttachMenu(false); send({ type: "PickFiles" }); });
@@ -5042,7 +5042,6 @@ function renderChat() {
   col.innerHTML = "";
   lastGroup = null;
   $("composer-bar").hidden = !conv;
-  $("composer-bar").classList.remove("channel-mode"); // DMs keep files/polls/voice
   // No chat open: show the "Your people" home view instead of the message column.
   $("home-view").hidden = !!conv;
   $("msg-col").hidden = !conv;
@@ -5627,27 +5626,37 @@ function renderPending() {
     const nm = document.createElement("span"); nm.className = "ac-name"; nm.textContent = a.name; nm.title = a.name;
     const sz = document.createElement("span"); sz.className = "ac-size"; sz.textContent = humanSize(a.size);
     meta.append(nm, sz);
-    const live = document.createElement("button");
-    live.type = "button"; live.className = "ac-live" + (a.live ? " on" : "");
-    live.textContent = a.live ? "Live" : "Stored";
-    live.title = a.live ? "Streamed in real time (both online, any size)" : "Kept on the server so it arrives even if they're offline";
-    live.addEventListener("click", () => { a.live = !a.live; renderPending(); });
     const rm = document.createElement("button");
     rm.type = "button"; rm.className = "ac-x"; rm.setAttribute("aria-label", "Remove");
     rm.innerHTML = SVG_X;
     rm.addEventListener("click", () => { attachments.splice(i, 1); renderPending(); });
-    box.append(meta, live, rm);
+    // Channel attachments are always sealed into the post (no live streaming), so
+    // the live/stored choice only appears for conversations, where both exist.
+    if (activeChannel && !activeConv) {
+      box.append(meta, rm);
+    } else {
+      const live = document.createElement("button");
+      live.type = "button"; live.className = "ac-live" + (a.live ? " on" : "");
+      live.textContent = a.live ? "Live" : "Stored";
+      live.title = a.live ? "Streamed in real time (both online, any size)" : "Kept on the server so it arrives even if they're offline";
+      live.addEventListener("click", () => { a.live = !a.live; renderPending(); });
+      box.append(meta, live, rm);
+    }
     tray.appendChild(box);
   });
 }
 // Send: the typed message (if any) plus every attachment, in one action.
 function sendComposed() {
   const input = $("message");
-  // A workspace channel is open: post to it (channels have no file attachments yet).
+  // A workspace text channel is open: post to it exactly like a group chat,
+  // files first (so they render above the text) then the message, minus calls.
   if (activeChannel && !activeConv) {
     const text = input.value.trim();
+    for (const a of attachments) send({ type: "SendChannelFile", workspace: activeWs, channel: activeChannel, path: a.path });
     if (text) sendActiveChannelPost(text);
     input.value = "";
+    attachments = [];
+    renderPending();
     return;
   }
   if (!activeConv) return;
@@ -5742,7 +5751,7 @@ function voiceState(state) {
   $("voice-preview").hidden = state !== "preview";
 }
 $("voice-btn").addEventListener("click", () => {
-  if (!activeConv) return;
+  if (!activeConv && !(activeChannel && !activeConv)) return;
   if (inCall) { toast("Can't record a voice message during a call"); return; }
   send({ type: "StartVoice" });
   recStart = Date.now();
@@ -5757,7 +5766,13 @@ $("voice-stop").addEventListener("click", () => { send({ type: "StopVoice" }); }
 $("voice-cancel").addEventListener("click", () => { send({ type: "CancelVoice" }); voiceState("normal"); });
 previewState.dur = $("preview-time");
 wireVoicePlay($("preview-play"), $("preview-wave"), previewState);
-$("preview-send").addEventListener("click", () => { send({ type: "SendVoice" }); voiceState("normal"); });
+$("preview-send").addEventListener("click", () => {
+  // A voice message in an open channel posts to the channel; otherwise to the
+  // active conversation.
+  if (activeChannel && !activeConv) send({ type: "SendChannelVoice", workspace: activeWs, channel: activeChannel });
+  else send({ type: "SendVoice" });
+  voiceState("normal");
+});
 $("preview-discard").addEventListener("click", () => { send({ type: "CancelVoice" }); voiceState("normal"); });
 
 // ---- calls: buttons ----
@@ -6389,6 +6404,15 @@ function openChannelMenu(e, ws, ch) {
 }
 
 function openChannel(wsId, chId) {
+  // Opening a different target drops any half-composed attachments and cancels an
+  // in-progress voice recording: they belonged to the composer you were in, and a
+  // stray send must never land in the wrong channel.
+  if (chId !== activeChannel || activeConv) {
+    if (attachments.length) { attachments = []; renderPending(); }
+    if ($("voice-preview").hidden === false || $("voice-rec").hidden === false) {
+      send({ type: "CancelVoice" }); voiceState("normal");
+    }
+  }
   activeWs = wsId; activeChannel = chId;
   loadingOlder = false; // any older-page load belonged to the channel we left
   renderWsPanel();
@@ -6421,8 +6445,9 @@ function renderChannelView(ws, ch, opts) {
   $("msg-col").hidden = false;
   $("composer-bar").hidden = false;
   $("composer").hidden = false; $("composer-locked").hidden = true; $("composer-hint").hidden = true;
-  // Channels post text only (files/polls/voice messages are DM-only for now).
-  $("composer-bar").classList.add("channel-mode");
+  // Channels take text, files and voice messages (just no calls), so the attach
+  // and mic buttons stay visible; only polls are still DM-only (the plus menu
+  // hides that one item in a channel).
   $("btn-home").hidden = false;
   $("btn-members").hidden = true; $("btn-call").hidden = true; $("btn-convmenu").hidden = true;
   // A rename button in the header for managers, mirroring the right-click menu.
@@ -6466,12 +6491,13 @@ function renderChannelView(ws, ch, opts) {
 }
 
 // Shape a channel message the way appendInto/messageGroup expect: `from` drives
-// the fold key and the avatar for other people's lines; `file` stays null so the
-// text branch renders.
+// the fold key and the avatar for other people's lines; file/voice fields flow
+// through so the shared renderer draws the file row or voice player, same as a DM.
 function chanMsg(m) {
   return {
     id: m.id, ts: m.ts, text: m.text, mine: m.mine,
-    user: m.user, from: m.mine ? myUsername : m.user, file: null,
+    user: m.user, from: m.mine ? myUsername : m.user,
+    file: m.file || null, voice_ms: m.voice_ms || 0, waveform: m.waveform || [],
   };
 }
 
@@ -6510,7 +6536,8 @@ $("messages").addEventListener("scroll", onMessagesScroll);
 function onChannelMessage(ev) {
   const arr = channelMsgs[ev.channel] || (channelMsgs[ev.channel] = []);
   if (arr.some((m) => m.id === ev.id)) return;
-  const m = { id: ev.id, user: ev.user, text: ev.text, ts: ev.ts, mine: ev.mine };
+  const m = { id: ev.id, user: ev.user, text: ev.text, ts: ev.ts, mine: ev.mine,
+    file: ev.file || null, voice_ms: ev.voice_ms || 0, waveform: ev.waveform || [] };
   arr.push(m);
   if (ev.channel === activeChannel) {
     const placeholder = $("msg-col").querySelector(".empty-room");

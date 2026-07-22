@@ -2778,6 +2778,80 @@ async fn members_exchange_messages_in_a_workspace_channel() {
     assert!(owners.iter().any(|m| m.text == "hello channel" && m.mine));
 }
 
+/// Files ride channels exactly like a group chat (minus calls): a file the owner
+/// posts to a text channel is sealed under the channel key, fanned by the relay,
+/// and opens for a co-member with its bytes intact -- and an oversize file is
+/// refused up front. Proves the ChannelAttach embed/seal/relay/receive/store path.
+#[tokio::test]
+async fn a_file_round_trips_through_a_workspace_channel() {
+    let handle = serve("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", handle.addr);
+    let mut owner = account(&url, "owner").await;
+    let mut bob = account(&url, "bob").await;
+    let owner_h = owner.name().to_string();
+    let bob_h = bob.name().to_string();
+
+    let ws = owner.create_workspace("Team").unwrap();
+    pump_until(&mut owner, |c| c.workspace(&ws).is_some()).await;
+    owner.workspace_add_member(&ws, &bob_h).await.unwrap();
+    pump_until(&mut bob, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
+    })
+    .await;
+    pump_until(&mut owner, |c| {
+        c.workspace(&ws).is_some_and(|s| s.members.len() == 2)
+    })
+    .await;
+    let chan = owner.create_channel(&ws, "general", None).unwrap();
+    pump_until(&mut bob, |c| {
+        c.workspace(&ws).is_some_and(|s| !s.channels.is_empty())
+    })
+    .await;
+
+    // Write a file with known bytes and post it to the channel.
+    let contents = b"the quick brown fox jumps over the lazy dog\n\x00\x01\x02\xff".to_vec();
+    let src = std::env::temp_dir().join(format!("enclave-chanfile-{}.bin", std::process::id()));
+    std::fs::write(&src, &contents).unwrap();
+    owner
+        .send_channel_file(&ws, &chan, &src.to_string_lossy())
+        .unwrap();
+
+    // Bob receives it as a file line: same name, same size, and the bytes the core
+    // wrote to his download cache match exactly.
+    pump_until(&mut bob, |c| {
+        c.channel_history(&ws, &chan)
+            .iter()
+            .any(|m| m.file.is_some())
+    })
+    .await;
+    let bobs = bob.channel_history(&ws, &chan);
+    let line = bobs.iter().find(|m| m.file.is_some()).unwrap();
+    assert_eq!(line.user, owner_h, "file is attributed to the signer");
+    assert!(!line.mine);
+    let f = line.file.as_ref().unwrap();
+    assert_eq!(f.name, src.file_name().unwrap().to_string_lossy());
+    assert_eq!(f.size, contents.len() as u64);
+    let got = std::fs::read(&f.path).expect("bob's stored channel file");
+    assert_eq!(got, contents, "channel file bytes round-trip intact");
+
+    // The owner's own echo carries the file too.
+    let owners = owner.channel_history(&ws, &chan);
+    assert!(owners.iter().any(|m| m.mine && m.file.is_some()));
+
+    // Non-happy path: an oversize file is refused before any send.
+    let big = std::env::temp_dir().join(format!("enclave-chanbig-{}.bin", std::process::id()));
+    std::fs::write(&big, vec![7u8; 9 * 1024 * 1024]).unwrap();
+    assert!(
+        owner
+            .send_channel_file(&ws, &chan, &big.to_string_lossy())
+            .is_err(),
+        "a file over the channel attachment cap is rejected"
+    );
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&big);
+}
+
 /// A non-member online during a workspace's channel traffic receives none of it:
 /// the relay fans channel posts only to members (deny-by-default), and a
 /// non-member holds no WG key to decrypt even if they did. Membership access

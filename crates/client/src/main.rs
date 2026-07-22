@@ -497,6 +497,19 @@ enum UiCommand {
         channel: String,
         text: String,
     },
+    /// Post one attached file (from the composer tray) to a text channel. Same
+    /// path as a group-chat file, minus calls: bytes are sealed under the channel
+    /// key and fanned to members. `path` must be one the core previously reported.
+    SendChannelFile {
+        workspace: String,
+        channel: String,
+        path: String,
+    },
+    /// Post the previewed (stopped) voice message to a text channel.
+    SendChannelVoice {
+        workspace: String,
+        channel: String,
+    },
     /// Load a text channel's history (op-log gives structure; messages come via
     /// the channel keys + backfill). Emits the channel's messages.
     OpenChannel {
@@ -695,6 +708,15 @@ struct ChannelLineOut {
     text: String,
     ts: u64,
     mine: bool,
+    /// Present when this channel post carries a file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<FileLine>,
+    /// Voice-message duration in ms, or 0 if not a voice message.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    voice_ms: u32,
+    /// Amplitude envelope for a voice message's waveform (empty otherwise).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    waveform: Vec<u8>,
 }
 
 /// Build the ChannelHistory UI event from the client's current (timestamp-sorted)
@@ -712,6 +734,13 @@ fn channel_history_event(c: &enclave_client::Client, workspace: &str, channel: &
                 text: m.text,
                 ts: m.ts,
                 mine: m.mine,
+                file: m.file.map(|f| FileLine {
+                    name: f.name,
+                    size: f.size,
+                    path: f.path,
+                }),
+                voice_ms: m.voice_ms,
+                waveform: m.waveform,
             })
             .collect(),
         has_more: c.channel_has_more(workspace, channel),
@@ -1180,6 +1209,16 @@ enum UiEvent {
         text: String,
         ts: u64,
         mine: bool,
+        /// Present when this channel post carries a file (same shape as a group
+        /// chat file line).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file: Option<FileLine>,
+        /// Voice-message duration in ms, or 0 if not a voice message.
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        voice_ms: u32,
+        /// Amplitude envelope for a voice message's waveform (empty otherwise).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        waveform: Vec<u8>,
     },
     /// A voice channel's occupants changed. Each member carries their mute/deafen
     /// state so the UI can badge them.
@@ -1925,6 +1964,9 @@ async fn run_client(
                     text,
                     ts,
                     mine,
+                    file,
+                    voice_ms,
+                    waveform,
                 } => emit(
                     &proxy,
                     UiEvent::ChannelMessage {
@@ -1935,6 +1977,13 @@ async fn run_client(
                         text,
                         ts,
                         mine,
+                        file: file.map(|f| FileLine {
+                            name: f.name,
+                            size: f.size,
+                            path: f.path,
+                        }),
+                        voice_ms,
+                        waveform,
                     },
                 ),
                 Event::ChannelHistoryChanged {
@@ -3163,6 +3212,24 @@ async fn handle_command(
             if let Some(c) = client.as_mut() {
                 if let Err(e) = c.send_channel_post(&workspace, &channel, &text) {
                     error_status(proxy, format!("Could not send: {e}"));
+                }
+            }
+        }
+        UiCommand::SendChannelFile {
+            workspace,
+            channel,
+            path,
+        } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.send_channel_file(&workspace, &channel, &path) {
+                    error_status(proxy, format!("Could not send file: {e}"));
+                }
+            }
+        }
+        UiCommand::SendChannelVoice { workspace, channel } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.send_channel_voice(&workspace, &channel) {
+                    error_status(proxy, format!("Could not send voice message: {e}"));
                 }
             }
         }
