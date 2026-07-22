@@ -2329,8 +2329,13 @@ label.member-row:hover { background: var(--raised); }
         <button class="btn" style="padding:7px 12px" id="ws-invite-copy">Copy</button>
       </div>
       <button class="btn" id="ws-invite-make">Create an invite code</button>
-      <span class="hint" style="font-size:12.5px;color:var(--muted)">
-        Anyone with the code can request to join. It works for 7 days while someone who can admit them is online.</span>
+      <div class="field audio-switch" style="margin-top:12px">
+        <div>
+          <label for="ws-open-join">Open join</label>
+          <span class="hint">Anyone with the code joins instantly, with no one online to admit them. Off = an admin must approve each newcomer.</span>
+        </div>
+        <input type="checkbox" id="ws-open-join">
+      </div>
     </div>
   </div>
 </div>
@@ -6731,6 +6736,7 @@ function openWorkspaceManage() {
   $("ws-roles-section").hidden = !can(ws, "manage_roles");
   $("ws-add-section").hidden = !can(ws, "manage_members");
   $("ws-invite-section").hidden = !can(ws, "manage_members");
+  $("ws-open-join").checked = !!ws.open_join;
   renderWsMembers();
   renderWsRoles();
   openModal("modal-ws");
@@ -6923,6 +6929,10 @@ $("ws-invite-make").addEventListener("click", () => {
 $("ws-invite-copy").addEventListener("click", () => {
   const code = $("ws-invite-code").value;
   if (code) copyText(code);
+});
+$("ws-open-join").addEventListener("change", (e) => {
+  const ws = activeWsObj();
+  if (ws) send({ type: "SetJoinPolicy", workspace: ws.id, open: e.target.checked });
 });
 // The minted code lands here; show it in the manage dialog's invite row.
 function onInviteCreated(ev) {

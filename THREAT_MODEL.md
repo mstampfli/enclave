@@ -841,6 +841,28 @@ op cannot brick a log's chain for everyone. Proven by the crypto workspace tests
   online admin, so a redeemer never joins without an admin's authority and never
   escapes the op-log's record of who added them. The code is a bearer secret
   (residual risk below).
+- **Spoofing / Elevation -- self-joining an open-join workspace.** *Mitigate,
+  with a deliberate trust relaxation.* A workspace may opt into **open join**
+  (owner-set `SetJoinPolicy` op, needs `ManageMembers`): a newcomer holding a
+  valid invite self-joins by MLS **external commit** against the group's public
+  `GroupInfo` (published by members; public state only, no key), with no member
+  online. It stays end-to-end -- the server never holds a group key, and the
+  joiner derives the shared secret from the commit. Authorization is layered: the
+  relay refuses to route the `ExternalJoin` unless the invite is valid AND the
+  workspace is open-join; the op-log's `SelfJoin` op is accepted by `apply()`
+  ONLY while the workspace is open-join and ONLY for the signing author (you
+  cannot self-join as someone else -- the op's member and key must equal the
+  signer's), and the joiner lands with **no roles** (fail closed -- an owner
+  grants roles afterward). The deliberate relaxation vs admin-approval: with open
+  join the **invite code is the sole gate**, and members trust the relay to
+  enforce it (they cannot see the invite secret to verify it independently). That
+  is the whole point of the setting, it is off by default, and an admin turns it
+  on per workspace knowing the code becomes the barrier. One metadata note: the
+  published `GroupInfo` exposes the group's public tree (roughly member count +
+  public keys) to the relay -- the same metadata tier the rest of the app already
+  accepts. Proven by `a_newcomer_self_joins_by_external_commit_and_shares_the_key`,
+  `open_join_lets_a_stranger_self_join_only_when_enabled_and_only_as_themselves`,
+  and the end-to-end `open_join_lets_a_stranger_self_join_without_an_admin`.
 - **Denial of service -- relay censors (drops ops or messages).** *Accept.* A
   liveness limit inherent to depending on a server you host; it can withhold but
   cannot forge or read.

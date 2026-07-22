@@ -453,6 +453,12 @@ enum UiCommand {
         #[serde(default)]
         parent: Option<String>,
     },
+    /// Set the workspace join policy: `open` = anyone with a valid invite may
+    /// self-join without an admin admitting them.
+    SetJoinPolicy {
+        workspace: String,
+        open: bool,
+    },
     /// Rename a category.
     RenameCategory {
         workspace: String,
@@ -630,6 +636,8 @@ struct WorkspaceOut {
     name: String,
     /// Whether we are the owner (holds every permission, untouchable).
     am_owner: bool,
+    /// Whether anyone with a valid invite may self-join without an admin.
+    open_join: bool,
     /// Our effective permission tokens (e.g. "manage_channels"), for gating UI.
     my_permissions: Vec<String>,
     /// The workspace's role definitions (the built-in Owner role included, flagged).
@@ -784,6 +792,7 @@ fn workspace_views(c: &enclave_client::Client) -> Vec<WorkspaceOut> {
             id: id_hex,
             name: state.name.clone(),
             am_owner: state.is_owner(&me),
+            open_join: state.open_join,
             my_permissions,
             roles,
             categories,
@@ -3085,6 +3094,13 @@ async fn handle_command(
             if let Some(c) = client.as_mut() {
                 if let Err(e) = c.create_category(&workspace, &name, parent.as_deref()) {
                     error_status(proxy, format!("Could not create category: {e}"));
+                }
+            }
+        }
+        UiCommand::SetJoinPolicy { workspace, open } => {
+            if let Some(c) = client.as_mut() {
+                if let Err(e) = c.set_workspace_join_policy(&workspace, open) {
+                    error_status(proxy, format!("Could not change the join policy: {e}"));
                 }
             }
         }
