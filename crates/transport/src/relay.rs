@@ -1428,6 +1428,9 @@ impl Relay {
                 let Some(me) = self.conn_user.get(&from).map(|u| u.0.clone()) else {
                     return vec![];
                 };
+                // Codes are lowercase hex; tolerate stray whitespace/case from a
+                // paste so a good code is never rejected on a formatting nit.
+                let code = code.trim().to_ascii_lowercase();
                 let now = self.now_secs();
                 let ws = match self.workspaces.peek_invite(&code, now) {
                     Ok(ws) => ws,

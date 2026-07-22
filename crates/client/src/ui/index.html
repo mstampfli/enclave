@@ -141,17 +141,10 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance
    (a slider riding on the meter so the thumb marks the level to transmit at). */
 .audio-switch { flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; }
 .range-val { color: var(--ink); font-weight: 500; }
-.mic-meter { height: 6px; border-radius: 3px; background: var(--raised); overflow: hidden; }
-.mic-meter-fill { height: 100%; width: 0%; background: var(--muted); border-radius: 3px;
+.mic-meter { height: 8px; border-radius: 4px; background: var(--raised); overflow: hidden; }
+.mic-meter-fill { height: 100%; width: 0%; background: var(--muted); border-radius: 4px;
   transition: width 60ms linear; }
 .mic-meter.active .mic-meter-fill { background: var(--accent); }
-.sens-wrap { position: relative; height: 16px; }
-.sens-wrap .mic-meter { position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%); }
-.sens-wrap input[type="range"] { position: absolute; left: 0; right: 0; top: 0; }
-/* Transparent track so the meter shows through; the thumb centres on the 6px meter
-   and keeps the same panel-coloured ring as the volume slider, so the two match. */
-.sens-wrap input[type="range"]::-webkit-slider-runnable-track { height: 6px; background: transparent; }
-.sens-wrap input[type="range"]::-webkit-slider-thumb { margin-top: -4px; }
 .field input:not([type="checkbox"]):not([type="range"]), .field select, .field textarea {
   padding: 8px 10px; border-radius: var(--radius);
   background: var(--bg); border: 1px solid var(--border);
@@ -2094,11 +2087,9 @@ label.member-row:hover { background: var(--raised); }
       </div>
       <div class="field">
         <label for="audio-activation">Input sensitivity</label>
-        <div class="sens-wrap">
-          <div class="mic-meter" id="mic-meter"><div class="mic-meter-fill" id="mic-meter-fill"></div></div>
-          <input type="range" id="audio-activation" min="0" max="100" value="15">
-        </div>
-        <span class="hint">Your mic transmits only while the meter passes the slider. Lower it for a more open mic.</span>
+        <div class="mic-meter" id="mic-meter"><div class="mic-meter-fill" id="mic-meter-fill"></div></div>
+        <input type="range" id="audio-activation" min="0" max="100" value="15">
+        <span class="hint">The bar is your live input; your mic transmits only while it passes the slider. Lower the slider for a more open mic.</span>
       </div>
       <div class="field">
         <label for="audio-gain">Input volume <span id="audio-gain-val" class="range-val"></span></label>
@@ -6657,7 +6648,14 @@ $("ws-add-join").addEventListener("click", () => {
   closeModals();
   askInput("Join a workspace", "Paste an invite code. An admin admits you once you redeem it.",
     "Invite code", "Join",
-    (code) => send({ type: "RedeemInvite", code }));
+    (code) => {
+      if (!code.trim()) return;
+      send({ type: "RedeemInvite", code });
+      // The redeemer is admitted by an online admin's signed op, so nothing is
+      // instant: confirm the request went out (a bad code / no admin replaces this
+      // with the real error), so a successful-but-pending redeem is never silent.
+      setStatus("Invite sent. You will join once an admin admits you.", false);
+    });
 });
 $("rail-home").addEventListener("click", selectHome);
 $("ws-manage").addEventListener("click", openWorkspaceManage);

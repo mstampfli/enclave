@@ -4622,8 +4622,16 @@ impl Client {
             match self.admit_workspace_member(id, &handle).await {
                 Ok(()) => return Some(handle),
                 // A bad handle (no key package, fetch failure) is dropped rather
-                // than wedging the queue; the next one still gets its chance.
-                Err(_) => continue,
+                // than wedging the queue; the next one still gets its chance. Report
+                // it so the admit is not a silent no-op (the redeemer never joins,
+                // and previously no one was told why).
+                Err(e) => {
+                    self.pending.push_back(Event::Error(format!(
+                        "Could not admit {handle}: {e}. They may need to reconnect so a \
+                         fresh key package is available."
+                    )));
+                    continue;
+                }
             }
         }
     }
