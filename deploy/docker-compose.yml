@@ -1,0 +1,31 @@
+# Enclave relay on cp1. Lives at /srv/docker/enclave/ alongside the other
+# services. Both ports publish on cp1's TAILNET address only -- a bare publish
+# would also bypass the host's lan-firewall.
+services:
+  enclave:
+    image: enclave-server:local
+    container_name: enclave
+    # `always`, not `unless-stopped`: a dockerd crash records containers as
+    # manually stopped, and `unless-stopped` then never revives them.
+    restart: always
+    ports:
+      # Signaling (WebSocket). The hub's Caddy terminates TLS and proxies here.
+      - "100.64.0.3:8443:8443/tcp"
+      # Media (UDP). Reached via the hub's DNAT, since the client derives the
+      # media address as <signaling host>:8444.
+      - "100.64.0.3:8444:8444/udp"
+    volumes:
+      # Bind mount (not a named volume) so the state is trivially backed up
+      # alongside the other cp1 services. It MUST be owned by uid 10001 -- the
+      # relay runs non-root and refuses to start if it cannot write here.
+      # deploy.sh creates it with the right owner.
+      - ./data:/data
+    # The relay holds no keys and reads no message content; it needs nothing
+    # from the host beyond its state directory.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

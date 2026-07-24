@@ -34,6 +34,16 @@ fn die(context: &str, e: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
+/// Prove the working directory really accepts a write, by creating, writing and
+/// removing a probe file. Checking permission bits (or that the directory
+/// merely exists) would pass on the case that actually bites in a container: a
+/// bind mount owned by a different uid than the one the relay runs as.
+fn check_state_dir_writable() -> std::io::Result<()> {
+    let probe = std::path::Path::new(".enclave-write-probe");
+    std::fs::write(probe, b"ok")?;
+    std::fs::remove_file(probe)
+}
+
 #[tokio::main]
 async fn main() {
     let signaling_addr = std::env::args()
@@ -42,6 +52,16 @@ async fn main() {
     let media_addr = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "127.0.0.1:8444".to_string());
+
+    // Every store below writes relative to the working directory, and each one
+    // discards its write errors so the relay keeps serving. That is the right
+    // behaviour for a transient failure, but it means an UNWRITABLE state
+    // directory would run fine and silently lose every account, op-log and
+    // queued message on restart. Refuse to start instead: a misconfigured mount
+    // is a deployment error, and it must be loud.
+    if let Err(e) = check_state_dir_writable() {
+        die("state directory is not writable", e);
+    }
 
     // Accounts and the OPAQUE server setup persist together: an envelope in the
     // account store is only usable under the setup it was registered against.

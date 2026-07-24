@@ -1,0 +1,14 @@
+target/
+.git/
+# Runtime state must never enter a build context or an image layer.
+enclave-*.json
+enclave-*.id
+enclave-*.session
+enclave-opaque.setup
+enclave-files/
+enclave-downloads/
+enclave-workspaces-history/
+avatars/
+voice/
+design/
+docs/
