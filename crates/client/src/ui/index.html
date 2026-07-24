@@ -4438,9 +4438,10 @@ $("plus-btn").addEventListener("click", (e) => {
   e.stopPropagation();
   const inChannel = activeChannel && !activeConv;
   if (!activeConv && !inChannel) { toast("Open a conversation first"); return; }
-  // Channels take files (and voice, via the mic button) but not polls yet, so
-  // only offer what actually works here rather than a dead menu item.
-  $("am-poll").hidden = inChannel;
+  // A channel takes files (and voice, via the mic button) but not polls, so the
+  // menu would hold a single item. Go straight to the file picker instead of
+  // opening a one-entry dropdown.
+  if (inChannel) { toggleAttachMenu(false); send({ type: "PickFiles" }); return; }
   toggleAttachMenu();
 });
 $("am-file").addEventListener("click", () => { toggleAttachMenu(false); send({ type: "PickFiles" }); });
@@ -6972,7 +6973,6 @@ function onInviteCreated(ev) {
 }
 
 // Composer routing: when a channel is open, the composer posts to it.
-const _wsOrigSend = null;
 function sendActiveChannelPost(text) {
   if (activeChannel && activeWs) {
     send({ type: "SendChannelPost", workspace: activeWs, channel: activeChannel, text });
