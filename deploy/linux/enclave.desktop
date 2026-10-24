@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Enclave
+Comment=End-to-end-encrypted voice, video, and text
+Exec=enclave
+Terminal=false
+Categories=Network;InstantMessaging;Chat;

@@ -1437,7 +1437,7 @@ dependencies = [
 
 [[package]]
 name = "enclave-client"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bincode",
  "chacha20poly1305 0.11.0",
@@ -1462,7 +1462,7 @@ dependencies = [
 
 [[package]]
 name = "enclave-crypto"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "bincode",
@@ -1487,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "enclave-media"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ashpd 0.13.12",
  "audiopus",
@@ -1509,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "enclave-protocol"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64",
  "serde",
@@ -1518,7 +1518,7 @@ dependencies = [
 
 [[package]]
 name = "enclave-server"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "enclave-protocol",
  "enclave-transport",
@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "enclave-transport"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "bincode",

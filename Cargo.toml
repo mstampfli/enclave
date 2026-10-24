@@ -10,11 +10,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.92"
 license = "AGPL-3.0-or-later"
-repository = ""
+repository = "https://github.com/mstampfli/enclave"
 
 # Shared dependency versions live here so every crate pins the same line.
 # Heavy deps (openmls, webrtc, opus, cpal, nokhwa, wry) are added per-phase in

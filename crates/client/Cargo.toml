@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 enclave-protocol = { path = "../protocol" }
 enclave-crypto = { path = "../crypto" }
-enclave-media = { version = "0.0.0", path = "../media" }
+enclave-media = { path = "../media" }
 enclave-transport = { path = "../transport" }
 thiserror.workspace = true
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
@@ -38,3 +38,20 @@ open = "5"
 
 [dev-dependencies]
 enclave-transport = { path = "../transport" }
+
+# Linux .deb for the release workflow (`cargo deb -p enclave-client`).
+# `$auto` derives the shared-library deps (WebKitGTK, GTK, ALSA, PipeWire) from
+# the built binary. The H.264 decoder and the screen-cast portal are loaded at
+# runtime, so dpkg-shlibdeps cannot see them: they are listed by hand.
+[package.metadata.deb]
+name = "enclave"
+maintainer = "Marc Stampfli <marc.kurt.stampfli@icloud.com>"
+section = "net"
+depends = "$auto"
+recommends = "gstreamer1.0-libav | gstreamer1.0-plugins-bad, xdg-desktop-portal, pipewire"
+extended-description = "End-to-end-encrypted voice, video, and text with a self-hosted relay that forwards ciphertext and never holds your keys."
+assets = [
+    ["target/release/enclave", "usr/bin/", "755"],
+    ["../../deploy/linux/enclave.desktop", "usr/share/applications/", "644"],
+    ["../../RUN.md", "usr/share/doc/enclave/", "644"],
+]

@@ -6,6 +6,10 @@
 //! The controller runs on its own thread with a Tokio runtime; the tao event
 //! loop owns the WebView on the main thread and shuttles events between them.
 
+// A release build on Windows is a GUI app: without this it also opens a console
+// window. Debug builds keep the console for logs.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

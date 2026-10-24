@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Builds the desktop client natively on each OS and publishes it as a GitHub
+# release. The build jobs hold read-only tokens; only `publish` can write, and
+# it runs no project code.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Client (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux system libraries (WebKitGTK, ALSA, PipeWire)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang nasm cmake pkg-config \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libpipewire-0.3-dev
+      # The tag must match the crate version, so a release can never ship a
+      # binary that reports a different version than its name says.
+      - name: Tag matches the workspace version
+        shell: bash
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          # pkgid ends in `#enclave-client@X.Y.Z`; keep what follows the last # or @.
+          have="$(cargo pkgid -p enclave-client | sed 's/.*[#@]//')"
+          echo "tag=$want crate=$have"
+          test "$want" = "$have"
+      - name: Test
+        run: cargo test --locked
+      - name: Build the client
+        run: cargo build --release --locked -p enclave-client --bin enclave
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "enclave-$env:GITHUB_REF_NAME-windows-x86_64"
+          New-Item -ItemType Directory -Path "dist/$name" | Out-Null
+          Copy-Item target/release/enclave.exe, LICENSE, RUN.md "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          Remove-Item -Recurse "dist/$name"
+
+      - uses: taiki-e/install-action@v2
+        if: runner.os == 'Linux'
+        with:
+          tool: cargo-deb
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          name="enclave-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir -p "dist/$name"
+          cp target/release/enclave LICENSE RUN.md deploy/linux/enclave.desktop "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -r "dist/$name"
+          cargo deb -p enclave-client --no-build --output dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * | tee SHA256SUMS
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Enclave $GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes "Desktop client for Windows (x86_64, needs the WebView2 runtime that ships with Windows 10/11) and Linux (x86_64, built on Ubuntu 24.04; the .deb pulls in WebKitGTK, GTK, ALSA and PipeWire). See RUN.md for usage. Not audited: do not rely on it yet."
