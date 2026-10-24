@@ -3,7 +3,7 @@
 //! Reader and writer run on their own tasks; the public API is a simple send /
 //! async-recv pair.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use enclave_protocol::{ClientMsg, ServerMsg};
 use futures_util::{SinkExt, StreamExt};
@@ -47,8 +47,17 @@ impl Drop for Connection {
 }
 
 impl Connection {
-    /// Connect over plaintext `ws://`.
+    /// Connect to `ws://` (plaintext) or `wss://` (TLS, verified against the
+    /// operating system's trust store -- see [`system_tls_config`]).
     pub async fn connect(url: &str) -> Result<Self, TransportError> {
+        if url.starts_with("wss://") {
+            return Self::connect_tls_shared(url, system_tls_config()?).await;
+        }
+        if !url.starts_with("ws://") {
+            return Err(TransportError::Tls(
+                "server url must start with ws:// or wss://".into(),
+            ));
+        }
         let (ws, _resp) = tokio_tungstenite::connect_async(url).await?;
         Ok(Self::from_ws(ws))
     }
@@ -60,9 +69,16 @@ impl Connection {
         url: &str,
         config: rustls::ClientConfig,
     ) -> Result<Self, TransportError> {
+        Self::connect_tls_shared(url, Arc::new(config)).await
+    }
+
+    async fn connect_tls_shared(
+        url: &str,
+        config: Arc<rustls::ClientConfig>,
+    ) -> Result<Self, TransportError> {
         let (host, port) = parse_wss_authority(url)?;
         let tcp = TcpStream::connect((host.as_str(), port)).await?;
-        let connector = TlsConnector::from(Arc::new(config));
+        let connector = TlsConnector::from(config);
         let server_name =
             ServerName::try_from(host).map_err(|e| TransportError::Tls(e.to_string()))?;
         let tls = connector.connect(server_name, tcp).await?;
@@ -155,17 +171,103 @@ impl Connection {
     }
 }
 
-/// Split `wss://host:port/...` into `(host, port)`.
+/// The TLS client config for `wss://` servers: the operating system's trust
+/// store (Windows certificate store, the distro CA bundle on Linux), so a relay
+/// behind a public CA works out of the box and an operator's private CA works
+/// once it is installed system-wide. Built once: reconnects reuse it rather than
+/// re-reading the store.
+fn system_tls_config() -> Result<Arc<rustls::ClientConfig>, TransportError> {
+    static CONFIG: OnceLock<Result<Arc<rustls::ClientConfig>, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let mut roots = rustls::RootCertStore::empty();
+            // Unreadable individual certificates are skipped, not fatal; only
+            // an empty store is, since it would reject every server.
+            let (added, _ignored) =
+                roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+            if added == 0 {
+                return Err("no trusted root certificates found on this system".into());
+            }
+            let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| e.to_string())?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            Ok(Arc::new(config))
+        })
+        .clone()
+        .map_err(TransportError::Tls)
+}
+
+/// Split `wss://host[:port]/...` into `(host, port)`; the port defaults to 443.
+/// An IPv6 literal must be bracketed (`wss://[::1]:8443`), as in any URL.
 fn parse_wss_authority(url: &str) -> Result<(String, u16), TransportError> {
     let rest = url
         .strip_prefix("wss://")
         .ok_or_else(|| TransportError::Tls("url must start with wss://".into()))?;
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let (host, port) = authority
-        .rsplit_once(':')
-        .ok_or_else(|| TransportError::Tls("wss url needs host:port".into()))?;
-    let port: u16 = port
-        .parse()
-        .map_err(|_| TransportError::Tls("invalid port in wss url".into()))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let (host, after) = v6
+            .split_once(']')
+            .ok_or_else(|| TransportError::Tls("unterminated [ in wss url".into()))?;
+        (host, after.strip_prefix(':'))
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return Err(TransportError::Tls("wss url has no host".into()));
+    }
+    let port = match port {
+        Some(p) => p
+            .parse()
+            .map_err(|_| TransportError::Tls("invalid port in wss url".into()))?,
+        None => 443,
+    };
     Ok((host.to_string(), port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_wss_authority;
+
+    fn parse(url: &str) -> Option<(String, u16)> {
+        parse_wss_authority(url).ok()
+    }
+
+    #[test]
+    fn explicit_port() {
+        assert_eq!(
+            parse("wss://localhost:8443"),
+            Some(("localhost".into(), 8443))
+        );
+    }
+
+    #[test]
+    fn port_defaults_to_443() {
+        let want = Some(("relay.example.com".into(), 443));
+        assert_eq!(parse("wss://relay.example.com"), want);
+        assert_eq!(parse("wss://relay.example.com/"), want);
+        assert_eq!(parse("wss://relay.example.com/ws?x=1"), want);
+    }
+
+    #[test]
+    fn bracketed_ipv6() {
+        assert_eq!(parse("wss://[::1]:8443"), Some(("::1".into(), 8443)));
+        assert_eq!(parse("wss://[fd7a::1]/"), Some(("fd7a::1".into(), 443)));
+    }
+
+    #[test]
+    fn rejects_malformed() {
+        assert_eq!(parse("ws://host:1"), None);
+        assert_eq!(parse("wss://"), None);
+        assert_eq!(parse("wss://:443"), None);
+        assert_eq!(parse("wss://host:notaport"), None);
+        assert_eq!(parse("wss://host:70000"), None);
+        assert_eq!(parse("wss://[::1"), None);
+    }
 }

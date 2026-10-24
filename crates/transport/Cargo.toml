@@ -19,6 +19,8 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "s
 tokio-tungstenite = "0.30.0"
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+# `wss://` servers are verified against the OS trust store (client.rs).
+rustls-native-certs = "0.8"
 argon2 = "0.5.3"
 serde = { workspace = true, features = ["derive"] }
 opaque-ke = { version = "4.0.1", features = ["argon2"] }
