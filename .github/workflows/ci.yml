@@ -45,7 +45,7 @@ jobs:
         # RUSTSEC-2026-0124 (libcrux-chacha20poly1305 DoS panic) is waived: it is
         # verified not exploitable in Enclave (not compiled on the Windows client
         # target; our AES-128-GCM ciphersuite never calls libcrux's ChaCha open;
-        # the server has no libcrux dep). No upstream fix exists yet -- the fix is
+        # the relay binary contains no libcrux symbol). No upstream fix exists yet -- the fix is
         # exact-pinned out via openmls_rust_crypto -> hpke-rs -> libcrux-aead
         # 0.0.7. See THREAT_MODEL.md. Every OTHER advisory still breaks the build.
         #
@@ -65,6 +65,18 @@ jobs:
         # -only and 0207/0208 are SHAKE correctness/DoS bugs of the 0124 class. See
         # THREAT_MODEL.md; drop these when openmls ships a provider on patched
         # libcrux.
+        #
+        # RUSTSEC-2026-0330/0331 (libcrux-kem hybrid-KEM panics) are waived: the
+        # crate is in Cargo.lock only and is compiled into no shipped binary
+        # (cargo tree --target all is empty; no libcrux_kem symbol in either
+        # release binary). Drop these when the lock moves to libcrux-kem >= 0.0.10.
+        #
+        # RUSTSEC-2026-0387 (crypto-bigint timing) is waived: it ships via the
+        # P-256/P-384/K-256 code of openmls's provider, but no secret on those
+        # curves can exist -- the relay holds none, Enclave generates none, and
+        # require_enclave_ciphersuite refuses any foreign suite at every MLS
+        # ingress (tests/ciphersuite_pinning.rs). Drop it when the provider moves
+        # to crypto-bigint >= 0.7.6. See THREAT_MODEL.md for all three.
         run: >-
           cargo audit
           --ignore RUSTSEC-2026-0124
@@ -72,6 +84,8 @@ jobs:
           --ignore RUSTSEC-2026-0207 --ignore RUSTSEC-2026-0208
           --ignore RUSTSEC-2026-0209 --ignore RUSTSEC-2026-0211
           --ignore RUSTSEC-2026-0212
+          --ignore RUSTSEC-2026-0330 --ignore RUSTSEC-2026-0331
+          --ignore RUSTSEC-2026-0387
 
   secret-scan:
     name: Secret scan

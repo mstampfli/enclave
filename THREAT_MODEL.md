@@ -108,10 +108,12 @@ Target level L2 (private communications). Chapters touched and status:
   password-derived key (Argon2id -> ChaCha20-Poly1305); see the account section.
 - **V7 Error Handling & Logging** [OK]: the server drops bad input silently and
   logs no key material; errors carry no secrets.
-- **V9 Communications** [FIXED]: optional TLS (wss) on the signaling hop via
+- **V9 Communications** [FIXED]: TLS (wss) on the signaling hop via
   `Server::serve_signaling_tls` + `Connection::connect_tls` (rustls/ring); the
-  server binary serves wss when `ENCLAVE_TLS_CERT`/`ENCLAVE_TLS_KEY` are set. See
-  `crates/transport/tests/tls_signaling.rs`.
+  server binary serves wss when `ENCLAVE_TLS_CERT`/`ENCLAVE_TLS_KEY` are set, or
+  sits behind a TLS-terminating proxy. `Connection::connect` dispatches on the
+  scheme and verifies a `wss://` server against the OS trust store (no option to
+  skip verification). See `crates/transport/tests/tls_signaling.rs`.
 - **V11 Business Logic** [FIXED]: a per-connection token bucket
   (`ratelimit::TokenBucket`) throttles signaling floods; unit-tested with an
   injected clock.
@@ -135,8 +137,10 @@ Target level L2 (private communications). Chapters touched and status:
      ciphersuite (`enclave_capabilities`), so a peer cannot add us to a ChaCha
      group even by choosing one -- ChaCha can never be negotiated for us.
   4. **Not present where it runs.** `libcrux-chacha20poly1305` is absent from the
-     Windows client build graph (`cargo tree -i` is empty), and `enclave-server`
-     does not depend on `enclave-crypto`, so the relay never pulls libcrux.
+     Windows client build graph (`cargo tree -i` is empty). The relay does depend
+     on `enclave-crypto` (it validates workspace op signatures), but its release
+     binary contains no `libcrux_*` symbol at all (`nm --defined-only`, checked
+     2026-10-24), and the Linux client's contains only `libcrux_sha3`.
 
   The correct remediation is an upstream bump, not forking a formally-verified
   crypto crate (which would void its verification provenance). No upstream fix is
@@ -166,6 +170,45 @@ Target level L2 (private communications). Chapters touched and status:
   Waived in CI; drop the ignores when openmls ships a provider on patched
   libcrux. (Residual risk acknowledged: these are in the MLS AEAD path, so track
   the upstream fix and re-evaluate rather than treat the waiver as permanent.)
+
+- **RUSTSEC-2026-0330 / RUSTSEC-2026-0331** -- `libcrux-kem` <= 0.0.9: panics in
+  `PublicKey::encapsulate_derand` on a short seed (0330) and in
+  `PublicKey::decode` / `PrivateKey::decode` on short hybrid X-Wing /
+  X25519-MLKEM768 keys (0331, network-reachable where it applies). Severe in
+  principle here, because release builds `panic = "abort"`: one decoded hostile
+  key would kill the whole relay. **Not exploitable in Enclave: the crate is not
+  compiled into any shipped binary.** It is in `Cargo.lock` only;
+  `cargo tree -i libcrux-kem --target all` is empty for both `enclave-server`
+  and `enclave-client`, and neither release binary contains a `libcrux_kem` or
+  `libcrux_ml_kem` symbol (`nm`, with `curve25519_dalek` / `opaque_ke` as
+  positive controls). Enclave's suite also uses no hybrid KEM. Waived in CI;
+  drop the ignores when the lockfile moves to libcrux-kem >= 0.0.10.
+
+- **RUSTSEC-2026-0387** -- `crypto-bigint` < 0.7.6: operations meant to be
+  constant-time can branch on secret data (timing side channel). It IS compiled
+  in, via the P-256/P-384/K-256 code openmls's provider ships for other suites
+  (`elliptic-curve` 0.13 pins crypto-bigint 0.5, so no compatible fix). A timing
+  leak needs a secret on those curves, so the analysis is about whether one can
+  ever exist:
+  1. **The relay has none.** It holds no MLS keys; its OPAQUE server key is
+     Ristretto255 and its only signature checks are Ed25519 (`sign.rs`). At most
+     it handles public P-256 data, whose timing reveals nothing.
+  2. **Enclave never creates one.** Every key it generates is pinned to the
+     compile-time `CIPHERSUITE` (X25519 / AES-128-GCM / SHA-256 / Ed25519).
+  3. **An attacker cannot make it create one.** This was NOT true before
+     2026-10-24: `Group::join_by_external_commit` took its suite from the
+     GroupInfo, which arrives through the untrusted relay, so a member could be
+     made to generate and use P-256 keys for an attacker-built group (proven: the
+     join succeeded). The impact was low -- those keys belong only to the
+     attacker's own group, and identity keys are Ed25519 -- but it broke the
+     one-suite invariant. Fixed by `require_enclave_ciphersuite` at every ingress
+     (external join, `add_member`); a Welcome in a foreign suite is refused by
+     openmls itself before any crypto (`creation.rs`, ciphersuite vs our key
+     package). Locked in by `crates/crypto/tests/ciphersuite_pinning.rs`, which
+     uses genuinely attacker-built P-256 groups and key packages and fails if the
+     guard is removed.
+  Waived in CI; drop the ignore when openmls's provider moves to
+  elliptic-curve / crypto-bigint >= 0.7.6.
 
 ## Account authentication (STRIDE + ASVS L2) -- zero-knowledge via OPAQUE
 
