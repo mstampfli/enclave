@@ -17,16 +17,21 @@ creates the state directory with the right owner, and starts it. cp1 needs no
 GitHub credential and no Rust toolchain -- it authenticates to nothing. Rerun to
 upgrade.
 
-Then prove it actually works, end to end, through the real deployment:
+Then prove it actually works, end to end, through the real deployment (after
+the one-time hub-side exposure below):
 
 ```sh
-ENCLAVE_RELAY_URL=ws://100.64.0.3:8443 \
+ENCLAVE_RELAY_URL=wss://enclave.home.mstampfli.com \
   cargo test -p enclave-client --test deployed_relay -- --nocapture
 ```
 
 That creates two accounts, builds a workspace and a channel, and round-trips a
 message and a file. It is skipped when `ENCLAVE_RELAY_URL` is unset, so it never
 runs in CI.
+
+Client devices cannot test `ws://100.64.0.3:8443` directly: the headscale ACL
+lets them reach cp1 on `:22` only, and the hub is the one path in. That is the
+point -- the relay is reachable solely through Caddy's TLS and VPN gate.
 
 ## What the compose file guarantees
 
@@ -48,10 +53,13 @@ runs in CI.
 
 Signaling is HTTP(S), so Caddy fronts it. Media is raw UDP, so it needs a DNAT.
 
-**1. Caddy vhost** on the hub, `/etc/caddy/Caddyfile`:
+**1. Caddy vhost** on the hub, `/etc/caddy/Caddyfile` (`cfdns` issues the cert
+over DNS-01, `access` logs requests to the journal, as on every `.home` vhost):
 
 ```caddyfile
 enclave.home.mstampfli.com {
+    import cfdns
+    import access
     @notvpn not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48
     handle @notvpn { abort }
     handle { reverse_proxy 100.64.0.3:8443 }
@@ -108,9 +116,10 @@ headscale policy check --file /etc/headscale/acl.hujson
 sudo systemctl restart headscale
 ```
 
-**5. Landing page** -- add the entry to `cp1:/srv/docker/web/sites/landing/index.html`
-(the `mstampfli/web` repo) under Private, then `docker compose restart web` and
-commit the repo.
+**5. Dashboard** -- `home.mstampfli.com` is maka-collector's embedded app, and
+its site-health list is hardcoded in `maka-hub/main.go` (`var sites`) in the
+`maka-infra` repo; add `enclave.home.mstampfli.com` there to monitor it. (The
+old `sites/landing/index.html` is no longer served.)
 
 ## Verifying the exposed deployment
 

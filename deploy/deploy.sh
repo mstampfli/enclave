@@ -54,11 +54,10 @@ cat <<EOF
 
 Relay is up on $TAILNET_IP:8443 (signaling) and $TAILNET_IP:8444/udp (media).
 
-Smoke-test it end to end from this device:
+Clients reach it only through the hub (TLS + the VPN gate), a separate,
+one-time step -- see deploy/README.md. Once that is in place, smoke-test it end
+to end from this device:
 
-  ENCLAVE_RELAY_URL=ws://$TAILNET_IP:8443 \\
+  ENCLAVE_RELAY_URL=wss://enclave.home.mstampfli.com \\
     cargo test -p enclave-client --test deployed_relay -- --nocapture
-
-Hub-side exposure (TLS + the VPN gate) is a separate, one-time step -- see
-deploy/README.md.
 EOF
