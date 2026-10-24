@@ -59,6 +59,24 @@ fn join_config() -> MlsGroupJoinConfig {
         .build()
 }
 
+/// SECURITY (one fixed ciphersuite, enforced at ingress): reject any suite but
+/// [`crate::CIPHERSUITE`] named by untrusted input, BEFORE openmls does crypto
+/// in it. openmls's provider ships every suite, so without this an
+/// attacker-built group (its GroupInfo arrives through the untrusted relay)
+/// could make a member generate and use keys on another curve -- P-256, say,
+/// whose crypto-bigint arithmetic carries RUSTSEC-2026-0387 -- or reach code
+/// paths Enclave never exercises.
+fn require_enclave_ciphersuite(got: Ciphersuite) -> Result<(), String> {
+    if got == crate::CIPHERSUITE {
+        Ok(())
+    } else {
+        Err(format!(
+            "unsupported ciphersuite {got:?} (Enclave speaks only {:?})",
+            crate::CIPHERSUITE
+        ))
+    }
+}
+
 /// An MLS group instance held by one member.
 pub struct Group {
     inner: MlsGroup,
@@ -108,6 +126,10 @@ impl Group {
         let key_package = key_package_in
             .validate(owner.provider.crypto(), ProtocolVersion::Mls10)
             .map_err(|e| CryptoError::KeyPackageInvalid(e.to_string()))?;
+        // Validation only verified a signature over public data; reject a
+        // foreign suite before the package can reach the group.
+        require_enclave_ciphersuite(key_package.ciphersuite())
+            .map_err(CryptoError::KeyPackageInvalid)?;
 
         // SECURITY (bind the add to the INTENDED peer): `validate` only proves the
         // package is self-consistently signed by its own credential -- NOT that it
@@ -275,6 +297,9 @@ impl Group {
         // recovery-margin ratchet tolerance as every other member.
         let config = join_config();
 
+        // A Welcome in a foreign suite is refused by openmls itself before any
+        // crypto (it must match our key package's suite, which is always
+        // CIPHERSUITE); `tests/ciphersuite_pinning.rs` locks that in.
         let staged = StagedWelcome::new_from_welcome(&joiner.provider, &config, welcome, None)
             .map_err(|e| CryptoError::Join(e.to_string()))?;
         let inner = staged
@@ -320,6 +345,11 @@ impl Group {
             MlsMessageBodyIn::GroupInfo(info) => info,
             _ => return Err(CryptoError::Join("message was not group info".into())),
         };
+        // An external join takes its suite from the GroupInfo alone (no key
+        // package of ours is involved, so openmls has nothing to match it
+        // against): check it before any key is generated for the group.
+        require_enclave_ciphersuite(verifiable_group_info.ciphersuite())
+            .map_err(CryptoError::Join)?;
         let (inner, bundle) = MlsGroup::external_commit_builder()
             .with_config(join_config())
             .build_group(
