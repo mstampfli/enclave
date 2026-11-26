@@ -1,11 +1,8 @@
 # Enclave
 
-> [!CAUTION]
-> ## Enclave is NOT secure, and it is only sparsely maintained for now.
->
-> Do not use it for conversations that must stay private. Its review covered the design as it
-> stood, not every change since, and fixes may take a long time to arrive. Treat it as a project
-> in progress, not as a secure messenger.
+> [!NOTE]
+> **Experimental and not independently audited;** maintained only now and then. Don't use it for
+> anything sensitive.
 
 End-to-end-encrypted voice, video, and text. Self-hosted relay: it forwards
 ciphertext and never holds your keys. You verify your friends' identities
